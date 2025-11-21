@@ -1,0 +1,81 @@
+# Created October 2025
+
+#NGEN_SEASON:  1   # 1 survey defined by PEAKMJD range, z-range and solid angle
+NGEN_LC:  10  # alternative to fix number writed
+#NGENTOT_LC:  100  # number of LC to generate
+
+# name of version to appear in $SNDATA_ROOT/SIM
+GENVERSION:  MY_LSST_KN_TEST_1
+#PATH_SNDATA_SIM: /data/SNANA/SIM
+
+# define SED model and rate model
+GENMODEL:  $SNDATA_ROOT/models/SIMSED/SIMSED.KN-BULLA19/SIMSED.BULLA-BNS-M3-3COMP
+#SIMSED_GRIDONLY: KN_INDEX
+DNDZ: POWERLAW  1.0E-6  0.0  # volumetric rate = 1.0E-6/Mpc^3/yr (no z-dependence)
+
+GENFILTERS:   ugrizY
+
+# define distribution of KN parameters
+SIMSED_PARAM: COSTHETA
+GENPEAK_COSTHETA: 0.186585
+GENRANGE_COSTHETA: 0.15 0.20
+GENSIGMA_COSTHETA: 0.01 0.01
+
+SIMSED_PARAM: MEJDYN
+GENPEAK_MEJDYN: 0.003125
+GENRANGE_MEJDYN: 0.003125 0.003125
+GENSIGMA_MEJDYN: 0 0
+
+SIMSED_PARAM: MEJWIND
+GENPEAK_MEJWIND: 0.038445
+GENRANGE_MEJWIND: 0.038445 0.038445
+GENSIGMA_MEJWIND: 0 0
+
+SIMSED_PARAM: PHI
+GENPEAK_PHI: 51.303497
+GENRANGE_PHI: 45 55
+GENSIGMA_PHI: 1 1
+
+
+# define 3 quantities which determine NGEN
+GENRANGE_PEAKMJD:  59740 63200
+GENRANGE_REDSHIFT: 0.01  0.22
+#REDSHIFT_CMB： 0.0674   # true CMB redshift of KN
+SOLID_ANGLE:  6.0            # approx solid angle, steridians
+
+GENRANGE_TREST:    -10 30  # days
+GENSOURCE: RANDOM
+RANSEED:   689541
+
+# cadence library
+SIMLIB_FILE:  $KN_DIR/data/simlib/baseline_v5.0.1_10yrs_test.SIMLIB
+USE_SIMLIB_REDSHIFT:   1    # use redshift in LIB
+
+# filter transmission curves and calibration info
+KCOR_FILE:    $SNDATA_ROOT/kcor/LSST/baseline_1.9/kcor_LSST.fits
+
+# Effic vs. SNR for detetctions
+SEARCHEFF_PIPELINE_LOGIC_FILE: $SNDATA_ROOT/models/searcheff/SEARCHEFF_PIPELINE_LOGIC.DAT
+#SEARCHEFF_PIPELINE_EFF_FILE:  $SNDATA_ROOT/models/searcheff/SEARCHEFF_PIPELINE_LSST.DAT
+SEARCHEFF_PIPELINE_FILE: SEARCHEFF_PIPELINE_LSST.DAT
+APPLY_SEARCHEFF_OPT:  1
+
+NEWMJD_DIF: 0.020833    # min MJD dif to count NEW MJD(30 min)
+
+#APPLY_CUTWIN_OPT:  1
+#CUTWIN_EPOCHS_SNRMIN:  4 30 grizY
+#CUTWIN_SNRMAX:         4 grizY 2 -20 60
+
+# convert SED into binary 
+SIMSED_USE_BINARY:  1   # speed up the initialization of SED files
+SIMSED_PATH_BINARY: /fred/oz016/bgao_kn/SNANA/SNDATA_ROOT/models/SIMSED/BINARY
+
+FORMAT_MASK:  32  # 2=TEXT  32=FITS
+
+# variables to include in one-row per SN text dump
+SIMGEN_DUMP:  23
+  CID LIBID GENTYPE  SNTYPE  ZCMB  RA DECL MWEBV MU
+  PEAKMJD SNRMAX SNRMAX2 SNRMAX3 
+  SNRMAX_u SNRMAX_g SNRMAX_r SNRMAX_i SNRMAX_z SNRMAX_Y
+  TIME_ABOVE_SNRMIN  NOBS CUTMASK  SIM_SEARCHEFF_MASK
+

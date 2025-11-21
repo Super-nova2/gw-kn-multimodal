@@ -1,0 +1,17 @@
+
+ &SNLCINP
+    VERSION_PHOTOMETRY = 'GW170817_AT2017gfo_LSST_WFD'
+    SNTABLE_LIST       = 'SNANA(text:key)'
+    TEXTFILE_PREFIX    = 'OUT_GW170817_AT2017gfo_LSST'
+
+    OPT_MWEBV      =  2   ! SFD98
+    USE_MWCOR      =  T  ! correct data for Galactic extinction
+
+  ! see manual for this cut
+    REQUIRE_EPOCHS_STRING = 'FILTER rizY  SNRMIN 5  TOBS_RANGES 20 25 20 '
+
+    CUTWIN_SNRMAX       = 5, 99999
+    CUTWIN_NFILT_SNRMAX = 2, 999  ! at least two bands with SNR>5
+
+    OPT_SETPKMJD   = 8  ! PEAKMJD estimate of epoch with max flux
+ &END

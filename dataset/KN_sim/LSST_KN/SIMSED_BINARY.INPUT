@@ -1,0 +1,18 @@
+# Provide a few sim-input keys 
+SIM_KEYS:
+  GENFILTERS:         ugrizY
+  KCOR_FILE:    $SNDATA_ROOT/kcor/LSST/baseline_1.9/kcor_LSST.fits
+  SIMLIB_FILE:  $KN_DIR/data/rubin_sim/baseline/baseline_v5.0.1_10yrs.db
+  SIMSED_PATH_BINARY: /fred/oz016/bgao_kn/SNANA/SNDATA_ROOT/models/SIMSED/BINARY
+
+# provide models
+SIMSED_MODELS:    # model                                                   zmin  zmax
+  - $SNDATA_ROOT/models/SIMSED/SIMSED.KN-BULLA19/SIMSED.BULLA-BNS-M3-3COMP  0.001  1.0
+
+
+# optional parallel jobs (interactive; not batch)
+NJOB_PARALLEL: 3 # process in groups of 3
+
+# after binaries are created, check processing status in 
+#      MAKE_SIMSED_BINARY_SUMMARY.INFO
+# Ideally zmax(SNR>5) should be about 0.1 to 0.2 below zmax.

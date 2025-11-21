@@ -1,0 +1,5 @@
+
+# to generate and analyze a full 10-year simulation
+# for LSST-WFD:
+ snlc_sim.exe SIMGEN_KN_LSST.INPUT
+ snana.exe    SIMANA_GW170817_AT2017gfo_LSST.NML
