@@ -1,0 +1,24 @@
+DOCUMENTATION:
+    PURPOSE: LSST detection efficiency vs. MAG
+    INTENT:  Jump at SNR=5
+    USAGE_KEY:  SEARCHEFF_PIPELINE_FILE
+    USAGE_CODE: snlc_sim.exe
+    TEST_CODE:     used in KN analysis 
+    TEST_SCIENCE:  used in KN analysis 
+    VERSIONS:
+        - DATE: 2025
+          AUTHORS: bzGao
+          # 24 11 2025:
+	#  Assume all passbands are the same
+
+DOCUMENTATION_END:
+
+PHOTFLAG_DETECT: 4096  # set this PHOTFLAG bit for each detection
+PHOTFLAG_TRIGGER: 1024 # set this PHOTFLAG bit for first trigger
+
+FILTER: ugrizY
+SNR:   0.00  0.0
+SNR:   4.999 0.0
+SNR:   5.000  1.0
+SNR:   20.0   1.0
+ENDMAP:
