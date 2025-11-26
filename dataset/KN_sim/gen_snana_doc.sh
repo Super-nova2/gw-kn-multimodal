@@ -22,8 +22,8 @@ inj_file=$(jq -r '.injections_file' $args_file)
 out_dir=$(jq -r '.OUTPUT_DIR' $args_file)
 
 # get all simulation IDs from the injections file
-# mapfile -t SIM_IDS < <(awk -F',' 'NR>1 {print $1}' ${inj_file})
-SIM_IDS=$2
+mapfile -t SIM_IDS < <(awk -F',' 'NR>1 {print $1}' ${inj_file})
+# SIM_IDS=$2
 
 # select a subset of SIM_IDS based on SLURM_ARRAY_TASK_ID
 BATCH_SIZE=10
