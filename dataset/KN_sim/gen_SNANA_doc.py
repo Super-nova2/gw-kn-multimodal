@@ -23,12 +23,14 @@ def r_peak(distmu, distsigma):
     """
     distmu = np.asarray(distmu, dtype=float)
     distsigma = np.asarray(distsigma, dtype=float)
-    return 0.5 * (distmu + np.sqrt(distmu**2 + 8.0 * distsigma**2))
+    dist_peak = 0.5 * (distmu + np.sqrt(distmu**2 + 8.0 * distsigma**2))
+    return dist_peak
 
 def sample_sky_from_moc(mocmap, level=0.9, within=True):
     """
     Sample sky coordinates from a MOC skymap within/without a credible level.
     """
+
     uniq = mocmap['UNIQ']
     probdensity = mocmap['PROBDENSITY']
     distmu = mocmap['DISTMU']
@@ -75,9 +77,14 @@ def sample_sky_from_moc(mocmap, level=0.9, within=True):
     # calculate distance with peak pdf from distmu and distsigma
     distmu = np.array(distmu[mask], dtype=float)
     distsigma = np.array(distsigma[mask], dtype=float)
+
+    # remove nan values
+    valid = np.isfinite(distmu) & np.isfinite(distsigma) & (distsigma>0)
+    distmu = distmu[valid]
+    distsigma = distsigma[valid]
     dist_peak = r_peak(distmu, distsigma)
 
-    return ras, decs, dist_peak
+    return ras[valid], decs[valid], dist_peak
 
 def get_NLIBID(simlib_file):
     with open(simlib_file, 'r') as f:
@@ -150,7 +157,7 @@ parser.add_argument("--GW_params", type=str, default="/fred/oz016/bgao_kn/ML+GW+
 parser.add_argument("--Opsim", type=str, default="/fred/oz016/bgao_kn/data/rubin_sim/baseline/baseline_v5.0.1_10yrs.db", help="Opsim database file")
 parser.add_argument("--within", action='store_true', help="sample within credible level")
 parser.add_argument("--level", type=float, default=0.9, help="credible level to sample sky position")
-parser.add_argument("--outdir", type=str, default="./simlib", help="output directory for SIMLIB")
+parser.add_argument("--outdir", type=str, default="./data", help="output directory for SIMLIB")
 parser.add_argument("--template_input", type=str, default="/fred/oz016/bgao_kn/data/SIM_INPUT/SIMGEN_KN_LSST_TEMPLATE.INPUT", help="template SIMGEN INPUT file")
 args = parser.parse_args()
 
@@ -185,7 +192,7 @@ OpSimSurv.compute_hp_rep(nside=nside, minVisits=1, maxVisits=10000)    # nest=Fa
 sim_ids = args.sim_ids
 
 for sim_id in sim_ids:
-    print(f"Processing simulation ID: {sim_id}")
+    print(f"\nProcessing simulation ID: {sim_id}")
     # MOC skymap for high resolution
     skymap = read_sky_map(f'/fred/oz016/bgao_kn/data/bns_skymap/{sim_id}.fits', moc=True)
     # Load with nest map
@@ -197,6 +204,7 @@ for sim_id in sim_ids:
 
     # Sample sky position within 90% credible region
     ra, dec, dist_peak = sample_sky_from_moc(skymap, level=args.level, within=args.within)
+    print("Range of dist_peak(Mpc):", dist_peak.min(), dist_peak.max())
     redshift = z_at_value(cosmo.luminosity_distance, dist_peak * u.Mpc).value
 
     OpSimSurv.sample_coordinates(ra, dec, redshift, nsides=nside, is_deg=True)
@@ -208,6 +216,7 @@ for sim_id in sim_ids:
 
     # generate corresponding SIMGEN INPUT file
     NLIBID = get_NLIBID(os.path.join(simlib_dir, f"baseline_v5.0.1_10yrs_{sim_id}.SIMLIB"))
+    print(f"NLIBID for simulation ID {sim_id}: {NLIBID}")
 
     # replace NLIBID and GENVERSION in the template
     text = template_text
@@ -217,7 +226,7 @@ for sim_id in sim_ids:
             text,
             flags=re.MULTILINE
     )
-    genversion_new = f"MY_LSST_KN_{sim_id}"
+    genversion_new = f"LSST_KN_{sim_id}"
     text = re.sub(
         r"^(GENVERSION:\s*)\S+.*$",
         rf"\1{genversion_new}",
