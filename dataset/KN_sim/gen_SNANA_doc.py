@@ -95,7 +95,7 @@ def get_NLIBID(simlib_file):
                 break
     return nlibid
 
-def gen_input(injections, text):
+def gen_input(injections, text, sim_id):
     """
     Generate SIMGEN INPUT file content by modifying the template text with GW parameters.
     """
@@ -106,6 +106,16 @@ def gen_input(injections, text):
     phi = injections['phi'].iloc[idx].values
     mej_dyn = injections['mej_dyn'].iloc[idx].values
     mej_wind = injections['mej_wind'].iloc[idx].values
+
+    # check if parameters are in model range
+    if mej_dyn[0] < 0.001:
+        mej_dyn[0] = 0.001
+    elif mej_dyn[0] > 0.02:
+        mej_dyn[0] = 0.02
+    if mej_wind[0] < 0.01:
+        mej_wind[0] = 0.01
+    elif mej_wind[0] > 0.13:
+        mej_wind[0] = 0.13
 
     # modify explosion time
     text = re.sub(
@@ -235,7 +245,7 @@ for sim_id in sim_ids:
     )
 
     # modify other parameters based on GW parameters and simlib file
-    text = gen_input(injections, text)
+    text = gen_input(injections, text, sim_id)
     # save to file
     with open(input_dir + f"SIMGEN_KN_LSST_{sim_id}.INPUT", "w", encoding="utf-8") as f:
         f.write(text)
