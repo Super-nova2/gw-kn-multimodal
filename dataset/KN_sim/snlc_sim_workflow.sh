@@ -83,6 +83,7 @@ for sim_id in "${group_ids[@]}"; do
         echo "    SIMLIB has NLIBID=0, skip $sim_id"
         echo "    LSST do not cover the skymap of this event."
         echo "  [$sim_id] Skipped."
+        rm -f "${simlib}"
         continue
     fi
 
@@ -103,7 +104,7 @@ for sim_id in "${group_ids[@]}"; do
     if ! snlc_sim.exe "$input" > /dev/null ; then
         echo "    snlc_sim failed for $sim_id"
         echo "  [$sim_id] Failed."
-        rm -f "$simlib"  # remove SIMLIB if snlc_sim fails
+        # rm -f "$simlib"  # remove SIMLIB if snlc_sim fails
         failed_ids+=("$sim_id")
         continue
     fi
