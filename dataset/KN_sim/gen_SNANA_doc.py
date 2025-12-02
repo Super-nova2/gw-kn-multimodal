@@ -162,28 +162,24 @@ def gen_input(injections, text, sim_id):
 
 parser = argparse.ArgumentParser(description="Generate SNANA SIMLIB for one GW event.")
 
+parser.add_argument("--GW_type", type=str, default="bns", help="bns/nsbh")
+parser.add_argument("--sim_name", type=str, default="LSST_KN_BNS", help="Name of simulation, eg:LSST_KN_BNS/NSBH")
 parser.add_argument("--sim_ids", nargs="+", type=int, required=True, help="a list of simulation_id, at most 10")
 parser.add_argument("--GW_params", type=str, default="/fred/oz016/bgao_kn/ML+GW+KN/dataset/O5_sim_bns/injections_final.csv", help="CSV file containing GW parameters")
 parser.add_argument("--Opsim", type=str, default="/fred/oz016/bgao_kn/data/rubin_sim/baseline/baseline_v5.0.1_10yrs.db", help="Opsim database file")
 parser.add_argument("--within", action='store_true', help="sample within credible level")
 parser.add_argument("--level", type=float, default=0.9, help="credible level to sample sky position")
-parser.add_argument("--outdir", type=str, default="./data", help="output directory for SIMLIB")
+parser.add_argument("--outdir", type=str, default="./data/", help="output directory for SIMLIB")
 parser.add_argument("--template_input", type=str, default="/fred/oz016/bgao_kn/data/SIM_INPUT/SIMGEN_KN_LSST_TEMPLATE.INPUT", help="template SIMGEN INPUT file")
 args = parser.parse_args()
 
 # check output directory
 if not args.outdir.endswith('/'):
     args.outdir += '/'
-if not os.path.exists(args.outdir):
-    os.makedirs(args.outdir)
-    os.makedirs(args.outdir + "SIM_INPUT/")
-    os.makedirs(args.outdir + "simlib/")
-else:
-    if not os.path.isdir(args.outdir + "SIM_INPUT/"):
-        os.makedirs(args.outdir + "SIM_INPUT/")
-    if not os.path.isdir(args.outdir + "simlib/"):
-        os.makedirs(args.outdir + "simlib/")
-simlib_dir = args.outdir + "simlib/"
+# os.makedirs(args.outdir, exist_ok=True)
+os.makedirs(args.outdir + "SIM_INPUT/", exist_ok=True)
+os.makedirs(args.outdir + "SIMLIB/", exist_ok=True)
+simlib_dir = args.outdir + "SIMLIB/"
 input_dir = args.outdir + "SIM_INPUT/"
 
 # load GW parameters
@@ -200,13 +196,14 @@ nside = 256
 OpSimSurv.compute_hp_rep(nside=nside, minVisits=1, maxVisits=10000)    # nest=False
 
 sim_ids = args.sim_ids
+sim_name = args.sim_name
 
 for sim_id in sim_ids:
     print(f"\nProcessing simulation ID: {sim_id}")
     # MOC skymap for high resolution
-    skymap = read_sky_map(f'/fred/oz016/bgao_kn/data/bns_skymap/{sim_id}.fits', moc=True)
+    skymap = read_sky_map(f'/fred/oz016/bgao_kn/data/{args.GW_type}_skymap/{sim_id}.fits', moc=True)
     # Load with nest map
-    nest_map, meta = read_sky_map(f'/fred/oz016/bgao_kn/data/bns_skymap/{sim_id}.fits', nest=True)
+    nest_map, meta = read_sky_map(f'/fred/oz016/bgao_kn/data/{args.GW_type}_skymap/{sim_id}.fits', nest=True)
     distmean = meta.get('distmean')
     diststd = meta.get('diststd')
     print("Simulation ID:", sim_id)
@@ -220,12 +217,12 @@ for sim_id in sim_ids:
     OpSimSurv.sample_coordinates(ra, dec, redshift, nsides=nside, is_deg=True)
 
     # Writing simlib
-    sim = opsim.sim_io.SNANA_Simlib(OpSimSurv, out_path=simlib_dir, file_suffix=f"_{sim_id}")
+    sim = opsim.sim_io.SNANA_Simlib(OpSimSurv, out_path=simlib_dir, file_suffix=f"_{sim_name}_{sim_id}")
     sim.write_SIMLIB()  # taking about 2 minutes
     print(f"SIMLIB for simulation ID {sim_id} written to {simlib_dir}")
 
     # generate corresponding SIMGEN INPUT file
-    NLIBID = get_NLIBID(os.path.join(simlib_dir, f"baseline_v5.0.1_10yrs_{sim_id}.SIMLIB"))
+    NLIBID = get_NLIBID(os.path.join(simlib_dir, f"baseline_v5.0.1_10yrs_{sim_name}_{sim_id}.SIMLIB"))
     print(f"NLIBID for simulation ID {sim_id}: {NLIBID}")
 
     # replace NLIBID and GENVERSION in the template
@@ -236,7 +233,7 @@ for sim_id in sim_ids:
             text,
             flags=re.MULTILINE
     )
-    genversion_new = f"LSST_KN_{sim_id}"
+    genversion_new = f"{sim_name}_{sim_id}"
     text = re.sub(
         r"^(GENVERSION:\s*)\S+.*$",
         rf"\1{genversion_new}",
@@ -247,6 +244,6 @@ for sim_id in sim_ids:
     # modify other parameters based on GW parameters and simlib file
     text = gen_input(injections, text, sim_id)
     # save to file
-    with open(input_dir + f"SIMGEN_KN_LSST_{sim_id}.INPUT", "w", encoding="utf-8") as f:
+    with open(input_dir + f"SIMGEN_{sim_name}_{sim_id}.INPUT", "w", encoding="utf-8") as f:
         f.write(text)
     print(f"SIMGEN INPUT file for simulation ID {sim_id} written to {input_dir}")

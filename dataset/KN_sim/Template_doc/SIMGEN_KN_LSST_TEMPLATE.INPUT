@@ -4,7 +4,7 @@ SIMLIB_NREPEAT:   1 # use each LIBID for one time
 NGENTOT_LC: 13107  # number of LC to generate, number of LIBID in SIMLIB file
 
 # name of version to appear in $SNDATA_ROOT/SIM
-GENVERSION: MY_LSST_KN
+GENVERSION: LSST_KN
 
 # define SED model and rate model
 GENMODEL:  $SNDATA_ROOT/models/SIMSED/SIMSED.KN-BULLA19/SIMSED.BULLA-BNS-M3-3COMP

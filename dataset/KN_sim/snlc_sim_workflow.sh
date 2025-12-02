@@ -1,10 +1,10 @@
 #!/bin/bash
-#SBATCH --job-name=snana_kn
-#SBATCH --time=1:00:00            
+#SBATCH --job-name=LSST_KN_NSBH
+#SBATCH --time=2:00:00            
 #SBATCH --cpus-per-task=1
 #SBATCH --mem=10G
-#SBATCH --array=0-182%10   # 1822 simulations, each job handles 10 sims, max 10 jobs running simultaneously
-#SBATCH --output=logs/SNANA_KN/%x_%A_%a.out
+#SBATCH --array=0-26%10   # 1822 simulations, each job handles 10 sims, max 10 jobs running simultaneously
+#SBATCH --output=logs/LSST_KN_NSBH/%x_%a.out
 
 # ml gcc/11.3/0 python/3.10.4
 # ml gsl/2.7 cfitsio/4.2.0
@@ -13,6 +13,7 @@ set -euo pipefail
 args_file=$1
 
 sim_name=$(jq -r '.SIM_NAME' $args_file)
+gw_type=$(jq -r '.GW_type' $args_file)
 opsim_db=$(jq -r '.OpsimDB' $args_file)
 nside=$(jq -r '.Nside' $args_file)
 data_dir=$(jq -r '.DATA_DIR' $args_file)
@@ -21,6 +22,7 @@ simlib_dir=$(jq -r '.SIMLIB_DIR' $args_file)
 inj_file=$(jq -r '.injections_file' $args_file)
 out_dir=$(jq -r '.OUTPUT_DIR' $args_file)
 log_dir=$(jq -r '.LOG_DIR' $args_file)
+tem_input=$(jq -r '.TEMPLATE_INPUT' $args_file)
 
 echo "Starting SNANA doc generation for simulation: $sim_name"
 echo "Using Opsim DB: $opsim_db"
@@ -33,7 +35,7 @@ echo "SNANA simulation results output directory: $out_dir"
 # get all simulation IDs from the injections file
 mapfile -t SIM_IDS < <(awk -F',' 'NR>1 {print $1}' ${inj_file})
 
-N=$(tail -n +2 ${inj_file} | wc -l)
+N=$(tail -n +2 ${inj_file} | wc -l)     # total number of GW events
 BATCH_SIZE=10
 NTASK=$(((N + BATCH_SIZE - 1) / BATCH_SIZE))
 echo "Number of GW events = $N, need array 0-$(($NTASK - 1)), each task handling up to $BATCH_SIZE events."
@@ -59,12 +61,14 @@ echo "Processing simulation ids: ${group_ids[@]}"
 #-------Generating SIMLIB and INPUT files for snlc_sim.exe--------#
 ###################################################################
 
-python /fred/oz016/bgao_kn/ML+GW+KN/dataset/KN_sim/gen_SNANA_doc.py --sim_ids "${group_ids[@]}" \
+python /fred/oz016/bgao_kn/ML+GW+KN/dataset/KN_sim/gen_SNANA_doc.py --sim_name ${sim_name} \
+    --GW_type ${gw_type} \
+    --sim_ids "${group_ids[@]}" \
     --GW_params ${inj_file} \
     --Opsim ${opsim_db} \
     --within \
     --outdir ${data_dir} \
-    --template_input ${input_dir}/SIMGEN_KN_LSST_TEMPLATE.INPUT
+    --template_input ${tem_input}
 
 ###################################################################
 #------------------Running snlc_sim.exe---------------------------#
@@ -72,8 +76,8 @@ python /fred/oz016/bgao_kn/ML+GW+KN/dataset/KN_sim/gen_SNANA_doc.py --sim_ids "$
 
 failed_ids=()
 for sim_id in "${group_ids[@]}"; do
-    simlib="${simlib_dir}baseline_v5.0.1_10yrs_${sim_id}.SIMLIB"
-    input="${input_dir}SIMGEN_KN_LSST_${sim_id}.INPUT"
+    simlib="${simlib_dir}baseline_v5.0.1_10yrs_${sim_name}_${sim_id}.SIMLIB"
+    input="${input_dir}SIMGEN_${sim_name}_${sim_id}.INPUT"
 
     echo "sim_id=$sim_id : checking files"
     #  check NLIBID in SIMLIB file, skip if NLIBID=0
@@ -110,6 +114,7 @@ for sim_id in "${group_ids[@]}"; do
     fi
 
     # clean up SIMLIB file to save space
+    echo "    snlc_sim success for $sim_id"
     echo "    removing SIMLIB $simlib"
     rm -f "$simlib"
 
@@ -117,7 +122,7 @@ for sim_id in "${group_ids[@]}"; do
 done
 
 echo "Failed simulation IDs: ${failed_ids[@]}"
-printf "%s " "${failed_ids[@]}" >> "${log_dir}SNANA_KN/failed_sim_ids.txt"
-echo "Failed simulation ids saved to ${log_dir}SNANA_KN/failed_sim_ids.txt"
+printf "%s " "${failed_ids[@]}" | tr -s ' ' >> "${data_dir}failed_sim_ids.txt"
+echo "Failed simulation ids saved to ${data_dir}failed_sim_ids.txt"
 
 echo "Task $task_id finished."
