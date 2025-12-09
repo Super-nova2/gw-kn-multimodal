@@ -6,7 +6,7 @@
     "SNANA_DIR": "/fred/oz016/bgao_kn/SNANA/SNANA",
     "SNDATA_ROOT": "/fred/oz016/bgao_kn/SNANA/SNDATA_ROOT",
     "DATA_DIR": "/fred/oz016/bgao_kn/data/LSST_KN_NSBH/",
-    "INPUT_DIR": "/fred/oz016/bgao_kn/data/LSST_KN_NSBH/SIM_INPUT",
+    "INPUT_DIR": "/fred/oz016/bgao_kn/data/LSST_KN_NSBH/SIM_INPUT/",
     "SIMLIB_DIR": "/fred/oz016/bgao_kn/data/LSST_KN_NSBH/SIMLIB/",
     "OUTPUT_DIR": "/fred/oz016/bgao_kn/SNANA/SNDATA_ROOT/SIM/",
     "injections_file": "/fred/oz016/bgao_kn/ML+GW+KN/dataset/O5_sim_nsbh/injections_final.csv",

@@ -1,10 +1,10 @@
 #!/bin/bash
-#SBATCH --job-name=LSST_KN_NSBH
-#SBATCH --time=2:00:00            
+#SBATCH --job-name=LSST_KN_BNS
+#SBATCH --time=5:00:00            
 #SBATCH --cpus-per-task=1
 #SBATCH --mem=10G
-#SBATCH --array=0-26%10   # 1822 simulations, each job handles 10 sims, max 10 jobs running simultaneously
-#SBATCH --output=logs/LSST_KN_NSBH/%x_%a.out
+#SBATCH --array=0-182%10   # 1822/268 simulations, each job handles 10 sims, max 10 jobs running simultaneously
+#SBATCH --output=logs/LSST_KN_BNS/%x_%a.out
 
 # ml gcc/11.3/0 python/3.10.4
 # ml gsl/2.7 cfitsio/4.2.0
@@ -30,7 +30,7 @@ echo "Data directory: $data_dir"
 echo "Input directory: $input_dir"
 echo "Simlib directory: $simlib_dir"
 echo "Injections file: $inj_file"
-echo "SNANA simulation results output directory: $out_dir"
+echo "SNANA simulation results output directory: ${out_dir}/${sim_name}"
 
 # get all simulation IDs from the injections file
 mapfile -t SIM_IDS < <(awk -F',' 'NR>1 {print $1}' ${inj_file})

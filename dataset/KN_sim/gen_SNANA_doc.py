@@ -149,13 +149,6 @@ def gen_input(injections, text, sim_id):
         text,
         flags=re.MULTILINE
     )
-    # MODIFY SIMLIB FILE
-    text = re.sub(
-        r"^(SIMLIB_FILE:\s*.+)_(?=\.SIMLIB)",
-        fr"\1_{sim_id}",
-        text,
-        flags=re.MULTILINE
-    )
 
     return text
 
@@ -237,6 +230,14 @@ for sim_id in sim_ids:
     text = re.sub(
         r"^(GENVERSION:\s*)\S+.*$",
         rf"\1{genversion_new}",
+        text,
+        flags=re.MULTILINE
+    )
+    # MODIFY SIMLIB FILE
+    simlib_file = f"{simlib_dir}baseline_v5.0.1_10yrs_{sim_name}_{sim_id}.SIMLIB"
+    text = re.sub(
+        r"^(SIMLIB_FILE:\s*)\S+/*$",
+        fr"\1{simlib_file}",
         text,
         flags=re.MULTILINE
     )
