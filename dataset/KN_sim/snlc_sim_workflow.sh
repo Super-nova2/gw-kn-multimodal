@@ -108,7 +108,7 @@ for sim_id in "${group_ids[@]}"; do
     if ! snlc_sim.exe "$input" > /dev/null ; then
         echo "    snlc_sim failed for $sim_id"
         echo "  [$sim_id] Failed."
-        # rm -f "$simlib"  # remove SIMLIB if snlc_sim fails
+        # rm -f "$simlib"  # do not remove SIMLIB if snlc_sim fails
         failed_ids+=("$sim_id")
         continue
     fi
