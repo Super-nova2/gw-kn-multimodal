@@ -24,6 +24,7 @@ out_dir=$(jq -r '.OUTPUT_DIR' $args_file)
 log_dir=$(jq -r '.LOG_DIR' $args_file)
 tem_input=$(jq -r '.TEMPLATE_INPUT' $args_file)
 
+echo "Start time: $(date '+%Y-%m-%d %H:%M:%S')"
 echo "Starting SNANA doc generation for simulation: $sim_name"
 echo "Using Opsim DB: $opsim_db"
 echo "Data directory: $data_dir"
