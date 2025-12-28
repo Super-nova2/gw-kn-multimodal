@@ -1,0 +1,75 @@
+// Updated GW-Optical ALBEF Architecture
+digraph {
+	rankdir=TB
+	splines=ortho
+	node [fontname=Arial fontsize=12]
+	edge [fontname=Arial fontsize=10]
+	subgraph cluster_inputs {
+		style=invis
+		GW_Input [label="GW Parameters
+(m, s, ...)" fillcolor="#E0E0E0" shape=box style=filled]
+		Ref_Time [label="Reference Time Points
+r = [r_1, ..., r_N]" fillcolor="#D1C4E9" shape=box style=filled]
+		CLS_Token [label="Learnable CLS Token
+(Parameter)" fillcolor="#D1C4E9" shape=box style=filled]
+		Opt_Input [label="Optical Data
+(LSST Light Curves)" fillcolor="#E0E0E0" shape=box style=filled]
+	}
+	subgraph cluster_encoders {
+		style=invis
+		GW_Enc [label="GW Encoder
+(MLP)" fillcolor="#BBDEFB" shape=component style=filled]
+		Opt_Enc [label="Optical Encoder
+(Multi-Time Attention)" fillcolor="#BBDEFB" shape=component style=filled]
+	}
+	subgraph cluster_tensors {
+		style=invis
+		Vec_g [label="GW Vector
+[ g ]" fillcolor="#FFE0B2" shape=ellipse style=filled]
+		Mat_Hl [label="Optical Matrix
+[ H_l ]
+((N+1) x J)" fillcolor="#FFE0B2" shape=ellipse style=filled]
+	}
+	subgraph cluster_alignment {
+		color=gray label="Alignment Branch (Contrastive)" style=dashed
+		Proj_GW [label="Projection Head
+(GW)" fillcolor="#BBDEFB" shape=component style=filled]
+		Proj_Opt [label="Projection Head
+(Optical)" fillcolor="#BBDEFB" shape=component style=filled]
+		z_g [label="z_g
+(M-dim)" fillcolor="#FFE0B2" shape=ellipse style=filled]
+		z_l [label="z_l
+(M-dim)" fillcolor="#FFE0B2" shape=ellipse style=filled]
+		Loss_ITC [label="Alignment Loss
+(L_itc)" fillcolor="#FFCDD2" shape=hexagon style=filled]
+	}
+	subgraph cluster_fusion {
+		color=gray label="Fusion Branch (Classification)" style=dashed
+		Cross_Attn [label="Cross Attention
+(Fusion)" fillcolor="#BBDEFB" shape=component style=filled]
+		Fused_Vec [label="Fused Vector" fillcolor="#FFE0B2" shape=ellipse style=filled]
+		Classifier [label="Classifier
+(MLP)" fillcolor="#BBDEFB" shape=component style=filled]
+		Loss_CLS [label="Classification Loss
+(L_cls)" fillcolor="#FFCDD2" shape=hexagon style=filled]
+	}
+	GW_Input -> GW_Enc
+	Opt_Input -> Opt_Enc
+	Ref_Time -> Opt_Enc
+	CLS_Token -> Opt_Enc
+	GW_Enc -> Vec_g
+	Opt_Enc -> Mat_Hl
+	Vec_g -> Proj_GW
+	Proj_GW -> z_g
+	z_g -> Loss_ITC
+	Mat_Hl -> Proj_Opt [label="Index 0
+(CLS Vector)" fontcolor=blue]
+	Proj_Opt -> z_l
+	z_l -> Loss_ITC
+	Vec_g -> Cross_Attn [label="Query (g)" fontcolor=blue]
+	Mat_Hl -> Cross_Attn [label="Key/Value
+(Indices 1:N)" fontcolor=blue]
+	Cross_Attn -> Fused_Vec
+	Fused_Vec -> Classifier
+	Classifier -> Loss_CLS
+}
