@@ -64,7 +64,7 @@ SEARCHEFF_PIPELINE_LOGIC_FILE: $SNDATA_ROOT/models/searcheff/SEARCHEFF_PIPELINE_
 SEARCHEFF_PIPELINE_FILE: $SNDATA_ROOT/models/searcheff/SEARCHEFF_PIPELINE_LSST_Heaviside.DAT  # SNR > 5 = detection
 APPLY_SEARCHEFF_OPT:  1
 
-NEWMJD_DIF: 7.0000e-03   # min MJD dif to count NEW MJD(10 min)
+# NEWMJD_DIF: 7.0000e-03   # min MJD dif to count NEW MJD(10 min)
 
 # convert SED into binary 
 SIMSED_USE_BINARY:  1   # speed up the initialization of SED files

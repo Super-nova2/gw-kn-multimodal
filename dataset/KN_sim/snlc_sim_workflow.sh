@@ -81,6 +81,13 @@ for sim_id in "${group_ids[@]}"; do
     input="${input_dir}SIMGEN_${sim_name}_${sim_id}.INPUT"
 
     echo "sim_id=$sim_id : checking files"
+
+    if [[ ! -f "$simlib" ]]; then
+        echo "    ERROR: SIMLIB not found: $simlib"
+        failed_ids+=("$sim_id")
+        continue
+    fi
+
     #  check NLIBID in SIMLIB file, skip if NLIBID=0
     nlibid=$(grep -m1 'NLIBID' "$simlib" | awk '{print $2}')
     echo "    simid=$sim_id : NLIBID=$nlibid"
@@ -92,11 +99,16 @@ for sim_id in "${group_ids[@]}"; do
         continue
     fi
 
-    if [[ ! -f "$simlib" ]]; then
-        echo "    ERROR: SIMLIB not found: $simlib"
+    # generate COADD SIMLIB
+    echo "    generating COADD SIMLIB for $sim_id"
+    if ! simlib_coadd.exe "$simlib" > /dev/null; then
+        echo "    simlib_coadd.exe failed for $sim_id"
+        rm -f "$simlib"   # remove SIMLIB if COADD SIMLIB generation fails
+        echo "    removed SIMLIB $simlib due to simlib_coadd.exe failure"
         failed_ids+=("$sim_id")
         continue
     fi
+
     if [[ ! -f "$input" ]]; then
         echo "    ERROR: INPUT not found: $input"
         rm -f "$simlib"   # remove SIMLIB if INPUT is missing
@@ -116,8 +128,8 @@ for sim_id in "${group_ids[@]}"; do
 
     # clean up SIMLIB file to save space
     echo "    snlc_sim success for $sim_id"
-    echo "    removing SIMLIB $simlib"
-    rm -f "$simlib"
+    echo "    removing SIMLIB $simlib and SIMLIB.COADD to save space"
+    rm -f "$simlib" "${simlib}.COADD"
 
     echo "  [$sim_id] done."
 done

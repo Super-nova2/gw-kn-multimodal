@@ -163,7 +163,7 @@ parser.add_argument("--Opsim", type=str, default="/fred/oz016/bgao_kn/data/rubin
 parser.add_argument("--within", action='store_true', help="sample within credible level")
 parser.add_argument("--level", type=float, default=0.9, help="credible level to sample sky position")
 parser.add_argument("--outdir", type=str, default="./data/", help="output directory for SIMLIB")
-parser.add_argument("--template_input", type=str, default="/fred/oz016/bgao_kn/data/SIM_INPUT/SIMGEN_KN_LSST_TEMPLATE.INPUT", help="template SIMGEN INPUT file")
+parser.add_argument("--template_input", type=str, default="./ML+GW+KN/dataset/KN_sim/Template_doc/SIMGEN_KN_LSST_TEMPLATE.INPUT", help="template SIMGEN INPUT file")
 args = parser.parse_args()
 
 # check output directory
@@ -234,7 +234,7 @@ for sim_id in sim_ids:
         flags=re.MULTILINE
     )
     # MODIFY SIMLIB FILE
-    simlib_file = f"{simlib_dir}baseline_v5.0.1_10yrs_{sim_name}_{sim_id}.SIMLIB"
+    simlib_file = f"{simlib_dir}baseline_v5.0.1_10yrs_{sim_name}_{sim_id}.SIMLIB.COADD"
     text = re.sub(
         r"^(SIMLIB_FILE:\s*)\S+/*$",
         fr"\1{simlib_file}",
