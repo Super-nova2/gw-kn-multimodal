@@ -75,6 +75,7 @@ class RelationalHDF5Dataset(Dataset):
         opt_err   = torch.from_numpy(self.h5_file['events/optical_data/errors'][idx])
         opt_mask  = torch.from_numpy(self.h5_file['events/optical_data/masks'][idx])
         opt_time  = torch.from_numpy(self.h5_file['events/optical_data/times'][idx])
+        opt_coords = torch.from_numpy(self.h5_file['events/optical_data/coordinates'][idx])
         
         # 2. Retrieve Parent GW Index
         gw_idx = self.h5_file['events/optical_data/parent_gw_idx'][idx]
@@ -86,7 +87,7 @@ class RelationalHDF5Dataset(Dataset):
         
         # Return tuple: (GW_Inputs, Optical_Inputs, Metadata)
         # gw_idx is returned for masking the contrastive loss (handling same-source negatives)
-        return gw_scalar, gw_skymap, opt_time, opt_val, opt_mask, opt_err, int(gw_idx)
+        return gw_scalar, gw_skymap, opt_time, opt_val, opt_mask, opt_err, opt_coords, int(gw_idx)
     
 class BalancedGWBatchedSampler(Sampler):
     """
@@ -222,7 +223,7 @@ def parse_snana_fits(event_id, sim_dir, sim_name="LSST_KN_BNS"):
             flux_all = data_phot['FLUXCAL']
             fluxerr_all = data_phot['FLUXCALERR'] # Optional usage
             flt_all = data_phot['BAND'] # Filters
-            
+
             extracted_lcs = []
             
             # Iterate over each realization in HEAD
@@ -232,12 +233,23 @@ def parse_snana_fits(event_id, sim_dir, sim_name="LSST_KN_BNS"):
                 # End index: value (exclusive in python slicing)
                 start_idx = ptrobs_min[i] - 1
                 end_idx = ptrobs_max[i]
+
+                # get coordinates
+                ra = data_head['RA'][i]
+                dec = data_head['DEC'][i]
+                coordinates = np.array([ra, dec], dtype=np.float32)
                 
                 # Slicing the PHOT data
                 lc_mjd = mjd_all[start_idx : end_idx]
                 lc_flux = flux_all[start_idx : end_idx]
                 lc_fluxerr = fluxerr_all[start_idx : end_idx]
                 lc_flt = flt_all[start_idx : end_idx]
+
+                # Normalization
+                std = np.std(lc_flux)
+                mean = np.mean(lc_flux)
+                lc_flux = (lc_flux - mean) / (std + 1e-8)
+                lc_fluxerr = lc_fluxerr / (std + 1e-8)
                 
                 # --- Format Conversion (to Tensor-ready numpy) ---
                 val_mat = np.zeros((MAX_LC_LENGTH, NUM_BANDS), dtype=np.float32)    # Values matrix (flux)
@@ -247,7 +259,7 @@ def parse_snana_fits(event_id, sim_dir, sim_name="LSST_KN_BNS"):
                 
                 # 1. Time Normalization (Relative to BNS merger time)
                 if len(lc_mjd) > 0:
-                    rel_times = lc_mjd - mjd_explode
+                    rel_times = (lc_mjd - mjd_explode) / 100  # Scale down to manageable range[-0.3, 0.6]
                 else:
                     continue # Skip empty light curves
 
@@ -275,7 +287,7 @@ def parse_snana_fits(event_id, sim_dir, sim_name="LSST_KN_BNS"):
                         mask_mat[t, b_idx] = 1.0
                         time_vec[t] = rel_times[t]
                 
-                extracted_lcs.append((val_mat, err_mat, mask_mat, time_vec))
+                extracted_lcs.append((val_mat, err_mat, mask_mat, time_vec, coordinates))
                 
             return extracted_lcs
 
@@ -301,7 +313,7 @@ def sample_moc_skymap(map_file):
     probdensity = moc_map['PROBDENSITY']
     distmu = moc_map['DISTMU']
     distsigma = moc_map['DISTSIGMA']
-    distnorm = moc_map['DISTNORM']
+    # distnorm = moc_map['DISTNORM']  # not used
 
     # 1) UNIQ -> order, ipix, nside
     order, ipix = uniq2nest(uniq)
@@ -311,25 +323,31 @@ def sample_moc_skymap(map_file):
     # 3) calculate pixel probability
     dP = probdensity * dA
     # 4) calculate theta, phi
-    ras  = np.zeros_like(ipix, dtype=np.float32)
-    decs = np.zeros_like(ipix, dtype=np.float32)
+    xs  = np.zeros_like(ipix, dtype=np.float32)
+    ys = np.zeros_like(ipix, dtype=np.float32)
+    zs = np.zeros_like(ipix, dtype=np.float32)
     for k in np.unique(order):
         m = (order == k)
         this_ipix  = ipix[m]
         this_nside = 2 ** k
         theta, phi = hp.pix2ang(this_nside, this_ipix, nest=True)
-        ras[m]  = np.degrees(phi)
-        decs[m] = 90.0 - np.degrees(theta)
+        # ras[m]  = np.degrees(phi)
+        # decs[m] = 90.0 - np.degrees(theta)
+        xs[m] = np.cos(theta) * np.cos(phi)   # dec,[0, pi]
+        ys[m] = np.cos(theta) * np.sin(phi)   # ra,[0, 2pi]
+        zs[m] = np.sin(theta)
     
     # 5) return torch tensors
-    gw_mocmap = torch.tensor(np.vstack([ras, decs,dA, dP, distmu, distsigma]), dtype=torch.float32)   # [6, N_pixels], no distnorm
+    gw_mocmap = torch.tensor(np.vstack([xs, ys, zs, dA, 100 * dP, distmu, distsigma]), dtype=torch.float32)   # [7, N_pixels], no distnorm
 
     # 6) process unnormal distance values
-    inf_dist_mu = torch.where(torch.isinf(gw_mocmap[4]))[0]
-    gw_mocmap[4, inf_dist_mu] = dist_mean  # set inf to mean value
-    gw_mocmap[5, inf_dist_mu] = dist_std   # set inf to std value
+    inf_dist_mu = torch.where(torch.isinf(gw_mocmap[5]))[0]
+    gw_mocmap[5, inf_dist_mu] = dist_mean  # set inf to mean value
+    gw_mocmap[6, inf_dist_mu] = dist_std   # set inf to std value
+    gw_mocmap[5,:] = gw_mocmap[5,:] / 1000.0  # scale down
+    gw_mocmap[6,:] = gw_mocmap[6,:] / 1000.0 # scale down
 
-    return gw_mocmap  # [6, N_pixels]
+    return gw_mocmap  # [7, N_pixels]
 
 # Function to create relational dataset
 def create_relational_dataset(
@@ -353,7 +371,7 @@ def create_relational_dataset(
         grp_gw = f.create_group('events/gw_data')
         
         # Pre-allocate GW datasets (we know exact size N_unique)
-        ds_gw_scalars = grp_gw.create_dataset('scalars', (n_unique, 9), dtype='f4')
+        ds_gw_scalars = grp_gw.create_dataset('scalars', (n_unique, 7), dtype='f4')
         ds_gw_skymaps = grp_gw.create_dataset('skymaps', (n_unique, 6, 19200), dtype='f4') # 6 channels after cleaning
         # Store IDs as fixed-length ASCII strings
         dt_str = h5py.special_dtype(vlen=str) 
@@ -429,7 +447,7 @@ def create_relational_dataset(
             # 1. Process & Save GW Data
             # Scalars (Columns m1...param14)
             # Adjust columns based on your CSV
-            gw_params_name = ['mjd_time', 'gps_time', 'mass1', 'mass2', 'spin1z', 'spin2z', 'inclination', 'distmean', 'diststd']
+            gw_params_name = ['mass1', 'mass2', 'spin1z', 'spin2z', 'inclination', 'distmean', 'diststd']
             scalars = row[gw_params_name].values.astype(np.float32)
             ds_gw_scalars[gw_idx] = scalars
             ds_gw_ids[gw_idx] = str(event_id)

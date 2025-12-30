@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import math
 
 # ==============================================================================
-# 1. Learnable Periodic Time Embedding (phi_h(t))
+# 1. Learnable Periodic Time Embedding (phi_h(t)) and Spatial Embedding Module
 # ==============================================================================
 class LearnablePeriodicEmbedding(nn.Module):
     """
@@ -93,6 +93,34 @@ class LearnablePeriodicEmbedding(nn.Module):
         # Output: [Batch, Seq_Len, H, d_r]
         return torch.cat([linear_term, periodic_term], dim=-1)
 
+class SpatialEmbedding(nn.Module):
+    def __init__(self, output_dim=64):
+        super().__init__()
+        # Spatial Embedding for Spherical Coordinates (RA, Dec)
+        # Using a simple MLP to map (x, y, z) on unit sphere to embedding
+        self.fc = nn.Sequential(
+            nn.Linear(3, output_dim), # Input: (x, y, z)
+            nn.BatchNorm1d(output_dim),
+            nn.ReLU(),
+            nn.Linear(output_dim, output_dim)
+        )
+
+    def forward(self, coordinates):
+        # coordinates: [Batch, 2] (RA in degrees, Dec in degrees)
+        # convert (RA, Dec) in degrees to radians
+        ra = coordinates[:, 0]   # [Batch]
+        dec = coordinates[:, 1]  # [Batch]
+        theta = (90.0 - dec) * (math.pi / 180.0)  # polar angle
+        phi = ra * (math.pi / 180.0)               # azimuthal angle
+
+        # Convert Spherical to Cartesian Coordinates
+        x = torch.cos(theta) * torch.cos(phi)
+        y = torch.cos(theta) * torch.sin(phi)
+        z = torch.sin(theta)
+        
+        coords = torch.stack([x, y, z], dim=1) # [Batch, 3]
+        return self.fc(coords)
+
 # ==============================================================================
 # 2. Multi-Time Attention Network (mTAN) Module
 # ==============================================================================
@@ -115,6 +143,8 @@ class MultiTimeAttention(nn.Module):
         self.V = nn.Linear(ref_dim, k_dim, bias=False)
         self.U = nn.Linear(num_heads * input_dim, output_dim)
 
+        self.lambda_param = nn.Parameter(torch.tensor(1.0))  # Learnable scalar parameter
+
         self.reset_parameters()
     
     def reset_parameters(self):
@@ -133,15 +163,15 @@ class MultiTimeAttention(nn.Module):
             bound = 1 / math.sqrt(fan_in)
             nn.init.uniform_(self.U.bias, -bound, bound)
 
-    def forward(self, query_emb, key_emb, values, mask=None):
+    def forward(self, query_emb, key_emb, values, mask=None, errors=None):
         """
         Args:
             query_emb: [Batch, K, H, d_r]
             key_emb:   [Batch, L, H, d_r]
             values:    [Batch, L, D]
-            mask:      [Batch, L, D] <--- Critical Change: Mask is per-dimension
-                       (1.0 for observed, 0.0 for padding/missing)
-
+            mask:      [Batch, L, D] (1.0 for observed, 0.0 for padding/missing)
+            errors:    [Batch, L, D] (Measurement errors / Sigma). Optional.
+                       If provided, implements Inverse Variance Weighting.
         Returns:
             h: [Batch, K, J]
         """
@@ -167,6 +197,24 @@ class MultiTimeAttention(nn.Module):
         
         # Expand Scores to D: [B, H, K, L, 1] -> [B, H, K, L, D]
         scores_expanded = scores.unsqueeze(-1).expand(-1, -1, -1, -1, self.D)
+
+        if errors is not None:
+            # errors shape: [Batch, L, D]
+            # We treat 'errors' as sigma. We want to add log(1 / sigma^2) to logits.
+            # Formula: Logit_new = Logit_original - log(sigma^2 + epsilon)
+            
+            # Expand errors to match scores shape: [B, 1, 1, L, D]
+            errors_expanded = errors.unsqueeze(1).unsqueeze(1)
+            
+            # Compute bias term
+            # Adding epsilon (1e-9) to avoid log(0) for perfect measurements or zero-padding
+            # Note: For zero-padding (error=0), this bias becomes large positive, 
+            # BUT the 'mask' step below will force them to -inf anyway.
+            sigma_sq = torch.square(errors_expanded)
+            error_bias = - self.lambda_param * torch.log(sigma_sq + 1e-9)
+            
+            # Add bias to scores
+            scores_expanded = scores_expanded + error_bias
         
         if mask is not None:
             # Mask input: [B, L, D]
@@ -216,7 +264,7 @@ class OpticalEncoderWithCLS(nn.Module):
         self.num_heads = num_heads
         self.ref_dim = ref_dim
         
-        # [cite_start]1. Time Embedding Layer (phi) [cite: 5, 6]
+        # 1. Time Embedding Layer (phi) [cite: 5, 6]
         self.time_embedding = LearnablePeriodicEmbedding(num_heads, ref_dim)
         
         # 2. Learnable CLS Token Parameter
@@ -224,14 +272,19 @@ class OpticalEncoderWithCLS(nn.Module):
         # Dimensions must match the embedded time: [1, 1, H, d_r]
         self.cls_token = nn.Parameter(torch.empty(1, 1, num_heads, ref_dim))
         nn.init.normal_(self.cls_token, mean=0.0, std=0.02) # BERT initialization
-        self.cls_token.requires_grad = True
+        # self.cls_token.requires_grad = True
         
-        # [cite_start]3. mTAN Core Module [cite: 3, 4]
+        # 3. mTAN Core Module [cite: 3, 4]
         self.mtan = MultiTimeAttention(input_dim, num_heads, ref_dim, k_dim, output_dim)
 
-    def forward(self, t_obs, values_obs, t_ref, mask=None):
+        # 4. spatial embedding
+        self.spatial_embedding = SpatialEmbedding(output_dim=ref_dim)
+        self.spatial_proj = nn.Linear(ref_dim, num_heads * ref_dim)
+
+    def forward(self, ra_dec_obs, t_obs, values_obs, t_ref, mask=None, errors_obs=None):
         """
         Args:
+            ra_dec_obs: [Batch, 2] (RA, Dec in radians for observed points)
             t_obs: [Batch, L] (Union of all time points)
             values_obs: [Batch, L, D] (Values, padded with 0 where missing)
             t_ref: [Batch, N]
@@ -243,6 +296,11 @@ class OpticalEncoderWithCLS(nn.Module):
         """
         batch_size = t_obs.size(0)
         
+        # 0. Compute Spatial Embedding for Observed Points
+        # Shape: [Batch, H * d_r]
+        spatial_feat = self.spatial_embedding(ra_dec_obs)   # [Batch, ref_dim]
+        spatial_emb = self.spatial_proj(spatial_feat).view(batch_size, 1, self.num_heads, self.ref_dim) # [Batch, 1, H, d_r]
+
         # 1. Embed Observed Times (Keys) -> phi(t_id)
         # Shape: [Batch, L, H, d_r]
         key_emb = self.time_embedding(t_obs)
@@ -254,7 +312,7 @@ class OpticalEncoderWithCLS(nn.Module):
         # 3. Prepare CLS Token (Queries Part B)
         # Expand learnable parameter to batch size
         # Shape: [Batch, 1, H, d_r]
-        cls_emb = self.cls_token.expand(batch_size, -1, -1, -1)
+        cls_emb = self.cls_token.expand(batch_size, -1, -1, -1) + spatial_emb
         
         # 4. Concatenate CLS and Reference Embeddings
         # Total Query Shape: [Batch, N + 1, H, d_r]
@@ -262,7 +320,7 @@ class OpticalEncoderWithCLS(nn.Module):
         
         # 5. Pass through mTAN
         # Output Shape: [Batch, N + 1, J]
-        full_output = self.mtan(query_emb, key_emb, values_obs, mask)
+        full_output = self.mtan(query_emb, key_emb, values_obs, mask, errors_obs)
         
         # 6. Split Output
         # Index 0 is CLS (z_l), Indices 1..N are time-series (H_l)
@@ -270,7 +328,6 @@ class OpticalEncoderWithCLS(nn.Module):
         H_l = full_output[:, 1:, :]  # [Batch, N, J]
         
         return z_l, H_l
-
 
 # ==============================================================================
 # 4. 1D ResNet Basic Module
@@ -589,3 +646,133 @@ class GWOpticalAlignment(nn.Module):
         loss = (loss_g + loss_o) / 2
         
         return loss
+
+# ==============================================================================
+# 7. End-to-End GW-Optical Contrastive Model
+# ==============================================================================
+class GWOpticalContrastiveModel(nn.Module):
+    """
+    End-to-End Model Wrapper for Contrastive Training.
+    Combines:
+      1. GW Encoder (Scalar MLP + Skymap ResNet)
+      2. Optical Encoder (mTAN + Attention)
+      3. Alignment Head (Projection + Loss)
+    """
+    def __init__(self, 
+                 gw_scalar_dim=7, 
+                 gw_skymap_channels=7, 
+                 optical_input_dim=6, 
+                 ref_time_dim=64,
+                 enc_dim=128, 
+                 proj_dim=256,
+                 temp_init=0.07):
+        super().__init__()
+        
+        # --- 1. Encoders ---
+        self.gw_encoder = GWMOCResNetEncoder(
+            scalar_input_dim=gw_scalar_dim,
+            skymap_channels=gw_skymap_channels,
+            final_output_dim=enc_dim
+        )
+        
+        self.optical_encoder = OpticalEncoderWithCLS(
+            input_dim=optical_input_dim,
+            output_dim=enc_dim,
+            num_heads=4,
+            ref_dim=ref_time_dim
+        )
+        
+        # --- 2. Projection Heads & Temperature ---
+        # Projects Encoder Features (128) -> Latent Space (256)
+        self.gw_proj = ProjectionHead(enc_dim, enc_dim, proj_dim)
+        self.opt_proj = ProjectionHead(enc_dim, enc_dim, proj_dim)
+        
+        # We store log_temp to ensure temperature is always positive (via exp)
+        self.log_temp = nn.Parameter(torch.ones([]) * torch.log(torch.tensor(temp_init)))
+
+        # --- 3. Standard Cross Entropy Loss ---
+        self.criterion = nn.CrossEntropyLoss()
+
+    def forward(self, gw_s, gw_m, opt_t, opt_v, opt_ref_t, opt_mask, opt_err, opt_coords, gw_indices, mask=None):
+        """
+        Args:
+            gw_s, gw_m: GW Inputs
+            opt_t, opt_v, ...: Optical Inputs
+            gw_indices: [Batch] ID of the GW event (for masking)
+        """
+        # --- A. Encode Features ---
+        # g: [Batch, enc_dim]
+        g = self.gw_encoder(gw_s, gw_m)
+        
+        # z_l: [Batch, enc_dim] (We discard H_l for contrastive pre-training)
+        z_l, _ = self.optical_encoder(opt_coords, opt_t, opt_v, opt_ref_t, opt_mask, errors_obs=opt_err)
+        
+        # --- B. Project & Normalize ---
+        # [Batch, proj_dim]
+        feat_g = F.normalize(self.gw_proj(g), dim=1)
+        feat_o = F.normalize(self.opt_proj(z_l), dim=1)
+        
+        # --- C. Compute Contrastive Loss ---
+        loss, logits = self.compute_masked_itc_loss(feat_g, feat_o, gw_indices, mask=None)
+        
+        return loss, logits
+
+    def compute_masked_itc_loss(self, feat_g, feat_o, gw_indices, mask=None):
+        """
+        Computes Image-Text Contrastive (ITC) loss.
+        Uses gw_indices to handle potential 'false negatives' 
+        (though BalancedSampler avoids them, this is robust).
+        """
+        batch_size = feat_g.size(0)
+        logit_scale = torch.clamp(self.log_temp.exp(), min=0.01, max=100.0)
+        
+        # 1. Similarity Matrix: [B, B]
+        sim_g2o = torch.matmul(feat_g, feat_o.T) * logit_scale
+        sim_o2g = sim_g2o.T
+        
+        if mask is not None:
+            # 2. Ground Truth Mask: [B, B]
+            # mask[i, j] = 1 if sample i and j come from the same GW event
+            # If using BalancedSampler, this is just an identity matrix.
+            labels_mask = (gw_indices.unsqueeze(0) == gw_indices.unsqueeze(1)).float()
+            
+            # 3. Compute Loss (Masked Cross Entropy)
+            # We want to maximize similarity for all positive pairs (where mask == 1)
+            
+            # For numerical stability with Softmax
+            sim_g2o_max, _ = torch.max(sim_g2o, dim=1, keepdim=True)
+            sim_g2o = sim_g2o - sim_g2o_max.detach()
+            
+            sim_o2g_max, _ = torch.max(sim_o2g, dim=1, keepdim=True)
+            sim_o2g = sim_o2g - sim_o2g_max.detach()
+            
+            # Log-Softmax denominator (sum over all samples in batch)
+            exp_g2o = torch.exp(sim_g2o)
+            exp_o2g = torch.exp(sim_o2g)
+            
+            # Note: If BalancedSampler is used, this simplifies to standard CE.
+            # Here we implement the generic form for safety.
+            
+            # Log-prob of positive pairs
+            # sum(exp(positives)) / sum(exp(all))
+            log_prob_g2o = sim_g2o - torch.log(exp_g2o.sum(dim=1, keepdim=True))
+            log_prob_o2g = sim_o2g - torch.log(exp_o2g.sum(dim=1, keepdim=True))
+            
+            # Compute mean loss over positive pairs
+            # We only care about entries where labels_mask == 1
+            loss_g = - (labels_mask * log_prob_g2o).sum(dim=1) / labels_mask.sum(dim=1)
+            loss_o = - (labels_mask * log_prob_o2g).sum(dim=1) / labels_mask.sum(dim=1)
+
+            total_loss = (loss_g.mean() + loss_o.mean()) / 2
+        else:
+            # 4. Standard Cross Entropy Labels
+            labels = torch.arange(batch_size, device=feat_g.device)
+            # Compute Symmetric Loss
+            # Loss 1: Given GW, classify correct Optical
+            loss_g = self.criterion(sim_g2o, labels)
+            # Loss 2: Given Optical, classify correct GW
+            loss_o = self.criterion(sim_o2g, labels)
+            
+            total_loss = (loss_g + loss_o) / 2
+        
+        return total_loss, sim_g2o

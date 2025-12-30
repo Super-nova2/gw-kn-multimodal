@@ -1,2 +1,5 @@
 snana_out.ipynb
 *.json
+*.pth
+*.pyc
+__pycache__/
