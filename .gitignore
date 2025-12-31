@@ -1,5 +1,12 @@
 snana_out.ipynb
+gen_SIMLIB.ipynb
 *.json
 *.pth
 *.pyc
 __pycache__/
+
+*.csv
+notebook/
+
+./dataset/KN_sim/notebook/
+dataset/O5_sim_bns/*.ipynb
