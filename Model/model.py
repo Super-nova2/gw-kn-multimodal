@@ -709,8 +709,8 @@ class GWOpticalContrastiveModel(nn.Module):
         
         # --- B. Project & Normalize ---
         # [Batch, proj_dim]
-        feat_g = F.normalize(self.gw_proj(g), dim=1)
-        feat_o = F.normalize(self.opt_proj(z_l), dim=1)
+        feat_g = F.normalize(self.gw_proj(g), p=2, dim=1, eps=1e-8)
+        feat_o = F.normalize(self.opt_proj(z_l), p=2, dim=1, eps=1e-8)
         
         # --- C. Compute Contrastive Loss ---
         loss, logits = self.compute_masked_itc_loss(feat_g, feat_o, gw_indices, mask=None)

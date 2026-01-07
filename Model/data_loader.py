@@ -447,7 +447,7 @@ def create_relational_dataset(
             # 1. Process & Save GW Data
             # Scalars (Columns m1...param14)
             # Adjust columns based on your CSV
-            gw_params_name = ['mass1', 'mass2', 'spin1z', 'spin2z', 'inclination', 'distmean', 'diststd']
+            gw_params_name = ['mass1_detector', 'mass2_detector', 'spin1z', 'spin2z', 'inclination', 'distmean', 'diststd']
             scalars = row[gw_params_name].values.astype(np.float32)
             ds_gw_scalars[gw_idx] = scalars
             ds_gw_ids[gw_idx] = str(event_id)
