@@ -13,6 +13,8 @@ import torch
 from collections import defaultdict
 from typing import List, Iterator
 from torch.utils.data import Dataset, DataLoader, Sampler
+from pathlib import Path
+import subprocess
 
 
 def build_gw_to_lc_mapping(h5_path: str):
@@ -47,15 +49,26 @@ class RelationalHDF5Dataset(Dataset):
     """
     PyTorch Dataset for the relational HDF5 structure.
     Reads optical data by index and fetches the corresponding unique GW data.
+    Optional negative optical samples can be drawn from a separate HDF5 file.
     """
-    def __init__(self, h5_path: str):
+    def __init__(self, h5_path: str, negative_h5_path: str = None, negative_group: str = "events/optical_data"):
         super().__init__()
         self.h5_path = h5_path
         self.h5_file = None
+        self.negative_h5_path = negative_h5_path
+        self.negative_group = negative_group
+        self.neg_file = None
+        self.neg_length = None
         
         # Open file temporarily to get dataset length
         with h5py.File(h5_path, 'r') as f:
             self.length = f['events/optical_data/values'].shape[0]
+        
+        if self.negative_h5_path is not None:
+            with h5py.File(self.negative_h5_path, 'r') as f:
+                if self.negative_group not in f:
+                    raise KeyError(f"Negative group '{self.negative_group}' not found in {self.negative_h5_path}")
+                self.neg_length = f[f"{self.negative_group}/values"].shape[0]
             
     def __len__(self):
         return self.length
@@ -85,6 +98,25 @@ class RelationalHDF5Dataset(Dataset):
         gw_scalar = torch.from_numpy(self.h5_file['events/gw_data/scalars'][gw_idx])
         gw_skymap = torch.from_numpy(self.h5_file['events/gw_data/skymaps'][gw_idx])
         
+        # Optional: Retrieve Negative Optical Data (non-KN or unrelated transient)
+        if self.negative_h5_path is not None:
+            if self.neg_file is None:
+                self.neg_file = h5py.File(self.negative_h5_path, 'r')
+
+            neg_idx = np.random.randint(0, self.neg_length)
+            neg_val = torch.from_numpy(self.neg_file[f"{self.negative_group}/values"][neg_idx])
+            neg_err = torch.from_numpy(self.neg_file[f"{self.negative_group}/errors"][neg_idx])
+            neg_mask = torch.from_numpy(self.neg_file[f"{self.negative_group}/masks"][neg_idx])
+            neg_time = torch.from_numpy(self.neg_file[f"{self.negative_group}/times"][neg_idx])
+            neg_coords = torch.from_numpy(self.neg_file[f"{self.negative_group}/coordinates"][neg_idx])
+
+            # Return tuple: (GW_Inputs, Optical_Inputs, Metadata, Negative_Optical_Inputs)
+            # gw_idx is returned for masking the contrastive loss (handling same-source negatives)
+            return (
+                gw_scalar, gw_skymap, opt_time, opt_val, opt_mask, opt_err, opt_coords, int(gw_idx),
+                neg_time, neg_val, neg_mask, neg_err, neg_coords
+            )
+
         # Return tuple: (GW_Inputs, Optical_Inputs, Metadata)
         # gw_idx is returned for masking the contrastive loss (handling same-source negatives)
         return gw_scalar, gw_skymap, opt_time, opt_val, opt_mask, opt_err, opt_coords, int(gw_idx)
@@ -141,7 +173,9 @@ def create_training_dataloader(
     h5_path: str, 
     batch_size: int = 32, 
     steps_per_epoch: int = 1000, 
-    num_workers: int = 4
+    num_workers: int = 4,
+    negative_h5_path: str = None,
+    negative_group: str = "events/optical_data"
 ):
     """
     Factory function to initialize the Dataset, Sampler, and DataLoader.
@@ -150,7 +184,11 @@ def create_training_dataloader(
     gw_map = build_gw_to_lc_mapping(h5_path)
     
     # 2. Initialize Dataset
-    dataset = RelationalHDF5Dataset(h5_path)
+    dataset = RelationalHDF5Dataset(
+        h5_path,
+        negative_h5_path=negative_h5_path,
+        negative_group=negative_group
+    )
     
     # 3. Initialize Custom Sampler
     # Note: 'steps_per_epoch' defines how many batches constitute one epoch loop
@@ -175,6 +213,7 @@ def create_training_dataloader(
 
 # Constants
 BAND_MAP = {'LSST-u': 0, 'LSST-g': 1, 'LSST-r': 2, 'LSST-i': 3, 'LSST-z': 4, 'LSST-Y': 5}
+NEG_BAND_MAP = {'u': 0, 'g': 1, 'r': 2, 'i': 3, 'z': 4, 'Y': 5}
 NUM_BANDS = 6
 MAX_LC_LENGTH = 200  # Maximum length of light curves all band
 
@@ -482,4 +521,258 @@ def create_relational_dataset(
         print(f"\nProcessing Complete.")
         print(f"Unique GW Events: {n_unique}")
         print(f"Total Light Curves: {total_optical_count}")
+        print(f"Saved to: {output_h5_path}")
+
+# Functions for parsing SNANA FITS files for negative samples
+def parse_snana_fits_neg(head_path, phot_path, type="SN"):
+    '''
+    Parses HEAD.fits and PHOT.fits.
+    Extracts multiple light curve realizations for a kind of transients.
+    
+    Args:
+        head_path: Path to HEAD FITS file.
+        phot_path: Path to PHOT FITS file.
+        type: Type of transient ('SN', 'TDE', 'AGN', 'uLens', 'dwarf-nova')
+        
+    Returns:
+        List of tuples: [(values, masks, times), ...]
+        Returns empty list if files are missing.
+    '''
+    allowed_types = ['SN', 'TDE', 'AGN', 'uLens', 'dwarf-nova']
+    if type not in allowed_types:
+        raise ValueError(f"Type must be one of {allowed_types}")
+
+    if not os.path.exists(head_path) or not os.path.exists(phot_path):
+        print(f"Warning: FITS files not found for {head_path}")
+        return []
+
+    try:
+        # Open FITS files
+        with fits.open(head_path) as hdul_head, fits.open(phot_path) as hdul_phot:
+            # Usually data is in extension 1
+            data_head = hdul_head[1].data
+            data_phot = hdul_phot[1].data
+            
+            # Use columns directly (Astropy FITS columns are case-insensitive usually)
+            # HEAD columns
+            
+            ptrobs_min = data_head['PTROBS_MIN']
+            ptrobs_max = data_head['PTROBS_MAX']
+            
+            # PHOT columns
+            mjd_all = data_phot['MJD']
+            flux_all = data_phot['FLUXCAL']
+            fluxerr_all = data_phot['FLUXCALERR'] # Optional usage
+            flt_all = data_phot['BAND'] # Filters
+
+            extracted_lcs = []
+            
+            # Iterate over each realization in HEAD
+            for i in range(len(data_head)):
+                # SNANA uses 1-based indexing for pointers, Python uses 0-based
+                # Start index: value - 1
+                # End index: value (exclusive in python slicing)
+                start_idx = ptrobs_min[i] - 1
+                end_idx = ptrobs_max[i]
+                nobs = data_head['NOBS'][i]
+                if nobs < 5:
+                    # print(f"Warning: Light curve for {head_path} realization {i} has less than 5 observations. Skipping.")
+                    continue  # Skip light curves with less than 5 observations
+
+                # get coordinates
+                ra = data_head['RA'][i]
+                dec = data_head['DEC'][i]
+                coordinates = np.array([ra, dec], dtype=np.float32)
+                
+                # Slicing the PHOT data
+                lc_mjd = mjd_all[start_idx : end_idx]
+                lc_flux = flux_all[start_idx : end_idx]
+                lc_fluxerr = fluxerr_all[start_idx : end_idx]
+                lc_flt = flt_all[start_idx : end_idx]
+
+                # Normalization
+                std = np.std(lc_flux)
+                mean = np.mean(lc_flux)
+                lc_flux = (lc_flux - mean) / (std + 1e-8)
+                lc_fluxerr = lc_fluxerr / (std + 1e-8)
+                
+                # --- Format Conversion (to Tensor-ready numpy) ---
+                val_mat = np.zeros((MAX_LC_LENGTH, NUM_BANDS), dtype=np.float32)    # Values matrix (flux)
+                err_mat = np.zeros((MAX_LC_LENGTH, NUM_BANDS), dtype=np.float32)    # Errors matrix (flux errors)
+                mask_mat = np.zeros((MAX_LC_LENGTH, NUM_BANDS), dtype=np.float32)
+                time_vec = np.zeros((MAX_LC_LENGTH,), dtype=np.float32)
+                
+                # 1. Time Normalization (Relative to pseudo-explosion time)
+                if len(lc_mjd) > 0:
+                    use_peak = type in ['SN', 'uLens', 'dwarf-nova', 'TDE']
+                    if use_peak and 'PEAKMJD' in data_head.columns.names:
+                        pesudo_mjd_explode = data_head['PEAKMJD'][i] - np.random.uniform(0.5, 5.0)
+                    else:
+                        pesudo_mjd_explode = np.random.uniform(lc_mjd.min(), lc_mjd.max())
+                    rel_times = (lc_mjd - pesudo_mjd_explode) / 100  # Scale down to manageable range[-0.3, 0.6]
+                    time_mask = np.where((rel_times >= -0.3) & (rel_times <= 0.6))[0]
+                    lc_mjd = lc_mjd[time_mask]
+                    lc_flux = lc_flux[time_mask]
+                    lc_fluxerr = lc_fluxerr[time_mask]
+                    lc_flt = lc_flt[time_mask]
+                    rel_times = rel_times[time_mask]
+                else:
+                    continue # Skip empty light curves
+
+                # 2. Fill Matrices
+                # Truncate if longer than MAX_LC_LENGTH
+                seq_len = min(len(lc_mjd), MAX_LC_LENGTH)
+                if len(lc_mjd) > MAX_LC_LENGTH:
+                    print(f"Warning: Light curve for realization {i} exceeds MAX_LC_LENGTH. Truncating.")
+                    # Keep the MAX_LC_LENGTH points with smallest absolute rel_times
+                    sorted_indices = np.argsort(np.abs(rel_times))[:MAX_LC_LENGTH]
+                    sorted_indices = np.sort(sorted_indices)  # Sort back to chronological order
+                    lc_mjd = lc_mjd[sorted_indices]
+                    lc_flux = lc_flux[sorted_indices]
+                    lc_fluxerr = lc_fluxerr[sorted_indices]
+                    lc_flt = lc_flt[sorted_indices]
+                    rel_times = rel_times[sorted_indices]
+                
+                for t in range(seq_len):
+                    band_char = lc_flt[t].strip() # Remove whitespace
+                    if band_char in NEG_BAND_MAP:
+                        b_idx = NEG_BAND_MAP[band_char]
+                        
+                        val_mat[t, b_idx] = lc_flux[t]
+                        err_mat[t, b_idx] = lc_fluxerr[t]
+                        mask_mat[t, b_idx] = 1.0
+                        time_vec[t] = rel_times[t]
+                
+                extracted_lcs.append((val_mat, err_mat, mask_mat, time_vec, coordinates))
+                
+            return extracted_lcs
+
+    except Exception as e:
+        print(f"Error processing FITS for {head_path}: {e}")
+        return []
+
+# Function to create negative dataset HDF5
+def create_negative_dataset(sim_root, output_h5_path, buffer_limit=5000):
+    sim_root = Path(sim_root)
+
+    # Decompress FITS.gz files (exclude KN) and remove .gz
+    gz_files = [p for p in sim_root.rglob("*.FITS.gz") if "ELASTICC2_TRAIN_02_KN_" not in p.as_posix()]
+    if len(gz_files) > 0:
+        for gz_path in tqdm(gz_files, desc="Decompressing FITS.gz"):
+            subprocess.run(["gunzip", "-f", str(gz_path)], check=False)
+
+    head_files = [p for p in sim_root.rglob("*_HEAD.FITS") if "ELASTICC2_TRAIN_02_KN_" not in p.as_posix()]
+    head_files = sorted(head_files)
+    if len(head_files) == 0:
+        raise FileNotFoundError(f"No HEAD.FITS files found under {sim_root}")
+
+    with h5py.File(output_h5_path, 'w') as f:
+        grp_opt = f.create_group('ELASTICC2_TRAIN/optical_data')
+        chunk_size = 1024
+        ds_opt_vals = grp_opt.create_dataset(
+            'values', (0, MAX_LC_LENGTH, NUM_BANDS),
+            maxshape=(None, MAX_LC_LENGTH, NUM_BANDS),
+            dtype='f4', chunks=(chunk_size, MAX_LC_LENGTH, NUM_BANDS)
+        )
+        ds_opt_errs = grp_opt.create_dataset(
+            'errors', (0, MAX_LC_LENGTH, NUM_BANDS),
+            maxshape=(None, MAX_LC_LENGTH, NUM_BANDS),
+            dtype='f4', chunks=(chunk_size, MAX_LC_LENGTH, NUM_BANDS)
+        )
+        ds_opt_masks = grp_opt.create_dataset(
+            'masks', (0, MAX_LC_LENGTH, NUM_BANDS),
+            maxshape=(None, MAX_LC_LENGTH, NUM_BANDS),
+            dtype='f4', chunks=(chunk_size, MAX_LC_LENGTH, NUM_BANDS)
+        )
+        ds_opt_times = grp_opt.create_dataset(
+            'times', (0, MAX_LC_LENGTH),
+            maxshape=(None, MAX_LC_LENGTH),
+            dtype='f4', chunks=(chunk_size, MAX_LC_LENGTH)
+        )
+        ds_opt_coords = grp_opt.create_dataset(
+            'coordinates', (0, 2),
+            maxshape=(None, 2),
+            dtype='f4', chunks=(chunk_size, 2)
+        )
+        dt_str = h5py.special_dtype(vlen=str)
+        ds_opt_types = grp_opt.create_dataset(
+            'types', (0,), maxshape=(None,), dtype=dt_str, chunks=(chunk_size,)
+        )
+
+        total_optical = 0
+        opt_buffer_vals = []
+        opt_buffer_errs = []
+        opt_buffer_masks = []
+        opt_buffer_times = []
+        opt_buffer_coords = []
+        opt_buffer_types = []
+
+        def flush_buffer():
+            nonlocal total_optical, opt_buffer_vals, opt_buffer_errs, opt_buffer_masks, opt_buffer_times, opt_buffer_coords, opt_buffer_types
+            if len(opt_buffer_vals) == 0:
+                return
+            n_new = len(opt_buffer_vals)
+            current_size = total_optical
+            new_size = current_size + n_new
+
+            ds_opt_vals.resize(new_size, axis=0)
+            ds_opt_errs.resize(new_size, axis=0)
+            ds_opt_masks.resize(new_size, axis=0)
+            ds_opt_times.resize(new_size, axis=0)
+            ds_opt_coords.resize(new_size, axis=0)
+            ds_opt_types.resize(new_size, axis=0)
+
+            ds_opt_vals[current_size:new_size] = np.array(opt_buffer_vals)
+            ds_opt_errs[current_size:new_size] = np.array(opt_buffer_errs)
+            ds_opt_masks[current_size:new_size] = np.array(opt_buffer_masks)
+            ds_opt_times[current_size:new_size] = np.array(opt_buffer_times)
+            ds_opt_coords[current_size:new_size] = np.array(opt_buffer_coords)
+            ds_opt_types[current_size:new_size] = np.array(opt_buffer_types, dtype=object)
+
+            total_optical += n_new
+            opt_buffer_vals = []
+            opt_buffer_errs = []
+            opt_buffer_masks = []
+            opt_buffer_times = []
+            opt_buffer_coords = []
+            opt_buffer_types = []
+
+        for head_path in tqdm(head_files):
+            name_lower = head_path.parent.name.lower()
+            if 'kn' in name_lower:
+                continue
+            if 'agn' in name_lower:
+                transient_type = 'AGN'
+            elif 'tde' in name_lower:
+                transient_type = 'TDE'
+            elif 'ulens' in name_lower:
+                transient_type = 'uLens'
+            elif 'dwarf-nova' in name_lower:
+                transient_type = 'dwarf-nova'
+            elif 'sn' in name_lower or 'slsn' in name_lower or 'pisn' in name_lower:
+                transient_type = 'SN'
+            else:
+                print(f"Skipping unsupported type folder: {head_path.parent.name}")
+                continue
+
+            phot_path = head_path.with_name(head_path.name.replace('_HEAD.FITS', '_PHOT.FITS'))
+            if not phot_path.exists():
+                print(f"Missing PHOT file for {head_path.name}")
+                continue
+
+            lcs = parse_snana_fits_neg(str(head_path), str(phot_path), type=transient_type)
+            for (vals, errs, masks, times, coordinates) in lcs:
+                opt_buffer_vals.append(vals)
+                opt_buffer_errs.append(errs)
+                opt_buffer_masks.append(masks)
+                opt_buffer_times.append(times)
+                opt_buffer_coords.append(coordinates)
+                opt_buffer_types.append(transient_type)
+
+            if len(opt_buffer_vals) >= buffer_limit:
+                flush_buffer()
+
+        flush_buffer()
+        f.attrs['n_total_optical'] = total_optical
+        print(f"Total negative light curves: {total_optical}")
         print(f"Saved to: {output_h5_path}")
