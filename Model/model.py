@@ -776,3 +776,156 @@ class GWOpticalContrastiveModel(nn.Module):
             total_loss = (loss_g + loss_o) / 2
         
         return total_loss, sim_g2o
+
+# ==============================================================================
+# 8. Fusion Branch and Joint ALBEF-Style Model
+# ==============================================================================
+class CrossAttentionFusion(nn.Module):
+    """
+    Cross-attention fusion head for GW (query) and optical sequence (key/value).
+    Outputs binary classification logits for matching.
+    """
+    def __init__(self, gw_dim, opt_dim, attn_dim=None, hidden_dim=None, dropout=0.1):
+        super().__init__()
+        self.attn_dim = attn_dim if attn_dim is not None else opt_dim
+        self.hidden_dim = hidden_dim if hidden_dim is not None else self.attn_dim * 2
+
+        self.q_proj = nn.Linear(gw_dim, self.attn_dim)
+        self.k_proj = nn.Linear(opt_dim, self.attn_dim)
+        self.v_proj = nn.Linear(opt_dim, self.attn_dim)
+        self.out_norm = nn.LayerNorm(self.attn_dim)
+        self.classifier = nn.Sequential(
+            nn.Linear(self.attn_dim, self.hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(self.hidden_dim, 2)
+        )
+
+    def forward(self, g_feat, h_l):
+        """
+        Args:
+            g_feat: [Batch, gw_dim]
+            h_l: [Batch, N, opt_dim]
+        Returns:
+            logits: [Batch, 2]
+            fused: [Batch, attn_dim]
+        """
+        q = self.q_proj(g_feat).unsqueeze(1)  # [B, 1, d]
+        k = self.k_proj(h_l)                 # [B, N, d]
+        v = self.v_proj(h_l)                 # [B, N, d]
+
+        attn_scores = torch.matmul(q, k.transpose(1, 2)) / math.sqrt(self.attn_dim)
+        attn_weights = torch.softmax(attn_scores, dim=-1)
+        fused = torch.matmul(attn_weights, v).squeeze(1)
+        fused = self.out_norm(fused)
+
+        logits = self.classifier(fused)
+        return logits, fused
+
+
+class GWOpticalALBEFModel(nn.Module):
+    """
+    Joint model for alignment (contrastive) and fusion (classification).
+    """
+    def __init__(
+        self,
+        gw_scalar_dim=7,
+        gw_skymap_channels=7,
+        optical_input_dim=6,
+        ref_time_dim=64,
+        enc_dim=128,
+        proj_dim=256,
+        fusion_attn_dim=None,
+        fusion_hidden_dim=None,
+        temp_init=0.07,
+        fusion_dropout=0.1
+    ):
+        super().__init__()
+
+        self.gw_encoder = GWMOCResNetEncoder(
+            scalar_input_dim=gw_scalar_dim,
+            skymap_channels=gw_skymap_channels,
+            final_output_dim=enc_dim
+        )
+        self.optical_encoder = OpticalEncoderWithCLS(
+            input_dim=optical_input_dim,
+            output_dim=enc_dim,
+            num_heads=4,
+            ref_dim=ref_time_dim
+        )
+
+        self.gw_proj = ProjectionHead(enc_dim, enc_dim, proj_dim)
+        self.opt_proj = ProjectionHead(enc_dim, enc_dim, proj_dim)
+        self.log_temp = nn.Parameter(torch.ones([]) * torch.log(torch.tensor(temp_init)))
+        self.itc_criterion = nn.CrossEntropyLoss()
+
+        self.fusion = CrossAttentionFusion(
+            gw_dim=enc_dim,
+            opt_dim=enc_dim,
+            attn_dim=fusion_attn_dim,
+            hidden_dim=fusion_hidden_dim,
+            dropout=fusion_dropout
+        )
+        self.cls_criterion = nn.CrossEntropyLoss()
+
+    def encode(self, gw_s, gw_m, opt_coords, opt_t, opt_v, opt_ref_t, opt_mask, opt_err):
+        g = self.gw_encoder(gw_s, gw_m)
+        z_l, h_l = self.optical_encoder(
+            opt_coords, opt_t, opt_v, opt_ref_t, opt_mask, errors_obs=opt_err
+        )
+        return g, z_l, h_l
+
+    def encode_optical(self, opt_coords, opt_t, opt_v, opt_ref_t, opt_mask, opt_err):
+        z_l, h_l = self.optical_encoder(
+            opt_coords, opt_t, opt_v, opt_ref_t, opt_mask, errors_obs=opt_err
+        )
+        return z_l, h_l
+
+    def compute_itc_loss(self, g, z_l, gw_indices=None, mask=False):
+        feat_g = F.normalize(self.gw_proj(g), p=2, dim=1, eps=1e-8)
+        feat_o = F.normalize(self.opt_proj(z_l), p=2, dim=1, eps=1e-8)
+
+        logit_scale = torch.clamp(self.log_temp.exp(), min=0.01, max=100.0)
+        sim_g2o = torch.matmul(feat_g, feat_o.T) * logit_scale
+        sim_o2g = sim_g2o.T
+
+        if mask and gw_indices is not None:
+            labels_mask = (gw_indices.unsqueeze(0) == gw_indices.unsqueeze(1)).float()
+
+            sim_g2o_max, _ = torch.max(sim_g2o, dim=1, keepdim=True)
+            sim_g2o = sim_g2o - sim_g2o_max.detach()
+            sim_o2g_max, _ = torch.max(sim_o2g, dim=1, keepdim=True)
+            sim_o2g = sim_o2g - sim_o2g_max.detach()
+
+            exp_g2o = torch.exp(sim_g2o)
+            exp_o2g = torch.exp(sim_o2g)
+            log_prob_g2o = sim_g2o - torch.log(exp_g2o.sum(dim=1, keepdim=True))
+            log_prob_o2g = sim_o2g - torch.log(exp_o2g.sum(dim=1, keepdim=True))
+
+            loss_g = - (labels_mask * log_prob_g2o).sum(dim=1) / labels_mask.sum(dim=1)
+            loss_o = - (labels_mask * log_prob_o2g).sum(dim=1) / labels_mask.sum(dim=1)
+            total_loss = (loss_g.mean() + loss_o.mean()) / 2
+        else:
+            batch_size = feat_g.size(0)
+            labels = torch.arange(batch_size, device=feat_g.device)
+            loss_g = self.itc_criterion(sim_g2o, labels)
+            loss_o = self.itc_criterion(sim_o2g, labels)
+            total_loss = (loss_g + loss_o) / 2
+
+        return total_loss, sim_g2o
+
+    def fusion_logits(self, g_feat, h_l):
+        logits, _ = self.fusion(g_feat, h_l)
+        return logits
+
+    @staticmethod
+    def sample_hard_negatives(sim_g2o, gw_indices=None):
+        sim = sim_g2o.detach()
+        batch_size = sim.size(0)
+        if gw_indices is not None:
+            same_event = gw_indices.unsqueeze(0) == gw_indices.unsqueeze(1)
+        else:
+            same_event = torch.eye(batch_size, device=sim.device, dtype=torch.bool)
+        sim = sim.masked_fill(same_event, -1e9)
+        hard_idx = sim.argmax(dim=1)
+        return hard_idx
