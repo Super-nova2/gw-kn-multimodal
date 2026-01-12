@@ -1,0 +1,287 @@
+from data_loader import create_training_dataloader
+from model import GWOpticalALBEFModel
+from tqdm import tqdm
+import torch
+from torch.utils.tensorboard import SummaryWriter
+import h5py
+import os
+import datetime
+import argparse
+import warnings
+warnings.filterwarnings("ignore", "Wswiglal-redir-stdio")
+
+
+def build_ref_time(batch_size, n_ref, ref_start, ref_end, device, dtype):
+    ref = torch.linspace(ref_start, ref_end, n_ref, dtype=dtype, device=device)
+    return ref.unsqueeze(0).repeat(batch_size, 1)
+
+def sample_easy_negatives(batch_size, device):
+    if batch_size < 2:
+        return None
+    shift = int(torch.randint(1, batch_size, (1,), device=device).item())
+    return (torch.arange(batch_size, device=device) + shift) % batch_size
+
+
+def train(args):
+    print("Training in Float32 precision.")
+
+    torch.manual_seed(42)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Running on device: {device}")
+
+    timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    log_dir = os.path.join(os.path.dirname(args.ckpt_path), "tb_logs", f"run_albef_{timestamp}")
+    writer = SummaryWriter(log_dir=log_dir)
+    print(f"TensorBoard logging started at: {log_dir}")
+
+    if args.steps_per_epoch is not None:
+        steps_per_epoch = args.steps_per_epoch
+    else:
+        with h5py.File(args.data_path, 'r') as f:
+            total_optical = f['events/optical_data/values'].shape[0]
+        steps_per_epoch = total_optical // args.batch_size
+        print(f"Dataset Size: {total_optical} | Steps/Epoch: {steps_per_epoch}")
+
+    train_loader = create_training_dataloader(
+        h5_path=args.data_path,
+        batch_size=args.batch_size,
+        steps_per_epoch=steps_per_epoch,
+        num_workers=args.num_workers,
+        negative_h5_path=args.neg_data_path,
+        negative_group=args.neg_group
+    )
+
+    model = GWOpticalALBEFModel(
+        gw_scalar_dim=7,
+        gw_skymap_channels=7,
+        optical_input_dim=6,
+        ref_time_dim=args.ref_dim,
+        enc_dim=args.enc_dim,
+        proj_dim=args.proj_dim,
+        fusion_attn_dim=args.fusion_attn_dim,
+        fusion_hidden_dim=args.fusion_hidden_dim,
+        temp_init=args.temp_init,
+        fusion_dropout=args.fusion_dropout
+    ).to(device)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    start_epoch = 0
+    global_step = 0
+    if args.resume is not None:
+        if not os.path.exists(args.resume):
+            raise FileNotFoundError(f"Resume checkpoint not found: {args.resume}")
+        ckpt = torch.load(args.resume, map_location=device)
+        model.load_state_dict(ckpt["model_state_dict"], strict=True)
+        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        start_epoch = ckpt.get("epoch", -1) + 1
+        global_step = start_epoch * steps_per_epoch
+        print(f"Resumed from {args.resume} at epoch {start_epoch}.")
+    model.train()
+    has_negatives = args.neg_data_path is not None
+
+    for epoch in range(start_epoch, args.epochs):
+        epoch_total = 0.0
+        epoch_itc = 0.0
+        epoch_cls = 0.0
+
+        pbar = tqdm(
+            train_loader,
+            desc=f"Epoch {epoch+1}/{args.epochs}"
+        )
+        
+        for batch_idx, batch_data in enumerate(pbar):
+            if has_negatives:
+                (gw_s, gw_m, opt_t, opt_v, opt_mask, opt_err, opt_coords, gw_indices,
+                 neg_t, neg_v, neg_mask, neg_err, neg_coords) = batch_data
+            else:
+                gw_s, gw_m, opt_t, opt_v, opt_mask, opt_err, opt_coords, gw_indices = batch_data
+
+            gw_s = gw_s.to(device, non_blocking=True)
+            gw_m = gw_m.to(device, non_blocking=True)
+            opt_t = opt_t.to(device, non_blocking=True)
+            opt_v = opt_v.to(device, non_blocking=True)
+            opt_mask = opt_mask.to(device, non_blocking=True)
+            opt_err = opt_err.to(device, non_blocking=True)
+            opt_coords = opt_coords.to(device, non_blocking=True)
+            gw_indices = gw_indices.to(device, non_blocking=True).long()
+
+            if torch.isnan(opt_v).any() or torch.isinf(opt_v).any():
+                print("NaN or Inf detected in optical values. Skipping batch.")
+                continue
+            if torch.isnan(opt_err).any() or torch.isinf(opt_err).any():
+                print("NaN or Inf detected in optical errors. Skipping batch.")
+                continue
+
+            if has_negatives:
+                neg_t = neg_t.to(device, non_blocking=True)
+                neg_v = neg_v.to(device, non_blocking=True)
+                neg_mask = neg_mask.to(device, non_blocking=True)
+                neg_err = neg_err.to(device, non_blocking=True)
+                neg_coords = neg_coords.to(device, non_blocking=True)
+                if torch.isnan(neg_v).any() or torch.isinf(neg_v).any():
+                    print("NaN or Inf detected in negative optical values. Skipping batch.")
+                    continue
+                if torch.isnan(neg_err).any() or torch.isinf(neg_err).any():
+                    print("NaN or Inf detected in negative optical errors. Skipping batch.")
+                    continue
+
+            batch_size = gw_s.size(0)
+            opt_ref_t = build_ref_time(
+                batch_size, args.n_ref, args.ref_start, args.ref_end, device, opt_t.dtype
+            )
+
+            optimizer.zero_grad(set_to_none=True)
+
+            g, z_l, h_l = model.encode(
+                gw_s, gw_m, opt_coords, opt_t, opt_v, opt_ref_t, opt_mask, opt_err
+            )
+            itc_loss, sim_g2o = model.compute_itc_loss(
+                g, z_l, gw_indices, mask=args.mask_itc
+            )
+
+            logits_pos = model.fusion_logits(g, h_l)
+            labels_pos = torch.ones(batch_size, device=device, dtype=torch.long)
+            labels_neg = torch.zeros(batch_size, device=device, dtype=torch.long)
+            pos_loss = model.cls_criterion(logits_pos, labels_pos)
+
+            use_hard_neg = epoch >= args.hard_neg_start_epoch
+            if use_hard_neg:
+                neg_idx = model.sample_hard_negatives(sim_g2o, gw_indices)
+            else:
+                neg_idx = sample_easy_negatives(batch_size, device)
+
+            if neg_idx is None:
+                hard_loss = torch.zeros((), device=device)
+                logits_hard = logits_pos.detach()
+            else:
+                h_l_hard = h_l[neg_idx]
+                logits_hard = model.fusion_logits(g, h_l_hard)
+                hard_loss = model.cls_criterion(logits_hard, labels_neg)
+
+            if has_negatives:
+                _, h_l_neg = model.encode_optical(
+                    neg_coords, neg_t, neg_v, opt_ref_t, neg_mask, neg_err
+                )
+                logits_neg = model.fusion_logits(g, h_l_neg)
+                neg_loss = model.cls_criterion(logits_neg, labels_neg)
+                cls_loss = (pos_loss + hard_loss + neg_loss) / 3.0
+            else:
+                cls_loss = 0.5 * (pos_loss + hard_loss)
+
+            total_loss = args.itc_weight * itc_loss + args.cls_weight * cls_loss
+            total_loss.backward()
+            optimizer.step()
+
+            total_val = total_loss.item()
+            itc_val = itc_loss.item()
+            pos_loss_val = pos_loss.item()
+            hard_loss_val = hard_loss.item()
+            if has_negatives:
+                neg_loss_val = neg_loss.item()
+            cls_val = cls_loss.item()
+            epoch_total += total_val
+            epoch_itc += itc_val
+            epoch_cls += cls_val
+
+            with torch.no_grad():
+                itc_preds = sim_g2o.argmax(dim=1)
+                itc_acc = (itc_preds == torch.arange(batch_size, device=device)).float().mean().item()
+                pos_acc = (logits_pos.argmax(dim=1) == labels_pos).float().mean().item()
+                hard_acc = (logits_hard.argmax(dim=1) == labels_neg).float().mean().item()
+                neg_acc = None
+                if has_negatives:
+                    neg_acc = (logits_neg.argmax(dim=1) == labels_neg).float().mean().item()
+                current_temp = model.log_temp.exp().item()
+
+            if batch_idx % 10 == 0:
+                writer.add_scalar('Train/Batch_Total_Loss', total_val, global_step)
+                writer.add_scalar('Train/Batch_ITC_Loss', itc_val, global_step)
+                writer.add_scalar('Train/Batch_CLS_Loss', cls_val, global_step)
+                writer.add_scalar('Train/Batch_Pos_Loss', pos_loss_val, global_step)
+                writer.add_scalar('Train/Batch_HardNeg_Loss', hard_loss_val, global_step)
+                if has_negatives:
+                    writer.add_scalar('Train/Batch_ExtraNeg_Loss', neg_loss_val, global_step)
+                writer.add_scalar('Train/Batch_ITC_Acc', itc_acc, global_step)
+                writer.add_scalar('Train/Batch_Pos_Acc', pos_acc, global_step)
+                writer.add_scalar('Train/Batch_HardNeg_Acc', hard_acc, global_step)
+                if has_negatives and neg_acc is not None:
+                    writer.add_scalar('Train/Batch_ExtraNeg_Acc', neg_acc, global_step)
+                writer.add_scalar('Train/Temperature', current_temp, global_step)
+                writer.add_scalar('Train/Learning_Rate', optimizer.param_groups[0]['lr'], global_step)
+
+            if batch_idx % 100 == 0:
+                postfix = {
+                    'Total': f"{total_val:.4f}",
+                    'ITC': f"{itc_val:.4f}",
+                    'CLS': f"{cls_val:.4f}",
+                    'ITC_Acc': f"{itc_acc:.2f}"
+                }
+                pbar.set_postfix(postfix)
+
+            global_step += 1
+
+        avg_total = epoch_total / len(train_loader)
+        avg_itc = epoch_itc / len(train_loader)
+        avg_cls = epoch_cls / len(train_loader)
+        print(
+            f"Epoch {epoch+1} Complete. Avg Total: {avg_total:.4f} | "
+            f"ITC: {avg_itc:.4f} | CLS: {avg_cls:.4f}"
+        )
+
+        writer.add_scalar('Train/Epoch_Total_Loss', avg_total, epoch)
+        writer.add_scalar('Train/Epoch_ITC_Loss', avg_itc, epoch)
+        writer.add_scalar('Train/Epoch_CLS_Loss', avg_cls, epoch)
+
+        checkpoint_path = os.path.join(args.ckpt_path, "ALBEF", f"albef_epoch_{epoch+1}.pth")
+        os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
+        torch.save({
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'loss': avg_total,
+        }, checkpoint_path)
+
+    writer.close()
+
+
+if __name__ == "__main__":
+    """
+    Example usage:
+    python ML+GW+KN/Model/ALBEF_train.py --data_path data/LSST_KN_BNS/combined_dataset.h5 \
+        --epochs 2 --batch_size 32 --steps_per_epoch 10 --ckpt_path data/model/checkpoints
+    """
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data_path", type=str, default="training_data.h5")
+    parser.add_argument("--neg_data_path", type=str, default=None)
+    parser.add_argument("--neg_group", type=str, default="events/optical_data")
+    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--steps_per_epoch", type=int, default=None)
+    parser.add_argument("--ckpt_path", type=str, default=None)
+    parser.add_argument("--resume", type=str, default=None)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--n_ref", type=int, default=64)
+    parser.add_argument("--ref_start", type=float, default=-0.3)
+    parser.add_argument("--ref_end", type=float, default=0.6)
+    parser.add_argument("--ref_dim", type=int, default=64)
+    parser.add_argument("--enc_dim", type=int, default=128)
+    parser.add_argument("--proj_dim", type=int, default=256)
+    parser.add_argument("--fusion_attn_dim", type=int, default=None)
+    parser.add_argument("--fusion_hidden_dim", type=int, default=None)
+    parser.add_argument("--fusion_dropout", type=float, default=0.1)
+    parser.add_argument("--temp_init", type=float, default=0.07)
+    parser.add_argument("--itc_weight", type=float, default=1.0)
+    parser.add_argument("--cls_weight", type=float, default=1.0)
+    parser.add_argument("--mask_itc", action='store_true', help="Mask same-event pairs in ITC loss")
+    parser.add_argument("--hard_neg_start_epoch", type=int, default=0)
+
+    args = parser.parse_args()
+
+    if os.path.exists(args.data_path):
+        if args.ckpt_path is None:
+            raise ValueError("ckpt_path must be provided.")
+        os.makedirs(args.ckpt_path, exist_ok=True)
+        train(args)
+    else:
+        print("Data file not found.")

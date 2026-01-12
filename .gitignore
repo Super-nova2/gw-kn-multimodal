@@ -10,3 +10,4 @@ notebook/
 
 ./dataset/KN_sim/notebook/
 dataset/O5_sim_bns/*.ipynb
+基于 ALBEF (Align Before Fuse) 架构将稀疏光学数据与引力波数据结合的完整技术实施方案.md
