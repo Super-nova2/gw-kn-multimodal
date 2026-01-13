@@ -51,7 +51,13 @@ class RelationalHDF5Dataset(Dataset):
     Reads optical data by index and fetches the corresponding unique GW data.
     Optional negative optical samples can be drawn from a separate HDF5 file.
     """
-    def __init__(self, h5_path: str, negative_h5_path: str = None, negative_group: str = "events/optical_data"):
+    def __init__(
+        self,
+        h5_path: str,
+        negative_h5_path: str = None,
+        negative_group: str = "events/optical_data",
+        cache_in_memory: bool = False
+    ):
         super().__init__()
         self.h5_path = h5_path
         self.h5_file = None
@@ -59,16 +65,40 @@ class RelationalHDF5Dataset(Dataset):
         self.negative_group = negative_group
         self.neg_file = None
         self.neg_length = None
+        self.cache_in_memory = cache_in_memory
+        self.data_cache = None
+        self.neg_cache = None
         
         # Open file temporarily to get dataset length
         with h5py.File(h5_path, 'r') as f:
             self.length = f['events/optical_data/values'].shape[0]
+            if self.cache_in_memory:
+                print(f"Caching positive dataset in memory from {h5_path}...")
+                self.data_cache = {
+                    "opt_val": f['events/optical_data/values'][:],
+                    "opt_err": f['events/optical_data/errors'][:],
+                    "opt_mask": f['events/optical_data/masks'][:],
+                    "opt_time": f['events/optical_data/times'][:],
+                    "opt_coords": f['events/optical_data/coordinates'][:],
+                    "parent_gw_idx": f['events/optical_data/parent_gw_idx'][:],
+                    "gw_scalar": f['events/gw_data/scalars'][:],
+                    "gw_skymap": f['events/gw_data/skymaps'][:]
+                }
         
         if self.negative_h5_path is not None:
             with h5py.File(self.negative_h5_path, 'r') as f:
                 if self.negative_group not in f:
                     raise KeyError(f"Negative group '{self.negative_group}' not found in {self.negative_h5_path}")
                 self.neg_length = f[f"{self.negative_group}/values"].shape[0]
+                if self.cache_in_memory:
+                    print(f"Caching negative dataset in memory from {self.negative_h5_path}...")
+                    self.neg_cache = {
+                        "neg_val": f[f"{self.negative_group}/values"][:],
+                        "neg_err": f[f"{self.negative_group}/errors"][:],
+                        "neg_mask": f[f"{self.negative_group}/masks"][:],
+                        "neg_time": f[f"{self.negative_group}/times"][:],
+                        "neg_coords": f[f"{self.negative_group}/coordinates"][:]
+                    }
             
     def __len__(self):
         return self.length
@@ -78,37 +108,53 @@ class RelationalHDF5Dataset(Dataset):
         Args:
             idx: Index of the light curve (optical data).
         """
-        # Lazy loading: Open file only when needed (crucial for num_workers > 0)
-        if self.h5_file is None:
-            self.h5_file = h5py.File(self.h5_path, 'r')
-            
-        # 1. Retrieve Optical Data (Values, Errors, Masks, Times)
-        #    HDF5 structure: events/optical_data/...
-        opt_val   = torch.from_numpy(self.h5_file['events/optical_data/values'][idx])
-        opt_err   = torch.from_numpy(self.h5_file['events/optical_data/errors'][idx])
-        opt_mask  = torch.from_numpy(self.h5_file['events/optical_data/masks'][idx])
-        opt_time  = torch.from_numpy(self.h5_file['events/optical_data/times'][idx])
-        opt_coords = torch.from_numpy(self.h5_file['events/optical_data/coordinates'][idx])
-        
-        # 2. Retrieve Parent GW Index
-        gw_idx = self.h5_file['events/optical_data/parent_gw_idx'][idx]
-        
-        # 3. Retrieve Unique GW Data using gw_idx
-        #    HDF5 structure: events/gw/...
-        gw_scalar = torch.from_numpy(self.h5_file['events/gw_data/scalars'][gw_idx])
-        gw_skymap = torch.from_numpy(self.h5_file['events/gw_data/skymaps'][gw_idx])
+        if self.data_cache is None:
+            # Lazy loading: Open file only when needed (crucial for num_workers > 0)
+            if self.h5_file is None:
+                self.h5_file = h5py.File(self.h5_path, 'r')
+
+            # 1. Retrieve Optical Data (Values, Errors, Masks, Times)
+            #    HDF5 structure: events/optical_data/...
+            opt_val = torch.from_numpy(self.h5_file['events/optical_data/values'][idx])
+            opt_err = torch.from_numpy(self.h5_file['events/optical_data/errors'][idx])
+            opt_mask = torch.from_numpy(self.h5_file['events/optical_data/masks'][idx])
+            opt_time = torch.from_numpy(self.h5_file['events/optical_data/times'][idx])
+            opt_coords = torch.from_numpy(self.h5_file['events/optical_data/coordinates'][idx])
+
+            # 2. Retrieve Parent GW Index
+            gw_idx = self.h5_file['events/optical_data/parent_gw_idx'][idx]
+
+            # 3. Retrieve Unique GW Data using gw_idx
+            #    HDF5 structure: events/gw/...
+            gw_scalar = torch.from_numpy(self.h5_file['events/gw_data/scalars'][gw_idx])
+            gw_skymap = torch.from_numpy(self.h5_file['events/gw_data/skymaps'][gw_idx])
+        else:
+            opt_val = torch.from_numpy(self.data_cache["opt_val"][idx])
+            opt_err = torch.from_numpy(self.data_cache["opt_err"][idx])
+            opt_mask = torch.from_numpy(self.data_cache["opt_mask"][idx])
+            opt_time = torch.from_numpy(self.data_cache["opt_time"][idx])
+            opt_coords = torch.from_numpy(self.data_cache["opt_coords"][idx])
+            gw_idx = self.data_cache["parent_gw_idx"][idx]
+            gw_scalar = torch.from_numpy(self.data_cache["gw_scalar"][gw_idx])
+            gw_skymap = torch.from_numpy(self.data_cache["gw_skymap"][gw_idx])
         
         # Optional: Retrieve Negative Optical Data (non-KN or unrelated transient)
         if self.negative_h5_path is not None:
-            if self.neg_file is None:
-                self.neg_file = h5py.File(self.negative_h5_path, 'r')
-
             neg_idx = np.random.randint(0, self.neg_length)
-            neg_val = torch.from_numpy(self.neg_file[f"{self.negative_group}/values"][neg_idx])
-            neg_err = torch.from_numpy(self.neg_file[f"{self.negative_group}/errors"][neg_idx])
-            neg_mask = torch.from_numpy(self.neg_file[f"{self.negative_group}/masks"][neg_idx])
-            neg_time = torch.from_numpy(self.neg_file[f"{self.negative_group}/times"][neg_idx])
-            neg_coords = torch.from_numpy(self.neg_file[f"{self.negative_group}/coordinates"][neg_idx])
+            if self.neg_cache is None:
+                if self.neg_file is None:
+                    self.neg_file = h5py.File(self.negative_h5_path, 'r')
+                neg_val = torch.from_numpy(self.neg_file[f"{self.negative_group}/values"][neg_idx])
+                neg_err = torch.from_numpy(self.neg_file[f"{self.negative_group}/errors"][neg_idx])
+                neg_mask = torch.from_numpy(self.neg_file[f"{self.negative_group}/masks"][neg_idx])
+                neg_time = torch.from_numpy(self.neg_file[f"{self.negative_group}/times"][neg_idx])
+                neg_coords = torch.from_numpy(self.neg_file[f"{self.negative_group}/coordinates"][neg_idx])
+            else:
+                neg_val = torch.from_numpy(self.neg_cache["neg_val"][neg_idx])
+                neg_err = torch.from_numpy(self.neg_cache["neg_err"][neg_idx])
+                neg_mask = torch.from_numpy(self.neg_cache["neg_mask"][neg_idx])
+                neg_time = torch.from_numpy(self.neg_cache["neg_time"][neg_idx])
+                neg_coords = torch.from_numpy(self.neg_cache["neg_coords"][neg_idx])
 
             # Return tuple: (GW_Inputs, Optical_Inputs, Metadata, Negative_Optical_Inputs)
             # gw_idx is returned for masking the contrastive loss (handling same-source negatives)
@@ -174,12 +220,18 @@ def create_training_dataloader(
     batch_size: int = 32, 
     steps_per_epoch: int = 1000, 
     num_workers: int = 4,
+    pin_memory: bool = True,
+    persistent_workers: bool = True,
+    prefetch_factor: int = 4,
     negative_h5_path: str = None,
-    negative_group: str = "events/optical_data"
+    negative_group: str = "events/optical_data",
+    cache_in_memory: bool = False
 ):
     """
     Factory function to initialize the Dataset, Sampler, and DataLoader.
     """
+    if cache_in_memory and num_workers > 0:
+        print("cache_in_memory=True with num_workers>0 may increase RAM usage.")
     # 1. Build Index Map (Once)
     gw_map = build_gw_to_lc_mapping(h5_path)
     
@@ -187,7 +239,8 @@ def create_training_dataloader(
     dataset = RelationalHDF5Dataset(
         h5_path,
         negative_h5_path=negative_h5_path,
-        negative_group=negative_group
+        negative_group=negative_group,
+        cache_in_memory=cache_in_memory
     )
     
     # 3. Initialize Custom Sampler
@@ -201,12 +254,22 @@ def create_training_dataloader(
     # 4. Initialize DataLoader
     # IMPORTANT: batch_sampler is used, so batch_size/shuffle/sampler/drop_last 
     # arguments in DataLoader constructor must not be provided.
-    loader = DataLoader(
-        dataset,
-        batch_sampler=sampler,
-        num_workers=num_workers,
-        pin_memory=True
-    )
+    if num_workers > 0:
+        loader = DataLoader(
+            dataset,
+            batch_sampler=sampler,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            persistent_workers=persistent_workers,
+            prefetch_factor=prefetch_factor
+        )
+    else:
+        loader = DataLoader(
+            dataset,
+            batch_sampler=sampler,
+            num_workers=0,
+            pin_memory=pin_memory
+        )
     
     return loader
 
