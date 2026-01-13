@@ -27,6 +27,8 @@ def train(args):
 
     torch.manual_seed(42)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
     print(f"Running on device: {device}")
 
     timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -47,6 +49,10 @@ def train(args):
         batch_size=args.batch_size,
         steps_per_epoch=steps_per_epoch,
         num_workers=args.num_workers,
+        pin_memory=bool(args.pin_memory),
+        persistent_workers=bool(args.persistent_workers),
+        prefetch_factor=args.prefetch_factor,
+        cache_in_memory=bool(args.cache_in_memory),
         negative_h5_path=args.neg_data_path,
         negative_group=args.neg_group
     )
@@ -79,14 +85,20 @@ def train(args):
     model.train()
     has_negatives = args.neg_data_path is not None
 
+    pbar_update_every = 500
+
     for epoch in range(start_epoch, args.epochs):
         epoch_total = 0.0
         epoch_itc = 0.0
         epoch_cls = 0.0
 
+        ref_time_cache = None
+
         pbar = tqdm(
             train_loader,
-            desc=f"Epoch {epoch+1}/{args.epochs}"
+            desc=f"Epoch {epoch+1}/{args.epochs}",
+            mininterval=0,
+            miniters=pbar_update_every
         )
         
         for batch_idx, batch_data in enumerate(pbar):
@@ -126,9 +138,16 @@ def train(args):
                     continue
 
             batch_size = gw_s.size(0)
-            opt_ref_t = build_ref_time(
-                batch_size, args.n_ref, args.ref_start, args.ref_end, device, opt_t.dtype
-            )
+
+            if (
+                ref_time_cache is None
+                or ref_time_cache.shape[0] != batch_size
+                or ref_time_cache.dtype != opt_t.dtype
+            ):
+                ref_time_cache = build_ref_time(
+                    batch_size, args.n_ref, args.ref_start, args.ref_end, device, opt_t.dtype
+                )
+            opt_ref_t = ref_time_cache
 
             optimizer.zero_grad(set_to_none=True)
 
@@ -261,6 +280,10 @@ if __name__ == "__main__":
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--pin_memory", type=int, default=1)
+    parser.add_argument("--persistent_workers", type=int, default=1)
+    parser.add_argument("--prefetch_factor", type=int, default=4)
+    parser.add_argument("--cache_in_memory", action='store_true')
     parser.add_argument("--n_ref", type=int, default=64)
     parser.add_argument("--ref_start", type=float, default=-0.3)
     parser.add_argument("--ref_end", type=float, default=0.6)
