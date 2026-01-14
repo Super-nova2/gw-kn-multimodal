@@ -3,7 +3,7 @@
 #SBATCH --output=logs/train/%x_%j.out
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=4
+#SBATCH --cpus-per-task=8
 #SBATCH --mem=40G
 #SBATCH --gres=gpu:1
 #SBATCH --time=24:00:00
@@ -27,12 +27,21 @@ RESUME=$(jq -r '.resume // empty' "$args_file")
 EPOCHS=$(jq -r '.epochs' "$args_file")
 BATCH_SIZE=$(jq -r '.batch_size' "$args_file")
 LR=$(jq -r '.lr' "$args_file")
+LR_SCHEDULER=$(jq -r '.lr_scheduler // empty' "$args_file")
+WARMUP_EPOCHS=$(jq -r '.warmup_epochs // empty' "$args_file")
+MIN_LR=$(jq -r '.min_lr // empty' "$args_file")
 NUM_WORKERS=$(jq -r '.num_workers' "$args_file")
 STEPS_PER_EPOCH=$(jq -r '.steps_per_epoch // empty' "$args_file")
 PIN_MEMORY=$(jq -r '.pin_memory // empty' "$args_file")
 PERSISTENT_WORKERS=$(jq -r '.persistent_workers // empty' "$args_file")
 PREFETCH_FACTOR=$(jq -r '.prefetch_factor // empty' "$args_file")
 CACHE_IN_MEMORY=$(jq -r '.cache_in_memory // false' "$args_file")
+VAL_SPLIT=$(jq -r '.val_split // empty' "$args_file")
+VAL_BATCH_SIZE=$(jq -r '.val_batch_size // empty' "$args_file")
+VAL_STEPS_PER_EPOCH=$(jq -r '.val_steps_per_epoch // empty' "$args_file")
+SPLIT_SEED=$(jq -r '.split_seed // empty' "$args_file")
+EARLY_STOP_PATIENCE=$(jq -r '.early_stop_patience // empty' "$args_file")
+EARLY_STOP_MIN_DELTA=$(jq -r '.early_stop_min_delta // empty' "$args_file")
 N_REF=$(jq -r '.n_ref // empty' "$args_file")
 REF_START=$(jq -r '.ref_start // empty' "$args_file")
 REF_END=$(jq -r '.ref_end // empty' "$args_file")
@@ -43,6 +52,12 @@ FUSION_ATTN_DIM=$(jq -r '.fusion_attn_dim // empty' "$args_file")
 FUSION_HIDDEN_DIM=$(jq -r '.fusion_hidden_dim // empty' "$args_file")
 FUSION_DROPOUT=$(jq -r '.fusion_dropout // empty' "$args_file")
 TEMP_INIT=$(jq -r '.temp_init // empty' "$args_file")
+TEMP_FINAL=$(jq -r '.temp_final // empty' "$args_file")
+TEMP_MIN=$(jq -r '.temp_min // empty' "$args_file")
+TEMP_MAX=$(jq -r '.temp_max // empty' "$args_file")
+TEMP_SCHEDULE=$(jq -r '.temp_schedule // empty' "$args_file")
+GW_DROPOUT=$(jq -r '.gw_dropout // empty' "$args_file")
+OPT_DROPOUT=$(jq -r '.opt_dropout // empty' "$args_file")
 ITC_WEIGHT=$(jq -r '.itc_weight // empty' "$args_file")
 CLS_WEIGHT=$(jq -r '.cls_weight // empty' "$args_file")
 HARD_NEG_START_EPOCH=$(jq -r '.hard_neg_start_epoch // empty' "$args_file")
@@ -93,6 +108,15 @@ fi
 if [[ -n "$RESUME" && "$RESUME" != "null" ]]; then
     cmd+=(--resume "$RESUME")
 fi
+if [[ -n "$LR_SCHEDULER" && "$LR_SCHEDULER" != "null" ]]; then
+    cmd+=(--lr_scheduler "$LR_SCHEDULER")
+fi
+if [[ -n "$WARMUP_EPOCHS" && "$WARMUP_EPOCHS" != "null" ]]; then
+    cmd+=(--warmup_epochs "$WARMUP_EPOCHS")
+fi
+if [[ -n "$MIN_LR" && "$MIN_LR" != "null" ]]; then
+    cmd+=(--min_lr "$MIN_LR")
+fi
 if [[ -n "$PIN_MEMORY" && "$PIN_MEMORY" != "null" ]]; then
     cmd+=(--pin_memory "$PIN_MEMORY")
 fi
@@ -104,6 +128,24 @@ if [[ -n "$PREFETCH_FACTOR" && "$PREFETCH_FACTOR" != "null" ]]; then
 fi
 if [[ "$CACHE_IN_MEMORY" == "true" ]]; then
     cmd+=(--cache_in_memory)
+fi
+if [[ -n "$VAL_SPLIT" && "$VAL_SPLIT" != "null" ]]; then
+    cmd+=(--val_split "$VAL_SPLIT")
+fi
+if [[ -n "$VAL_BATCH_SIZE" && "$VAL_BATCH_SIZE" != "null" ]]; then
+    cmd+=(--val_batch_size "$VAL_BATCH_SIZE")
+fi
+if [[ -n "$VAL_STEPS_PER_EPOCH" && "$VAL_STEPS_PER_EPOCH" != "null" ]]; then
+    cmd+=(--val_steps_per_epoch "$VAL_STEPS_PER_EPOCH")
+fi
+if [[ -n "$SPLIT_SEED" && "$SPLIT_SEED" != "null" ]]; then
+    cmd+=(--split_seed "$SPLIT_SEED")
+fi
+if [[ -n "$EARLY_STOP_PATIENCE" && "$EARLY_STOP_PATIENCE" != "null" ]]; then
+    cmd+=(--early_stop_patience "$EARLY_STOP_PATIENCE")
+fi
+if [[ -n "$EARLY_STOP_MIN_DELTA" && "$EARLY_STOP_MIN_DELTA" != "null" ]]; then
+    cmd+=(--early_stop_min_delta "$EARLY_STOP_MIN_DELTA")
 fi
 if [[ -n "$N_REF" && "$N_REF" != "null" ]]; then
     cmd+=(--n_ref "$N_REF")
@@ -134,6 +176,24 @@ if [[ -n "$FUSION_DROPOUT" && "$FUSION_DROPOUT" != "null" ]]; then
 fi
 if [[ -n "$TEMP_INIT" && "$TEMP_INIT" != "null" ]]; then
     cmd+=(--temp_init "$TEMP_INIT")
+fi
+if [[ -n "$TEMP_FINAL" && "$TEMP_FINAL" != "null" ]]; then
+    cmd+=(--temp_final "$TEMP_FINAL")
+fi
+if [[ -n "$TEMP_MIN" && "$TEMP_MIN" != "null" ]]; then
+    cmd+=(--temp_min "$TEMP_MIN")
+fi
+if [[ -n "$TEMP_MAX" && "$TEMP_MAX" != "null" ]]; then
+    cmd+=(--temp_max "$TEMP_MAX")
+fi
+if [[ -n "$TEMP_SCHEDULE" && "$TEMP_SCHEDULE" != "null" ]]; then
+    cmd+=(--temp_schedule "$TEMP_SCHEDULE")
+fi
+if [[ -n "$GW_DROPOUT" && "$GW_DROPOUT" != "null" ]]; then
+    cmd+=(--gw_dropout "$GW_DROPOUT")
+fi
+if [[ -n "$OPT_DROPOUT" && "$OPT_DROPOUT" != "null" ]]; then
+    cmd+=(--opt_dropout "$OPT_DROPOUT")
 fi
 if [[ -n "$ITC_WEIGHT" && "$ITC_WEIGHT" != "null" ]]; then
     cmd+=(--itc_weight "$ITC_WEIGHT")

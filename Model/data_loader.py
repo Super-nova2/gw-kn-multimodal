@@ -215,6 +215,88 @@ class BalancedGWBatchedSampler(Sampler):
     def __len__(self):
         return self.steps_per_epoch
 
+class GWBatchedSampler(Sampler):
+    """
+    Batch sampler that iterates over GW IDs once per epoch.
+    """
+    def __init__(self, gw_to_lc_map: dict, batch_size: int, shuffle: bool = True, max_steps: int = None):
+        self.gw_to_lc_map = gw_to_lc_map
+        self.gw_ids = np.array(sorted(gw_to_lc_map.keys()))
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.max_steps = max_steps
+
+        if self.batch_size > len(self.gw_ids):
+            raise ValueError(f"Batch size ({batch_size}) > Unique GW events ({len(self.gw_ids)}).")
+
+    def __iter__(self) -> Iterator[List[int]]:
+        gw_ids = self.gw_ids.copy()
+        if self.shuffle:
+            np.random.shuffle(gw_ids)
+
+        steps = 0
+        for i in range(0, len(gw_ids), self.batch_size):
+            if self.max_steps is not None and steps >= self.max_steps:
+                break
+            batch_gw_ids = gw_ids[i:i + self.batch_size]
+            if len(batch_gw_ids) < self.batch_size:
+                break
+
+            batch_lc_indices = []
+            for gw_id in batch_gw_ids:
+                possible_lcs = self.gw_to_lc_map[gw_id]
+                chosen_lc = np.random.choice(possible_lcs)
+                batch_lc_indices.append(chosen_lc)
+
+            yield batch_lc_indices
+            steps += 1
+
+    def __len__(self):
+        total_steps = len(self.gw_ids) // self.batch_size
+        if self.max_steps is None:
+            return total_steps
+        return min(total_steps, self.max_steps)
+
+def split_gw_map(gw_to_lc_map: dict, val_split: float, seed: int):
+    if val_split <= 0 or val_split >= 1:
+        raise ValueError("val_split must be in (0, 1).")
+
+    gw_ids = np.array(sorted(gw_to_lc_map.keys()))
+    rng = np.random.default_rng(seed)
+    rng.shuffle(gw_ids)
+
+    val_size = max(1, int(len(gw_ids) * val_split))
+    val_ids = set(gw_ids[:val_size])
+    train_ids = set(gw_ids[val_size:])
+
+    train_map = {gw_id: gw_to_lc_map[gw_id] for gw_id in train_ids}
+    val_map = {gw_id: gw_to_lc_map[gw_id] for gw_id in val_ids}
+    return train_map, val_map
+
+def _build_dataloader(
+    dataset: Dataset,
+    sampler: Sampler,
+    num_workers: int,
+    pin_memory: bool,
+    persistent_workers: bool,
+    prefetch_factor: int
+):
+    if num_workers > 0:
+        return DataLoader(
+            dataset,
+            batch_sampler=sampler,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            persistent_workers=persistent_workers,
+            prefetch_factor=prefetch_factor
+        )
+    return DataLoader(
+        dataset,
+        batch_sampler=sampler,
+        num_workers=0,
+        pin_memory=pin_memory
+    )
+
 def create_training_dataloader(
     h5_path: str, 
     batch_size: int = 32, 
@@ -250,28 +332,107 @@ def create_training_dataloader(
         batch_size=batch_size,
         steps_per_epoch=steps_per_epoch
     )
-    
+
     # 4. Initialize DataLoader
     # IMPORTANT: batch_sampler is used, so batch_size/shuffle/sampler/drop_last 
     # arguments in DataLoader constructor must not be provided.
-    if num_workers > 0:
-        loader = DataLoader(
-            dataset,
-            batch_sampler=sampler,
-            num_workers=num_workers,
-            pin_memory=pin_memory,
-            persistent_workers=persistent_workers,
-            prefetch_factor=prefetch_factor
+    return _build_dataloader(
+        dataset,
+        sampler,
+        num_workers,
+        pin_memory,
+        persistent_workers,
+        prefetch_factor
+    )
+
+def create_train_val_dataloaders(
+    h5_path: str,
+    batch_size: int = 32,
+    val_batch_size: int = None,
+    steps_per_epoch: int = None,
+    val_steps_per_epoch: int = None,
+    val_split: float = 0.1,
+    split_seed: int = 42,
+    num_workers: int = 4,
+    pin_memory: bool = True,
+    persistent_workers: bool = True,
+    prefetch_factor: int = 4,
+    negative_h5_path: str = None,
+    negative_group: str = "events/optical_data",
+    cache_in_memory: bool = False
+):
+    if cache_in_memory and num_workers > 0:
+        print("cache_in_memory=True with num_workers>0 may increase RAM usage.")
+
+    gw_map = build_gw_to_lc_mapping(h5_path)
+    train_map, val_map = split_gw_map(gw_map, val_split, split_seed)
+
+    if steps_per_epoch is None:
+        train_optical = sum(len(v) for v in train_map.values())
+        steps_per_epoch = max(1, train_optical // batch_size)
+    if val_batch_size is None:
+        val_batch_size = batch_size
+    val_batch_size = min(val_batch_size, len(val_map))
+    if val_batch_size < 1:
+        raise ValueError("val_batch_size must be >= 1.")
+    if val_batch_size < batch_size:
+        print(f"Validation batch size adjusted to {val_batch_size} based on unique GW events.")
+    if val_steps_per_epoch is None:
+        val_optical = sum(len(v) for v in val_map.values())
+        val_steps_per_epoch = max(1, val_optical // val_batch_size)
+
+    if cache_in_memory:
+        shared_dataset = RelationalHDF5Dataset(
+            h5_path,
+            negative_h5_path=negative_h5_path,
+            negative_group=negative_group,
+            cache_in_memory=cache_in_memory
         )
+        train_dataset = shared_dataset
+        val_dataset = shared_dataset
     else:
-        loader = DataLoader(
-            dataset,
-            batch_sampler=sampler,
-            num_workers=0,
-            pin_memory=pin_memory
+        train_dataset = RelationalHDF5Dataset(
+            h5_path,
+            negative_h5_path=negative_h5_path,
+            negative_group=negative_group,
+            cache_in_memory=cache_in_memory
         )
-    
-    return loader
+        val_dataset = RelationalHDF5Dataset(
+            h5_path,
+            negative_h5_path=negative_h5_path,
+            negative_group=negative_group,
+            cache_in_memory=cache_in_memory
+        )
+
+    train_sampler = BalancedGWBatchedSampler(
+        gw_to_lc_map=train_map,
+        batch_size=batch_size,
+        steps_per_epoch=steps_per_epoch
+    )
+    val_sampler = BalancedGWBatchedSampler(
+        gw_to_lc_map=val_map,
+        batch_size=val_batch_size,
+        steps_per_epoch=val_steps_per_epoch
+    )
+
+    train_loader = _build_dataloader(
+        train_dataset,
+        train_sampler,
+        num_workers,
+        pin_memory,
+        persistent_workers,
+        prefetch_factor
+    )
+    val_loader = _build_dataloader(
+        val_dataset,
+        val_sampler,
+        num_workers,
+        pin_memory,
+        persistent_workers,
+        prefetch_factor
+    )
+
+    return train_loader, val_loader, steps_per_epoch, len(val_sampler)
 
 
 # Constants
