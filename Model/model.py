@@ -259,7 +259,7 @@ class OpticalEncoderWithCLS(nn.Module):
       2. CLS Token Injection
       3. mTAN Attention Module
     """
-    def __init__(self, input_dim, num_heads=4, ref_dim=64, k_dim=64, output_dim=128):
+    def __init__(self, input_dim, num_heads=4, ref_dim=64, k_dim=64, output_dim=128, dropout=0.0):
         super().__init__()
         self.num_heads = num_heads
         self.ref_dim = ref_dim
@@ -280,6 +280,7 @@ class OpticalEncoderWithCLS(nn.Module):
         # 4. spatial embedding
         self.spatial_embedding = SpatialEmbedding(output_dim=ref_dim)
         self.spatial_proj = nn.Linear(ref_dim, num_heads * ref_dim)
+        self.output_dropout = nn.Dropout(dropout)
 
     def forward(self, ra_dec_obs, t_obs, values_obs, t_ref, mask=None, errors_obs=None):
         """
@@ -321,6 +322,7 @@ class OpticalEncoderWithCLS(nn.Module):
         # 5. Pass through mTAN
         # Output Shape: [Batch, N + 1, J]
         full_output = self.mtan(query_emb, key_emb, values_obs, mask, errors_obs)
+        full_output = self.output_dropout(full_output)
         
         # 6. Split Output
         # Index 0 is CLS (z_l), Indices 1..N are time-series (H_l)
@@ -451,7 +453,8 @@ class GWMOCResNetEncoder(nn.Module):
                  skymap_channels,          # <--- Flexible channel input
                  scalar_hidden_dim=256, 
                  resnet_output_dim=128,
-                 final_output_dim=128):
+                 final_output_dim=128,
+                 dropout=0.1):
         super().__init__()
         
         # --- 1. Scalar Encoder (MLP) ---
@@ -459,7 +462,7 @@ class GWMOCResNetEncoder(nn.Module):
             nn.Linear(scalar_input_dim, scalar_hidden_dim),
             nn.BatchNorm1d(scalar_hidden_dim),
             nn.ReLU(),
-            nn.Dropout(0.1),
+            nn.Dropout(dropout),
             nn.Linear(scalar_hidden_dim, scalar_hidden_dim),
             nn.BatchNorm1d(scalar_hidden_dim),
             nn.ReLU()
@@ -479,7 +482,7 @@ class GWMOCResNetEncoder(nn.Module):
             nn.Linear(fusion_input_dim, final_output_dim * 2),
             nn.BatchNorm1d(final_output_dim * 2),
             nn.ReLU(),
-            nn.Dropout(0.1),
+            nn.Dropout(dropout),
             nn.Linear(final_output_dim * 2, final_output_dim) 
             # Final output 'g' vector
         )
@@ -838,25 +841,33 @@ class GWOpticalALBEFModel(nn.Module):
         fusion_attn_dim=None,
         fusion_hidden_dim=None,
         temp_init=0.07,
-        fusion_dropout=0.1
+        temp_min=0.01,
+        temp_max=100.0,
+        fusion_dropout=0.1,
+        gw_dropout=0.1,
+        opt_dropout=0.1
     ):
         super().__init__()
 
         self.gw_encoder = GWMOCResNetEncoder(
             scalar_input_dim=gw_scalar_dim,
             skymap_channels=gw_skymap_channels,
-            final_output_dim=enc_dim
+            final_output_dim=enc_dim,
+            dropout=gw_dropout
         )
         self.optical_encoder = OpticalEncoderWithCLS(
             input_dim=optical_input_dim,
             output_dim=enc_dim,
             num_heads=4,
-            ref_dim=ref_time_dim
+            ref_dim=ref_time_dim,
+            dropout=opt_dropout
         )
 
         self.gw_proj = ProjectionHead(enc_dim, enc_dim, proj_dim)
         self.opt_proj = ProjectionHead(enc_dim, enc_dim, proj_dim)
         self.log_temp = nn.Parameter(torch.ones([]) * torch.log(torch.tensor(temp_init)))
+        self.temp_min = float(temp_min)
+        self.temp_max = float(temp_max)
         self.itc_criterion = nn.CrossEntropyLoss()
 
         self.fusion = CrossAttentionFusion(
@@ -885,7 +896,7 @@ class GWOpticalALBEFModel(nn.Module):
         feat_g = F.normalize(self.gw_proj(g), p=2, dim=1, eps=1e-8)
         feat_o = F.normalize(self.opt_proj(z_l), p=2, dim=1, eps=1e-8)
 
-        logit_scale = torch.clamp(self.log_temp.exp(), min=0.01, max=100.0)
+        logit_scale = torch.clamp(self.log_temp.exp(), min=self.temp_min, max=self.temp_max)
         sim_g2o = torch.matmul(feat_g, feat_o.T) * logit_scale
         sim_o2g = sim_g2o.T
 

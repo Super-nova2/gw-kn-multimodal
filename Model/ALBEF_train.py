@@ -1,4 +1,4 @@
-from data_loader import create_training_dataloader
+from data_loader import create_training_dataloader, create_train_val_dataloaders
 from model import GWOpticalALBEFModel
 from tqdm import tqdm
 import torch
@@ -7,6 +7,7 @@ import h5py
 import os
 import datetime
 import argparse
+import math
 import warnings
 warnings.filterwarnings("ignore", "Wswiglal-redir-stdio")
 
@@ -21,9 +22,182 @@ def sample_easy_negatives(batch_size, device):
     shift = int(torch.randint(1, batch_size, (1,), device=device).item())
     return (torch.arange(batch_size, device=device) + shift) % batch_size
 
+def build_lr_scheduler(optimizer, args, steps_per_epoch, start_step):
+    if args.lr_scheduler == "none":
+        return None
+    total_steps = max(1, args.epochs * steps_per_epoch)
+    warmup_steps = max(0, args.warmup_epochs * steps_per_epoch)
+    min_lr = args.min_lr if args.min_lr is not None else 0.0
+    min_lr_ratio = min(min_lr / args.lr, 1.0)
+
+    def lr_lambda(step):
+        if warmup_steps > 0 and step < warmup_steps:
+            return float(step + 1) / float(max(1, warmup_steps))
+        progress = (step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda, last_epoch=start_step - 1)
+
+def apply_temperature_schedule(model, args, epoch):
+    if args.temp_schedule == "learned":
+        return None
+    if args.temp_schedule == "fixed":
+        target_temp = args.temp_init
+    else:
+        progress = epoch / float(max(1, args.epochs - 1))
+        target_temp = args.temp_final + 0.5 * (args.temp_init - args.temp_final) * (1.0 + math.cos(math.pi * progress))
+    target_temp = max(args.temp_min, min(args.temp_max, target_temp))
+    model.log_temp.data.fill_(math.log(target_temp))
+    return target_temp
+
+def clamp_temperature(model, args):
+    if args.temp_schedule != "learned":
+        return
+    min_log = math.log(args.temp_min)
+    max_log = math.log(args.temp_max)
+    model.log_temp.data.clamp_(min_log, max_log)
+
+def evaluate(model, val_loader, device, args, epoch):
+    model.eval()
+    has_negatives = args.neg_data_path is not None
+    ref_time_cache = None
+
+    val_total = 0.0
+    val_itc = 0.0
+    val_cls = 0.0
+    val_itc_acc = 0.0
+    val_pos_acc = 0.0
+    val_hard_acc = 0.0
+    val_neg_acc = 0.0
+    val_batches = 0
+
+    with torch.no_grad():
+        for batch_data in val_loader:
+            if has_negatives:
+                (gw_s, gw_m, opt_t, opt_v, opt_mask, opt_err, opt_coords, gw_indices,
+                 neg_t, neg_v, neg_mask, neg_err, neg_coords) = batch_data
+            else:
+                gw_s, gw_m, opt_t, opt_v, opt_mask, opt_err, opt_coords, gw_indices = batch_data
+
+            gw_s = gw_s.to(device, non_blocking=True)
+            gw_m = gw_m.to(device, non_blocking=True)
+            opt_t = opt_t.to(device, non_blocking=True)
+            opt_v = opt_v.to(device, non_blocking=True)
+            opt_mask = opt_mask.to(device, non_blocking=True)
+            opt_err = opt_err.to(device, non_blocking=True)
+            opt_coords = opt_coords.to(device, non_blocking=True)
+            gw_indices = gw_indices.to(device, non_blocking=True).long()
+
+            if torch.isnan(opt_v).any() or torch.isinf(opt_v).any():
+                continue
+            if torch.isnan(opt_err).any() or torch.isinf(opt_err).any():
+                continue
+
+            if has_negatives:
+                neg_t = neg_t.to(device, non_blocking=True)
+                neg_v = neg_v.to(device, non_blocking=True)
+                neg_mask = neg_mask.to(device, non_blocking=True)
+                neg_err = neg_err.to(device, non_blocking=True)
+                neg_coords = neg_coords.to(device, non_blocking=True)
+                if torch.isnan(neg_v).any() or torch.isinf(neg_v).any():
+                    continue
+                if torch.isnan(neg_err).any() or torch.isinf(neg_err).any():
+                    continue
+
+            batch_size = gw_s.size(0)
+            if (
+                ref_time_cache is None
+                or ref_time_cache.shape[0] != batch_size
+                or ref_time_cache.dtype != opt_t.dtype
+            ):
+                ref_time_cache = build_ref_time(
+                    batch_size, args.n_ref, args.ref_start, args.ref_end, device, opt_t.dtype
+                )
+            opt_ref_t = ref_time_cache
+
+            g, z_l, h_l = model.encode(
+                gw_s, gw_m, opt_coords, opt_t, opt_v, opt_ref_t, opt_mask, opt_err
+            )
+            itc_loss, sim_g2o = model.compute_itc_loss(
+                g, z_l, gw_indices, mask=args.mask_itc
+            )
+
+            logits_pos = model.fusion_logits(g, h_l)
+            labels_pos = torch.ones(batch_size, device=device, dtype=torch.long)
+            labels_neg = torch.zeros(batch_size, device=device, dtype=torch.long)
+            pos_loss = model.cls_criterion(logits_pos, labels_pos)
+
+            use_hard_neg = epoch >= args.hard_neg_start_epoch
+            if use_hard_neg:
+                neg_idx = model.sample_hard_negatives(sim_g2o, gw_indices)
+            else:
+                neg_idx = sample_easy_negatives(batch_size, device)
+
+            if neg_idx is None:
+                hard_loss = torch.zeros((), device=device)
+                logits_hard = logits_pos.detach()
+            else:
+                h_l_hard = h_l[neg_idx]
+                logits_hard = model.fusion_logits(g, h_l_hard)
+                hard_loss = model.cls_criterion(logits_hard, labels_neg)
+
+            if has_negatives:
+                _, h_l_neg = model.encode_optical(
+                    neg_coords, neg_t, neg_v, opt_ref_t, neg_mask, neg_err
+                )
+                logits_neg = model.fusion_logits(g, h_l_neg)
+                neg_loss = model.cls_criterion(logits_neg, labels_neg)
+                cls_loss = (pos_loss + hard_loss + neg_loss) / 3.0
+            else:
+                cls_loss = 0.5 * (pos_loss + hard_loss)
+
+            total_loss = args.itc_weight * itc_loss + args.cls_weight * cls_loss
+
+            val_total += total_loss.item()
+            val_itc += itc_loss.item()
+            val_cls += cls_loss.item()
+
+            itc_preds = sim_g2o.argmax(dim=1)
+            itc_acc = (itc_preds == torch.arange(batch_size, device=device)).float().mean().item()
+            pos_acc = (logits_pos.argmax(dim=1) == labels_pos).float().mean().item()
+            hard_acc = (logits_hard.argmax(dim=1) == labels_neg).float().mean().item()
+            neg_acc = 0.0
+            if has_negatives:
+                neg_acc = (logits_neg.argmax(dim=1) == labels_neg).float().mean().item()
+
+            val_itc_acc += itc_acc
+            val_pos_acc += pos_acc
+            val_hard_acc += hard_acc
+            val_neg_acc += neg_acc
+            val_batches += 1
+
+    if val_batches == 0:
+        model.train()
+        return None
+
+    metrics = {
+        "total": val_total / val_batches,
+        "itc": val_itc / val_batches,
+        "cls": val_cls / val_batches,
+        "itc_acc": val_itc_acc / val_batches,
+        "pos_acc": val_pos_acc / val_batches,
+        "hard_acc": val_hard_acc / val_batches,
+        "neg_acc": val_neg_acc / val_batches
+    }
+
+    model.train()
+    return metrics
+
 
 def train(args):
     print("Training in Float32 precision.")
+    if args.temp_final is None:
+        args.temp_final = args.temp_init
+    if args.temp_min <= 0 or args.temp_max <= 0:
+        raise ValueError("temp_min and temp_max must be > 0.")
+    if args.temp_min >= args.temp_max:
+        raise ValueError("temp_min must be < temp_max.")
 
     torch.manual_seed(42)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -36,26 +210,46 @@ def train(args):
     writer = SummaryWriter(log_dir=log_dir)
     print(f"TensorBoard logging started at: {log_dir}")
 
-    if args.steps_per_epoch is not None:
-        steps_per_epoch = args.steps_per_epoch
+    val_loader = None
+    if args.val_split is not None and 0 < args.val_split < 1:
+        train_loader, val_loader, steps_per_epoch, val_steps = create_train_val_dataloaders(
+            h5_path=args.data_path,
+            batch_size=args.batch_size,
+            val_batch_size=args.val_batch_size,
+            steps_per_epoch=args.steps_per_epoch,
+            val_steps_per_epoch=args.val_steps_per_epoch,
+            val_split=args.val_split,
+            split_seed=args.split_seed,
+            num_workers=args.num_workers,
+            pin_memory=bool(args.pin_memory),
+            persistent_workers=bool(args.persistent_workers),
+            prefetch_factor=args.prefetch_factor,
+            cache_in_memory=bool(args.cache_in_memory),
+            negative_h5_path=args.neg_data_path,
+            negative_group=args.neg_group
+        )
+        print(f"Train Steps/Epoch: {steps_per_epoch} | Val Steps/Epoch: {val_steps}")
     else:
-        with h5py.File(args.data_path, 'r') as f:
-            total_optical = f['events/optical_data/values'].shape[0]
-        steps_per_epoch = total_optical // args.batch_size
-        print(f"Dataset Size: {total_optical} | Steps/Epoch: {steps_per_epoch}")
+        if args.steps_per_epoch is not None:
+            steps_per_epoch = args.steps_per_epoch
+        else:
+            with h5py.File(args.data_path, 'r') as f:
+                total_optical = f['events/optical_data/values'].shape[0]
+            steps_per_epoch = total_optical // args.batch_size
+            print(f"Dataset Size: {total_optical} | Steps/Epoch: {steps_per_epoch}")
 
-    train_loader = create_training_dataloader(
-        h5_path=args.data_path,
-        batch_size=args.batch_size,
-        steps_per_epoch=steps_per_epoch,
-        num_workers=args.num_workers,
-        pin_memory=bool(args.pin_memory),
-        persistent_workers=bool(args.persistent_workers),
-        prefetch_factor=args.prefetch_factor,
-        cache_in_memory=bool(args.cache_in_memory),
-        negative_h5_path=args.neg_data_path,
-        negative_group=args.neg_group
-    )
+        train_loader = create_training_dataloader(
+            h5_path=args.data_path,
+            batch_size=args.batch_size,
+            steps_per_epoch=steps_per_epoch,
+            num_workers=args.num_workers,
+            pin_memory=bool(args.pin_memory),
+            persistent_workers=bool(args.persistent_workers),
+            prefetch_factor=args.prefetch_factor,
+            cache_in_memory=bool(args.cache_in_memory),
+            negative_h5_path=args.neg_data_path,
+            negative_group=args.neg_group
+        )
 
     model = GWOpticalALBEFModel(
         gw_scalar_dim=7,
@@ -67,6 +261,10 @@ def train(args):
         fusion_attn_dim=args.fusion_attn_dim,
         fusion_hidden_dim=args.fusion_hidden_dim,
         temp_init=args.temp_init,
+        temp_min=args.temp_min,
+        temp_max=args.temp_max,
+        gw_dropout=args.gw_dropout,
+        opt_dropout=args.opt_dropout,
         fusion_dropout=args.fusion_dropout
     ).to(device)
 
@@ -84,8 +282,13 @@ def train(args):
         print(f"Resumed from {args.resume} at epoch {start_epoch}.")
     model.train()
     has_negatives = args.neg_data_path is not None
+    if args.temp_schedule != "learned":
+        model.log_temp.requires_grad_(False)
 
     pbar_update_every = 500
+    best_val = None
+    epochs_no_improve = 0
+    lr_scheduler = build_lr_scheduler(optimizer, args, steps_per_epoch, global_step)
 
     for epoch in range(start_epoch, args.epochs):
         epoch_total = 0.0
@@ -93,6 +296,7 @@ def train(args):
         epoch_cls = 0.0
 
         ref_time_cache = None
+        apply_temperature_schedule(model, args, epoch)
 
         pbar = tqdm(
             train_loader,
@@ -190,6 +394,9 @@ def train(args):
             total_loss = args.itc_weight * itc_loss + args.cls_weight * cls_loss
             total_loss.backward()
             optimizer.step()
+            if lr_scheduler is not None:
+                lr_scheduler.step()
+            clamp_temperature(model, args)
 
             total_val = total_loss.item()
             itc_val = itc_loss.item()
@@ -251,6 +458,42 @@ def train(args):
         writer.add_scalar('Train/Epoch_ITC_Loss', avg_itc, epoch)
         writer.add_scalar('Train/Epoch_CLS_Loss', avg_cls, epoch)
 
+        stop_early = False
+        if val_loader is not None:
+            val_metrics = evaluate(model, val_loader, device, args, epoch)
+            if val_metrics is not None:
+                print(
+                    f"Val Avg Total: {val_metrics['total']:.4f} | "
+                    f"ITC: {val_metrics['itc']:.4f} | CLS: {val_metrics['cls']:.4f}"
+                )
+                writer.add_scalar('Val/Epoch_Total_Loss', val_metrics['total'], epoch)
+                writer.add_scalar('Val/Epoch_ITC_Loss', val_metrics['itc'], epoch)
+                writer.add_scalar('Val/Epoch_CLS_Loss', val_metrics['cls'], epoch)
+                writer.add_scalar('Val/Epoch_ITC_Acc', val_metrics['itc_acc'], epoch)
+                writer.add_scalar('Val/Epoch_Pos_Acc', val_metrics['pos_acc'], epoch)
+                writer.add_scalar('Val/Epoch_HardNeg_Acc', val_metrics['hard_acc'], epoch)
+                if args.neg_data_path is not None:
+                    writer.add_scalar('Val/Epoch_ExtraNeg_Acc', val_metrics['neg_acc'], epoch)
+
+                if args.early_stop_patience > 0:
+                    if best_val is None or val_metrics['total'] < best_val - args.early_stop_min_delta:
+                        best_val = val_metrics['total']
+                        epochs_no_improve = 0
+                        best_ckpt = os.path.join(args.ckpt_path, "ALBEF", "albef_best.pth")
+                        os.makedirs(os.path.dirname(best_ckpt), exist_ok=True)
+                        torch.save({
+                            'epoch': epoch,
+                            'model_state_dict': model.state_dict(),
+                            'optimizer_state_dict': optimizer.state_dict(),
+                            'loss': val_metrics['total'],
+                        }, best_ckpt)
+                        print(f"Saved best checkpoint: {best_ckpt}")
+                    else:
+                        epochs_no_improve += 1
+                        if epochs_no_improve >= args.early_stop_patience:
+                            print("Early stopping triggered.")
+                            stop_early = True
+
         checkpoint_path = os.path.join(args.ckpt_path, "ALBEF", f"albef_epoch_{epoch+1}.pth")
         os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
         torch.save({
@@ -259,6 +502,8 @@ def train(args):
             'optimizer_state_dict': optimizer.state_dict(),
             'loss': avg_total,
         }, checkpoint_path)
+        if stop_early:
+            break
 
     writer.close()
 
@@ -279,11 +524,20 @@ if __name__ == "__main__":
     parser.add_argument("--ckpt_path", type=str, default=None)
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--lr_scheduler", type=str, default="none", choices=["none", "cosine"])
+    parser.add_argument("--warmup_epochs", type=int, default=0)
+    parser.add_argument("--min_lr", type=float, default=0.0)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--pin_memory", type=int, default=1)
     parser.add_argument("--persistent_workers", type=int, default=1)
     parser.add_argument("--prefetch_factor", type=int, default=4)
     parser.add_argument("--cache_in_memory", action='store_true')
+    parser.add_argument("--val_split", type=float, default=0.1)
+    parser.add_argument("--val_batch_size", type=int, default=None)
+    parser.add_argument("--val_steps_per_epoch", type=int, default=None)
+    parser.add_argument("--split_seed", type=int, default=42)
+    parser.add_argument("--early_stop_patience", type=int, default=10)
+    parser.add_argument("--early_stop_min_delta", type=float, default=1e-4)
     parser.add_argument("--n_ref", type=int, default=64)
     parser.add_argument("--ref_start", type=float, default=-0.3)
     parser.add_argument("--ref_end", type=float, default=0.6)
@@ -294,6 +548,12 @@ if __name__ == "__main__":
     parser.add_argument("--fusion_hidden_dim", type=int, default=None)
     parser.add_argument("--fusion_dropout", type=float, default=0.1)
     parser.add_argument("--temp_init", type=float, default=0.07)
+    parser.add_argument("--temp_final", type=float, default=None)
+    parser.add_argument("--temp_min", type=float, default=0.01)
+    parser.add_argument("--temp_max", type=float, default=100.0)
+    parser.add_argument("--temp_schedule", type=str, default="learned", choices=["learned", "fixed", "cosine"])
+    parser.add_argument("--gw_dropout", type=float, default=0.1)
+    parser.add_argument("--opt_dropout", type=float, default=0.1)
     parser.add_argument("--itc_weight", type=float, default=1.0)
     parser.add_argument("--cls_weight", type=float, default=1.0)
     parser.add_argument("--mask_itc", action='store_true', help="Mask same-event pairs in ITC loss")
