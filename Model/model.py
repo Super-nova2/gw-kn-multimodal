@@ -845,7 +845,8 @@ class GWOpticalALBEFModel(nn.Module):
         temp_max=100.0,
         fusion_dropout=0.1,
         gw_dropout=0.1,
-        opt_dropout=0.1
+        opt_dropout=0.1,
+        label_smoothing=0.0
     ):
         super().__init__()
 
@@ -877,7 +878,7 @@ class GWOpticalALBEFModel(nn.Module):
             hidden_dim=fusion_hidden_dim,
             dropout=fusion_dropout
         )
-        self.cls_criterion = nn.CrossEntropyLoss()
+        self.cls_criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
 
     def encode(self, gw_s, gw_m, opt_coords, opt_t, opt_v, opt_ref_t, opt_mask, opt_err):
         g = self.gw_encoder(gw_s, gw_m)

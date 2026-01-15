@@ -1,5 +1,6 @@
 #!/bin/bash
-#SBATCH --job-name=GW_Opt_ALBEF_train
+
+#SBATCH --job-name=ALBEF_anti_overfit
 #SBATCH --output=logs/train/%x_%j.out
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -27,6 +28,8 @@ RESUME=$(jq -r '.resume // empty' "$args_file")
 EPOCHS=$(jq -r '.epochs' "$args_file")
 BATCH_SIZE=$(jq -r '.batch_size' "$args_file")
 LR=$(jq -r '.lr' "$args_file")
+WEIGHT_DECAY=$(jq -r '.weight_decay // empty' "$args_file")
+GRAD_CLIP_NORM=$(jq -r '.grad_clip_norm // empty' "$args_file")
 LR_SCHEDULER=$(jq -r '.lr_scheduler // empty' "$args_file")
 WARMUP_EPOCHS=$(jq -r '.warmup_epochs // empty' "$args_file")
 MIN_LR=$(jq -r '.min_lr // empty' "$args_file")
@@ -58,6 +61,7 @@ TEMP_MAX=$(jq -r '.temp_max // empty' "$args_file")
 TEMP_SCHEDULE=$(jq -r '.temp_schedule // empty' "$args_file")
 GW_DROPOUT=$(jq -r '.gw_dropout // empty' "$args_file")
 OPT_DROPOUT=$(jq -r '.opt_dropout // empty' "$args_file")
+LABEL_SMOOTHING=$(jq -r '.label_smoothing // empty' "$args_file")
 ITC_WEIGHT=$(jq -r '.itc_weight // empty' "$args_file")
 CLS_WEIGHT=$(jq -r '.cls_weight // empty' "$args_file")
 HARD_NEG_START_EPOCH=$(jq -r '.hard_neg_start_epoch // empty' "$args_file")
@@ -65,10 +69,21 @@ MASK_ITC=$(jq -r '.mask_itc // false' "$args_file")
 
 mkdir -p "$CKPT_PATH"
 
+echo "========================================"
+echo "SLURM Job Information"
+echo "========================================"
 echo "Job ID: $SLURM_JOB_ID"
+echo "Job Name: $SLURM_JOB_NAME"
 echo "Node: $SLURMD_NODENAME"
+echo "Partition: $SLURM_JOB_PARTITION"
+echo "CPUs: $SLURM_CPUS_PER_TASK"
+echo "Memory: ${SLURM_MEM_PER_NODE}MB"
 echo "Start time: $(date)"
-echo "------------------------------------------------"
+echo "========================================"
+echo ""
+echo "Configuration File: $args_file"
+echo "Checkpoint Path: $CKPT_PATH"
+echo ""
 
 # Optional: stage large HDF5 to local disk to reduce Lustre I/O
 if [ "$STAGE_TO_JOBFS" = "true" ]; then
@@ -116,6 +131,12 @@ if [[ -n "$WARMUP_EPOCHS" && "$WARMUP_EPOCHS" != "null" ]]; then
 fi
 if [[ -n "$MIN_LR" && "$MIN_LR" != "null" ]]; then
     cmd+=(--min_lr "$MIN_LR")
+fi
+if [[ -n "$WEIGHT_DECAY" && "$WEIGHT_DECAY" != "null" ]]; then
+    cmd+=(--weight_decay "$WEIGHT_DECAY")
+fi
+if [[ -n "$GRAD_CLIP_NORM" && "$GRAD_CLIP_NORM" != "null" ]]; then
+    cmd+=(--grad_clip_norm "$GRAD_CLIP_NORM")
 fi
 if [[ -n "$PIN_MEMORY" && "$PIN_MEMORY" != "null" ]]; then
     cmd+=(--pin_memory "$PIN_MEMORY")
@@ -194,6 +215,9 @@ if [[ -n "$GW_DROPOUT" && "$GW_DROPOUT" != "null" ]]; then
 fi
 if [[ -n "$OPT_DROPOUT" && "$OPT_DROPOUT" != "null" ]]; then
     cmd+=(--opt_dropout "$OPT_DROPOUT")
+fi
+if [[ -n "$LABEL_SMOOTHING" && "$LABEL_SMOOTHING" != "null" ]]; then
+    cmd+=(--label_smoothing "$LABEL_SMOOTHING")
 fi
 if [[ -n "$ITC_WEIGHT" && "$ITC_WEIGHT" != "null" ]]; then
     cmd+=(--itc_weight "$ITC_WEIGHT")

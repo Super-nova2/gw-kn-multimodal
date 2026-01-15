@@ -265,10 +265,11 @@ def train(args):
         temp_max=args.temp_max,
         gw_dropout=args.gw_dropout,
         opt_dropout=args.opt_dropout,
-        fusion_dropout=args.fusion_dropout
+        fusion_dropout=args.fusion_dropout,
+        label_smoothing=args.label_smoothing
     ).to(device)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     start_epoch = 0
     global_step = 0
     if args.resume is not None:
@@ -393,6 +394,9 @@ def train(args):
 
             total_loss = args.itc_weight * itc_loss + args.cls_weight * cls_loss
             total_loss.backward()
+            # 添加梯度裁剪防止梯度爆炸
+            if args.grad_clip_norm > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_clip_norm)
             optimizer.step()
             if lr_scheduler is not None:
                 lr_scheduler.step()
@@ -524,6 +528,8 @@ if __name__ == "__main__":
     parser.add_argument("--ckpt_path", type=str, default=None)
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--weight_decay", type=float, default=1e-4, help="Weight decay for AdamW optimizer")
+    parser.add_argument("--grad_clip_norm", type=float, default=1.0, help="Max norm for gradient clipping (0 to disable)")
     parser.add_argument("--lr_scheduler", type=str, default="none", choices=["none", "cosine"])
     parser.add_argument("--warmup_epochs", type=int, default=0)
     parser.add_argument("--min_lr", type=float, default=0.0)
@@ -547,6 +553,7 @@ if __name__ == "__main__":
     parser.add_argument("--fusion_attn_dim", type=int, default=None)
     parser.add_argument("--fusion_hidden_dim", type=int, default=None)
     parser.add_argument("--fusion_dropout", type=float, default=0.1)
+    parser.add_argument("--label_smoothing", type=float, default=0.0, help="Label smoothing for classification loss (0 to disable)")
     parser.add_argument("--temp_init", type=float, default=0.07)
     parser.add_argument("--temp_final", type=float, default=None)
     parser.add_argument("--temp_min", type=float, default=0.01)
