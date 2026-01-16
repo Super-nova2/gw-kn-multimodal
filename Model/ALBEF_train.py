@@ -22,6 +22,46 @@ def sample_easy_negatives(batch_size, device):
     shift = int(torch.randint(1, batch_size, (1,), device=device).item())
     return (torch.arange(batch_size, device=device) + shift) % batch_size
 
+def augment_gw_data(gw_s, gw_m, training=True,
+                    noise_std=0.05, scalar_jitter=0.02, channel_dropout_prob=0.1):
+    """
+    GW数据增强函数，增加训练样本的有效多样性。
+
+    Args:
+        gw_s: GW scalar features [Batch, 7] (质量、自旋等参数)
+        gw_m: GW skymap [Batch, 7, 19200] (MOC skymap序列)
+        training: 是否在训练模式（验证时不增强）
+        noise_std: skymap高斯噪声标准差
+        scalar_jitter: scalar参数扰动比例
+        channel_dropout_prob: 随机dropout某个skymap通道的概率
+
+    Returns:
+        augmented gw_s, gw_m
+    """
+    if not training:
+        return gw_s, gw_m
+
+    # 1. Skymap高斯噪声注入
+    # 添加小幅随机噪声，模拟观测不确定性
+    skymap_noise = torch.randn_like(gw_m) * noise_std
+    gw_m = gw_m + skymap_noise
+
+    # 2. Scalar参数扰动
+    # 对质量、自旋、距离等参数添加小幅随机扰动
+    # 使用乘性噪声保持参数的量纲
+    scalar_multiplier = 1.0 + (torch.rand_like(gw_s) - 0.5) * 2 * scalar_jitter
+    gw_s = gw_s * scalar_multiplier
+
+    # 3. Skymap通道Dropout（可选）
+    # 随机将某个通道（如distance信息）置零，增加鲁棒性
+    if torch.rand(1).item() < channel_dropout_prob:
+        # 随机选择一个通道（0-6），但避免dropout概率通道(index 4)
+        channel_idx = torch.randint(0, gw_m.size(1), (1,)).item()
+        if channel_idx != 4:  # 保留概率通道
+            gw_m[:, channel_idx, :] = 0
+
+    return gw_s, gw_m
+
 def build_lr_scheduler(optimizer, args, steps_per_epoch, start_step):
     if args.lr_scheduler == "none":
         return None
@@ -266,8 +306,12 @@ def train(args):
         gw_dropout=args.gw_dropout,
         opt_dropout=args.opt_dropout,
         fusion_dropout=args.fusion_dropout,
-        label_smoothing=args.label_smoothing
+        label_smoothing=args.label_smoothing,
+        use_lightweight_gw=getattr(args, 'use_lightweight_gw', False)
     ).to(device)
+
+    if args.use_lightweight_gw:
+        print("Using lightweight GW encoder (~100K params) to prevent overfitting.")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     start_epoch = 0
@@ -315,6 +359,13 @@ def train(args):
 
             gw_s = gw_s.to(device, non_blocking=True)
             gw_m = gw_m.to(device, non_blocking=True)
+            # 应用GW数据增强（仅训练时）
+            gw_s, gw_m = augment_gw_data(
+                gw_s, gw_m, training=True,
+                noise_std=args.gw_aug_noise,
+                scalar_jitter=args.gw_aug_jitter,
+                channel_dropout_prob=args.gw_aug_dropout
+            )
             opt_t = opt_t.to(device, non_blocking=True)
             opt_v = opt_v.to(device, non_blocking=True)
             opt_mask = opt_mask.to(device, non_blocking=True)
@@ -565,6 +616,15 @@ if __name__ == "__main__":
     parser.add_argument("--cls_weight", type=float, default=1.0)
     parser.add_argument("--mask_itc", action='store_true', help="Mask same-event pairs in ITC loss")
     parser.add_argument("--hard_neg_start_epoch", type=int, default=0)
+    parser.add_argument("--use_lightweight_gw", action='store_true',
+                        help="Use lightweight GW encoder (~100K params) instead of ResNet-18 (~11M params) to prevent overfitting on small GW datasets")
+    # GW数据增强参数
+    parser.add_argument("--gw_aug_noise", type=float, default=0.05,
+                        help="GW skymap augmentation noise std (default: 0.05)")
+    parser.add_argument("--gw_aug_jitter", type=float, default=0.02,
+                        help="GW scalar augmentation jitter ratio (default: 0.02)")
+    parser.add_argument("--gw_aug_dropout", type=float, default=0.1,
+                        help="GW channel dropout probability (default: 0.1)")
 
     args = parser.parse_args()
 

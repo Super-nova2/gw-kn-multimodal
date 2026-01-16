@@ -66,6 +66,10 @@ ITC_WEIGHT=$(jq -r '.itc_weight // empty' "$args_file")
 CLS_WEIGHT=$(jq -r '.cls_weight // empty' "$args_file")
 HARD_NEG_START_EPOCH=$(jq -r '.hard_neg_start_epoch // empty' "$args_file")
 MASK_ITC=$(jq -r '.mask_itc // false' "$args_file")
+USE_LIGHTWEIGHT_GW=$(jq -r '.use_lightweight_gw // false' "$args_file")
+GW_AUG_NOISE=$(jq -r '.gw_aug_noise // empty' "$args_file")
+GW_AUG_JITTER=$(jq -r '.gw_aug_jitter // empty' "$args_file")
+GW_AUG_DROPOUT=$(jq -r '.gw_aug_dropout // empty' "$args_file")
 
 mkdir -p "$CKPT_PATH"
 
@@ -230,6 +234,18 @@ if [[ -n "$HARD_NEG_START_EPOCH" && "$HARD_NEG_START_EPOCH" != "null" ]]; then
 fi
 if [[ "$MASK_ITC" == "true" ]]; then
     cmd+=(--mask_itc)
+fi
+if [[ "$USE_LIGHTWEIGHT_GW" == "true" ]]; then
+    cmd+=(--use_lightweight_gw)
+fi
+if [[ -n "$GW_AUG_NOISE" && "$GW_AUG_NOISE" != "null" ]]; then
+    cmd+=(--gw_aug_noise "$GW_AUG_NOISE")
+fi
+if [[ -n "$GW_AUG_JITTER" && "$GW_AUG_JITTER" != "null" ]]; then
+    cmd+=(--gw_aug_jitter "$GW_AUG_JITTER")
+fi
+if [[ -n "$GW_AUG_DROPOUT" && "$GW_AUG_DROPOUT" != "null" ]]; then
+    cmd+=(--gw_aug_dropout "$GW_AUG_DROPOUT")
 fi
 
 echo "Command: ${cmd[*]}"

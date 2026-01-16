@@ -846,16 +846,28 @@ class GWOpticalALBEFModel(nn.Module):
         fusion_dropout=0.1,
         gw_dropout=0.1,
         opt_dropout=0.1,
-        label_smoothing=0.0
+        label_smoothing=0.0,
+        use_lightweight_gw=False
     ):
         super().__init__()
 
-        self.gw_encoder = GWMOCResNetEncoder(
-            scalar_input_dim=gw_scalar_dim,
-            skymap_channels=gw_skymap_channels,
-            final_output_dim=enc_dim,
-            dropout=gw_dropout
-        )
+        # 根据参数选择GW编码器类型
+        if use_lightweight_gw:
+            # 轻量级编码器：~100K参数，适用于小样本GW数据集
+            self.gw_encoder = LightweightGWEncoder(
+                scalar_input_dim=gw_scalar_dim,
+                skymap_channels=gw_skymap_channels,
+                final_output_dim=enc_dim,
+                dropout=gw_dropout
+            )
+        else:
+            # 原始ResNet编码器：~11M参数
+            self.gw_encoder = GWMOCResNetEncoder(
+                scalar_input_dim=gw_scalar_dim,
+                skymap_channels=gw_skymap_channels,
+                final_output_dim=enc_dim,
+                dropout=gw_dropout
+            )
         self.optical_encoder = OpticalEncoderWithCLS(
             input_dim=optical_input_dim,
             output_dim=enc_dim,
@@ -941,3 +953,130 @@ class GWOpticalALBEFModel(nn.Module):
         sim = sim.masked_fill(same_event, -1e9)
         hard_idx = sim.argmax(dim=1)
         return hard_idx
+
+# ==============================================================================
+# 9. Lightweight GW Encoder (解决过拟合问题)
+# ==============================================================================
+class LightweightSkymapEncoder(nn.Module):
+    """
+    轻量级1D CNN编码器，专门设计用于小样本GW数据集。
+    参数量：~100K（相比ResNet-18的~11M）
+
+    设计原则：
+    - 减少参数量以匹配有限的GW训练样本（~400个）
+    - 使用更强的dropout正则化
+    - 保持足够的表达能力提取skymap特征
+    """
+    def __init__(self, in_channels=7, output_dim=128, dropout=0.5):
+        super().__init__()
+        self.conv = nn.Sequential(
+            # Block 1: [B, 7, 19200] -> [B, 32, 4800]
+            nn.Conv1d(in_channels, 32, kernel_size=7, stride=4, padding=3),
+            nn.BatchNorm1d(32),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+
+            # Block 2: [B, 32, 4800] -> [B, 64, 1200]
+            nn.Conv1d(32, 64, kernel_size=5, stride=4, padding=2),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+
+            # Block 3: [B, 64, 1200] -> [B, 128, 300]
+            nn.Conv1d(64, 128, kernel_size=3, stride=4, padding=1),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+
+            # Global pooling: [B, 128, 300] -> [B, 128, 1]
+            nn.AdaptiveAvgPool1d(1)
+        )
+        self.fc = nn.Linear(128, output_dim)
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv1d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm1d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+
+    def forward(self, x):
+        # x: [Batch, in_channels, Length]
+        x = self.conv(x).squeeze(-1)  # [Batch, 128]
+        return self.fc(x)  # [Batch, output_dim]
+
+
+class LightweightGWEncoder(nn.Module):
+    """
+    轻量级GW双流编码器，替代原GWMOCResNetEncoder。
+
+    总参数量：~100K（相比原~11M）
+    适用于小样本GW数据集（<500个唯一事件）
+    """
+    def __init__(self,
+                 scalar_input_dim=7,
+                 skymap_channels=7,
+                 scalar_hidden_dim=128,
+                 final_output_dim=128,
+                 dropout=0.5):
+        super().__init__()
+
+        # 简化的Scalar编码器
+        self.scalar_enc = nn.Sequential(
+            nn.Linear(scalar_input_dim, scalar_hidden_dim),
+            nn.BatchNorm1d(scalar_hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(scalar_hidden_dim, scalar_hidden_dim),
+            nn.BatchNorm1d(scalar_hidden_dim),
+            nn.ReLU()
+        )
+
+        # 轻量级Skymap编码器
+        self.skymap_enc = LightweightSkymapEncoder(
+            in_channels=skymap_channels,
+            output_dim=scalar_hidden_dim,
+            dropout=dropout
+        )
+
+        # 融合层
+        self.fusion_head = nn.Sequential(
+            nn.Linear(scalar_hidden_dim * 2, final_output_dim),
+            nn.BatchNorm1d(final_output_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(final_output_dim, final_output_dim)
+        )
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm1d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+
+    def forward(self, gw_scalars, skymap_sequence):
+        """
+        Args:
+            gw_scalars: [Batch, D_scalar]
+            skymap_sequence: [Batch, skymap_channels, Length]
+        Returns:
+            g: [Batch, final_output_dim]
+        """
+        h_scalar = self.scalar_enc(gw_scalars)  # [B, scalar_hidden]
+        h_skymap = self.skymap_enc(skymap_sequence)  # [B, scalar_hidden]
+        combined = torch.cat([h_scalar, h_skymap], dim=1)  # [B, scalar_hidden * 2]
+        return self.fusion_head(combined)  # [B, final_output_dim]
