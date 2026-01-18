@@ -61,10 +61,12 @@ TEMP_MAX=$(jq -r '.temp_max // empty' "$args_file")
 TEMP_SCHEDULE=$(jq -r '.temp_schedule // empty' "$args_file")
 GW_DROPOUT=$(jq -r '.gw_dropout // empty' "$args_file")
 OPT_DROPOUT=$(jq -r '.opt_dropout // empty' "$args_file")
+PROJ_DROPOUT=$(jq -r '.proj_dropout // empty' "$args_file")
 LABEL_SMOOTHING=$(jq -r '.label_smoothing // empty' "$args_file")
 ITC_WEIGHT=$(jq -r '.itc_weight // empty' "$args_file")
 CLS_WEIGHT=$(jq -r '.cls_weight // empty' "$args_file")
 HARD_NEG_START_EPOCH=$(jq -r '.hard_neg_start_epoch // empty' "$args_file")
+CLS_START_EPOCH=$(jq -r '.cls_start_epoch // empty' "$args_file")
 MASK_ITC=$(jq -r '.mask_itc // false' "$args_file")
 USE_LIGHTWEIGHT_GW=$(jq -r '.use_lightweight_gw // false' "$args_file")
 GW_AUG_NOISE=$(jq -r '.gw_aug_noise // empty' "$args_file")
@@ -220,6 +222,9 @@ fi
 if [[ -n "$OPT_DROPOUT" && "$OPT_DROPOUT" != "null" ]]; then
     cmd+=(--opt_dropout "$OPT_DROPOUT")
 fi
+if [[ -n "$PROJ_DROPOUT" && "$PROJ_DROPOUT" != "null" ]]; then
+    cmd+=(--proj_dropout "$PROJ_DROPOUT")
+fi
 if [[ -n "$LABEL_SMOOTHING" && "$LABEL_SMOOTHING" != "null" ]]; then
     cmd+=(--label_smoothing "$LABEL_SMOOTHING")
 fi
@@ -231,6 +236,9 @@ if [[ -n "$CLS_WEIGHT" && "$CLS_WEIGHT" != "null" ]]; then
 fi
 if [[ -n "$HARD_NEG_START_EPOCH" && "$HARD_NEG_START_EPOCH" != "null" ]]; then
     cmd+=(--hard_neg_start_epoch "$HARD_NEG_START_EPOCH")
+fi
+if [[ -n "$CLS_START_EPOCH" && "$CLS_START_EPOCH" != "null" ]]; then
+    cmd+=(--cls_start_epoch "$CLS_START_EPOCH")
 fi
 if [[ "$MASK_ITC" == "true" ]]; then
     cmd+=(--mask_itc)
