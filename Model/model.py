@@ -554,12 +554,13 @@ class ProjectionHead(nn.Module):
     MLP Projection Head used in Contrastive Learning (SimCLR/MoCo/ALBEF style).
     Projects features from Encoder Dim -> Latent Dim.
     """
-    def __init__(self, input_dim, hidden_dim, output_dim):
+    def __init__(self, input_dim, hidden_dim, output_dim, dropout=0.0):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.BatchNorm1d(hidden_dim),
             nn.ReLU(inplace=True),
+            nn.Dropout(dropout),  # 防止ITC过拟合
             nn.Linear(hidden_dim, output_dim)
         )
         self._init_weights()
@@ -846,6 +847,7 @@ class GWOpticalALBEFModel(nn.Module):
         fusion_dropout=0.1,
         gw_dropout=0.1,
         opt_dropout=0.1,
+        proj_dropout=0.0,
         label_smoothing=0.0,
         use_lightweight_gw=False
     ):
@@ -876,8 +878,8 @@ class GWOpticalALBEFModel(nn.Module):
             dropout=opt_dropout
         )
 
-        self.gw_proj = ProjectionHead(enc_dim, enc_dim, proj_dim)
-        self.opt_proj = ProjectionHead(enc_dim, enc_dim, proj_dim)
+        self.gw_proj = ProjectionHead(enc_dim, enc_dim, proj_dim, dropout=proj_dropout)
+        self.opt_proj = ProjectionHead(enc_dim, enc_dim, proj_dim, dropout=proj_dropout)
         self.log_temp = nn.Parameter(torch.ones([]) * torch.log(torch.tensor(temp_init)))
         self.temp_min = float(temp_min)
         self.temp_max = float(temp_max)

@@ -192,7 +192,9 @@ def evaluate(model, val_loader, device, args, epoch):
             else:
                 cls_loss = 0.5 * (pos_loss + hard_loss)
 
-            total_loss = args.itc_weight * itc_loss + args.cls_weight * cls_loss
+            # 分阶段训练：验证时也使用相同的权重逻辑
+            effective_cls_weight = args.cls_weight if epoch >= args.cls_start_epoch else 0.0
+            total_loss = args.itc_weight * itc_loss + effective_cls_weight * cls_loss
 
             val_total += total_loss.item()
             val_itc += itc_loss.item()
@@ -305,6 +307,7 @@ def train(args):
         temp_max=args.temp_max,
         gw_dropout=args.gw_dropout,
         opt_dropout=args.opt_dropout,
+        proj_dropout=getattr(args, 'proj_dropout', 0.0),
         fusion_dropout=args.fusion_dropout,
         label_smoothing=args.label_smoothing,
         use_lightweight_gw=getattr(args, 'use_lightweight_gw', False)
@@ -443,7 +446,9 @@ def train(args):
             else:
                 cls_loss = 0.5 * (pos_loss + hard_loss)
 
-            total_loss = args.itc_weight * itc_loss + args.cls_weight * cls_loss
+            # 分阶段训练：cls_start_epoch之前只训练ITC
+            effective_cls_weight = args.cls_weight if epoch >= args.cls_start_epoch else 0.0
+            total_loss = args.itc_weight * itc_loss + effective_cls_weight * cls_loss
             total_loss.backward()
             # 添加梯度裁剪防止梯度爆炸
             if args.grad_clip_norm > 0:
@@ -612,10 +617,14 @@ if __name__ == "__main__":
     parser.add_argument("--temp_schedule", type=str, default="learned", choices=["learned", "fixed", "cosine"])
     parser.add_argument("--gw_dropout", type=float, default=0.1)
     parser.add_argument("--opt_dropout", type=float, default=0.1)
+    parser.add_argument("--proj_dropout", type=float, default=0.0,
+                        help="Projection head dropout to prevent ITC overfitting (default: 0.0)")
     parser.add_argument("--itc_weight", type=float, default=1.0)
     parser.add_argument("--cls_weight", type=float, default=1.0)
     parser.add_argument("--mask_itc", action='store_true', help="Mask same-event pairs in ITC loss")
     parser.add_argument("--hard_neg_start_epoch", type=int, default=0)
+    parser.add_argument("--cls_start_epoch", type=int, default=0,
+                        help="Epoch to start CLS training. Before this epoch, only ITC loss is used (for staged training)")
     parser.add_argument("--use_lightweight_gw", action='store_true',
                         help="Use lightweight GW encoder (~100K params) instead of ResNet-18 (~11M params) to prevent overfitting on small GW datasets")
     # GW数据增强参数
