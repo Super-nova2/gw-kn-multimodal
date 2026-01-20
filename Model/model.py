@@ -578,79 +578,6 @@ class ProjectionHead(nn.Module):
     def forward(self, x):
         return self.net(x)
 
-class GWOpticalAlignment(nn.Module):
-    """
-    Alignment Branch for Multi-Modal Contrastive Learning.
-    Calculates the ITC (Image-Text Contrastive) Loss.
-    """
-    def __init__(self, gw_dim=128, opt_dim=128, project_dim=256, init_temp=0.07):
-        """
-        Args:
-            gw_dim: Input dimension of GW vector 'g'.
-            opt_dim: Input dimension of Optical vector 'z_l'.
-            project_dim: Dimension of the shared latent space.
-            init_temp: Initial value for the learnable temperature parameter.
-        """
-        super().__init__()
-        
-        # 1. Independent Projection Heads
-        # Even if input dims are same, use separate heads because modalities differ.
-        self.gw_proj = ProjectionHead(gw_dim, gw_dim, project_dim)
-        self.opt_proj = ProjectionHead(opt_dim, opt_dim, project_dim)
-        
-        # 2. Learnable Temperature Parameter
-        # We store log_temp to ensure temperature is always positive (via exp)
-        self.log_temp = nn.Parameter(torch.ones([]) * torch.log(torch.tensor(init_temp)))
-        
-        # 3. Standard Cross Entropy Loss
-        self.criterion = nn.CrossEntropyLoss()
-
-    def forward(self, g, z_l):
-        """
-        Args:
-            g: GW features [Batch, gw_dim]
-            z_l: Optical CLS features [Batch, opt_dim]
-            
-        Returns:
-            loss: The scalar contrastive loss value.
-            sim_matrix: Similarity matrix (useful for monitoring/logging).
-        """
-        # 1. Project features
-        # [Batch, project_dim]
-        proj_g = self.gw_proj(g)
-        proj_o = self.opt_proj(z_l)
-        
-        # 2. L2 Normalize (Crucial for Cosine Similarity)
-        # vectors lie on a hypersphere unit surface
-        proj_g = F.normalize(proj_g, dim=1)
-        proj_o = F.normalize(proj_o, dim=1)
-        
-        # 3. Retrieve Temperature
-        # Clamp to prevent numerical instability (too small) or collapse (too large)
-        logit_scale = torch.clamp(self.log_temp.exp(), min=0.01, max=100.0)
-        
-        # 4. Compute Similarity Matrix (Logits)
-        # [Batch, Batch] = [Batch, Dim] @ [Dim, Batch]
-        # Element (i, j) is the similarity between GW_i and Optical_j
-        logits_g2o = torch.matmul(proj_g, proj_o.T) * logit_scale
-        logits_o2g = logits_g2o.T
-        
-        # 5. Generate Labels
-        # The positive pair for GW_i is Optical_i.
-        # So the target labels are the diagonal indices: [0, 1, 2, ..., Batch-1]
-        batch_size = g.size(0)
-        labels = torch.arange(batch_size, device=g.device)
-        
-        # 6. Compute Symmetric Loss
-        # Loss 1: Given GW, classify correct Optical
-        loss_g = self.criterion(logits_g2o, labels)
-        # Loss 2: Given Optical, classify correct GW
-        loss_o = self.criterion(logits_o2g, labels)
-        
-        loss = (loss_g + loss_o) / 2
-        
-        return loss
-
 # ==============================================================================
 # 7. End-to-End GW-Optical Contrastive Model
 # ==============================================================================
@@ -848,7 +775,9 @@ class GWOpticalALBEFModel(nn.Module):
         gw_dropout=0.1,
         opt_dropout=0.1,
         proj_dropout=0.0,
+        feature_dropout=0.0,
         label_smoothing=0.0,
+        itc_label_smoothing=0.0,
         use_lightweight_gw=False
     ):
         super().__init__()
@@ -880,10 +809,12 @@ class GWOpticalALBEFModel(nn.Module):
 
         self.gw_proj = ProjectionHead(enc_dim, enc_dim, proj_dim, dropout=proj_dropout)
         self.opt_proj = ProjectionHead(enc_dim, enc_dim, proj_dim, dropout=proj_dropout)
+        self.feature_dropout = nn.Dropout(feature_dropout)
+        self.itc_label_smoothing = float(itc_label_smoothing)
         self.log_temp = nn.Parameter(torch.ones([]) * torch.log(torch.tensor(temp_init)))
         self.temp_min = float(temp_min)
         self.temp_max = float(temp_max)
-        self.itc_criterion = nn.CrossEntropyLoss()
+        self.itc_criterion = nn.CrossEntropyLoss(label_smoothing=itc_label_smoothing)
 
         self.fusion = CrossAttentionFusion(
             gw_dim=enc_dim,
@@ -896,15 +827,23 @@ class GWOpticalALBEFModel(nn.Module):
 
     def encode(self, gw_s, gw_m, opt_coords, opt_t, opt_v, opt_ref_t, opt_mask, opt_err):
         g = self.gw_encoder(gw_s, gw_m)
+        if self.feature_dropout.p > 0:
+            g = self.feature_dropout(g)
         z_l, h_l = self.optical_encoder(
             opt_coords, opt_t, opt_v, opt_ref_t, opt_mask, errors_obs=opt_err
         )
+        if self.feature_dropout.p > 0:
+            z_l = self.feature_dropout(z_l)
+            h_l = self.feature_dropout(h_l)
         return g, z_l, h_l
 
     def encode_optical(self, opt_coords, opt_t, opt_v, opt_ref_t, opt_mask, opt_err):
         z_l, h_l = self.optical_encoder(
             opt_coords, opt_t, opt_v, opt_ref_t, opt_mask, errors_obs=opt_err
         )
+        if self.feature_dropout.p > 0:
+            z_l = self.feature_dropout(z_l)
+            h_l = self.feature_dropout(h_l)
         return z_l, h_l
 
     def compute_itc_loss(self, g, z_l, gw_indices=None, mask=False):
@@ -917,20 +856,17 @@ class GWOpticalALBEFModel(nn.Module):
 
         if mask and gw_indices is not None:
             labels_mask = (gw_indices.unsqueeze(0) == gw_indices.unsqueeze(1)).float()
+            batch_size = feat_g.size(0)
+            target = labels_mask / labels_mask.sum(dim=1, keepdim=True).clamp_min(1.0)
+            if self.itc_label_smoothing > 0:
+                smooth = self.itc_label_smoothing
+                target = target * (1.0 - smooth) + smooth / float(batch_size)
 
-            sim_g2o_max, _ = torch.max(sim_g2o, dim=1, keepdim=True)
-            sim_g2o = sim_g2o - sim_g2o_max.detach()
-            sim_o2g_max, _ = torch.max(sim_o2g, dim=1, keepdim=True)
-            sim_o2g = sim_o2g - sim_o2g_max.detach()
-
-            exp_g2o = torch.exp(sim_g2o)
-            exp_o2g = torch.exp(sim_o2g)
-            log_prob_g2o = sim_g2o - torch.log(exp_g2o.sum(dim=1, keepdim=True))
-            log_prob_o2g = sim_o2g - torch.log(exp_o2g.sum(dim=1, keepdim=True))
-
-            loss_g = - (labels_mask * log_prob_g2o).sum(dim=1) / labels_mask.sum(dim=1)
-            loss_o = - (labels_mask * log_prob_o2g).sum(dim=1) / labels_mask.sum(dim=1)
-            total_loss = (loss_g.mean() + loss_o.mean()) / 2
+            log_prob_g2o = F.log_softmax(sim_g2o, dim=1)
+            log_prob_o2g = F.log_softmax(sim_o2g, dim=1)
+            loss_g = -(target * log_prob_g2o).sum(dim=1).mean()
+            loss_o = -(target * log_prob_o2g).sum(dim=1).mean()
+            total_loss = (loss_g + loss_o) / 2.0
         else:
             batch_size = feat_g.size(0)
             labels = torch.arange(batch_size, device=feat_g.device)

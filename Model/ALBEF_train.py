@@ -62,6 +62,45 @@ def augment_gw_data(gw_s, gw_m, training=True,
 
     return gw_s, gw_m
 
+def augment_optical_data(opt_t, opt_v, opt_mask, opt_err, training=True,
+                         time_jitter=0.0, flux_noise=0.0,
+                         obs_dropout=0.0, band_dropout=0.0):
+    """
+    Optical data augmentation to improve generalization.
+    """
+    if not training:
+        return opt_t, opt_v, opt_mask, opt_err
+
+    if time_jitter > 0:
+        time_mask = (opt_mask.sum(dim=-1) > 0).float()
+        opt_t = opt_t + torch.randn_like(opt_t) * time_jitter * time_mask
+
+    if flux_noise > 0:
+        if opt_err is not None:
+            noise = torch.randn_like(opt_v) * (opt_err * flux_noise)
+        else:
+            noise = torch.randn_like(opt_v) * flux_noise
+        opt_v = opt_v + noise * opt_mask
+
+    if obs_dropout > 0:
+        drop_mask = (torch.rand_like(opt_mask) < obs_dropout) & (opt_mask > 0)
+        if drop_mask.any():
+            opt_mask = opt_mask.masked_fill(drop_mask, 0)
+            opt_v = opt_v.masked_fill(drop_mask, 0.0)
+            if opt_err is not None:
+                opt_err = opt_err.masked_fill(drop_mask, 0.0)
+
+    if band_dropout > 0:
+        band_mask = torch.rand(opt_v.size(0), opt_v.size(2), device=opt_v.device) < band_dropout
+        if band_mask.any():
+            band_mask = band_mask[:, None, :]
+            opt_mask = opt_mask.masked_fill(band_mask, 0)
+            opt_v = opt_v.masked_fill(band_mask, 0.0)
+            if opt_err is not None:
+                opt_err = opt_err.masked_fill(band_mask, 0.0)
+
+    return opt_t, opt_v, opt_mask, opt_err
+
 def build_lr_scheduler(optimizer, args, steps_per_epoch, start_step):
     if args.lr_scheduler == "none":
         return None
@@ -78,6 +117,63 @@ def build_lr_scheduler(optimizer, args, steps_per_epoch, start_step):
         return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
 
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda, last_epoch=start_step - 1)
+
+def compute_cls_weight(args, epoch):
+    if epoch < args.cls_start_epoch:
+        return 0.0
+    if args.cls_ramp_epochs <= 0:
+        return args.cls_weight
+    progress = (epoch - args.cls_start_epoch + 1) / float(args.cls_ramp_epochs)
+    return args.cls_weight * min(1.0, progress)
+
+def compute_itc_weight(args, epoch):
+    if args.itc_decay_epochs <= 0 or args.itc_decay_ratio <= 0:
+        return args.itc_weight
+    if epoch < args.itc_decay_start_epoch:
+        return args.itc_weight
+    progress = (epoch - args.itc_decay_start_epoch + 1) / float(args.itc_decay_epochs)
+    progress = min(1.0, progress)
+    return args.itc_weight * (1.0 - args.itc_decay_ratio * progress)
+
+def compute_hard_neg_ratio(args, epoch):
+    if epoch < args.hard_neg_start_epoch:
+        return 0.0
+    if args.hard_neg_ramp_epochs <= 0:
+        return 1.0
+    progress = (epoch - args.hard_neg_start_epoch + 1) / float(args.hard_neg_ramp_epochs)
+    return min(1.0, progress)
+
+def set_requires_grad(module, requires_grad):
+    for param in module.parameters():
+        param.requires_grad = requires_grad
+
+def apply_freeze_schedule(model, args, epoch):
+    freeze_enc = args.freeze_encoder_epochs > 0 and epoch < args.freeze_encoder_epochs
+    freeze_itc = args.freeze_itc_epochs > 0 and epoch < args.freeze_itc_epochs
+
+    set_requires_grad(model.gw_encoder, not freeze_enc)
+    set_requires_grad(model.optical_encoder, not freeze_enc)
+
+    set_requires_grad(model.gw_proj, not freeze_itc)
+    set_requires_grad(model.opt_proj, not freeze_itc)
+    if args.temp_schedule == "learned":
+        model.log_temp.requires_grad_(not freeze_itc)
+    else:
+        model.log_temp.requires_grad_(False)
+
+def compute_weighted_cls_loss(pos_loss, hard_loss, neg_loss, has_negatives, args):
+    pos_weight = args.cls_pos_weight
+    neg_weight = args.cls_neg_weight
+    extra_neg_weight = args.cls_extra_neg_weight
+
+    if has_negatives:
+        denom = max(1e-8, pos_weight + neg_weight + extra_neg_weight)
+        return (
+            pos_weight * pos_loss + neg_weight * hard_loss + extra_neg_weight * neg_loss
+        ) / denom
+
+    denom = max(1e-8, pos_weight + neg_weight)
+    return (pos_weight * pos_loss + neg_weight * hard_loss) / denom
 
 def apply_temperature_schedule(model, args, epoch):
     if args.temp_schedule == "learned":
@@ -102,6 +198,9 @@ def evaluate(model, val_loader, device, args, epoch):
     model.eval()
     has_negatives = args.neg_data_path is not None
     ref_time_cache = None
+    cls_weight = compute_cls_weight(args, epoch)
+    itc_weight = compute_itc_weight(args, epoch)
+    hard_neg_ratio = compute_hard_neg_ratio(args, epoch)
 
     val_total = 0.0
     val_itc = 0.0
@@ -168,11 +267,18 @@ def evaluate(model, val_loader, device, args, epoch):
             labels_neg = torch.zeros(batch_size, device=device, dtype=torch.long)
             pos_loss = model.cls_criterion(logits_pos, labels_pos)
 
-            use_hard_neg = epoch >= args.hard_neg_start_epoch
-            if use_hard_neg:
-                neg_idx = model.sample_hard_negatives(sim_g2o, gw_indices)
+            easy_idx = sample_easy_negatives(batch_size, device)
+            if easy_idx is None:
+                neg_idx = None
+            elif hard_neg_ratio <= 0:
+                neg_idx = easy_idx
             else:
-                neg_idx = sample_easy_negatives(batch_size, device)
+                hard_idx = model.sample_hard_negatives(sim_g2o, gw_indices)
+                if hard_neg_ratio >= 1:
+                    neg_idx = hard_idx
+                else:
+                    choose_hard = torch.rand(batch_size, device=device) < hard_neg_ratio
+                    neg_idx = torch.where(choose_hard, hard_idx, easy_idx)
 
             if neg_idx is None:
                 hard_loss = torch.zeros((), device=device)
@@ -188,13 +294,15 @@ def evaluate(model, val_loader, device, args, epoch):
                 )
                 logits_neg = model.fusion_logits(g, h_l_neg)
                 neg_loss = model.cls_criterion(logits_neg, labels_neg)
-                cls_loss = (pos_loss + hard_loss + neg_loss) / 3.0
             else:
-                cls_loss = 0.5 * (pos_loss + hard_loss)
+                neg_loss = None
+
+            cls_loss = compute_weighted_cls_loss(
+                pos_loss, hard_loss, neg_loss, has_negatives, args
+            )
 
             # 分阶段训练：验证时也使用相同的权重逻辑
-            effective_cls_weight = args.cls_weight if epoch >= args.cls_start_epoch else 0.0
-            total_loss = args.itc_weight * itc_loss + effective_cls_weight * cls_loss
+            total_loss = itc_weight * itc_loss + cls_weight * cls_loss
 
             val_total += total_loss.item()
             val_itc += itc_loss.item()
@@ -308,8 +416,10 @@ def train(args):
         gw_dropout=args.gw_dropout,
         opt_dropout=args.opt_dropout,
         proj_dropout=getattr(args, 'proj_dropout', 0.0),
+        feature_dropout=args.feature_dropout,
         fusion_dropout=args.fusion_dropout,
         label_smoothing=args.label_smoothing,
+        itc_label_smoothing=args.itc_label_smoothing,
         use_lightweight_gw=getattr(args, 'use_lightweight_gw', False)
     ).to(device)
 
@@ -319,7 +429,15 @@ def train(args):
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     start_epoch = 0
     global_step = 0
-    if args.resume is not None:
+    if args.resume is not None and args.pretrained is not None:
+        raise ValueError("resume and pretrained are mutually exclusive.")
+    if args.pretrained is not None:
+        if not os.path.exists(args.pretrained):
+            raise FileNotFoundError(f"Pretrained checkpoint not found: {args.pretrained}")
+        ckpt = torch.load(args.pretrained, map_location=device)
+        model.load_state_dict(ckpt["model_state_dict"], strict=True)
+        print(f"Loaded pretrained weights from {args.pretrained}.")
+    elif args.resume is not None:
         if not os.path.exists(args.resume):
             raise FileNotFoundError(f"Resume checkpoint not found: {args.resume}")
         ckpt = torch.load(args.resume, map_location=device)
@@ -330,8 +448,7 @@ def train(args):
         print(f"Resumed from {args.resume} at epoch {start_epoch}.")
     model.train()
     has_negatives = args.neg_data_path is not None
-    if args.temp_schedule != "learned":
-        model.log_temp.requires_grad_(False)
+    apply_freeze_schedule(model, args, start_epoch)
 
     pbar_update_every = 500
     best_val = None
@@ -345,6 +462,10 @@ def train(args):
 
         ref_time_cache = None
         apply_temperature_schedule(model, args, epoch)
+        apply_freeze_schedule(model, args, epoch)
+        cls_weight = compute_cls_weight(args, epoch)
+        itc_weight = compute_itc_weight(args, epoch)
+        hard_neg_ratio = compute_hard_neg_ratio(args, epoch)
 
         pbar = tqdm(
             train_loader,
@@ -396,6 +517,22 @@ def train(args):
                     print("NaN or Inf detected in negative optical errors. Skipping batch.")
                     continue
 
+            opt_t, opt_v, opt_mask, opt_err = augment_optical_data(
+                opt_t, opt_v, opt_mask, opt_err, training=True,
+                time_jitter=args.opt_aug_time_jitter,
+                flux_noise=args.opt_aug_noise,
+                obs_dropout=args.opt_aug_dropout,
+                band_dropout=args.opt_aug_band_dropout
+            )
+            if has_negatives:
+                neg_t, neg_v, neg_mask, neg_err = augment_optical_data(
+                    neg_t, neg_v, neg_mask, neg_err, training=True,
+                    time_jitter=args.opt_aug_time_jitter,
+                    flux_noise=args.opt_aug_noise,
+                    obs_dropout=args.opt_aug_dropout,
+                    band_dropout=args.opt_aug_band_dropout
+                )
+
             batch_size = gw_s.size(0)
 
             if (
@@ -422,11 +559,18 @@ def train(args):
             labels_neg = torch.zeros(batch_size, device=device, dtype=torch.long)
             pos_loss = model.cls_criterion(logits_pos, labels_pos)
 
-            use_hard_neg = epoch >= args.hard_neg_start_epoch
-            if use_hard_neg:
-                neg_idx = model.sample_hard_negatives(sim_g2o, gw_indices)
+            easy_idx = sample_easy_negatives(batch_size, device)
+            if easy_idx is None:
+                neg_idx = None
+            elif hard_neg_ratio <= 0:
+                neg_idx = easy_idx
             else:
-                neg_idx = sample_easy_negatives(batch_size, device)
+                hard_idx = model.sample_hard_negatives(sim_g2o, gw_indices)
+                if hard_neg_ratio >= 1:
+                    neg_idx = hard_idx
+                else:
+                    choose_hard = torch.rand(batch_size, device=device) < hard_neg_ratio
+                    neg_idx = torch.where(choose_hard, hard_idx, easy_idx)
 
             if neg_idx is None:
                 hard_loss = torch.zeros((), device=device)
@@ -442,13 +586,15 @@ def train(args):
                 )
                 logits_neg = model.fusion_logits(g, h_l_neg)
                 neg_loss = model.cls_criterion(logits_neg, labels_neg)
-                cls_loss = (pos_loss + hard_loss + neg_loss) / 3.0
             else:
-                cls_loss = 0.5 * (pos_loss + hard_loss)
+                neg_loss = None
+
+            cls_loss = compute_weighted_cls_loss(
+                pos_loss, hard_loss, neg_loss, has_negatives, args
+            )
 
             # 分阶段训练：cls_start_epoch之前只训练ITC
-            effective_cls_weight = args.cls_weight if epoch >= args.cls_start_epoch else 0.0
-            total_loss = args.itc_weight * itc_loss + effective_cls_weight * cls_loss
+            total_loss = itc_weight * itc_loss + cls_weight * cls_loss
             total_loss.backward()
             # 添加梯度裁剪防止梯度爆炸
             if args.grad_clip_norm > 0:
@@ -492,6 +638,9 @@ def train(args):
                 writer.add_scalar('Train/Batch_HardNeg_Acc', hard_acc, global_step)
                 if has_negatives and neg_acc is not None:
                     writer.add_scalar('Train/Batch_ExtraNeg_Acc', neg_acc, global_step)
+                writer.add_scalar('Train/Itc_Weight', itc_weight, global_step)
+                writer.add_scalar('Train/Cls_Weight', cls_weight, global_step)
+                writer.add_scalar('Train/HardNeg_Ratio', hard_neg_ratio, global_step)
                 writer.add_scalar('Train/Temperature', current_temp, global_step)
                 writer.add_scalar('Train/Learning_Rate', optimizer.param_groups[0]['lr'], global_step)
 
@@ -583,6 +732,8 @@ if __name__ == "__main__":
     parser.add_argument("--steps_per_epoch", type=int, default=None)
     parser.add_argument("--ckpt_path", type=str, default=None)
     parser.add_argument("--resume", type=str, default=None)
+    parser.add_argument("--pretrained", type=str, default=None,
+                        help="Load model weights from checkpoint without optimizer state")
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-4, help="Weight decay for AdamW optimizer")
     parser.add_argument("--grad_clip_norm", type=float, default=1.0, help="Max norm for gradient clipping (0 to disable)")
@@ -619,10 +770,34 @@ if __name__ == "__main__":
     parser.add_argument("--opt_dropout", type=float, default=0.1)
     parser.add_argument("--proj_dropout", type=float, default=0.0,
                         help="Projection head dropout to prevent ITC overfitting (default: 0.0)")
+    parser.add_argument("--feature_dropout", type=float, default=0.0,
+                        help="Dropout applied to encoder features before ITC/CLS heads")
+    parser.add_argument("--freeze_encoder_epochs", type=int, default=0,
+                        help="Freeze GW/optical encoders for N initial epochs")
+    parser.add_argument("--freeze_itc_epochs", type=int, default=0,
+                        help="Freeze ITC projection heads/temp for N initial epochs")
     parser.add_argument("--itc_weight", type=float, default=1.0)
     parser.add_argument("--cls_weight", type=float, default=1.0)
+    parser.add_argument("--cls_pos_weight", type=float, default=1.0,
+                        help="Positive class weight for CLS loss")
+    parser.add_argument("--cls_neg_weight", type=float, default=1.0,
+                        help="Negative class weight for CLS loss")
+    parser.add_argument("--cls_extra_neg_weight", type=float, default=1.0,
+                        help="Extra negative class weight for CLS loss")
+    parser.add_argument("--cls_ramp_epochs", type=int, default=0,
+                        help="Epochs to ramp CLS weight from 0 to cls_weight (0 to disable)")
+    parser.add_argument("--itc_decay_start_epoch", type=int, default=0,
+                        help="Epoch to start decaying ITC weight (ignored if itc_decay_epochs <= 0)")
+    parser.add_argument("--itc_decay_epochs", type=int, default=0,
+                        help="Epochs to decay ITC weight (0 to disable)")
+    parser.add_argument("--itc_decay_ratio", type=float, default=0.0,
+                        help="Fractional decay of ITC weight by the end of itc_decay_epochs")
+    parser.add_argument("--itc_label_smoothing", type=float, default=0.0,
+                        help="Label smoothing for ITC loss (0 to disable)")
     parser.add_argument("--mask_itc", action='store_true', help="Mask same-event pairs in ITC loss")
     parser.add_argument("--hard_neg_start_epoch", type=int, default=0)
+    parser.add_argument("--hard_neg_ramp_epochs", type=int, default=0,
+                        help="Epochs to ramp hard negative ratio to 1.0 (0 to disable)")
     parser.add_argument("--cls_start_epoch", type=int, default=0,
                         help="Epoch to start CLS training. Before this epoch, only ITC loss is used (for staged training)")
     parser.add_argument("--use_lightweight_gw", action='store_true',
@@ -634,6 +809,15 @@ if __name__ == "__main__":
                         help="GW scalar augmentation jitter ratio (default: 0.02)")
     parser.add_argument("--gw_aug_dropout", type=float, default=0.1,
                         help="GW channel dropout probability (default: 0.1)")
+    # Optical data augmentation parameters
+    parser.add_argument("--opt_aug_noise", type=float, default=0.0,
+                        help="Optical flux noise scale relative to errors (default: 0.0)")
+    parser.add_argument("--opt_aug_time_jitter", type=float, default=0.0,
+                        help="Optical time jitter std (default: 0.0)")
+    parser.add_argument("--opt_aug_dropout", type=float, default=0.0,
+                        help="Optical observation dropout probability (default: 0.0)")
+    parser.add_argument("--opt_aug_band_dropout", type=float, default=0.0,
+                        help="Optical band dropout probability (default: 0.0)")
 
     args = parser.parse_args()
 

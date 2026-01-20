@@ -25,6 +25,7 @@ NEG_GROUP=$(jq -r '.neg_group // empty' "$args_file")
 CKPT_PATH=$(jq -r '.ckpt_path' "$args_file")
 STAGE_TO_JOBFS=$(jq -r '.stage_to_jobfs // false' "$args_file")
 RESUME=$(jq -r '.resume // empty' "$args_file")
+PRETRAINED=$(jq -r '.pretrained // empty' "$args_file")
 EPOCHS=$(jq -r '.epochs' "$args_file")
 BATCH_SIZE=$(jq -r '.batch_size' "$args_file")
 LR=$(jq -r '.lr' "$args_file")
@@ -63,15 +64,31 @@ GW_DROPOUT=$(jq -r '.gw_dropout // empty' "$args_file")
 OPT_DROPOUT=$(jq -r '.opt_dropout // empty' "$args_file")
 PROJ_DROPOUT=$(jq -r '.proj_dropout // empty' "$args_file")
 LABEL_SMOOTHING=$(jq -r '.label_smoothing // empty' "$args_file")
+FEATURE_DROPOUT=$(jq -r '.feature_dropout // empty' "$args_file")
+FREEZE_ENCODER_EPOCHS=$(jq -r '.freeze_encoder_epochs // empty' "$args_file")
+FREEZE_ITC_EPOCHS=$(jq -r '.freeze_itc_epochs // empty' "$args_file")
 ITC_WEIGHT=$(jq -r '.itc_weight // empty' "$args_file")
 CLS_WEIGHT=$(jq -r '.cls_weight // empty' "$args_file")
+CLS_POS_WEIGHT=$(jq -r '.cls_pos_weight // empty' "$args_file")
+CLS_NEG_WEIGHT=$(jq -r '.cls_neg_weight // empty' "$args_file")
+CLS_EXTRA_NEG_WEIGHT=$(jq -r '.cls_extra_neg_weight // empty' "$args_file")
+CLS_RAMP_EPOCHS=$(jq -r '.cls_ramp_epochs // empty' "$args_file")
+ITC_DECAY_START_EPOCH=$(jq -r '.itc_decay_start_epoch // empty' "$args_file")
+ITC_DECAY_EPOCHS=$(jq -r '.itc_decay_epochs // empty' "$args_file")
+ITC_DECAY_RATIO=$(jq -r '.itc_decay_ratio // empty' "$args_file")
+ITC_LABEL_SMOOTHING=$(jq -r '.itc_label_smoothing // empty' "$args_file")
 HARD_NEG_START_EPOCH=$(jq -r '.hard_neg_start_epoch // empty' "$args_file")
+HARD_NEG_RAMP_EPOCHS=$(jq -r '.hard_neg_ramp_epochs // empty' "$args_file")
 CLS_START_EPOCH=$(jq -r '.cls_start_epoch // empty' "$args_file")
 MASK_ITC=$(jq -r '.mask_itc // false' "$args_file")
 USE_LIGHTWEIGHT_GW=$(jq -r '.use_lightweight_gw // false' "$args_file")
 GW_AUG_NOISE=$(jq -r '.gw_aug_noise // empty' "$args_file")
 GW_AUG_JITTER=$(jq -r '.gw_aug_jitter // empty' "$args_file")
 GW_AUG_DROPOUT=$(jq -r '.gw_aug_dropout // empty' "$args_file")
+OPT_AUG_NOISE=$(jq -r '.opt_aug_noise // empty' "$args_file")
+OPT_AUG_TIME_JITTER=$(jq -r '.opt_aug_time_jitter // empty' "$args_file")
+OPT_AUG_DROPOUT=$(jq -r '.opt_aug_dropout // empty' "$args_file")
+OPT_AUG_BAND_DROPOUT=$(jq -r '.opt_aug_band_dropout // empty' "$args_file")
 
 mkdir -p "$CKPT_PATH"
 
@@ -128,6 +145,9 @@ if [[ -n "$STEPS_PER_EPOCH" && "$STEPS_PER_EPOCH" != "null" ]]; then
 fi
 if [[ -n "$RESUME" && "$RESUME" != "null" ]]; then
     cmd+=(--resume "$RESUME")
+fi
+if [[ -n "$PRETRAINED" && "$PRETRAINED" != "null" ]]; then
+    cmd+=(--pretrained "$PRETRAINED")
 fi
 if [[ -n "$LR_SCHEDULER" && "$LR_SCHEDULER" != "null" ]]; then
     cmd+=(--lr_scheduler "$LR_SCHEDULER")
@@ -228,14 +248,50 @@ fi
 if [[ -n "$LABEL_SMOOTHING" && "$LABEL_SMOOTHING" != "null" ]]; then
     cmd+=(--label_smoothing "$LABEL_SMOOTHING")
 fi
+if [[ -n "$FEATURE_DROPOUT" && "$FEATURE_DROPOUT" != "null" ]]; then
+    cmd+=(--feature_dropout "$FEATURE_DROPOUT")
+fi
+if [[ -n "$FREEZE_ENCODER_EPOCHS" && "$FREEZE_ENCODER_EPOCHS" != "null" ]]; then
+    cmd+=(--freeze_encoder_epochs "$FREEZE_ENCODER_EPOCHS")
+fi
+if [[ -n "$FREEZE_ITC_EPOCHS" && "$FREEZE_ITC_EPOCHS" != "null" ]]; then
+    cmd+=(--freeze_itc_epochs "$FREEZE_ITC_EPOCHS")
+fi
 if [[ -n "$ITC_WEIGHT" && "$ITC_WEIGHT" != "null" ]]; then
     cmd+=(--itc_weight "$ITC_WEIGHT")
 fi
 if [[ -n "$CLS_WEIGHT" && "$CLS_WEIGHT" != "null" ]]; then
     cmd+=(--cls_weight "$CLS_WEIGHT")
 fi
+if [[ -n "$CLS_POS_WEIGHT" && "$CLS_POS_WEIGHT" != "null" ]]; then
+    cmd+=(--cls_pos_weight "$CLS_POS_WEIGHT")
+fi
+if [[ -n "$CLS_NEG_WEIGHT" && "$CLS_NEG_WEIGHT" != "null" ]]; then
+    cmd+=(--cls_neg_weight "$CLS_NEG_WEIGHT")
+fi
+if [[ -n "$CLS_EXTRA_NEG_WEIGHT" && "$CLS_EXTRA_NEG_WEIGHT" != "null" ]]; then
+    cmd+=(--cls_extra_neg_weight "$CLS_EXTRA_NEG_WEIGHT")
+fi
+if [[ -n "$CLS_RAMP_EPOCHS" && "$CLS_RAMP_EPOCHS" != "null" ]]; then
+    cmd+=(--cls_ramp_epochs "$CLS_RAMP_EPOCHS")
+fi
+if [[ -n "$ITC_DECAY_START_EPOCH" && "$ITC_DECAY_START_EPOCH" != "null" ]]; then
+    cmd+=(--itc_decay_start_epoch "$ITC_DECAY_START_EPOCH")
+fi
+if [[ -n "$ITC_DECAY_EPOCHS" && "$ITC_DECAY_EPOCHS" != "null" ]]; then
+    cmd+=(--itc_decay_epochs "$ITC_DECAY_EPOCHS")
+fi
+if [[ -n "$ITC_DECAY_RATIO" && "$ITC_DECAY_RATIO" != "null" ]]; then
+    cmd+=(--itc_decay_ratio "$ITC_DECAY_RATIO")
+fi
+if [[ -n "$ITC_LABEL_SMOOTHING" && "$ITC_LABEL_SMOOTHING" != "null" ]]; then
+    cmd+=(--itc_label_smoothing "$ITC_LABEL_SMOOTHING")
+fi
 if [[ -n "$HARD_NEG_START_EPOCH" && "$HARD_NEG_START_EPOCH" != "null" ]]; then
     cmd+=(--hard_neg_start_epoch "$HARD_NEG_START_EPOCH")
+fi
+if [[ -n "$HARD_NEG_RAMP_EPOCHS" && "$HARD_NEG_RAMP_EPOCHS" != "null" ]]; then
+    cmd+=(--hard_neg_ramp_epochs "$HARD_NEG_RAMP_EPOCHS")
 fi
 if [[ -n "$CLS_START_EPOCH" && "$CLS_START_EPOCH" != "null" ]]; then
     cmd+=(--cls_start_epoch "$CLS_START_EPOCH")
@@ -254,6 +310,18 @@ if [[ -n "$GW_AUG_JITTER" && "$GW_AUG_JITTER" != "null" ]]; then
 fi
 if [[ -n "$GW_AUG_DROPOUT" && "$GW_AUG_DROPOUT" != "null" ]]; then
     cmd+=(--gw_aug_dropout "$GW_AUG_DROPOUT")
+fi
+if [[ -n "$OPT_AUG_NOISE" && "$OPT_AUG_NOISE" != "null" ]]; then
+    cmd+=(--opt_aug_noise "$OPT_AUG_NOISE")
+fi
+if [[ -n "$OPT_AUG_TIME_JITTER" && "$OPT_AUG_TIME_JITTER" != "null" ]]; then
+    cmd+=(--opt_aug_time_jitter "$OPT_AUG_TIME_JITTER")
+fi
+if [[ -n "$OPT_AUG_DROPOUT" && "$OPT_AUG_DROPOUT" != "null" ]]; then
+    cmd+=(--opt_aug_dropout "$OPT_AUG_DROPOUT")
+fi
+if [[ -n "$OPT_AUG_BAND_DROPOUT" && "$OPT_AUG_BAND_DROPOUT" != "null" ]]; then
+    cmd+=(--opt_aug_band_dropout "$OPT_AUG_BAND_DROPOUT")
 fi
 
 echo "Command: ${cmd[*]}"
