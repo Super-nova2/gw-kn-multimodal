@@ -1,4 +1,8 @@
-from data_loader import create_training_dataloader, create_train_val_dataloaders
+from data_loader import (
+    create_training_dataloader,
+    create_train_val_dataloaders,
+    create_supcon_dataloaders
+)
 from model import GWOpticalALBEFModel
 from tqdm import tqdm
 import torch
@@ -209,6 +213,7 @@ def evaluate(model, val_loader, device, args, epoch):
     val_pos_acc = 0.0
     val_hard_acc = 0.0
     val_neg_acc = 0.0
+    val_total_acc = 0.0
     val_batches = 0
 
     with torch.no_grad():
@@ -258,9 +263,14 @@ def evaluate(model, val_loader, device, args, epoch):
             g, z_l, h_l = model.encode(
                 gw_s, gw_m, opt_coords, opt_t, opt_v, opt_ref_t, opt_mask, opt_err
             )
-            itc_loss, sim_g2o = model.compute_itc_loss(
-                g, z_l, gw_indices, mask=args.mask_itc
-            )
+            if args.itc_loss_type == "supcon":
+                itc_loss, sim_g2o = model.compute_supcon_loss(
+                    g, z_l, gw_indices, temperature=args.supcon_temperature
+                )
+            else:
+                itc_loss, sim_g2o = model.compute_itc_loss(
+                    g, z_l, gw_indices, mask=args.mask_itc
+                )
 
             logits_pos = model.fusion_logits(g, h_l)
             labels_pos = torch.ones(batch_size, device=device, dtype=torch.long)
@@ -315,11 +325,15 @@ def evaluate(model, val_loader, device, args, epoch):
             neg_acc = 0.0
             if has_negatives:
                 neg_acc = (logits_neg.argmax(dim=1) == labels_neg).float().mean().item()
+                total_acc = (pos_acc + hard_acc + neg_acc) / 3.0
+            else:
+                total_acc = (pos_acc + hard_acc) / 2.0
 
             val_itc_acc += itc_acc
             val_pos_acc += pos_acc
             val_hard_acc += hard_acc
             val_neg_acc += neg_acc
+            val_total_acc += total_acc
             val_batches += 1
 
     if val_batches == 0:
@@ -333,7 +347,8 @@ def evaluate(model, val_loader, device, args, epoch):
         "itc_acc": val_itc_acc / val_batches,
         "pos_acc": val_pos_acc / val_batches,
         "hard_acc": val_hard_acc / val_batches,
-        "neg_acc": val_neg_acc / val_batches
+        "neg_acc": val_neg_acc / val_batches,
+        "total_acc": val_total_acc / val_batches
     }
 
     model.train()
@@ -362,22 +377,46 @@ def train(args):
 
     val_loader = None
     if args.val_split is not None and 0 < args.val_split < 1:
-        train_loader, val_loader, steps_per_epoch, val_steps = create_train_val_dataloaders(
-            h5_path=args.data_path,
-            batch_size=args.batch_size,
-            val_batch_size=args.val_batch_size,
-            steps_per_epoch=args.steps_per_epoch,
-            val_steps_per_epoch=args.val_steps_per_epoch,
-            val_split=args.val_split,
-            split_seed=args.split_seed,
-            num_workers=args.num_workers,
-            pin_memory=bool(args.pin_memory),
-            persistent_workers=bool(args.persistent_workers),
-            prefetch_factor=args.prefetch_factor,
-            cache_in_memory=bool(args.cache_in_memory),
-            negative_h5_path=args.neg_data_path,
-            negative_group=args.neg_group
-        )
+        if args.itc_loss_type == "supcon":
+            train_loader, val_loader, steps_per_epoch, val_steps = create_supcon_dataloaders(
+                h5_path=args.data_path,
+                batch_size=args.batch_size,
+                samples_per_gw=args.samples_per_gw,
+                val_batch_size=args.val_batch_size,
+                steps_per_epoch=args.steps_per_epoch,
+                val_steps_per_epoch=args.val_steps_per_epoch,
+                val_split=args.val_split,
+                split_seed=args.split_seed,
+                num_workers=args.num_workers,
+                pin_memory=bool(args.pin_memory),
+                persistent_workers=bool(args.persistent_workers),
+                prefetch_factor=args.prefetch_factor,
+                cache_in_memory=bool(args.cache_in_memory),
+                negative_h5_path=args.neg_data_path,
+                negative_group=args.neg_group,
+                min_lc_per_gw=args.min_lc_per_gw
+            )
+            print(
+                f"SupCon mode: {args.samples_per_gw} samples/GW, "
+                f"{args.batch_size // args.samples_per_gw} GW/batch"
+            )
+        else:
+            train_loader, val_loader, steps_per_epoch, val_steps = create_train_val_dataloaders(
+                h5_path=args.data_path,
+                batch_size=args.batch_size,
+                val_batch_size=args.val_batch_size,
+                steps_per_epoch=args.steps_per_epoch,
+                val_steps_per_epoch=args.val_steps_per_epoch,
+                val_split=args.val_split,
+                split_seed=args.split_seed,
+                num_workers=args.num_workers,
+                pin_memory=bool(args.pin_memory),
+                persistent_workers=bool(args.persistent_workers),
+                prefetch_factor=args.prefetch_factor,
+                cache_in_memory=bool(args.cache_in_memory),
+                negative_h5_path=args.neg_data_path,
+                negative_group=args.neg_group
+            )
         print(f"Train Steps/Epoch: {steps_per_epoch} | Val Steps/Epoch: {val_steps}")
     else:
         if args.steps_per_epoch is not None:
@@ -550,9 +589,14 @@ def train(args):
             g, z_l, h_l = model.encode(
                 gw_s, gw_m, opt_coords, opt_t, opt_v, opt_ref_t, opt_mask, opt_err
             )
-            itc_loss, sim_g2o = model.compute_itc_loss(
-                g, z_l, gw_indices, mask=args.mask_itc
-            )
+            if args.itc_loss_type == "supcon":
+                itc_loss, sim_g2o = model.compute_supcon_loss(
+                    g, z_l, gw_indices, temperature=args.supcon_temperature
+                )
+            else:
+                itc_loss, sim_g2o = model.compute_itc_loss(
+                    g, z_l, gw_indices, mask=args.mask_itc
+                )
 
             logits_pos = model.fusion_logits(g, h_l)
             labels_pos = torch.ones(batch_size, device=device, dtype=torch.long)
@@ -679,6 +723,7 @@ def train(args):
                 writer.add_scalar('Val/Epoch_ITC_Loss', val_metrics['itc'], epoch)
                 writer.add_scalar('Val/Epoch_CLS_Loss', val_metrics['cls'], epoch)
                 writer.add_scalar('Val/Epoch_ITC_Acc', val_metrics['itc_acc'], epoch)
+                writer.add_scalar('Val/Epoch_Total_Acc', val_metrics['total_acc'], epoch)
                 writer.add_scalar('Val/Epoch_Pos_Acc', val_metrics['pos_acc'], epoch)
                 writer.add_scalar('Val/Epoch_HardNeg_Acc', val_metrics['hard_acc'], epoch)
                 if args.neg_data_path is not None:
@@ -794,6 +839,15 @@ if __name__ == "__main__":
                         help="Fractional decay of ITC weight by the end of itc_decay_epochs")
     parser.add_argument("--itc_label_smoothing", type=float, default=0.0,
                         help="Label smoothing for ITC loss (0 to disable)")
+    parser.add_argument("--itc_loss_type", type=str, default="infonce",
+                        choices=["infonce", "supcon"],
+                        help="ITC loss type: 'infonce' (original) or 'supcon' (supervised contrastive)")
+    parser.add_argument("--supcon_temperature", type=float, default=0.1,
+                        help="Temperature for SupCon loss (typically 0.07-0.2)")
+    parser.add_argument("--samples_per_gw", type=int, default=4,
+                        help="Number of optical samples per GW event for SupCon (default: 4)")
+    parser.add_argument("--min_lc_per_gw", type=int, default=2,
+                        help="Minimum light curves required for a GW to be eligible for SupCon")
     parser.add_argument("--mask_itc", action='store_true', help="Mask same-event pairs in ITC loss")
     parser.add_argument("--hard_neg_start_epoch", type=int, default=0)
     parser.add_argument("--hard_neg_ramp_epochs", type=int, default=0,
