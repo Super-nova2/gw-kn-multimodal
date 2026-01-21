@@ -876,6 +876,52 @@ class GWOpticalALBEFModel(nn.Module):
 
         return total_loss, sim_g2o
 
+    def compute_supcon_loss(self, g, z_l, gw_indices, temperature=0.07):
+        """
+        Supervised Contrastive Loss for many-to-many GW-optical matching.
+
+        Reference: "Supervised Contrastive Learning" (Khosla et al., NeurIPS 2020)
+
+        Key difference from InfoNCE:
+        - Treats all samples with same gw_index as positives
+        - Normalizes loss by number of positives per anchor
+        - More stable with multiple positives per class
+        """
+        feat_g = F.normalize(self.gw_proj(g), p=2, dim=1, eps=1e-8)
+        feat_o = F.normalize(self.opt_proj(z_l), p=2, dim=1, eps=1e-8)
+
+        batch_size = feat_g.size(0)
+        device = feat_g.device
+
+        features = torch.cat([feat_g, feat_o], dim=0)
+        labels = torch.cat([gw_indices, gw_indices], dim=0)
+
+        sim_matrix = torch.matmul(features, features.T) / temperature
+
+        labels_eq = labels.unsqueeze(0) == labels.unsqueeze(1)
+        mask_pos = labels_eq.float()
+        mask_pos.fill_diagonal_(0)
+
+        mask_self = torch.eye(2 * batch_size, device=device, dtype=torch.bool)
+
+        logits_max, _ = sim_matrix.max(dim=1, keepdim=True)
+        logits = sim_matrix - logits_max.detach()
+
+        exp_logits = torch.exp(logits)
+        exp_logits = exp_logits.masked_fill(mask_self, 0)
+        log_sum_exp = torch.log(exp_logits.sum(dim=1, keepdim=True) + 1e-8)
+
+        log_prob = logits - log_sum_exp
+
+        num_positives = mask_pos.sum(dim=1).clamp_min(1)
+        mean_log_prob_pos = (mask_pos * log_prob).sum(dim=1) / num_positives
+
+        loss = -mean_log_prob_pos.mean()
+
+        sim_g2o = torch.matmul(feat_g, feat_o.T) * (1.0 / temperature)
+
+        return loss, sim_g2o
+
     def fusion_logits(self, g_feat, h_l):
         logits, _ = self.fusion(g_feat, h_l)
         return logits

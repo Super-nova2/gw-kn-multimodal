@@ -215,6 +215,84 @@ class BalancedGWBatchedSampler(Sampler):
     def __len__(self):
         return self.steps_per_epoch
 
+class MultiPositiveGWBatchedSampler(Sampler):
+    """
+    Batch sampler for Supervised Contrastive Learning.
+    Ensures multiple optical samples per GW event in each batch.
+
+    Structure per batch:
+    - Select (batch_size // samples_per_gw) unique GW events
+    - For each GW, sample 'samples_per_gw' optical light curves
+    - Total batch size = n_gw_per_batch * samples_per_gw
+    """
+    def __init__(
+        self,
+        gw_to_lc_map: dict,
+        batch_size: int,
+        samples_per_gw: int,
+        steps_per_epoch: int,
+        min_lc_per_gw: int = 2
+    ):
+        """
+        Args:
+            gw_to_lc_map: Dictionary mapping GW_ID -> [LC_ID_1, LC_ID_2, ...]
+            batch_size: Total samples per batch
+            samples_per_gw: Number of optical samples to draw per GW event
+            steps_per_epoch: Number of batches per epoch
+            min_lc_per_gw: Minimum light curves required for a GW to be eligible
+        """
+        self.gw_to_lc_map = gw_to_lc_map
+        self.samples_per_gw = samples_per_gw
+        self.steps_per_epoch = steps_per_epoch
+
+        self.eligible_gw_ids = [
+            gw_id for gw_id, lcs in gw_to_lc_map.items()
+            if len(lcs) >= min_lc_per_gw
+        ]
+
+        self.n_gw_per_batch = batch_size // samples_per_gw
+
+        if self.n_gw_per_batch < 2:
+            raise ValueError(
+                f"batch_size ({batch_size}) / samples_per_gw ({samples_per_gw}) "
+                f"must be >= 2 for contrastive learning"
+            )
+        if self.n_gw_per_batch > len(self.eligible_gw_ids):
+            raise ValueError(
+                f"Not enough GW events with >= {min_lc_per_gw} light curves. "
+                f"Need {self.n_gw_per_batch}, have {len(self.eligible_gw_ids)}"
+            )
+
+        print(
+            f"MultiPositiveSampler: {len(self.eligible_gw_ids)} eligible GW events, "
+            f"{self.n_gw_per_batch} GW/batch, {samples_per_gw} samples/GW"
+        )
+
+    def __iter__(self) -> Iterator[List[int]]:
+        for _ in range(self.steps_per_epoch):
+            batch_gw_ids = np.random.choice(
+                self.eligible_gw_ids,
+                size=self.n_gw_per_batch,
+                replace=False
+            )
+
+            batch_lc_indices = []
+
+            for gw_id in batch_gw_ids:
+                possible_lcs = self.gw_to_lc_map[gw_id]
+                replace = len(possible_lcs) < self.samples_per_gw
+                chosen_lcs = np.random.choice(
+                    possible_lcs,
+                    size=self.samples_per_gw,
+                    replace=replace
+                )
+                batch_lc_indices.extend(chosen_lcs.tolist())
+
+            yield batch_lc_indices
+
+    def __len__(self):
+        return self.steps_per_epoch
+
 class GWBatchedSampler(Sampler):
     """
     Batch sampler that iterates over GW IDs once per epoch.
@@ -413,6 +491,106 @@ def create_train_val_dataloaders(
         gw_to_lc_map=val_map,
         batch_size=val_batch_size,
         steps_per_epoch=val_steps_per_epoch
+    )
+
+    train_loader = _build_dataloader(
+        train_dataset,
+        train_sampler,
+        num_workers,
+        pin_memory,
+        persistent_workers,
+        prefetch_factor
+    )
+    val_loader = _build_dataloader(
+        val_dataset,
+        val_sampler,
+        num_workers,
+        pin_memory,
+        persistent_workers,
+        prefetch_factor
+    )
+
+    return train_loader, val_loader, steps_per_epoch, len(val_sampler)
+
+def create_supcon_dataloaders(
+    h5_path: str,
+    batch_size: int = 128,
+    samples_per_gw: int = 4,
+    val_batch_size: int = None,
+    steps_per_epoch: int = None,
+    val_steps_per_epoch: int = None,
+    val_split: float = 0.1,
+    split_seed: int = 42,
+    num_workers: int = 4,
+    pin_memory: bool = True,
+    persistent_workers: bool = True,
+    prefetch_factor: int = 4,
+    negative_h5_path: str = None,
+    negative_group: str = "events/optical_data",
+    cache_in_memory: bool = False,
+    min_lc_per_gw: int = 2
+):
+    """
+    Create dataloaders for Supervised Contrastive Learning.
+
+    Each batch contains:
+    - (batch_size // samples_per_gw) unique GW events
+    - samples_per_gw optical samples per GW (positives for each other)
+    """
+    if cache_in_memory and num_workers > 0:
+        print("cache_in_memory=True with num_workers>0 may increase RAM usage.")
+
+    gw_map = build_gw_to_lc_mapping(h5_path)
+    train_map, val_map = split_gw_map(gw_map, val_split, split_seed)
+
+    if steps_per_epoch is None:
+        # Calculate based on total optical samples, not GW events
+        total_train_optical = sum(len(lcs) for lcs in train_map.values())
+        steps_per_epoch = max(1, total_train_optical // batch_size)
+
+    if val_batch_size is None:
+        val_batch_size = batch_size
+    if val_steps_per_epoch is None:
+        # Calculate based on total optical samples, not GW events
+        total_val_optical = sum(len(lcs) for lcs in val_map.values())
+        val_steps_per_epoch = max(1, total_val_optical // val_batch_size)
+
+    if cache_in_memory:
+        shared_dataset = RelationalHDF5Dataset(
+            h5_path,
+            negative_h5_path=negative_h5_path,
+            negative_group=negative_group,
+            cache_in_memory=cache_in_memory
+        )
+        train_dataset = shared_dataset
+        val_dataset = shared_dataset
+    else:
+        train_dataset = RelationalHDF5Dataset(
+            h5_path,
+            negative_h5_path=negative_h5_path,
+            negative_group=negative_group,
+            cache_in_memory=cache_in_memory
+        )
+        val_dataset = RelationalHDF5Dataset(
+            h5_path,
+            negative_h5_path=negative_h5_path,
+            negative_group=negative_group,
+            cache_in_memory=cache_in_memory
+        )
+
+    train_sampler = MultiPositiveGWBatchedSampler(
+        gw_to_lc_map=train_map,
+        batch_size=batch_size,
+        samples_per_gw=samples_per_gw,
+        steps_per_epoch=steps_per_epoch,
+        min_lc_per_gw=min_lc_per_gw
+    )
+    val_sampler = MultiPositiveGWBatchedSampler(
+        gw_to_lc_map=val_map,
+        batch_size=val_batch_size,
+        samples_per_gw=samples_per_gw,
+        steps_per_epoch=val_steps_per_epoch,
+        min_lc_per_gw=min_lc_per_gw
     )
 
     train_loader = _build_dataloader(

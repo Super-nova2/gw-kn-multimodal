@@ -7,17 +7,67 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=40G
 #SBATCH --gres=gpu:1
-#SBATCH --time=24:00:00
+#SBATCH --time=12:00:00
 #SBATCH --partition=gpu
 
 set -euo pipefail
-which python
 
 args_file=${1:-}
 if [[ -z "${args_file}" || ! -f "${args_file}" ]]; then
     echo "Usage: $0 <args.json>"
     exit 1
 fi
+
+args_dir="$(cd "$(dirname "${args_file}")" && pwd)"
+args_file="${args_dir}/$(basename "${args_file}")"
+
+if [[ -z "${SLURM_JOB_ID:-}" ]]; then
+    if ! command -v sbatch >/dev/null 2>&1; then
+        echo "sbatch not found; run inside a Slurm allocation or install Slurm tools."
+        exit 1
+    fi
+
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    script_path="${script_dir}/$(basename "${BASH_SOURCE[0]}")"
+
+    sbatch_opts=()
+    if [[ -n "${JOB_NAME:-}" ]]; then
+        sbatch_opts+=(--job-name="${JOB_NAME}")
+    fi
+    if [[ -n "${OUTPUT_LOG:-}" ]]; then
+        sbatch_opts+=(--output="${OUTPUT_LOG}")
+    fi
+    if [[ -n "${TIME_LIMIT:-}" ]]; then
+        sbatch_opts+=(--time="${TIME_LIMIT}")
+    fi
+    if [[ -n "${PARTITION:-}" ]]; then
+        sbatch_opts+=(--partition="${PARTITION}")
+    fi
+    if [[ -n "${CPUS_PER_TASK:-}" ]]; then
+        sbatch_opts+=(--cpus-per-task="${CPUS_PER_TASK}")
+    fi
+    if [[ -n "${MEM_PER_TASK:-}" ]]; then
+        sbatch_opts+=(--mem="${MEM_PER_TASK}")
+    fi
+    if [[ -n "${GPUS:-}" ]]; then
+        sbatch_opts+=(--gres="gpu:${GPUS}")
+    fi
+    if [[ -n "${NODES:-}" ]]; then
+        sbatch_opts+=(--nodes="${NODES}")
+    fi
+    if [[ -n "${NTASKS:-}" ]]; then
+        sbatch_opts+=(--ntasks="${NTASKS}")
+    fi
+    if [[ -n "${CHDIR:-}" ]]; then
+        sbatch_opts+=(--chdir="${CHDIR}")
+    fi
+
+    echo "Submitting job with: sbatch ${sbatch_opts[*]} ${script_path} ${args_file}"
+    sbatch "${sbatch_opts[@]}" "${script_path}" "${args_file}"
+    exit 0
+fi
+
+which python
 
 DATA_PATH=$(jq -r '.data_path' "$args_file")
 NEG_DATA_PATH=$(jq -r '.neg_data_path // empty' "$args_file")
@@ -77,6 +127,10 @@ ITC_DECAY_START_EPOCH=$(jq -r '.itc_decay_start_epoch // empty' "$args_file")
 ITC_DECAY_EPOCHS=$(jq -r '.itc_decay_epochs // empty' "$args_file")
 ITC_DECAY_RATIO=$(jq -r '.itc_decay_ratio // empty' "$args_file")
 ITC_LABEL_SMOOTHING=$(jq -r '.itc_label_smoothing // empty' "$args_file")
+ITC_LOSS_TYPE=$(jq -r '.itc_loss_type // empty' "$args_file")
+SUPCON_TEMPERATURE=$(jq -r '.supcon_temperature // empty' "$args_file")
+SAMPLES_PER_GW=$(jq -r '.samples_per_gw // empty' "$args_file")
+MIN_LC_PER_GW=$(jq -r '.min_lc_per_gw // empty' "$args_file")
 HARD_NEG_START_EPOCH=$(jq -r '.hard_neg_start_epoch // empty' "$args_file")
 HARD_NEG_RAMP_EPOCHS=$(jq -r '.hard_neg_ramp_epochs // empty' "$args_file")
 CLS_START_EPOCH=$(jq -r '.cls_start_epoch // empty' "$args_file")
@@ -286,6 +340,18 @@ if [[ -n "$ITC_DECAY_RATIO" && "$ITC_DECAY_RATIO" != "null" ]]; then
 fi
 if [[ -n "$ITC_LABEL_SMOOTHING" && "$ITC_LABEL_SMOOTHING" != "null" ]]; then
     cmd+=(--itc_label_smoothing "$ITC_LABEL_SMOOTHING")
+fi
+if [[ -n "$ITC_LOSS_TYPE" && "$ITC_LOSS_TYPE" != "null" ]]; then
+    cmd+=(--itc_loss_type "$ITC_LOSS_TYPE")
+fi
+if [[ -n "$SUPCON_TEMPERATURE" && "$SUPCON_TEMPERATURE" != "null" ]]; then
+    cmd+=(--supcon_temperature "$SUPCON_TEMPERATURE")
+fi
+if [[ -n "$SAMPLES_PER_GW" && "$SAMPLES_PER_GW" != "null" ]]; then
+    cmd+=(--samples_per_gw "$SAMPLES_PER_GW")
+fi
+if [[ -n "$MIN_LC_PER_GW" && "$MIN_LC_PER_GW" != "null" ]]; then
+    cmd+=(--min_lc_per_gw "$MIN_LC_PER_GW")
 fi
 if [[ -n "$HARD_NEG_START_EPOCH" && "$HARD_NEG_START_EPOCH" != "null" ]]; then
     cmd+=(--hard_neg_start_epoch "$HARD_NEG_START_EPOCH")
