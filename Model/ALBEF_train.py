@@ -1,7 +1,8 @@
 from data_loader import (
     create_training_dataloader,
     create_train_val_dataloaders,
-    create_supcon_dataloaders
+    create_supcon_dataloaders,
+    create_mixed_gw_dataloaders
 )
 from model import GWOpticalALBEFModel
 from tqdm import tqdm
@@ -201,6 +202,7 @@ def clamp_temperature(model, args):
 def evaluate(model, val_loader, device, args, epoch):
     model.eval()
     has_negatives = args.neg_data_path is not None
+    use_neg_gw_dataloader = args.use_neg_gw
     ref_time_cache = None
     cls_weight = compute_cls_weight(args, epoch)
     itc_weight = compute_itc_weight(args, epoch)
@@ -218,7 +220,15 @@ def evaluate(model, val_loader, device, args, epoch):
 
     with torch.no_grad():
         for batch_data in val_loader:
-            if has_negatives:
+            is_neg_gw_batch = None
+            if use_neg_gw_dataloader:
+                if has_negatives:
+                    (gw_s, gw_m, opt_t, opt_v, opt_mask, opt_err, opt_coords, gw_indices,
+                     neg_t, neg_v, neg_mask, neg_err, neg_coords, is_neg_gw_batch) = batch_data
+                else:
+                    (gw_s, gw_m, opt_t, opt_v, opt_mask, opt_err, opt_coords, gw_indices,
+                     is_neg_gw_batch) = batch_data
+            elif has_negatives:
                 (gw_s, gw_m, opt_t, opt_v, opt_mask, opt_err, opt_coords, gw_indices,
                  neg_t, neg_v, neg_mask, neg_err, neg_coords) = batch_data
             else:
@@ -232,6 +242,12 @@ def evaluate(model, val_loader, device, args, epoch):
             opt_err = opt_err.to(device, non_blocking=True)
             opt_coords = opt_coords.to(device, non_blocking=True)
             gw_indices = gw_indices.to(device, non_blocking=True).long()
+            if is_neg_gw_batch is not None:
+                is_neg_gw_batch = is_neg_gw_batch.to(device, non_blocking=True)
+                if is_neg_gw_batch.any():
+                    neg_positions = torch.where(is_neg_gw_batch)[0]
+                    gw_indices = gw_indices.clone()
+                    gw_indices[neg_positions] = -(neg_positions + 1).to(gw_indices.dtype)
 
             if torch.isnan(opt_v).any() or torch.isinf(opt_v).any():
                 continue
@@ -265,7 +281,8 @@ def evaluate(model, val_loader, device, args, epoch):
             )
             if args.itc_loss_type == "supcon":
                 itc_loss, sim_g2o = model.compute_supcon_loss(
-                    g, z_l, gw_indices, temperature=args.supcon_temperature
+                    g, z_l, gw_indices, temperature=args.supcon_temperature,
+                    margin=args.supcon_margin
                 )
             else:
                 itc_loss, sim_g2o = model.compute_itc_loss(
@@ -275,6 +292,8 @@ def evaluate(model, val_loader, device, args, epoch):
             logits_pos = model.fusion_logits(g, h_l)
             labels_pos = torch.ones(batch_size, device=device, dtype=torch.long)
             labels_neg = torch.zeros(batch_size, device=device, dtype=torch.long)
+            if is_neg_gw_batch is not None:
+                labels_pos = torch.where(is_neg_gw_batch, labels_neg, labels_pos)
             pos_loss = model.cls_criterion(logits_pos, labels_pos)
 
             easy_idx = sample_easy_negatives(batch_size, device)
@@ -376,8 +395,35 @@ def train(args):
     print(f"TensorBoard logging started at: {log_dir}")
 
     val_loader = None
+    use_neg_gw_dataloader = False  # Track if we're using mixed GW dataloader
     if args.val_split is not None and 0 < args.val_split < 1:
-        if args.itc_loss_type == "supcon":
+        if args.use_neg_gw:
+            # Use mixed GW dataloader with negative GW events
+            train_loader, val_loader, steps_per_epoch, val_steps = create_mixed_gw_dataloaders(
+                h5_path=args.data_path,
+                batch_size=args.batch_size,
+                neg_gw_ratio=args.neg_gw_ratio,
+                samples_per_gw=args.samples_per_gw if args.itc_loss_type == "supcon" else 1,
+                val_batch_size=args.val_batch_size,
+                steps_per_epoch=args.steps_per_epoch,
+                val_steps_per_epoch=args.val_steps_per_epoch,
+                val_split=args.val_split,
+                split_seed=args.split_seed,
+                num_workers=args.num_workers,
+                pin_memory=bool(args.pin_memory),
+                persistent_workers=bool(args.persistent_workers),
+                prefetch_factor=args.prefetch_factor,
+                cache_in_memory=bool(args.cache_in_memory),
+                negative_h5_path=args.neg_data_path,
+                negative_group=args.neg_group,
+                min_lc_per_gw=args.min_lc_per_gw
+            )
+            use_neg_gw_dataloader = True
+            print(
+                f"Mixed GW mode: {args.neg_gw_ratio*100:.0f}% negative GW per batch, "
+                f"batch_size={args.batch_size}"
+            )
+        elif args.itc_loss_type == "supcon":
             train_loader, val_loader, steps_per_epoch, val_steps = create_supcon_dataloaders(
                 h5_path=args.data_path,
                 batch_size=args.batch_size,
@@ -514,7 +560,17 @@ def train(args):
         )
         
         for batch_idx, batch_data in enumerate(pbar):
-            if has_negatives:
+            is_neg_gw_batch = None  # Track which samples are negative GW pairs
+            if use_neg_gw_dataloader:
+                if has_negatives:
+                    # Mixed GW dataloader with negative optical samples
+                    (gw_s, gw_m, opt_t, opt_v, opt_mask, opt_err, opt_coords, gw_indices,
+                     neg_t, neg_v, neg_mask, neg_err, neg_coords, is_neg_gw_batch) = batch_data
+                else:
+                    # Mixed GW dataloader: 9 elements with is_neg_gw flag
+                    (gw_s, gw_m, opt_t, opt_v, opt_mask, opt_err, opt_coords, gw_indices,
+                     is_neg_gw_batch) = batch_data
+            elif has_negatives:
                 (gw_s, gw_m, opt_t, opt_v, opt_mask, opt_err, opt_coords, gw_indices,
                  neg_t, neg_v, neg_mask, neg_err, neg_coords) = batch_data
             else:
@@ -523,18 +579,24 @@ def train(args):
             gw_s = gw_s.to(device, non_blocking=True)
             gw_m = gw_m.to(device, non_blocking=True)
             # 应用GW数据增强（仅训练时）
-            gw_s, gw_m = augment_gw_data(
-                gw_s, gw_m, training=True,
-                noise_std=args.gw_aug_noise,
-                scalar_jitter=args.gw_aug_jitter,
-                channel_dropout_prob=args.gw_aug_dropout
-            )
+            # gw_s, gw_m = augment_gw_data(
+            #     gw_s, gw_m, training=True,
+            #     noise_std=args.gw_aug_noise,
+            #     scalar_jitter=args.gw_aug_jitter,
+            #     channel_dropout_prob=args.gw_aug_dropout
+            # )
             opt_t = opt_t.to(device, non_blocking=True)
             opt_v = opt_v.to(device, non_blocking=True)
             opt_mask = opt_mask.to(device, non_blocking=True)
             opt_err = opt_err.to(device, non_blocking=True)
             opt_coords = opt_coords.to(device, non_blocking=True)
             gw_indices = gw_indices.to(device, non_blocking=True).long()
+            if is_neg_gw_batch is not None:
+                is_neg_gw_batch = is_neg_gw_batch.to(device, non_blocking=True)
+                if is_neg_gw_batch.any():
+                    neg_positions = torch.where(is_neg_gw_batch)[0]
+                    gw_indices = gw_indices.clone()
+                    gw_indices[neg_positions] = -(neg_positions + 1).to(gw_indices.dtype)
 
             if torch.isnan(opt_v).any() or torch.isinf(opt_v).any():
                 print("NaN or Inf detected in optical values. Skipping batch.")
@@ -556,21 +618,21 @@ def train(args):
                     print("NaN or Inf detected in negative optical errors. Skipping batch.")
                     continue
 
-            opt_t, opt_v, opt_mask, opt_err = augment_optical_data(
-                opt_t, opt_v, opt_mask, opt_err, training=True,
-                time_jitter=args.opt_aug_time_jitter,
-                flux_noise=args.opt_aug_noise,
-                obs_dropout=args.opt_aug_dropout,
-                band_dropout=args.opt_aug_band_dropout
-            )
-            if has_negatives:
-                neg_t, neg_v, neg_mask, neg_err = augment_optical_data(
-                    neg_t, neg_v, neg_mask, neg_err, training=True,
-                    time_jitter=args.opt_aug_time_jitter,
-                    flux_noise=args.opt_aug_noise,
-                    obs_dropout=args.opt_aug_dropout,
-                    band_dropout=args.opt_aug_band_dropout
-                )
+            # opt_t, opt_v, opt_mask, opt_err = augment_optical_data(
+            #     opt_t, opt_v, opt_mask, opt_err, training=True,
+            #     time_jitter=args.opt_aug_time_jitter,
+            #     flux_noise=args.opt_aug_noise,
+            #     obs_dropout=args.opt_aug_dropout,
+            #     band_dropout=args.opt_aug_band_dropout
+            # )
+            # if has_negatives:
+                # neg_t, neg_v, neg_mask, neg_err = augment_optical_data(
+                #     neg_t, neg_v, neg_mask, neg_err, training=True,
+                #     time_jitter=args.opt_aug_time_jitter,
+                #     flux_noise=args.opt_aug_noise,
+                #     obs_dropout=args.opt_aug_dropout,
+                #     band_dropout=args.opt_aug_band_dropout
+                # )
 
             batch_size = gw_s.size(0)
 
@@ -591,7 +653,8 @@ def train(args):
             )
             if args.itc_loss_type == "supcon":
                 itc_loss, sim_g2o = model.compute_supcon_loss(
-                    g, z_l, gw_indices, temperature=args.supcon_temperature
+                    g, z_l, gw_indices, temperature=args.supcon_temperature,
+                    margin=args.supcon_margin
                 )
             else:
                 itc_loss, sim_g2o = model.compute_itc_loss(
@@ -601,6 +664,9 @@ def train(args):
             logits_pos = model.fusion_logits(g, h_l)
             labels_pos = torch.ones(batch_size, device=device, dtype=torch.long)
             labels_neg = torch.zeros(batch_size, device=device, dtype=torch.long)
+            # For negative GW pairs, the label should be 0 (no match)
+            if is_neg_gw_batch is not None:
+                labels_pos = torch.where(is_neg_gw_batch, labels_neg, labels_pos)
             pos_loss = model.cls_criterion(logits_pos, labels_pos)
 
             easy_idx = sample_easy_negatives(batch_size, device)
@@ -609,7 +675,11 @@ def train(args):
             elif hard_neg_ratio <= 0:
                 neg_idx = easy_idx
             else:
-                hard_idx = model.sample_hard_negatives(sim_g2o, gw_indices)
+                # Use semi-hard mining if top_k > 1, otherwise use hardest
+                if args.hard_neg_top_k > 1:
+                    hard_idx = model.sample_semi_hard_negatives(sim_g2o, gw_indices, top_k=args.hard_neg_top_k)
+                else:
+                    hard_idx = model.sample_hard_negatives(sim_g2o, gw_indices)
                 if hard_neg_ratio >= 1:
                     neg_idx = hard_idx
                 else:
@@ -844,14 +914,22 @@ if __name__ == "__main__":
                         help="ITC loss type: 'infonce' (original) or 'supcon' (supervised contrastive)")
     parser.add_argument("--supcon_temperature", type=float, default=0.1,
                         help="Temperature for SupCon loss (typically 0.07-0.2)")
+    parser.add_argument("--supcon_margin", type=float, default=0.0,
+                        help="Margin for SupCon loss to enforce separation between positives and negatives (default: 0.0)")
     parser.add_argument("--samples_per_gw", type=int, default=4,
                         help="Number of optical samples per GW event for SupCon (default: 4)")
     parser.add_argument("--min_lc_per_gw", type=int, default=2,
                         help="Minimum light curves required for a GW to be eligible for SupCon")
+    parser.add_argument("--use_neg_gw", action='store_true',
+                        help="Include negative GW events (BNS without KN) in training")
+    parser.add_argument("--neg_gw_ratio", type=float, default=0.2,
+                        help="Ratio of negative GW samples per batch (default: 0.2)")
     parser.add_argument("--mask_itc", action='store_true', help="Mask same-event pairs in ITC loss")
     parser.add_argument("--hard_neg_start_epoch", type=int, default=0)
     parser.add_argument("--hard_neg_ramp_epochs", type=int, default=0,
                         help="Epochs to ramp hard negative ratio to 1.0 (0 to disable)")
+    parser.add_argument("--hard_neg_top_k", type=int, default=1,
+                        help="Sample from top-k hardest negatives instead of always hardest (default: 1 = hardest only)")
     parser.add_argument("--cls_start_epoch", type=int, default=0,
                         help="Epoch to start CLS training. Before this epoch, only ITC loss is used (for staged training)")
     parser.add_argument("--use_lightweight_gw", action='store_true',
