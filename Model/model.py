@@ -876,7 +876,7 @@ class GWOpticalALBEFModel(nn.Module):
 
         return total_loss, sim_g2o
 
-    def compute_supcon_loss(self, g, z_l, gw_indices, temperature=0.07):
+    def compute_supcon_loss(self, g, z_l, gw_indices, temperature=0.07, margin=0.0):
         """
         Supervised Contrastive Loss for many-to-many GW-optical matching.
 
@@ -886,6 +886,16 @@ class GWOpticalALBEFModel(nn.Module):
         - Treats all samples with same gw_index as positives
         - Normalizes loss by number of positives per anchor
         - More stable with multiple positives per class
+
+        Args:
+            g: GW embeddings [batch, dim]
+            z_l: Optical embeddings [batch, dim]
+            gw_indices: GW event indices for each sample
+            temperature: Temperature scaling factor
+            margin: Margin to enforce between positive and negative similarities.
+                    When margin > 0, negatives are penalized by subtracting margin
+                    from their similarity, pushing positives to be more similar
+                    than negatives by at least this margin.
         """
         feat_g = F.normalize(self.gw_proj(g), p=2, dim=1, eps=1e-8)
         feat_o = F.normalize(self.opt_proj(z_l), p=2, dim=1, eps=1e-8)
@@ -901,8 +911,15 @@ class GWOpticalALBEFModel(nn.Module):
         labels_eq = labels.unsqueeze(0) == labels.unsqueeze(1)
         mask_pos = labels_eq.float()
         mask_pos.fill_diagonal_(0)
+        mask_neg = 1.0 - labels_eq.float()
 
         mask_self = torch.eye(2 * batch_size, device=device, dtype=torch.bool)
+
+        # Apply margin: subtract margin from negative similarities
+        # This encourages positives to be more similar than negatives by margin
+        if margin > 0:
+            margin_matrix = margin * mask_neg / temperature
+            sim_matrix = sim_matrix - margin_matrix
 
         logits_max, _ = sim_matrix.max(dim=1, keepdim=True)
         logits = sim_matrix - logits_max.detach()
@@ -937,6 +954,47 @@ class GWOpticalALBEFModel(nn.Module):
         sim = sim.masked_fill(same_event, -1e9)
         hard_idx = sim.argmax(dim=1)
         return hard_idx
+
+    @staticmethod
+    def sample_semi_hard_negatives(sim_g2o, gw_indices=None, top_k=5):
+        """
+        Sample semi-hard negatives instead of the hardest.
+
+        Instead of always selecting the most similar negative (which can be
+        more similar than positives), randomly sample from the top-k most
+        similar negatives. This provides a curriculum of increasing difficulty.
+
+        Args:
+            sim_g2o: Similarity matrix [batch, batch]
+            gw_indices: GW event indices to identify same-event pairs
+            top_k: Number of top similar negatives to sample from
+
+        Returns:
+            semi_hard_idx: Selected negative indices [batch]
+        """
+        sim = sim_g2o.detach()
+        batch_size = sim.size(0)
+        device = sim.device
+
+        # Mask same-event pairs
+        if gw_indices is not None:
+            same_event = gw_indices.unsqueeze(0) == gw_indices.unsqueeze(1)
+        else:
+            same_event = torch.eye(batch_size, device=device, dtype=torch.bool)
+        sim = sim.masked_fill(same_event, -1e9)
+
+        # Ensure top_k doesn't exceed available negatives
+        n_negatives = (~same_event).sum(dim=1).min().item()
+        actual_k = min(top_k, max(1, n_negatives))
+
+        # Get top-k similar negatives for each anchor
+        topk_vals, topk_idx = sim.topk(actual_k, dim=1)
+
+        # Randomly sample from top-k (not always the hardest)
+        rand_select = torch.randint(0, actual_k, (batch_size,), device=device)
+        semi_hard_idx = topk_idx[torch.arange(batch_size, device=device), rand_select]
+
+        return semi_hard_idx
 
 # ==============================================================================
 # 9. Lightweight GW Encoder (解决过拟合问题)

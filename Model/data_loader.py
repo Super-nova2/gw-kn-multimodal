@@ -56,7 +56,8 @@ class RelationalHDF5Dataset(Dataset):
         h5_path: str,
         negative_h5_path: str = None,
         negative_group: str = "events/optical_data",
-        cache_in_memory: bool = False
+        cache_in_memory: bool = False,
+        use_neg_gw: bool = False
     ):
         super().__init__()
         self.h5_path = h5_path
@@ -68,7 +69,12 @@ class RelationalHDF5Dataset(Dataset):
         self.cache_in_memory = cache_in_memory
         self.data_cache = None
         self.neg_cache = None
-        
+
+        # Negative GW support (BNS events without KN)
+        self.use_neg_gw = use_neg_gw
+        self.neg_gw_indices = None
+        self.n_pos_gw = None
+
         # Open file temporarily to get dataset length
         with h5py.File(h5_path, 'r') as f:
             self.length = f['events/optical_data/values'].shape[0]
@@ -84,6 +90,18 @@ class RelationalHDF5Dataset(Dataset):
                     "gw_scalar": f['events/gw_data/scalars'][:],
                     "gw_skymap": f['events/gw_data/skymaps'][:]
                 }
+
+            # Load negative GW data if available and requested
+            if use_neg_gw and 'events/gw_data/has_kn' in f:
+                has_kn = f['events/gw_data/has_kn'][:]
+                self.neg_gw_indices = np.where(has_kn == 0)[0]
+                self.n_pos_gw = int(np.sum(has_kn == 1))
+                print(f"Loaded {len(self.neg_gw_indices)} negative GW events (no KN)")
+
+                if self.cache_in_memory:
+                    # Cache negative GW data separately for efficient sampling
+                    self.data_cache["neg_gw_scalar"] = f['events/gw_data/scalars'][self.neg_gw_indices]
+                    self.data_cache["neg_gw_skymap"] = f['events/gw_data/skymaps'][self.neg_gw_indices]
         
         if self.negative_h5_path is not None:
             with h5py.File(self.negative_h5_path, 'r') as f:
@@ -108,6 +126,21 @@ class RelationalHDF5Dataset(Dataset):
         Args:
             idx: Index of the light curve (optical data).
         """
+        neg_gw_local_idx = None
+        if isinstance(idx, (tuple, list)):
+            if len(idx) != 2:
+                raise TypeError("Expected index int or (opt_idx, neg_gw_local_idx) tuple.")
+            opt_idx, neg_gw_local_idx = idx
+        elif isinstance(idx, np.ndarray):
+            if idx.shape == ():
+                opt_idx = int(idx)
+            elif idx.size == 2:
+                opt_idx, neg_gw_local_idx = idx.tolist()
+            else:
+                raise TypeError("Expected index int or (opt_idx, neg_gw_local_idx) tuple.")
+        else:
+            opt_idx = idx
+
         if self.data_cache is None:
             # Lazy loading: Open file only when needed (crucial for num_workers > 0)
             if self.h5_file is None:
@@ -115,28 +148,40 @@ class RelationalHDF5Dataset(Dataset):
 
             # 1. Retrieve Optical Data (Values, Errors, Masks, Times)
             #    HDF5 structure: events/optical_data/...
-            opt_val = torch.from_numpy(self.h5_file['events/optical_data/values'][idx])
-            opt_err = torch.from_numpy(self.h5_file['events/optical_data/errors'][idx])
-            opt_mask = torch.from_numpy(self.h5_file['events/optical_data/masks'][idx])
-            opt_time = torch.from_numpy(self.h5_file['events/optical_data/times'][idx])
-            opt_coords = torch.from_numpy(self.h5_file['events/optical_data/coordinates'][idx])
+            opt_val = torch.from_numpy(self.h5_file['events/optical_data/values'][opt_idx])
+            opt_err = torch.from_numpy(self.h5_file['events/optical_data/errors'][opt_idx])
+            opt_mask = torch.from_numpy(self.h5_file['events/optical_data/masks'][opt_idx])
+            opt_time = torch.from_numpy(self.h5_file['events/optical_data/times'][opt_idx])
+            opt_coords = torch.from_numpy(self.h5_file['events/optical_data/coordinates'][opt_idx])
 
             # 2. Retrieve Parent GW Index
-            gw_idx = self.h5_file['events/optical_data/parent_gw_idx'][idx]
+            gw_idx = self.h5_file['events/optical_data/parent_gw_idx'][opt_idx]
 
             # 3. Retrieve Unique GW Data using gw_idx
             #    HDF5 structure: events/gw/...
             gw_scalar = torch.from_numpy(self.h5_file['events/gw_data/scalars'][gw_idx])
             gw_skymap = torch.from_numpy(self.h5_file['events/gw_data/skymaps'][gw_idx])
         else:
-            opt_val = torch.from_numpy(self.data_cache["opt_val"][idx])
-            opt_err = torch.from_numpy(self.data_cache["opt_err"][idx])
-            opt_mask = torch.from_numpy(self.data_cache["opt_mask"][idx])
-            opt_time = torch.from_numpy(self.data_cache["opt_time"][idx])
-            opt_coords = torch.from_numpy(self.data_cache["opt_coords"][idx])
-            gw_idx = self.data_cache["parent_gw_idx"][idx]
+            opt_val = torch.from_numpy(self.data_cache["opt_val"][opt_idx])
+            opt_err = torch.from_numpy(self.data_cache["opt_err"][opt_idx])
+            opt_mask = torch.from_numpy(self.data_cache["opt_mask"][opt_idx])
+            opt_time = torch.from_numpy(self.data_cache["opt_time"][opt_idx])
+            opt_coords = torch.from_numpy(self.data_cache["opt_coords"][opt_idx])
+            gw_idx = self.data_cache["parent_gw_idx"][opt_idx]
             gw_scalar = torch.from_numpy(self.data_cache["gw_scalar"][gw_idx])
             gw_skymap = torch.from_numpy(self.data_cache["gw_skymap"][gw_idx])
+
+        is_neg_gw = False
+        if (
+            neg_gw_local_idx is not None
+            and self.use_neg_gw
+            and int(neg_gw_local_idx) >= 0
+        ):
+            neg_gw_s, neg_gw_m = self.get_neg_gw_sample(int(neg_gw_local_idx))
+            if neg_gw_s is not None and neg_gw_m is not None:
+                gw_scalar = neg_gw_s
+                gw_skymap = neg_gw_m
+                is_neg_gw = True
         
         # Optional: Retrieve Negative Optical Data (non-KN or unrelated transient)
         if self.negative_h5_path is not None:
@@ -158,6 +203,11 @@ class RelationalHDF5Dataset(Dataset):
 
             # Return tuple: (GW_Inputs, Optical_Inputs, Metadata, Negative_Optical_Inputs)
             # gw_idx is returned for masking the contrastive loss (handling same-source negatives)
+            if neg_gw_local_idx is not None:
+                return (
+                    gw_scalar, gw_skymap, opt_time, opt_val, opt_mask, opt_err, opt_coords, int(gw_idx),
+                    neg_time, neg_val, neg_mask, neg_err, neg_coords, is_neg_gw
+                )
             return (
                 gw_scalar, gw_skymap, opt_time, opt_val, opt_mask, opt_err, opt_coords, int(gw_idx),
                 neg_time, neg_val, neg_mask, neg_err, neg_coords
@@ -165,8 +215,40 @@ class RelationalHDF5Dataset(Dataset):
 
         # Return tuple: (GW_Inputs, Optical_Inputs, Metadata)
         # gw_idx is returned for masking the contrastive loss (handling same-source negatives)
+        if neg_gw_local_idx is not None:
+            return gw_scalar, gw_skymap, opt_time, opt_val, opt_mask, opt_err, opt_coords, int(gw_idx), is_neg_gw
         return gw_scalar, gw_skymap, opt_time, opt_val, opt_mask, opt_err, opt_coords, int(gw_idx)
-    
+
+    def get_neg_gw_sample(self, local_idx: int = None):
+        """
+        Sample a random negative GW event (BNS without KN).
+
+        Args:
+            local_idx: Optional index into neg_gw_indices array. If None, random.
+
+        Returns:
+            Tuple of (gw_scalar, gw_skymap) as torch tensors.
+        """
+        if self.neg_gw_indices is None or len(self.neg_gw_indices) == 0:
+            return None, None
+
+        if local_idx is None:
+            local_idx = np.random.randint(len(self.neg_gw_indices))
+
+        if self.data_cache is not None and "neg_gw_scalar" in self.data_cache:
+            gw_scalar = torch.from_numpy(self.data_cache["neg_gw_scalar"][local_idx].copy())
+            gw_skymap = torch.from_numpy(self.data_cache["neg_gw_skymap"][local_idx].copy())
+        else:
+            # Load from file
+            if self.h5_file is None:
+                self.h5_file = h5py.File(self.h5_path, 'r')
+            actual_idx = self.neg_gw_indices[local_idx]
+            gw_scalar = torch.from_numpy(self.h5_file['events/gw_data/scalars'][actual_idx])
+            gw_skymap = torch.from_numpy(self.h5_file['events/gw_data/skymaps'][actual_idx])
+
+        return gw_scalar, gw_skymap
+
+
 class BalancedGWBatchedSampler(Sampler):
     """
     Custom Batch Sampler that ensures:
@@ -292,6 +374,121 @@ class MultiPositiveGWBatchedSampler(Sampler):
 
     def __len__(self):
         return self.steps_per_epoch
+
+
+class MixedGWBatchedSampler(Sampler):
+    """
+    Batch sampler that includes both positive and negative GW events.
+
+    Structure per batch (batch_size=128, neg_gw_ratio=0.2):
+    - 102 positive GW-optical pairs (80%)
+    - 26 negative GW paired with random optical (20%)
+
+    The sampler yields lists of (opt_idx, neg_gw_local_idx) tuples:
+    - opt_idx: Optical sample index
+    - neg_gw_local_idx: -1 means "use parent GW", >= 0 means "use negative GW at this local index"
+    """
+    def __init__(
+        self,
+        gw_to_lc_map: dict,
+        neg_gw_indices: np.ndarray,
+        batch_size: int,
+        steps_per_epoch: int,
+        neg_gw_ratio: float = 0.2,
+        samples_per_gw: int = 1
+    ):
+        """
+        Args:
+            gw_to_lc_map: Dictionary mapping positive GW_ID -> [LC_ID_1, LC_ID_2, ...]
+            neg_gw_indices: Array of local indices into dataset.neg_gw_indices
+            batch_size: Total samples per batch
+            steps_per_epoch: Number of batches per epoch
+            neg_gw_ratio: Fraction of batch to fill with negative GW pairs
+            samples_per_gw: Number of optical samples per GW (for SupCon compatibility)
+        """
+        self.gw_to_lc_map = gw_to_lc_map
+        self.neg_gw_local_indices = np.array(neg_gw_indices, dtype=int)
+        self.batch_size = batch_size
+        self.steps_per_epoch = steps_per_epoch
+        self.neg_gw_ratio = neg_gw_ratio
+        self.samples_per_gw = samples_per_gw
+
+        self.pos_gw_ids = list(gw_to_lc_map.keys())
+        self.n_neg_per_batch = int(batch_size * neg_gw_ratio)
+        self.n_pos_per_batch = batch_size - self.n_neg_per_batch
+
+        # Collect all optical indices for negative pairing
+        self.all_opt_indices = []
+        for lcs in gw_to_lc_map.values():
+            self.all_opt_indices.extend(lcs)
+        self.all_opt_indices = np.array(self.all_opt_indices)
+
+        # Adjust for SupCon mode
+        if samples_per_gw > 1:
+            self.n_gw_per_batch = self.n_pos_per_batch // samples_per_gw
+            self.n_pos_per_batch = self.n_gw_per_batch * samples_per_gw
+            self.n_neg_per_batch = self.batch_size - self.n_pos_per_batch
+        else:
+            self.n_gw_per_batch = self.n_pos_per_batch
+
+        if self.n_gw_per_batch > len(self.pos_gw_ids):
+            raise ValueError(
+                f"Not enough positive GW events. Need {self.n_gw_per_batch}, have {len(self.pos_gw_ids)}"
+            )
+        if len(self.neg_gw_local_indices) == 0 and self.n_neg_per_batch > 0:
+            raise ValueError("No negative GW indices provided for mixed sampling.")
+
+        print(
+            f"MixedGWBatchedSampler: {len(self.pos_gw_ids)} positive GW, "
+            f"{len(self.neg_gw_local_indices)} negative GW, "
+            f"{self.n_pos_per_batch} pos/batch, {self.n_neg_per_batch} neg/batch"
+        )
+
+    def __iter__(self) -> Iterator[list]:
+        for _ in range(self.steps_per_epoch):
+            batch_opt_indices = []
+            batch_neg_gw_local_indices = []  # -1 for positive, local index for negative
+
+            # 1. Sample positive GW-optical pairs
+            if self.samples_per_gw > 1:
+                # SupCon mode: multiple samples per GW
+                batch_gw_ids = np.random.choice(
+                    self.pos_gw_ids, self.n_gw_per_batch, replace=False
+                )
+                for gw_id in batch_gw_ids:
+                    lcs = self.gw_to_lc_map[gw_id]
+                    replace = len(lcs) < self.samples_per_gw
+                    chosen_lcs = np.random.choice(lcs, self.samples_per_gw, replace=replace)
+                    batch_opt_indices.extend(chosen_lcs.tolist())
+                    batch_neg_gw_local_indices.extend([-1] * self.samples_per_gw)
+            else:
+                # Standard mode: one sample per GW
+                batch_gw_ids = np.random.choice(
+                    self.pos_gw_ids, self.n_pos_per_batch, replace=False
+                )
+                for gw_id in batch_gw_ids:
+                    lcs = self.gw_to_lc_map[gw_id]
+                    batch_opt_indices.append(np.random.choice(lcs))
+                    batch_neg_gw_local_indices.append(-1)
+
+            # 2. Sample negative GW pairs
+            # Random optical indices paired with random negative GW
+            if self.n_neg_per_batch > 0:
+                opt_replace = self.n_neg_per_batch > len(self.all_opt_indices)
+                neg_opt = np.random.choice(self.all_opt_indices, self.n_neg_per_batch, replace=opt_replace)
+                neg_replace = self.n_neg_per_batch > len(self.neg_gw_local_indices)
+                neg_gw_local = np.random.choice(
+                    self.neg_gw_local_indices, self.n_neg_per_batch, replace=neg_replace
+                )
+                batch_opt_indices.extend(neg_opt.tolist())
+                batch_neg_gw_local_indices.extend(neg_gw_local.tolist())
+
+            batch_pairs = list(zip(batch_opt_indices, batch_neg_gw_local_indices))
+            yield batch_pairs
+
+    def __len__(self):
+        return self.steps_per_epoch
+
 
 class GWBatchedSampler(Sampler):
     """
@@ -591,6 +788,153 @@ def create_supcon_dataloaders(
         samples_per_gw=samples_per_gw,
         steps_per_epoch=val_steps_per_epoch,
         min_lc_per_gw=min_lc_per_gw
+    )
+
+    train_loader = _build_dataloader(
+        train_dataset,
+        train_sampler,
+        num_workers,
+        pin_memory,
+        persistent_workers,
+        prefetch_factor
+    )
+    val_loader = _build_dataloader(
+        val_dataset,
+        val_sampler,
+        num_workers,
+        pin_memory,
+        persistent_workers,
+        prefetch_factor
+    )
+
+    return train_loader, val_loader, steps_per_epoch, len(val_sampler)
+
+
+def create_mixed_gw_dataloaders(
+    h5_path: str,
+    batch_size: int = 128,
+    neg_gw_ratio: float = 0.2,
+    samples_per_gw: int = 1,
+    val_batch_size: int = None,
+    steps_per_epoch: int = None,
+    val_steps_per_epoch: int = None,
+    val_split: float = 0.1,
+    split_seed: int = 42,
+    num_workers: int = 4,
+    pin_memory: bool = True,
+    persistent_workers: bool = True,
+    prefetch_factor: int = 4,
+    negative_h5_path: str = None,
+    negative_group: str = "events/optical_data",
+    cache_in_memory: bool = False,
+    min_lc_per_gw: int = 1
+):
+    """
+    Create dataloaders with mixed positive/negative GW sampling.
+
+    Each batch contains:
+    - (1 - neg_gw_ratio) * batch_size positive GW-optical pairs
+    - neg_gw_ratio * batch_size negative GW paired with random optical
+
+    Args:
+        h5_path: Path to HDF5 file with has_kn field in gw_data
+        batch_size: Total samples per batch
+        neg_gw_ratio: Fraction of batch with negative GW (default 0.2 = 20%)
+        samples_per_gw: Optical samples per GW for positive pairs (SupCon mode)
+        val_batch_size: Validation batch size (default: same as batch_size)
+        steps_per_epoch: Training steps per epoch (default: auto-calculated)
+        val_steps_per_epoch: Validation steps per epoch (default: auto-calculated)
+        val_split: Fraction of GW events for validation
+        split_seed: Random seed for train/val split
+        num_workers: DataLoader workers
+        pin_memory: Pin memory for GPU transfer
+        persistent_workers: Keep workers alive between epochs
+        prefetch_factor: Prefetch batches per worker
+        negative_h5_path: Path to negative optical samples (non-KN transients)
+        negative_group: HDF5 group for negative optical data
+        cache_in_memory: Cache datasets in memory
+        min_lc_per_gw: Minimum light curves per GW event
+
+    Returns:
+        train_loader, val_loader, steps_per_epoch, val_steps
+    """
+    if cache_in_memory and num_workers > 0:
+        print("cache_in_memory=True with num_workers>0 may increase RAM usage.")
+
+    gw_map = build_gw_to_lc_mapping(h5_path)
+    train_map, val_map = split_gw_map(gw_map, val_split, split_seed)
+
+    # Create dataset with negative GW support
+    if cache_in_memory:
+        shared_dataset = RelationalHDF5Dataset(
+            h5_path,
+            negative_h5_path=negative_h5_path,
+            negative_group=negative_group,
+            cache_in_memory=cache_in_memory,
+            use_neg_gw=True
+        )
+        train_dataset = shared_dataset
+        val_dataset = shared_dataset
+    else:
+        train_dataset = RelationalHDF5Dataset(
+            h5_path,
+            negative_h5_path=negative_h5_path,
+            negative_group=negative_group,
+            cache_in_memory=cache_in_memory,
+            use_neg_gw=True
+        )
+        val_dataset = RelationalHDF5Dataset(
+            h5_path,
+            negative_h5_path=negative_h5_path,
+            negative_group=negative_group,
+            cache_in_memory=cache_in_memory,
+            use_neg_gw=True
+        )
+
+    # Check that negative GW data is available
+    if train_dataset.neg_gw_indices is None or len(train_dataset.neg_gw_indices) == 0:
+        raise ValueError(
+            f"No negative GW events found in {h5_path}. "
+            f"Ensure the dataset has 'events/gw_data/has_kn' field."
+        )
+
+    # Calculate steps
+    if steps_per_epoch is None:
+        total_train_optical = sum(len(lcs) for lcs in train_map.values())
+        steps_per_epoch = max(1, total_train_optical // batch_size)
+
+    if val_batch_size is None:
+        val_batch_size = batch_size
+    if val_steps_per_epoch is None:
+        total_val_optical = sum(len(lcs) for lcs in val_map.values())
+        val_steps_per_epoch = max(1, total_val_optical // val_batch_size)
+
+    # Split negative GW indices across train/val (local indices into dataset.neg_gw_indices)
+    neg_local_indices = np.arange(len(train_dataset.neg_gw_indices))
+    rng = np.random.default_rng(split_seed)
+    rng.shuffle(neg_local_indices)
+    val_neg_count = max(1, int(len(neg_local_indices) * val_split))
+    if len(neg_local_indices) - val_neg_count < 1:
+        val_neg_count = max(0, len(neg_local_indices) - 1)
+    val_neg_local = neg_local_indices[:val_neg_count]
+    train_neg_local = neg_local_indices[val_neg_count:]
+
+    # Create mixed samplers
+    train_sampler = MixedGWBatchedSampler(
+        gw_to_lc_map=train_map,
+        neg_gw_indices=train_neg_local,
+        batch_size=batch_size,
+        steps_per_epoch=steps_per_epoch,
+        neg_gw_ratio=neg_gw_ratio,
+        samples_per_gw=samples_per_gw
+    )
+    val_sampler = MixedGWBatchedSampler(
+        gw_to_lc_map=val_map,
+        neg_gw_indices=val_neg_local,
+        batch_size=val_batch_size,
+        steps_per_epoch=val_steps_per_epoch,
+        neg_gw_ratio=neg_gw_ratio,
+        samples_per_gw=samples_per_gw
     )
 
     train_loader = _build_dataloader(
