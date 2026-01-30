@@ -79,17 +79,26 @@ class RelationalHDF5Dataset(Dataset):
         with h5py.File(h5_path, 'r') as f:
             self.length = f['events/optical_data/values'].shape[0]
             if self.cache_in_memory:
-                print(f"Caching positive dataset in memory from {h5_path}...")
+                print(f"Caching positive dataset in memory from {h5_path} (as tensors)...")
                 self.data_cache = {
-                    "opt_val": f['events/optical_data/values'][:],
-                    "opt_err": f['events/optical_data/errors'][:],
-                    "opt_mask": f['events/optical_data/masks'][:],
-                    "opt_time": f['events/optical_data/times'][:],
-                    "opt_coords": f['events/optical_data/coordinates'][:],
-                    "parent_gw_idx": f['events/optical_data/parent_gw_idx'][:],
-                    "gw_scalar": f['events/gw_data/scalars'][:],
-                    "gw_skymap": f['events/gw_data/skymaps'][:]
+                    "opt_val": torch.from_numpy(f['events/optical_data/values'][:]),
+                    "opt_err": torch.from_numpy(f['events/optical_data/errors'][:]),
+                    "opt_mask": torch.from_numpy(f['events/optical_data/masks'][:]),
+                    "opt_time": torch.from_numpy(f['events/optical_data/times'][:]),
+                    "opt_coords": torch.from_numpy(f['events/optical_data/coordinates'][:]),
+                    "parent_gw_idx": f['events/optical_data/parent_gw_idx'][:],  # keep numpy for indexing
+                    "gw_scalar": torch.from_numpy(f['events/gw_data/scalars'][:]),
+                    "gw_skymap": torch.from_numpy(f['events/gw_data/skymaps'][:])
                 }
+                # Validate data integrity once at load time
+                assert not torch.isnan(self.data_cache["opt_val"]).any(), "NaN found in cached optical values"
+                assert not torch.isinf(self.data_cache["opt_val"]).any(), "Inf found in cached optical values"
+                assert not torch.isnan(self.data_cache["opt_err"]).any(), "NaN found in cached optical errors"
+                assert not torch.isinf(self.data_cache["opt_err"]).any(), "Inf found in cached optical errors"
+                # Move tensors to shared memory to avoid CoW duplication in forked workers
+                for k, v in self.data_cache.items():
+                    if isinstance(v, torch.Tensor):
+                        self.data_cache[k] = v.share_memory_()
 
             # Load negative GW data if available and requested
             if use_neg_gw and 'events/gw_data/has_kn' in f:
@@ -99,9 +108,9 @@ class RelationalHDF5Dataset(Dataset):
                 print(f"Loaded {len(self.neg_gw_indices)} negative GW events (no KN)")
 
                 if self.cache_in_memory:
-                    # Cache negative GW data separately for efficient sampling
-                    self.data_cache["neg_gw_scalar"] = f['events/gw_data/scalars'][self.neg_gw_indices]
-                    self.data_cache["neg_gw_skymap"] = f['events/gw_data/skymaps'][self.neg_gw_indices]
+                    # Cache negative GW data separately for efficient sampling (as tensors)
+                    self.data_cache["neg_gw_scalar"] = torch.from_numpy(f['events/gw_data/scalars'][self.neg_gw_indices]).share_memory_()
+                    self.data_cache["neg_gw_skymap"] = torch.from_numpy(f['events/gw_data/skymaps'][self.neg_gw_indices]).share_memory_()
         
         if self.negative_h5_path is not None:
             with h5py.File(self.negative_h5_path, 'r') as f:
@@ -109,14 +118,21 @@ class RelationalHDF5Dataset(Dataset):
                     raise KeyError(f"Negative group '{self.negative_group}' not found in {self.negative_h5_path}")
                 self.neg_length = f[f"{self.negative_group}/values"].shape[0]
                 if self.cache_in_memory:
-                    print(f"Caching negative dataset in memory from {self.negative_h5_path}...")
+                    print(f"Caching negative dataset in memory from {self.negative_h5_path} (as tensors)...")
                     self.neg_cache = {
-                        "neg_val": f[f"{self.negative_group}/values"][:],
-                        "neg_err": f[f"{self.negative_group}/errors"][:],
-                        "neg_mask": f[f"{self.negative_group}/masks"][:],
-                        "neg_time": f[f"{self.negative_group}/times"][:],
-                        "neg_coords": f[f"{self.negative_group}/coordinates"][:]
+                        "neg_val": torch.from_numpy(f[f"{self.negative_group}/values"][:]),
+                        "neg_err": torch.from_numpy(f[f"{self.negative_group}/errors"][:]),
+                        "neg_mask": torch.from_numpy(f[f"{self.negative_group}/masks"][:]),
+                        "neg_time": torch.from_numpy(f[f"{self.negative_group}/times"][:]),
+                        "neg_coords": torch.from_numpy(f[f"{self.negative_group}/coordinates"][:])
                     }
+                    # Validate negative data integrity
+                    assert not torch.isnan(self.neg_cache["neg_val"]).any(), "NaN found in cached negative values"
+                    assert not torch.isinf(self.neg_cache["neg_val"]).any(), "Inf found in cached negative values"
+                    # Move to shared memory to avoid CoW duplication in forked workers
+                    for k, v in self.neg_cache.items():
+                        if isinstance(v, torch.Tensor):
+                            self.neg_cache[k] = v.share_memory_()
             
     def __len__(self):
         return self.length
@@ -162,14 +178,15 @@ class RelationalHDF5Dataset(Dataset):
             gw_scalar = torch.from_numpy(self.h5_file['events/gw_data/scalars'][gw_idx])
             gw_skymap = torch.from_numpy(self.h5_file['events/gw_data/skymaps'][gw_idx])
         else:
-            opt_val = torch.from_numpy(self.data_cache["opt_val"][opt_idx])
-            opt_err = torch.from_numpy(self.data_cache["opt_err"][opt_idx])
-            opt_mask = torch.from_numpy(self.data_cache["opt_mask"][opt_idx])
-            opt_time = torch.from_numpy(self.data_cache["opt_time"][opt_idx])
-            opt_coords = torch.from_numpy(self.data_cache["opt_coords"][opt_idx])
+            # Data is already cached as tensors - direct indexing, no conversion needed
+            opt_val = self.data_cache["opt_val"][opt_idx]
+            opt_err = self.data_cache["opt_err"][opt_idx]
+            opt_mask = self.data_cache["opt_mask"][opt_idx]
+            opt_time = self.data_cache["opt_time"][opt_idx]
+            opt_coords = self.data_cache["opt_coords"][opt_idx]
             gw_idx = self.data_cache["parent_gw_idx"][opt_idx]
-            gw_scalar = torch.from_numpy(self.data_cache["gw_scalar"][gw_idx])
-            gw_skymap = torch.from_numpy(self.data_cache["gw_skymap"][gw_idx])
+            gw_scalar = self.data_cache["gw_scalar"][gw_idx]
+            gw_skymap = self.data_cache["gw_skymap"][gw_idx]
 
         is_neg_gw = False
         if (
@@ -195,11 +212,12 @@ class RelationalHDF5Dataset(Dataset):
                 neg_time = torch.from_numpy(self.neg_file[f"{self.negative_group}/times"][neg_idx])
                 neg_coords = torch.from_numpy(self.neg_file[f"{self.negative_group}/coordinates"][neg_idx])
             else:
-                neg_val = torch.from_numpy(self.neg_cache["neg_val"][neg_idx])
-                neg_err = torch.from_numpy(self.neg_cache["neg_err"][neg_idx])
-                neg_mask = torch.from_numpy(self.neg_cache["neg_mask"][neg_idx])
-                neg_time = torch.from_numpy(self.neg_cache["neg_time"][neg_idx])
-                neg_coords = torch.from_numpy(self.neg_cache["neg_coords"][neg_idx])
+                # Data is already cached as tensors - direct indexing
+                neg_val = self.neg_cache["neg_val"][neg_idx]
+                neg_err = self.neg_cache["neg_err"][neg_idx]
+                neg_mask = self.neg_cache["neg_mask"][neg_idx]
+                neg_time = self.neg_cache["neg_time"][neg_idx]
+                neg_coords = self.neg_cache["neg_coords"][neg_idx]
 
             # Return tuple: (GW_Inputs, Optical_Inputs, Metadata, Negative_Optical_Inputs)
             # gw_idx is returned for masking the contrastive loss (handling same-source negatives)
@@ -236,8 +254,9 @@ class RelationalHDF5Dataset(Dataset):
             local_idx = np.random.randint(len(self.neg_gw_indices))
 
         if self.data_cache is not None and "neg_gw_scalar" in self.data_cache:
-            gw_scalar = torch.from_numpy(self.data_cache["neg_gw_scalar"][local_idx].copy())
-            gw_skymap = torch.from_numpy(self.data_cache["neg_gw_skymap"][local_idx].copy())
+            # Data is already cached as tensors - clone to avoid in-place modification issues
+            gw_scalar = self.data_cache["neg_gw_scalar"][local_idx].clone()
+            gw_skymap = self.data_cache["neg_gw_skymap"][local_idx].clone()
         else:
             # Load from file
             if self.h5_file is None:

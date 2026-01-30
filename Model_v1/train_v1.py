@@ -73,6 +73,7 @@ def evaluate(model, val_loader, device, args, epoch):
     val_pos_acc = 0.0
     val_neg_acc = 0.0
     val_extra_acc = 0.0
+    val_total_acc = 0.0
     val_batches = 0
 
     with torch.no_grad():
@@ -156,6 +157,10 @@ def evaluate(model, val_loader, device, args, epoch):
             val_pos_acc += pos_acc
             val_neg_acc += neg_acc
             val_extra_acc += extra_acc
+            if has_negatives:
+                val_total_acc += (pos_acc + neg_acc + extra_acc) / 3.0
+            else:
+                val_total_acc += (pos_acc + neg_acc) / 2.0
             val_batches += 1
 
     if val_batches == 0:
@@ -163,14 +168,16 @@ def evaluate(model, val_loader, device, args, epoch):
             "loss": 0.0,
             "pos_acc": 0.0,
             "neg_acc": 0.0,
-            "extra_acc": 0.0
+            "extra_acc": 0.0,
+            "total_acc": 0.0
         }
 
     return {
         "loss": val_loss / val_batches,
         "pos_acc": val_pos_acc / val_batches,
         "neg_acc": val_neg_acc / val_batches,
-        "extra_acc": val_extra_acc / val_batches
+        "extra_acc": val_extra_acc / val_batches,
+        "total_acc": val_total_acc / val_batches
     }
 
 
@@ -624,9 +631,10 @@ def train(args):
             writer.add_scalar('Val/Epoch_Neg_Acc', val_metrics['neg_acc'], epoch)
             if has_negatives:
                 writer.add_scalar('Val/Epoch_Extra_Acc', val_metrics['extra_acc'], epoch)
+                writer.add_scalar('Val/Epoch_Total_Acc', val_metrics['total_acc'], epoch)
             print(
                 f"Val: loss={val_metrics['loss']:.4f} pos_acc={val_metrics['pos_acc']:.3f} "
-                f"neg_acc={val_metrics['neg_acc']:.3f}"
+                f"neg_acc={val_metrics['neg_acc']:.3f} total_acc={val_metrics['total_acc']:.3f}"
             )
 
             if best_val is None or val_metrics['loss'] < best_val - args.early_stop_min_delta:
