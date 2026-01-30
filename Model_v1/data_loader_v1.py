@@ -551,20 +551,31 @@ def create_mixed_gw_dataloaders(
         total_val_optical = sum(len(lcs) for lcs in val_map.values())
         val_steps_per_epoch = max(1, total_val_optical // val_batch_size)
 
-    train_dataset = PixelGWRelationalDataset(
-        h5_path,
-        negative_h5_path=negative_h5_path,
-        negative_group=negative_group,
-        cache_in_memory=cache_in_memory,
-        use_neg_gw=True
-    )
-    val_dataset = PixelGWRelationalDataset(
-        h5_path,
-        negative_h5_path=negative_h5_path,
-        negative_group=negative_group,
-        cache_in_memory=cache_in_memory,
-        use_neg_gw=True
-    )
+    if cache_in_memory:
+        shared_dataset = PixelGWRelationalDataset(
+            h5_path,
+            negative_h5_path=negative_h5_path,
+            negative_group=negative_group,
+            cache_in_memory=cache_in_memory,
+            use_neg_gw=True
+        )
+        train_dataset = shared_dataset
+        val_dataset = shared_dataset
+    else:
+        train_dataset = PixelGWRelationalDataset(
+            h5_path,
+            negative_h5_path=negative_h5_path,
+            negative_group=negative_group,
+            cache_in_memory=cache_in_memory,
+            use_neg_gw=True
+        )
+        val_dataset = PixelGWRelationalDataset(
+            h5_path,
+            negative_h5_path=negative_h5_path,
+            negative_group=negative_group,
+            cache_in_memory=cache_in_memory,
+            use_neg_gw=True
+        )
 
     neg_gw_indices = train_dataset.neg_gw_indices
     if neg_gw_indices is None or len(neg_gw_indices) == 0:

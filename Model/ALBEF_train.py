@@ -7,6 +7,7 @@ from data_loader import (
 from model import GWOpticalALBEFModel
 from tqdm import tqdm
 import torch
+from torch.amp import autocast, GradScaler
 from torch.utils.tensorboard import SummaryWriter
 import h5py
 import os
@@ -199,7 +200,7 @@ def clamp_temperature(model, args):
     max_log = math.log(args.temp_max)
     model.log_temp.data.clamp_(min_log, max_log)
 
-def evaluate(model, val_loader, device, args, epoch):
+def evaluate(model, val_loader, device, args, epoch, amp_dtype=torch.float32):
     model.eval()
     has_negatives = args.neg_data_path is not None
     use_neg_gw_dataloader = args.use_neg_gw
@@ -249,21 +250,12 @@ def evaluate(model, val_loader, device, args, epoch):
                     gw_indices = gw_indices.clone()
                     gw_indices[neg_positions] = -(neg_positions + 1).to(gw_indices.dtype)
 
-            if torch.isnan(opt_v).any() or torch.isinf(opt_v).any():
-                continue
-            if torch.isnan(opt_err).any() or torch.isinf(opt_err).any():
-                continue
-
             if has_negatives:
                 neg_t = neg_t.to(device, non_blocking=True)
                 neg_v = neg_v.to(device, non_blocking=True)
                 neg_mask = neg_mask.to(device, non_blocking=True)
                 neg_err = neg_err.to(device, non_blocking=True)
                 neg_coords = neg_coords.to(device, non_blocking=True)
-                if torch.isnan(neg_v).any() or torch.isinf(neg_v).any():
-                    continue
-                if torch.isnan(neg_err).any() or torch.isinf(neg_err).any():
-                    continue
 
             batch_size = gw_s.size(0)
             if (
@@ -276,62 +268,63 @@ def evaluate(model, val_loader, device, args, epoch):
                 )
             opt_ref_t = ref_time_cache
 
-            g, z_l, h_l = model.encode(
-                gw_s, gw_m, opt_coords, opt_t, opt_v, opt_ref_t, opt_mask, opt_err
-            )
-            if args.itc_loss_type == "supcon":
-                itc_loss, sim_g2o = model.compute_supcon_loss(
-                    g, z_l, gw_indices, temperature=args.supcon_temperature,
-                    margin=args.supcon_margin
+            with autocast(device_type='cuda', dtype=amp_dtype, enabled=(device.type == 'cuda')):
+                g, z_l, h_l = model.encode(
+                    gw_s, gw_m, opt_coords, opt_t, opt_v, opt_ref_t, opt_mask, opt_err
                 )
-            else:
-                itc_loss, sim_g2o = model.compute_itc_loss(
-                    g, z_l, gw_indices, mask=args.mask_itc
-                )
-
-            logits_pos = model.fusion_logits(g, h_l)
-            labels_pos = torch.ones(batch_size, device=device, dtype=torch.long)
-            labels_neg = torch.zeros(batch_size, device=device, dtype=torch.long)
-            if is_neg_gw_batch is not None:
-                labels_pos = torch.where(is_neg_gw_batch, labels_neg, labels_pos)
-            pos_loss = model.cls_criterion(logits_pos, labels_pos)
-
-            easy_idx = sample_easy_negatives(batch_size, device)
-            if easy_idx is None:
-                neg_idx = None
-            elif hard_neg_ratio <= 0:
-                neg_idx = easy_idx
-            else:
-                hard_idx = model.sample_hard_negatives(sim_g2o, gw_indices)
-                if hard_neg_ratio >= 1:
-                    neg_idx = hard_idx
+                if args.itc_loss_type == "supcon":
+                    itc_loss, sim_g2o = model.compute_supcon_loss(
+                        g, z_l, gw_indices, temperature=args.supcon_temperature,
+                        margin=args.supcon_margin
+                    )
                 else:
-                    choose_hard = torch.rand(batch_size, device=device) < hard_neg_ratio
-                    neg_idx = torch.where(choose_hard, hard_idx, easy_idx)
+                    itc_loss, sim_g2o = model.compute_itc_loss(
+                        g, z_l, gw_indices, mask=args.mask_itc
+                    )
 
-            if neg_idx is None:
-                hard_loss = torch.zeros((), device=device)
-                logits_hard = logits_pos.detach()
-            else:
-                h_l_hard = h_l[neg_idx]
-                logits_hard = model.fusion_logits(g, h_l_hard)
-                hard_loss = model.cls_criterion(logits_hard, labels_neg)
+                logits_pos = model.fusion_logits(g, h_l)
+                labels_pos = torch.ones(batch_size, device=device, dtype=torch.long)
+                labels_neg = torch.zeros(batch_size, device=device, dtype=torch.long)
+                if is_neg_gw_batch is not None:
+                    labels_pos = torch.where(is_neg_gw_batch, labels_neg, labels_pos)
+                pos_loss = model.cls_criterion(logits_pos, labels_pos)
 
-            if has_negatives:
-                _, h_l_neg = model.encode_optical(
-                    neg_coords, neg_t, neg_v, opt_ref_t, neg_mask, neg_err
+                easy_idx = sample_easy_negatives(batch_size, device)
+                if easy_idx is None:
+                    neg_idx = None
+                elif hard_neg_ratio <= 0:
+                    neg_idx = easy_idx
+                else:
+                    hard_idx = model.sample_hard_negatives(sim_g2o, gw_indices)
+                    if hard_neg_ratio >= 1:
+                        neg_idx = hard_idx
+                    else:
+                        choose_hard = torch.rand(batch_size, device=device) < hard_neg_ratio
+                        neg_idx = torch.where(choose_hard, hard_idx, easy_idx)
+
+                if neg_idx is None:
+                    hard_loss = torch.zeros((), device=device)
+                    logits_hard = logits_pos.detach()
+                else:
+                    h_l_hard = h_l[neg_idx]
+                    logits_hard = model.fusion_logits(g, h_l_hard)
+                    hard_loss = model.cls_criterion(logits_hard, labels_neg)
+
+                if has_negatives:
+                    _, h_l_neg = model.encode_optical(
+                        neg_coords, neg_t, neg_v, opt_ref_t, neg_mask, neg_err
+                    )
+                    logits_neg = model.fusion_logits(g, h_l_neg)
+                    neg_loss = model.cls_criterion(logits_neg, labels_neg)
+                else:
+                    neg_loss = None
+
+                cls_loss = compute_weighted_cls_loss(
+                    pos_loss, hard_loss, neg_loss, has_negatives, args
                 )
-                logits_neg = model.fusion_logits(g, h_l_neg)
-                neg_loss = model.cls_criterion(logits_neg, labels_neg)
-            else:
-                neg_loss = None
 
-            cls_loss = compute_weighted_cls_loss(
-                pos_loss, hard_loss, neg_loss, has_negatives, args
-            )
-
-            # 分阶段训练：验证时也使用相同的权重逻辑
-            total_loss = itc_weight * itc_loss + cls_weight * cls_loss
+                # 分阶段训练：验证时也使用相同的权重逻辑
+                total_loss = itc_weight * itc_loss + cls_weight * cls_loss
 
             val_total += total_loss.item()
             val_itc += itc_loss.item()
@@ -375,7 +368,6 @@ def evaluate(model, val_loader, device, args, epoch):
 
 
 def train(args):
-    print("Training in Float32 precision.")
     if args.temp_final is None:
         args.temp_final = args.temp_init
     if args.temp_min <= 0 or args.temp_max <= 0:
@@ -387,7 +379,14 @@ def train(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
-    print(f"Running on device: {device}")
+        use_bf16 = torch.cuda.is_bf16_supported()
+        amp_dtype = torch.bfloat16 if use_bf16 else torch.float16
+        scaler = GradScaler(enabled=(not use_bf16))
+        print(f"Running on device: {device} | AMP dtype={amp_dtype}")
+    else:
+        amp_dtype = torch.float32
+        scaler = GradScaler(enabled=False)
+        print(f"Running on device: {device} | No AMP (CPU)")
 
     timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     log_dir = os.path.join(os.path.dirname(args.ckpt_path), "tb_logs", f"run_albef_{timestamp}")
@@ -511,6 +510,10 @@ def train(args):
     if args.use_lightweight_gw:
         print("Using lightweight GW encoder (~100K params) to prevent overfitting.")
 
+    if hasattr(torch, 'compile'):
+        model = torch.compile(model)
+        print("Model compiled with torch.compile() for optimized execution.")
+
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     start_epoch = 0
     global_step = 0
@@ -528,6 +531,8 @@ def train(args):
         ckpt = torch.load(args.resume, map_location=device)
         model.load_state_dict(ckpt["model_state_dict"], strict=True)
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        if 'scaler_state_dict' in ckpt:
+            scaler.load_state_dict(ckpt['scaler_state_dict'])
         start_epoch = ckpt.get("epoch", -1) + 1
         global_step = start_epoch * steps_per_epoch
         print(f"Resumed from {args.resume} at epoch {start_epoch}.")
@@ -598,25 +603,12 @@ def train(args):
                     gw_indices = gw_indices.clone()
                     gw_indices[neg_positions] = -(neg_positions + 1).to(gw_indices.dtype)
 
-            if torch.isnan(opt_v).any() or torch.isinf(opt_v).any():
-                print("NaN or Inf detected in optical values. Skipping batch.")
-                continue
-            if torch.isnan(opt_err).any() or torch.isinf(opt_err).any():
-                print("NaN or Inf detected in optical errors. Skipping batch.")
-                continue
-
             if has_negatives:
                 neg_t = neg_t.to(device, non_blocking=True)
                 neg_v = neg_v.to(device, non_blocking=True)
                 neg_mask = neg_mask.to(device, non_blocking=True)
                 neg_err = neg_err.to(device, non_blocking=True)
                 neg_coords = neg_coords.to(device, non_blocking=True)
-                if torch.isnan(neg_v).any() or torch.isinf(neg_v).any():
-                    print("NaN or Inf detected in negative optical values. Skipping batch.")
-                    continue
-                if torch.isnan(neg_err).any() or torch.isinf(neg_err).any():
-                    print("NaN or Inf detected in negative optical errors. Skipping batch.")
-                    continue
 
             # opt_t, opt_v, opt_mask, opt_err = augment_optical_data(
             #     opt_t, opt_v, opt_mask, opt_err, training=True,
@@ -648,72 +640,75 @@ def train(args):
 
             optimizer.zero_grad(set_to_none=True)
 
-            g, z_l, h_l = model.encode(
-                gw_s, gw_m, opt_coords, opt_t, opt_v, opt_ref_t, opt_mask, opt_err
-            )
-            if args.itc_loss_type == "supcon":
-                itc_loss, sim_g2o = model.compute_supcon_loss(
-                    g, z_l, gw_indices, temperature=args.supcon_temperature,
-                    margin=args.supcon_margin
+            with autocast(device_type='cuda', dtype=amp_dtype, enabled=(device.type == 'cuda')):
+                g, z_l, h_l = model.encode(
+                    gw_s, gw_m, opt_coords, opt_t, opt_v, opt_ref_t, opt_mask, opt_err
                 )
-            else:
-                itc_loss, sim_g2o = model.compute_itc_loss(
-                    g, z_l, gw_indices, mask=args.mask_itc
-                )
-
-            logits_pos = model.fusion_logits(g, h_l)
-            labels_pos = torch.ones(batch_size, device=device, dtype=torch.long)
-            labels_neg = torch.zeros(batch_size, device=device, dtype=torch.long)
-            # For negative GW pairs, the label should be 0 (no match)
-            if is_neg_gw_batch is not None:
-                labels_pos = torch.where(is_neg_gw_batch, labels_neg, labels_pos)
-            pos_loss = model.cls_criterion(logits_pos, labels_pos)
-
-            easy_idx = sample_easy_negatives(batch_size, device)
-            if easy_idx is None:
-                neg_idx = None
-            elif hard_neg_ratio <= 0:
-                neg_idx = easy_idx
-            else:
-                # Use semi-hard mining if top_k > 1, otherwise use hardest
-                if args.hard_neg_top_k > 1:
-                    hard_idx = model.sample_semi_hard_negatives(sim_g2o, gw_indices, top_k=args.hard_neg_top_k)
+                if args.itc_loss_type == "supcon":
+                    itc_loss, sim_g2o = model.compute_supcon_loss(
+                        g, z_l, gw_indices, temperature=args.supcon_temperature,
+                        margin=args.supcon_margin
+                    )
                 else:
-                    hard_idx = model.sample_hard_negatives(sim_g2o, gw_indices)
-                if hard_neg_ratio >= 1:
-                    neg_idx = hard_idx
+                    itc_loss, sim_g2o = model.compute_itc_loss(
+                        g, z_l, gw_indices, mask=args.mask_itc
+                    )
+
+                logits_pos = model.fusion_logits(g, h_l)
+                labels_pos = torch.ones(batch_size, device=device, dtype=torch.long)
+                labels_neg = torch.zeros(batch_size, device=device, dtype=torch.long)
+                # For negative GW pairs, the label should be 0 (no match)
+                if is_neg_gw_batch is not None:
+                    labels_pos = torch.where(is_neg_gw_batch, labels_neg, labels_pos)
+                pos_loss = model.cls_criterion(logits_pos, labels_pos)
+
+                easy_idx = sample_easy_negatives(batch_size, device)
+                if easy_idx is None:
+                    neg_idx = None
+                elif hard_neg_ratio <= 0:
+                    neg_idx = easy_idx
                 else:
-                    choose_hard = torch.rand(batch_size, device=device) < hard_neg_ratio
-                    neg_idx = torch.where(choose_hard, hard_idx, easy_idx)
+                    # Use semi-hard mining if top_k > 1, otherwise use hardest
+                    if args.hard_neg_top_k > 1:
+                        hard_idx = model.sample_semi_hard_negatives(sim_g2o, gw_indices, top_k=args.hard_neg_top_k)
+                    else:
+                        hard_idx = model.sample_hard_negatives(sim_g2o, gw_indices)
+                    if hard_neg_ratio >= 1:
+                        neg_idx = hard_idx
+                    else:
+                        choose_hard = torch.rand(batch_size, device=device) < hard_neg_ratio
+                        neg_idx = torch.where(choose_hard, hard_idx, easy_idx)
 
-            if neg_idx is None:
-                hard_loss = torch.zeros((), device=device)
-                logits_hard = logits_pos.detach()
-            else:
-                h_l_hard = h_l[neg_idx]
-                logits_hard = model.fusion_logits(g, h_l_hard)
-                hard_loss = model.cls_criterion(logits_hard, labels_neg)
+                if neg_idx is None:
+                    hard_loss = torch.zeros((), device=device)
+                    logits_hard = logits_pos.detach()
+                else:
+                    h_l_hard = h_l[neg_idx]
+                    logits_hard = model.fusion_logits(g, h_l_hard)
+                    hard_loss = model.cls_criterion(logits_hard, labels_neg)
 
-            if has_negatives:
-                _, h_l_neg = model.encode_optical(
-                    neg_coords, neg_t, neg_v, opt_ref_t, neg_mask, neg_err
+                if has_negatives:
+                    _, h_l_neg = model.encode_optical(
+                        neg_coords, neg_t, neg_v, opt_ref_t, neg_mask, neg_err
+                    )
+                    logits_neg = model.fusion_logits(g, h_l_neg)
+                    neg_loss = model.cls_criterion(logits_neg, labels_neg)
+                else:
+                    neg_loss = None
+
+                cls_loss = compute_weighted_cls_loss(
+                    pos_loss, hard_loss, neg_loss, has_negatives, args
                 )
-                logits_neg = model.fusion_logits(g, h_l_neg)
-                neg_loss = model.cls_criterion(logits_neg, labels_neg)
-            else:
-                neg_loss = None
 
-            cls_loss = compute_weighted_cls_loss(
-                pos_loss, hard_loss, neg_loss, has_negatives, args
-            )
+                # 分阶段训练：cls_start_epoch之前只训练ITC
+                total_loss = itc_weight * itc_loss + cls_weight * cls_loss
 
-            # 分阶段训练：cls_start_epoch之前只训练ITC
-            total_loss = itc_weight * itc_loss + cls_weight * cls_loss
-            total_loss.backward()
-            # 添加梯度裁剪防止梯度爆炸
+            scaler.scale(total_loss).backward()
             if args.grad_clip_norm > 0:
+                scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_clip_norm)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             if lr_scheduler is not None:
                 lr_scheduler.step()
             clamp_temperature(model, args)
@@ -783,7 +778,7 @@ def train(args):
 
         stop_early = False
         if val_loader is not None:
-            val_metrics = evaluate(model, val_loader, device, args, epoch)
+            val_metrics = evaluate(model, val_loader, device, args, epoch, amp_dtype=amp_dtype)
             if val_metrics is not None:
                 print(
                     f"Val Avg Total: {val_metrics['total']:.4f} | "
@@ -809,6 +804,7 @@ def train(args):
                             'epoch': epoch,
                             'model_state_dict': model.state_dict(),
                             'optimizer_state_dict': optimizer.state_dict(),
+                            'scaler_state_dict': scaler.state_dict(),
                             'loss': val_metrics['total'],
                         }, best_ckpt)
                         print(f"Saved best checkpoint: {best_ckpt}")
@@ -824,6 +820,7 @@ def train(args):
             'epoch': epoch,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
+            'scaler_state_dict': scaler.state_dict(),
             'loss': avg_total,
         }, checkpoint_path)
         if stop_early:
