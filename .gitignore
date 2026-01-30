@@ -6,7 +6,11 @@ gen_SIMLIB.ipynb
 __pycache__/
 
 *.csv
+*.dat
 notebook/
+
+hpo_results/
+logs/
 
 ./dataset/KN_sim/notebook/
 dataset/O5_sim_bns/*.ipynb
