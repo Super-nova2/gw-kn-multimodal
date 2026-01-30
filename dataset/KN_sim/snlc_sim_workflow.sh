@@ -1,10 +1,10 @@
 #!/bin/bash
-#SBATCH --job-name=LSST_KN_BNS
-#SBATCH --time=5:00:00            
+#SBATCH --job-name=LSST_KN_BNS_AUG
+#SBATCH --time=4:00:00            
 #SBATCH --cpus-per-task=1
 #SBATCH --mem=10G
-#SBATCH --array=0-182%10   # 1822/268 simulations, each job handles 10 sims, max 10 jobs running simultaneously
-#SBATCH --output=logs/LSST_KN_BNS/%x_%a.out
+#SBATCH --array=127-1147%20   # 22941/1822/268 simulations, each job handles 10 sims, max 20 jobs running simultaneously
+#SBATCH --output=logs/LSST_KN_BNS_AUG/%x_%a.out
 
 # ml gcc/11.3/0 python/3.10.4
 # ml gsl/2.7 cfitsio/4.2.0
@@ -37,7 +37,7 @@ echo "SNANA simulation results output directory: ${out_dir}/${sim_name}"
 mapfile -t SIM_IDS < <(awk -F',' 'NR>1 {print $1}' ${inj_file})
 
 N=$(tail -n +2 ${inj_file} | wc -l)     # total number of GW events
-BATCH_SIZE=10
+BATCH_SIZE=20
 NTASK=$(((N + BATCH_SIZE - 1) / BATCH_SIZE))
 echo "Number of GW events = $N, need array 0-$(($NTASK - 1)), each task handling up to $BATCH_SIZE events."
 
@@ -95,7 +95,7 @@ for sim_id in "${group_ids[@]}"; do
         echo "    SIMLIB has NLIBID=0, skip $sim_id"
         echo "    LSST do not cover the skymap of this event."
         echo "  [$sim_id] Skipped."
-        rm -f "${simlib}"
+        rm -f "${simlib}" "${input}"
         continue
     fi
 
@@ -111,7 +111,7 @@ for sim_id in "${group_ids[@]}"; do
 
     if [[ ! -f "$input" ]]; then
         echo "    ERROR: INPUT not found: $input"
-        rm -f "$simlib"   # remove SIMLIB if INPUT is missing
+        rm -f "$simlib" "${simlib}.COADD"   # remove SIMLIB if INPUT is missing
         echo "    removed SIMLIB $simlib due to missing INPUT"
         failed_ids+=("$sim_id")
         continue
@@ -121,15 +121,15 @@ for sim_id in "${group_ids[@]}"; do
     if ! snlc_sim.exe "$input" > /dev/null ; then
         echo "    snlc_sim failed for $sim_id"
         echo "  [$sim_id] Failed."
-        # rm -f "$simlib"  # do not remove SIMLIB if snlc_sim fails
+        rm -f "$simlib" "${simlib}.COADD" "${input}"  # remove SIMLIB if snlc_sim fails
         failed_ids+=("$sim_id")
         continue
     fi
 
     # clean up SIMLIB file to save space
     echo "    snlc_sim success for $sim_id"
-    echo "    removing SIMLIB $simlib and SIMLIB.COADD to save space"
-    rm -f "$simlib" "${simlib}.COADD"
+    echo "    removing SIMLIB $simlib, SIMLIB.COADD, and INPUT to save space"
+    rm -f "$simlib" "${simlib}.COADD" "${input}"    # remove INPUT file as well
 
     echo "  [$sim_id] done."
 done

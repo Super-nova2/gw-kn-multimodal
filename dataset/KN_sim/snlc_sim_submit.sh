@@ -13,16 +13,16 @@ fi
 
 
 # Configurable resource knobs (override via env if needed)
-TIME_LIMIT=${TIME_LIMIT:-4:00:00}
+TIME_LIMIT=${TIME_LIMIT:-8:00:00}
 CPUS_PER_TASK=${CPUS_PER_TASK:-1}
-MEM_PER_TASK=${MEM_PER_TASK:-10G}
-BATCH_SIZE=${BATCH_SIZE:-10}          # must match batch size in snlc_sim_workflow.sh
+MEM_PER_TASK=${MEM_PER_TASK:-16G}
+BATCH_SIZE=${BATCH_SIZE:-20}          # must match batch size in snlc_sim_workflow.sh
 MAX_ARRAY_CONCURRENCY=${MAX_ARRAY_CONCURRENCY:-10}
 
 sim_name=$(jq -r '.SIM_NAME' "${args_file}")
 inj_file=$(jq -r '.injections_file' "${args_file}")
 log_dir=$(jq -r '.LOG_DIR' "${args_file}")
-data_dir=$(jq -r '.DATA_DIR' $args_file)
+data_dir=$(jq -r '.DATA_DIR' "${args_file}")
 
 # Count events (skip header row)
 N=$(tail -n +2 "${inj_file}" | wc -l)
@@ -48,7 +48,7 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 workflow="${script_dir}/snlc_sim_workflow.sh"
 
 # remove all old failed ids files
-rm -f ${data_dir}failed_sim_ids.txt
+rm -f "${data_dir}failed_sim_ids.txt"
 echo "Have removed old failed_sim_ids.txt"
 
 sbatch \
