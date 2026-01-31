@@ -850,8 +850,8 @@ class GWOpticalALBEFModel(nn.Module):
         feat_g = F.normalize(self.gw_proj(g), p=2, dim=1, eps=1e-8)
         feat_o = F.normalize(self.opt_proj(z_l), p=2, dim=1, eps=1e-8)
 
-        logit_scale = torch.clamp(self.log_temp.exp(), min=self.temp_min, max=self.temp_max)
-        sim_g2o = torch.matmul(feat_g, feat_o.T) * logit_scale
+        temperature = torch.clamp(self.log_temp.exp(), min=self.temp_min, max=self.temp_max)
+        sim_g2o = torch.matmul(feat_g, feat_o.T) / temperature
         sim_o2g = sim_g2o.T
 
         if mask and gw_indices is not None:
@@ -876,7 +876,8 @@ class GWOpticalALBEFModel(nn.Module):
 
         return total_loss, sim_g2o
 
-    def compute_supcon_loss(self, g, z_l, gw_indices, temperature=0.07, margin=0.0):
+    def compute_supcon_loss(self, g, z_l, gw_indices, temperature=0.07, margin=0.0,
+                            is_neg_gw=None):
         """
         Supervised Contrastive Loss for many-to-many GW-optical matching.
 
@@ -896,6 +897,9 @@ class GWOpticalALBEFModel(nn.Module):
                     When margin > 0, negatives are penalized by subtracting margin
                     from their similarity, pushing positives to be more similar
                     than negatives by at least this margin.
+            is_neg_gw: Boolean tensor [batch] marking negative GW positions.
+                       These positions are excluded from the loss to avoid
+                       creating false positive pairs.
         """
         feat_g = F.normalize(self.gw_proj(g), p=2, dim=1, eps=1e-8)
         feat_o = F.normalize(self.opt_proj(z_l), p=2, dim=1, eps=1e-8)
@@ -912,6 +916,15 @@ class GWOpticalALBEFModel(nn.Module):
         mask_pos = labels_eq.float()
         mask_pos.fill_diagonal_(0)
         mask_neg = 1.0 - labels_eq.float()
+
+        # Zero out positive masks for negative GW positions to prevent
+        # false positive pairs (neg GW should not be pulled toward any optical)
+        if is_neg_gw is not None and is_neg_gw.any():
+            neg_gw_mask_2b = torch.cat([is_neg_gw, is_neg_gw], dim=0)
+            # Remove all positive associations for neg GW anchors (rows)
+            mask_pos[neg_gw_mask_2b] = 0.0
+            # Remove neg GW as positive targets for other anchors (cols)
+            mask_pos[:, neg_gw_mask_2b] = 0.0
 
         mask_self = torch.eye(2 * batch_size, device=device, dtype=torch.bool)
 
@@ -933,7 +946,12 @@ class GWOpticalALBEFModel(nn.Module):
         num_positives = mask_pos.sum(dim=1).clamp_min(1)
         mean_log_prob_pos = (mask_pos * log_prob).sum(dim=1) / num_positives
 
-        loss = -mean_log_prob_pos.mean()
+        # Only average over anchors that have at least one positive
+        has_pos = mask_pos.sum(dim=1) > 0
+        if has_pos.any():
+            loss = -mean_log_prob_pos[has_pos].mean()
+        else:
+            loss = torch.zeros((), device=device)
 
         sim_g2o = torch.matmul(feat_g, feat_o.T) * (1.0 / temperature)
 
