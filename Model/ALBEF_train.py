@@ -7,6 +7,7 @@ from data_loader import (
 from model import GWOpticalALBEFModel
 from tqdm import tqdm
 import torch
+import torch.nn.functional as F
 from torch.amp import autocast, GradScaler
 from torch.utils.tensorboard import SummaryWriter
 import h5py
@@ -14,6 +15,7 @@ import os
 import datetime
 import argparse
 import math
+import gc
 import warnings
 warnings.filterwarnings("ignore", "Wswiglal-redir-stdio")
 
@@ -201,6 +203,10 @@ def clamp_temperature(model, args):
     model.log_temp.data.clamp_(min_log, max_log)
 
 def evaluate(model, val_loader, device, args, epoch, amp_dtype=torch.float32):
+    from metrics import (compute_retrieval_metrics,
+                         compute_classification_metrics,
+                         compute_embedding_metrics)
+
     model.eval()
     has_negatives = args.neg_data_path is not None
     use_neg_gw_dataloader = args.use_neg_gw
@@ -218,6 +224,16 @@ def evaluate(model, val_loader, device, args, epoch, amp_dtype=torch.float32):
     val_neg_acc = 0.0
     val_total_acc = 0.0
     val_batches = 0
+
+    # Accumulators for new metrics (computed globally after all batches)
+    all_cls_probs = []    # predicted P(match) for classification metrics
+    all_cls_labels = []   # ground-truth labels for classification metrics
+    all_cls_sources = []  # source tag per sample ('pos', 'hard', 'neg')
+    all_feat_g = []       # L2-normalized GW embeddings for embedding metrics
+    all_feat_o = []       # L2-normalized optical embeddings
+    all_gw_indices = []   # GW event indices
+    all_is_neg_gw = []    # negative GW flags
+    retrieval_metrics_accum = []  # per-batch retrieval metric dicts
 
     with torch.no_grad():
         for batch_data in val_loader:
@@ -275,12 +291,16 @@ def evaluate(model, val_loader, device, args, epoch, amp_dtype=torch.float32):
                 if args.itc_loss_type == "supcon":
                     itc_loss, sim_g2o = model.compute_supcon_loss(
                         g, z_l, gw_indices, temperature=args.supcon_temperature,
-                        margin=args.supcon_margin
+                        margin=args.supcon_margin, is_neg_gw=is_neg_gw_batch
                     )
                 else:
                     itc_loss, sim_g2o = model.compute_itc_loss(
                         g, z_l, gw_indices, mask=args.mask_itc
                     )
+
+                # Extract L2-normalized projected features for embedding metrics
+                feat_g = F.normalize(model.gw_proj(g), p=2, dim=1, eps=1e-8)
+                feat_o = F.normalize(model.opt_proj(z_l), p=2, dim=1, eps=1e-8)
 
                 logits_pos = model.fusion_logits(g, h_l)
                 labels_pos = torch.ones(batch_size, device=device, dtype=torch.long)
@@ -330,8 +350,23 @@ def evaluate(model, val_loader, device, args, epoch, amp_dtype=torch.float32):
             val_itc += itc_loss.item()
             val_cls += cls_loss.item()
 
-            itc_preds = sim_g2o.argmax(dim=1)
-            itc_acc = (itc_preds == torch.arange(batch_size, device=device)).float().mean().item()
+            # --- Per-batch retrieval metrics ---
+            sim_g2o_d = sim_g2o.detach()
+            batch_ret = compute_retrieval_metrics(
+                sim_g2o_d, gw_indices, is_neg_gw=is_neg_gw_batch, ks=(1, 5, 10)
+            )
+            retrieval_metrics_accum.append(batch_ret)
+
+            # --- Legacy ITC accuracy (kept for backward compatibility) ---
+            if is_neg_gw_batch is not None and is_neg_gw_batch.any():
+                pos_mask_itc = ~is_neg_gw_batch
+            else:
+                pos_mask_itc = torch.ones(batch_size, dtype=torch.bool, device=device)
+            itc_preds = sim_g2o_d[pos_mask_itc].argmax(dim=1)
+            anchor_gw = gw_indices[pos_mask_itc]
+            pred_gw = gw_indices[itc_preds]
+            itc_acc = (anchor_gw == pred_gw).float().mean().item()
+
             pos_acc = (logits_pos.argmax(dim=1) == labels_pos).float().mean().item()
             hard_acc = (logits_hard.argmax(dim=1) == labels_neg).float().mean().item()
             neg_acc = 0.0
@@ -348,9 +383,62 @@ def evaluate(model, val_loader, device, args, epoch, amp_dtype=torch.float32):
             val_total_acc += total_acc
             val_batches += 1
 
+            # --- Accumulate for global classification + embedding metrics ---
+            pos_probs = torch.softmax(logits_pos.detach().float(), dim=1)[:, 1]
+            all_cls_probs.append(pos_probs.cpu())
+            all_cls_labels.append(labels_pos.cpu())
+            all_cls_sources.extend(['pos'] * batch_size)
+
+            hard_probs = torch.softmax(logits_hard.detach().float(), dim=1)[:, 1]
+            all_cls_probs.append(hard_probs.cpu())
+            all_cls_labels.append(labels_neg[:batch_size].cpu())
+            all_cls_sources.extend(['hard'] * batch_size)
+
+            if has_negatives:
+                neg_probs_val = torch.softmax(logits_neg.detach().float(), dim=1)[:, 1]
+                all_cls_probs.append(neg_probs_val.cpu())
+                all_cls_labels.append(labels_neg[:batch_size].cpu())
+                all_cls_sources.extend(['neg'] * batch_size)
+
+            all_feat_g.append(feat_g.detach().cpu())
+            all_feat_o.append(feat_o.detach().cpu())
+            all_gw_indices.append(gw_indices.cpu())
+            if is_neg_gw_batch is not None:
+                all_is_neg_gw.append(is_neg_gw_batch.cpu())
+            else:
+                all_is_neg_gw.append(torch.zeros(batch_size, dtype=torch.bool))
+
+            # Memory cleanup in validation loop
+            del g, z_l, h_l, sim_g2o, sim_g2o_d, itc_loss, cls_loss, total_loss
+            del logits_pos, logits_hard, pos_loss, hard_loss, feat_g, feat_o
+            if has_negatives:
+                del h_l_neg, logits_neg, neg_loss
+
     if val_batches == 0:
         model.train()
         return None
+
+    # --- Compute global metrics ---
+    # Average per-batch retrieval metrics
+    retrieval = {}
+    if retrieval_metrics_accum:
+        for key in retrieval_metrics_accum[0]:
+            retrieval[key] = sum(d[key] for d in retrieval_metrics_accum) / len(retrieval_metrics_accum)
+
+    # Global classification metrics
+    cls_metrics = compute_classification_metrics(
+        torch.cat(all_cls_probs),
+        torch.cat(all_cls_labels),
+        all_sources=all_cls_sources
+    )
+
+    # Global embedding metrics
+    emb_metrics = compute_embedding_metrics(
+        torch.cat(all_feat_g),
+        torch.cat(all_feat_o),
+        torch.cat(all_gw_indices),
+        is_neg_gw=torch.cat(all_is_neg_gw)
+    )
 
     metrics = {
         "total": val_total / val_batches,
@@ -360,10 +448,17 @@ def evaluate(model, val_loader, device, args, epoch, amp_dtype=torch.float32):
         "pos_acc": val_pos_acc / val_batches,
         "hard_acc": val_hard_acc / val_batches,
         "neg_acc": val_neg_acc / val_batches,
-        "total_acc": val_total_acc / val_batches
+        "total_acc": val_total_acc / val_batches,
+        "retrieval": retrieval,
+        "classification": cls_metrics,
+        "embedding": emb_metrics,
     }
 
     model.train()
+    # Memory cleanup after validation
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    gc.collect()
     return metrics
 
 
@@ -584,12 +679,12 @@ def train(args):
             gw_s = gw_s.to(device, non_blocking=True)
             gw_m = gw_m.to(device, non_blocking=True)
             # 应用GW数据增强（仅训练时）
-            # gw_s, gw_m = augment_gw_data(
-            #     gw_s, gw_m, training=True,
-            #     noise_std=args.gw_aug_noise,
-            #     scalar_jitter=args.gw_aug_jitter,
-            #     channel_dropout_prob=args.gw_aug_dropout
-            # )
+            gw_s, gw_m = augment_gw_data(
+                gw_s, gw_m, training=True,
+                noise_std=args.gw_aug_noise,
+                scalar_jitter=args.gw_aug_jitter,
+                channel_dropout_prob=args.gw_aug_dropout
+            )
             opt_t = opt_t.to(device, non_blocking=True)
             opt_v = opt_v.to(device, non_blocking=True)
             opt_mask = opt_mask.to(device, non_blocking=True)
@@ -610,21 +705,21 @@ def train(args):
                 neg_err = neg_err.to(device, non_blocking=True)
                 neg_coords = neg_coords.to(device, non_blocking=True)
 
-            # opt_t, opt_v, opt_mask, opt_err = augment_optical_data(
-            #     opt_t, opt_v, opt_mask, opt_err, training=True,
-            #     time_jitter=args.opt_aug_time_jitter,
-            #     flux_noise=args.opt_aug_noise,
-            #     obs_dropout=args.opt_aug_dropout,
-            #     band_dropout=args.opt_aug_band_dropout
-            # )
-            # if has_negatives:
-                # neg_t, neg_v, neg_mask, neg_err = augment_optical_data(
-                #     neg_t, neg_v, neg_mask, neg_err, training=True,
-                #     time_jitter=args.opt_aug_time_jitter,
-                #     flux_noise=args.opt_aug_noise,
-                #     obs_dropout=args.opt_aug_dropout,
-                #     band_dropout=args.opt_aug_band_dropout
-                # )
+            opt_t, opt_v, opt_mask, opt_err = augment_optical_data(
+                opt_t, opt_v, opt_mask, opt_err, training=True,
+                time_jitter=args.opt_aug_time_jitter,
+                flux_noise=args.opt_aug_noise,
+                obs_dropout=args.opt_aug_dropout,
+                band_dropout=args.opt_aug_band_dropout
+            )
+            if has_negatives:
+                neg_t, neg_v, neg_mask, neg_err = augment_optical_data(
+                    neg_t, neg_v, neg_mask, neg_err, training=True,
+                    time_jitter=args.opt_aug_time_jitter,
+                    flux_noise=args.opt_aug_noise,
+                    obs_dropout=args.opt_aug_dropout,
+                    band_dropout=args.opt_aug_band_dropout
+                )
 
             batch_size = gw_s.size(0)
 
@@ -647,7 +742,7 @@ def train(args):
                 if args.itc_loss_type == "supcon":
                     itc_loss, sim_g2o = model.compute_supcon_loss(
                         g, z_l, gw_indices, temperature=args.supcon_temperature,
-                        margin=args.supcon_margin
+                        margin=args.supcon_margin, is_neg_gw=is_neg_gw_batch
                     )
                 else:
                     itc_loss, sim_g2o = model.compute_itc_loss(
@@ -724,9 +819,20 @@ def train(args):
             epoch_itc += itc_val
             epoch_cls += cls_val
 
+            # Detach similarity matrix to prevent gradient graph retention
+            sim_g2o_detached = sim_g2o.detach()
             with torch.no_grad():
-                itc_preds = sim_g2o.argmax(dim=1)
-                itc_acc = (itc_preds == torch.arange(batch_size, device=device)).float().mean().item()
+                # Corrected ITC accuracy: exclude neg GW positions and accept
+                # any optical sample from the same GW event as a correct match
+                if is_neg_gw_batch is not None and is_neg_gw_batch.any():
+                    pos_mask = ~is_neg_gw_batch
+                else:
+                    pos_mask = torch.ones(batch_size, dtype=torch.bool, device=device)
+                itc_preds = sim_g2o_detached[pos_mask].argmax(dim=1)
+                anchor_gw = gw_indices[pos_mask]
+                pred_gw = gw_indices[itc_preds]
+                itc_acc = (anchor_gw == pred_gw).float().mean().item()
+
                 pos_acc = (logits_pos.argmax(dim=1) == labels_pos).float().mean().item()
                 hard_acc = (logits_hard.argmax(dim=1) == labels_neg).float().mean().item()
                 neg_acc = None
@@ -734,7 +840,7 @@ def train(args):
                     neg_acc = (logits_neg.argmax(dim=1) == labels_neg).float().mean().item()
                 current_temp = model.log_temp.exp().item()
 
-            if batch_idx % 10 == 0:
+            if batch_idx % 50 == 0:
                 writer.add_scalar('Train/Batch_Total_Loss', total_val, global_step)
                 writer.add_scalar('Train/Batch_ITC_Loss', itc_val, global_step)
                 writer.add_scalar('Train/Batch_CLS_Loss', cls_val, global_step)
@@ -762,8 +868,24 @@ def train(args):
                 }
                 pbar.set_postfix(postfix)
 
+            # Memory cleanup: delete large tensors to free memory
+            del g, z_l, h_l, sim_g2o, sim_g2o_detached, itc_loss, total_loss
+            del logits_pos, logits_hard, pos_loss, hard_loss, cls_loss
+            if has_negatives:
+                del h_l_neg, logits_neg, neg_loss
+            
+            # Periodic aggressive memory cleanup every 50 batches
+            if batch_idx % 50 == 0:
+                if device.type == 'cuda':
+                    torch.cuda.empty_cache()
+                gc.collect()
+
             global_step += 1
 
+        # End of epoch cleanup
+        pbar.close()
+        del pbar
+        
         avg_total = epoch_total / len(train_loader)
         avg_itc = epoch_itc / len(train_loader)
         avg_cls = epoch_cls / len(train_loader)
@@ -775,6 +897,9 @@ def train(args):
         writer.add_scalar('Train/Epoch_Total_Loss', avg_total, epoch)
         writer.add_scalar('Train/Epoch_ITC_Loss', avg_itc, epoch)
         writer.add_scalar('Train/Epoch_CLS_Loss', avg_cls, epoch)
+        
+        # Flush tensorboard to prevent memory accumulation
+        writer.flush()
 
         stop_early = False
         if val_loader is not None:
@@ -794,6 +919,38 @@ def train(args):
                 if args.neg_data_path is not None:
                     writer.add_scalar('Val/Epoch_ExtraNeg_Acc', val_metrics['neg_acc'], epoch)
 
+                # Retrieval metrics
+                ret = val_metrics.get('retrieval', {})
+                for k, v in ret.items():
+                    writer.add_scalar(f'Val/Retrieval/{k}', v, epoch)
+
+                # Classification metrics
+                cls_m = val_metrics.get('classification', {})
+                for k in ('auroc', 'auprc', 'f1_optimal', 'f1_threshold', 'ece'):
+                    if k in cls_m:
+                        writer.add_scalar(f'Val/Classification/{k}', cls_m[k], epoch)
+                for k in ('acc_pos', 'acc_hard', 'acc_neg', 'acc_neg_gw'):
+                    if k in cls_m:
+                        writer.add_scalar(f'Val/Classification/{k}', cls_m[k], epoch)
+
+                # Embedding quality metrics
+                emb = val_metrics.get('embedding', {})
+                for k, v in emb.items():
+                    writer.add_scalar(f'Val/Embedding/{k}', v, epoch)
+
+                # Print summary of new metrics
+                r1 = ret.get('g2o_recall_at_1', 0)
+                r5 = ret.get('g2o_recall_at_5', 0)
+                mrr = ret.get('g2o_mrr', 0)
+                auroc = cls_m.get('auroc', 0)
+                auprc = cls_m.get('auprc', 0)
+                align = emb.get('alignment', 0)
+                print(
+                    f"  Retrieval: R@1={r1:.4f} R@5={r5:.4f} MRR={mrr:.4f} | "
+                    f"CLS: AUROC={auroc:.4f} AUPRC={auprc:.4f} | "
+                    f"Emb: align={align:.4f}"
+                )
+
                 if args.early_stop_patience > 0:
                     if best_val is None or val_metrics['total'] < best_val - args.early_stop_min_delta:
                         best_val = val_metrics['total']
@@ -806,6 +963,7 @@ def train(args):
                             'optimizer_state_dict': optimizer.state_dict(),
                             'scaler_state_dict': scaler.state_dict(),
                             'loss': val_metrics['total'],
+                            'args': vars(args),
                         }, best_ckpt)
                         print(f"Saved best checkpoint: {best_ckpt}")
                     else:
@@ -822,7 +980,14 @@ def train(args):
             'optimizer_state_dict': optimizer.state_dict(),
             'scaler_state_dict': scaler.state_dict(),
             'loss': avg_total,
+            'args': vars(args),
         }, checkpoint_path)
+        
+        # End-of-epoch memory cleanup
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
+        gc.collect()
+        
         if stop_early:
             break
 
