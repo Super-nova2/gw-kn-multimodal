@@ -5,9 +5,10 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=48G
+#SBATCH --mem=150G
 #SBATCH --gres=gpu:1
-#SBATCH --time=48:00:00
+#SBATCH --tmp=110G
+#SBATCH --time=72:00:00
 #SBATCH --partition=gpu
 
 set -euo pipefail
@@ -122,6 +123,28 @@ echo ""
 
 # Create output directory
 mkdir -p "$OUTPUT_DIR"
+
+# Stage data to local disk for faster I/O
+JOBFS_DIR="${SLURM_TMPDIR:-${TMPDIR:-${JOBFS:-}}}"
+if [[ -n "$JOBFS_DIR" && -d "$JOBFS_DIR" ]]; then
+    echo "Staging datasets to local disk: $JOBFS_DIR"
+    echo "  Copying: $DATA_PATH"
+    cp -f "$DATA_PATH" "$JOBFS_DIR/"
+    DATA_PATH="$JOBFS_DIR/$(basename "$DATA_PATH")"
+    echo "  Staged to: $DATA_PATH"
+    
+    if [[ -n "$NEG_DATA_PATH" && "$NEG_DATA_PATH" != "null" && -f "$NEG_DATA_PATH" ]]; then
+        echo "  Copying: $NEG_DATA_PATH"
+        cp -f "$NEG_DATA_PATH" "$JOBFS_DIR/"
+        NEG_DATA_PATH="$JOBFS_DIR/$(basename "$NEG_DATA_PATH")"
+        echo "  Staged to: $NEG_DATA_PATH"
+    fi
+    echo "Staging complete."
+    echo ""
+else
+    echo "WARNING: No local scratch directory available. Reading from Lustre (slower)."
+    echo ""
+fi
 
 # Build command
 cmd=(

@@ -114,9 +114,10 @@ class SpatialEmbedding(nn.Module):
         phi = ra * (math.pi / 180.0)               # azimuthal angle
 
         # Convert Spherical to Cartesian Coordinates
-        x = torch.cos(theta) * torch.cos(phi)
-        y = torch.cos(theta) * torch.sin(phi)
-        z = torch.sin(theta)
+        # Standard convention consistent with HEALPix (data_loader.sample_moc_skymap)
+        x = torch.sin(theta) * torch.cos(phi)
+        y = torch.sin(theta) * torch.sin(phi)
+        z = torch.cos(theta)
         
         coords = torch.stack([x, y, z], dim=1) # [Batch, 3]
         return self.fc(coords)
@@ -432,12 +433,13 @@ class ResNet1D(nn.Module):
         x = self.layer2(x)  # [Batch, 128, L/16=1200]
         x = self.layer3(x)  # [Batch, 256, L/32=600]
         x = self.layer4(x)  # [Batch, 512, L/64=300]
+        feature_map = x     # preserve spatial features before pooling
 
         x = self.avgpool(x) # [Batch, 512, 1]
         x = x.flatten(1)    # [Batch, 512]
         x = self.fc(x)      # [Batch, Output_Dim]
-        
-        return x
+
+        return x, feature_map
 
 # ==============================================================================
 # 5. Dual-Stream Fusion Encoder
@@ -483,8 +485,16 @@ class GWMOCResNetEncoder(nn.Module):
             nn.BatchNorm1d(final_output_dim * 2),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(final_output_dim * 2, final_output_dim) 
+            nn.Linear(final_output_dim * 2, final_output_dim)
             # Final output 'g' vector
+        )
+
+        # --- 4. Skymap sequence projection for dual fusion ---
+        # Projects ResNet feature map (512-d) to enc_dim for cross-attention
+        self.skymap_seq_proj = nn.Sequential(
+            nn.Conv1d(512, final_output_dim, kernel_size=1),
+            nn.BatchNorm1d(final_output_dim),
+            nn.ReLU()
         )
 
         # Initialize weights
@@ -651,14 +661,15 @@ class GWOpticalContrastiveModel(nn.Module):
     def compute_masked_itc_loss(self, feat_g, feat_o, gw_indices, mask=None):
         """
         Computes Image-Text Contrastive (ITC) loss.
-        Uses gw_indices to handle potential 'false negatives' 
+        Uses gw_indices to handle potential 'false negatives'
         (though BalancedSampler avoids them, this is robust).
         """
         batch_size = feat_g.size(0)
-        logit_scale = torch.clamp(self.log_temp.exp(), min=0.01, max=100.0)
-        
+        temperature = torch.clamp(self.log_temp.exp(), min=0.01, max=100.0)
+
         # 1. Similarity Matrix: [B, B]
-        sim_g2o = torch.matmul(feat_g, feat_o.T) * logit_scale
+        # Divide by temperature (smaller temp → sharper distribution)
+        sim_g2o = torch.matmul(feat_g, feat_o.T) / temperature
         sim_o2g = sim_g2o.T
         
         if mask is not None:
@@ -876,8 +887,7 @@ class GWOpticalALBEFModel(nn.Module):
 
         return total_loss, sim_g2o
 
-    def compute_supcon_loss(self, g, z_l, gw_indices, temperature=0.07, margin=0.0,
-                            is_neg_gw=None):
+    def compute_supcon_loss(self, g, z_l, gw_indices, margin=0.0):
         """
         Supervised Contrastive Loss for many-to-many GW-optical matching.
 
@@ -888,18 +898,17 @@ class GWOpticalALBEFModel(nn.Module):
         - Normalizes loss by number of positives per anchor
         - More stable with multiple positives per class
 
+        Uses the model's learned/scheduled temperature (self.log_temp) so that
+        temperature scheduling and learned temperature mode work consistently.
+
         Args:
             g: GW embeddings [batch, dim]
             z_l: Optical embeddings [batch, dim]
             gw_indices: GW event indices for each sample
-            temperature: Temperature scaling factor
             margin: Margin to enforce between positive and negative similarities.
                     When margin > 0, negatives are penalized by subtracting margin
                     from their similarity, pushing positives to be more similar
                     than negatives by at least this margin.
-            is_neg_gw: Boolean tensor [batch] marking negative GW positions.
-                       These positions are excluded from the loss to avoid
-                       creating false positive pairs.
         """
         feat_g = F.normalize(self.gw_proj(g), p=2, dim=1, eps=1e-8)
         feat_o = F.normalize(self.opt_proj(z_l), p=2, dim=1, eps=1e-8)
@@ -907,24 +916,20 @@ class GWOpticalALBEFModel(nn.Module):
         batch_size = feat_g.size(0)
         device = feat_g.device
 
+        temperature = torch.clamp(self.log_temp.exp(), min=self.temp_min, max=self.temp_max)
+
         features = torch.cat([feat_g, feat_o], dim=0)
         labels = torch.cat([gw_indices, gw_indices], dim=0)
 
         sim_matrix = torch.matmul(features, features.T) / temperature
 
         labels_eq = labels.unsqueeze(0) == labels.unsqueeze(1)
-        mask_pos = labels_eq.float()
-        mask_pos.fill_diagonal_(0)
+        mask_pos = labels_eq.clone()
+        mask_pos[:batch_size, :batch_size] = False
+        mask_pos[batch_size:, batch_size:] = False
+        mask_pos.fill_diagonal_(False)
+        mask_pos = mask_pos.float()
         mask_neg = 1.0 - labels_eq.float()
-
-        # Zero out positive masks for negative GW positions to prevent
-        # false positive pairs (neg GW should not be pulled toward any optical)
-        if is_neg_gw is not None and is_neg_gw.any():
-            neg_gw_mask_2b = torch.cat([is_neg_gw, is_neg_gw], dim=0)
-            # Remove all positive associations for neg GW anchors (rows)
-            mask_pos[neg_gw_mask_2b] = 0.0
-            # Remove neg GW as positive targets for other anchors (cols)
-            mask_pos[:, neg_gw_mask_2b] = 0.0
 
         mask_self = torch.eye(2 * batch_size, device=device, dtype=torch.bool)
 
@@ -948,12 +953,14 @@ class GWOpticalALBEFModel(nn.Module):
 
         # Only average over anchors that have at least one positive
         has_pos = mask_pos.sum(dim=1) > 0
+        pos_rate = has_pos.float().mean().item()
+        # print(f"Supervised Contrastive Loss - Positive Rate: {pos_rate*100:.2f}%")
         if has_pos.any():
             loss = -mean_log_prob_pos[has_pos].mean()
         else:
             loss = torch.zeros((), device=device)
 
-        sim_g2o = torch.matmul(feat_g, feat_o.T) * (1.0 / temperature)
+        sim_g2o = torch.matmul(feat_g, feat_o.T) / temperature
 
         return loss, sim_g2o
 
@@ -974,18 +981,22 @@ class GWOpticalALBEFModel(nn.Module):
         return hard_idx
 
     @staticmethod
-    def sample_semi_hard_negatives(sim_g2o, gw_indices=None, top_k=5):
+    def sample_semi_hard_negatives(sim_g2o, gw_indices=None, margin=0.2):
         """
-        Sample semi-hard negatives instead of the hardest.
+        Sample semi-hard negatives using relative margin around positive median.
 
-        Instead of always selecting the most similar negative (which can be
-        more similar than positives), randomly sample from the top-k most
-        similar negatives. This provides a curriculum of increasing difficulty.
+        For each anchor, compute the median similarity among its positive
+        (same-event) pairs, then select negatives from the band:
+            sim in [(1 - margin) * pos_median, pos_median]
+
+        Fallback: if no candidates in the band, pick the negative with
+        similarity closest to (but below) pos_median. If all negatives
+        exceed pos_median, fall back to a random negative.
 
         Args:
             sim_g2o: Similarity matrix [batch, batch]
             gw_indices: GW event indices to identify same-event pairs
-            top_k: Number of top similar negatives to sample from
+            margin: Relative margin in (0, 1). Band width = margin * pos_median.
 
         Returns:
             semi_hard_idx: Selected negative indices [batch]
@@ -994,25 +1005,44 @@ class GWOpticalALBEFModel(nn.Module):
         batch_size = sim.size(0)
         device = sim.device
 
-        # Mask same-event pairs
         if gw_indices is not None:
             same_event = gw_indices.unsqueeze(0) == gw_indices.unsqueeze(1)
         else:
             same_event = torch.eye(batch_size, device=device, dtype=torch.bool)
-        sim = sim.masked_fill(same_event, -1e9)
 
-        # Ensure top_k doesn't exceed available negatives
-        n_negatives = (~same_event).sum(dim=1).min().item()
-        actual_k = min(top_k, max(1, n_negatives))
+        # Median positive similarity per anchor
+        pos_sim = sim.clone()
+        pos_sim.masked_fill_(~same_event, float('nan'))
+        pos_med = pos_sim.nanmedian(dim=1).values  # [batch]
 
-        # Get top-k similar negatives for each anchor
-        topk_vals, topk_idx = sim.topk(actual_k, dim=1)
+        # Mask positives out of negative candidates
+        neg_sim = sim.masked_fill(same_event, -1e9)
 
-        # Randomly sample from top-k (not always the hardest)
-        rand_select = torch.randint(0, actual_k, (batch_size,), device=device)
-        semi_hard_idx = topk_idx[torch.arange(batch_size, device=device), rand_select]
+        # Semi-hard band: [(1-margin)*pos_med, pos_med]
+        lower = ((1.0 - margin) * pos_med).unsqueeze(1)  # [batch, 1]
+        upper = pos_med.unsqueeze(1)                       # [batch, 1]
+        semi_hard_mask = (neg_sim >= lower) & (neg_sim <= upper)
 
-        return semi_hard_idx
+        result = torch.zeros(batch_size, dtype=torch.long, device=device)
+        for i in range(batch_size):
+            candidates = semi_hard_mask[i].nonzero(as_tuple=False).squeeze(-1)
+            if candidates.numel() > 0:
+                pick = torch.randint(0, candidates.numel(), (1,), device=device)
+                result[i] = candidates[pick]
+            else:
+                # Fallback: closest negative below pos_med
+                below_mask = (neg_sim[i] <= pos_med[i]) & (neg_sim[i] > -1e8)
+                below_idx = below_mask.nonzero(as_tuple=False).squeeze(-1)
+                if below_idx.numel() > 0:
+                    best = neg_sim[i, below_idx].argmax()
+                    result[i] = below_idx[best]
+                else:
+                    # All negatives exceed pos_med — pick random negative
+                    neg_idx = (~same_event[i]).nonzero(as_tuple=False).squeeze(-1)
+                    pick = torch.randint(0, neg_idx.numel(), (1,), device=device)
+                    result[i] = neg_idx[pick]
+
+        return result
 
 # ==============================================================================
 # 9. Lightweight GW Encoder (解决过拟合问题)

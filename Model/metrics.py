@@ -183,6 +183,9 @@ def compute_classification_metrics(all_probs, all_labels, all_sources=None,
                 src_labels = labels[mask]
                 src_acc = (src_preds == src_labels).float().mean().item()
                 results[f"acc_{src}"] = src_acc
+        source_accs = [v for k, v in results.items() if k.startswith('acc_')]
+        if source_accs:
+            results['acc_total'] = sum(source_accs) / len(source_accs)
 
     return results
 

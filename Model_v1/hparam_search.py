@@ -32,12 +32,30 @@ from train_v1 import train_with_config
 def create_objective(data_path, neg_data_path, neg_group, max_epochs):
     """Create an Optuna objective function with the given data paths."""
 
+    # Fixed products for consistent samples per epoch
+    TRAIN_SAMPLES_PER_EPOCH = 1024000  # batch_size * steps_per_epoch
+    VAL_SAMPLES_PER_EPOCH = 25600      # val_batch_size * val_steps_per_epoch
+
     def objective(trial):
+        # Sample batch_size first to compute dependent parameters
+        # batch_size = trial.suggest_categorical("batch_size", [128, 256, 512, 1024])
+        batch_size = 1024  # Fix batch size to 1024 for consistent training time
+        
+        # Compute steps_per_epoch to maintain fixed samples per epoch
+        steps_per_epoch = TRAIN_SAMPLES_PER_EPOCH // batch_size
+
+        # Use same batch_size for validation and compute val_steps_per_epoch
+        val_batch_size = batch_size
+        val_steps_per_epoch = VAL_SAMPLES_PER_EPOCH // val_batch_size
+
         config = {
             # Training hyperparameters
             "lr": trial.suggest_float("lr", 1e-5, 1e-2, log=True),
             "weight_decay": trial.suggest_float("weight_decay", 1e-5, 1e-1, log=True),
-            "batch_size": trial.suggest_categorical("batch_size", [32, 64, 128, 256]),
+            "batch_size": batch_size,
+            "steps_per_epoch": steps_per_epoch,
+            "val_batch_size": val_batch_size,
+            "val_steps_per_epoch": val_steps_per_epoch,
             "grad_clip_norm": trial.suggest_float("grad_clip_norm", 0.5, 2.0),
             "label_smoothing": trial.suggest_float("label_smoothing", 0.0, 0.2),
 
