@@ -13,7 +13,7 @@ hpo_results/
 logs/
 eval_results/
 *.png
-
+PRD/
 
 ./dataset/KN_sim/notebook/
 dataset/O5_sim_bns/*.ipynb

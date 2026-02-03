@@ -567,7 +567,7 @@ def split_gw_map(gw_to_lc_map: dict, val_split: float, seed: int):
     val_map = {gw_id: gw_to_lc_map[gw_id] for gw_id in val_ids}
     return train_map, val_map
 
-def _build_dataloader(
+def     _build_dataloader(
     dataset: Dataset,
     sampler: Sampler,
     num_workers: int,
@@ -983,7 +983,7 @@ NUM_BANDS = 6
 MAX_LC_LENGTH = 200  # Maximum length of light curves all band
 
 # Functions for parsing SNANA FITS files, and sampling MOC skymaps
-def parse_snana_fits(event_id, sim_dir, sim_name="LSST_KN_BNS"):
+def parse_snana_fits(event_id, sim_dir, sim_name="LSST_KN_BNS_AUG"):
     """
     Parses {event_id}_HEAD.fits and {event_id}_PHOT.fits.
     Extracts multiple light curve realizations for a single GW event.
@@ -1037,6 +1037,10 @@ def parse_snana_fits(event_id, sim_dir, sim_name="LSST_KN_BNS"):
                 # End index: value (exclusive in python slicing)
                 start_idx = ptrobs_min[i] - 1
                 end_idx = ptrobs_max[i]
+                nobs = data_head['NOBS'][i]
+                if nobs < 5:
+                    # print(f"Warning: Light curve for event {event_id} realization {i} has less than 5 observations. Skipping.")
+                    continue  # Skip light curves with less than 5 observations
 
                 # get coordinates
                 ra = data_head['RA'][i]
@@ -1137,9 +1141,9 @@ def sample_moc_skymap(map_file):
         theta, phi = hp.pix2ang(this_nside, this_ipix, nest=True)
         # ras[m]  = np.degrees(phi)
         # decs[m] = 90.0 - np.degrees(theta)
-        xs[m] = np.cos(theta) * np.cos(phi)   # dec,[0, pi]
-        ys[m] = np.cos(theta) * np.sin(phi)   # ra,[0, 2pi]
-        zs[m] = np.sin(theta)
+        xs[m] = np.sin(theta) * np.cos(phi)   # dec,[0, pi]
+        ys[m] = np.sin(theta) * np.sin(phi)   # ra,[0, 2pi]
+        zs[m] = np.cos(theta)
     
     # 5) return torch tensors
     gw_mocmap = torch.tensor(np.vstack([xs, ys, zs, dA, 100 * dP, distmu, distsigma]), dtype=torch.float32)   # [7, N_pixels], no distnorm
@@ -1153,140 +1157,6 @@ def sample_moc_skymap(map_file):
 
     return gw_mocmap  # [7, N_pixels]
 
-# Function to create relational dataset
-def create_relational_dataset(
-    gw_catalog_path, 
-    fits_dir, 
-    output_h5_path
-):
-    """
-    Main function to process all data and save to HDF5.
-    """
-    # 1. Load GW Catalog
-    print(f"Loading GW Catalog from {gw_catalog_path}...")
-    # Assuming CSV has columns: event_id, m1, m2, ..., skymap_path
-    gw_df = pd.read_csv(gw_catalog_path)
-    
-    n_unique = len(gw_df)
-    
-    # 2. Initialize HDF5 File
-    with h5py.File(output_h5_path, 'w') as f:
-        # --- Group A: Unique GW Events ---
-        grp_gw = f.create_group('events/gw_data')
-        
-        # Pre-allocate GW datasets (we know exact size N_unique)
-        ds_gw_scalars = grp_gw.create_dataset('scalars', (n_unique, 7), dtype='f4')
-        ds_gw_skymaps = grp_gw.create_dataset('skymaps', (n_unique, 6, 19200), dtype='f4') # 6 channels after cleaning
-        # Store IDs as fixed-length ASCII strings
-        dt_str = h5py.special_dtype(vlen=str) 
-        ds_gw_ids = grp_gw.create_dataset('ids', (n_unique,), dtype=dt_str)
-        
-        # --- Group B: All Optical Data ---
-        # We don't know total optical count yet, so we use resizable datasets (chunked)
-        grp_opt = f.create_group('events/optical_data')
-        
-        chunk_size = 1024
-        ds_opt_vals = grp_opt.create_dataset('values', (0, MAX_LC_LENGTH, NUM_BANDS), 
-                                             maxshape=(None, MAX_LC_LENGTH, NUM_BANDS), dtype='f4', chunks=(chunk_size, MAX_LC_LENGTH, NUM_BANDS))
-        ds_opt_errs = grp_opt.create_dataset('errors', (0, MAX_LC_LENGTH, NUM_BANDS),
-                                             maxshape=(None, MAX_LC_LENGTH, NUM_BANDS), dtype='f4', chunks=(chunk_size, MAX_LC_LENGTH, NUM_BANDS))
-        ds_opt_masks = grp_opt.create_dataset('masks', (0, MAX_LC_LENGTH, NUM_BANDS), 
-                                              maxshape=(None, MAX_LC_LENGTH, NUM_BANDS), dtype='f4', chunks=(chunk_size, MAX_LC_LENGTH, NUM_BANDS))
-        ds_opt_times = grp_opt.create_dataset('times', (0, MAX_LC_LENGTH), 
-                                              maxshape=(None, MAX_LC_LENGTH), dtype='f4', chunks=(chunk_size, MAX_LC_LENGTH))
-        
-        # Parent Index Mapping (The Relation)
-        ds_parent_idx = grp_opt.create_dataset('parent_gw_idx', (0,), maxshape=(None,), dtype='i4', chunks=(chunk_size,))
-        
-        # --- Processing Loop ---
-        print("Starting processing loop...")
-        total_optical_count = 0
-        
-        # Buffer for optical data to reduce HDF5 resize calls (optimization)
-        opt_buffer_vals = []
-        opt_buffer_errs = []
-        opt_buffer_masks = []
-        opt_buffer_times = []
-        opt_buffer_p_idx = []
-        BUFFER_LIMIT = 5000 
-
-        def flush_buffer():
-            nonlocal total_optical_count, opt_buffer_vals, opt_buffer_errs, opt_buffer_masks, opt_buffer_times, opt_buffer_p_idx
-            if len(opt_buffer_vals) == 0: return
-            
-            n_new = len(opt_buffer_vals)
-            current_size = total_optical_count
-            new_size = current_size + n_new
-            
-            # Resize datasets
-            ds_opt_vals.resize(new_size, axis=0)
-            ds_opt_errs.resize(new_size, axis=0)
-            ds_opt_masks.resize(new_size, axis=0)
-            ds_opt_times.resize(new_size, axis=0)
-            ds_parent_idx.resize(new_size, axis=0)
-            
-            # Write data
-            ds_opt_vals[current_size:new_size] = np.array(opt_buffer_vals)
-            ds_opt_errs[current_size:new_size] = np.array(opt_buffer_errs)
-            ds_opt_masks[current_size:new_size] = np.array(opt_buffer_masks)
-            ds_opt_times[current_size:new_size] = np.array(opt_buffer_times)
-            ds_parent_idx[current_size:new_size] = np.array(opt_buffer_p_idx)
-            
-            total_optical_count += n_new
-            
-            # Clear buffer
-            opt_buffer_vals = []
-            opt_buffer_errs = []
-            opt_buffer_masks = []
-            opt_buffer_times = []
-            opt_buffer_p_idx = []
-
-        # Iterate over unique GW events
-        for gw_idx, row in tqdm(gw_df.iterrows(), total=n_unique):
-            # if gw_idx > 1:
-            #     break
-            event_id = int(row['simulation_id'])
-            # print(f"Processing GW Event {event_id} ({gw_idx+1}/{n_unique})...")
-            
-            # 1. Process & Save GW Data
-            # Scalars (Columns m1...param14)
-            # Adjust columns based on your CSV
-            gw_params_name = ['mass1_detector', 'mass2_detector', 'spin1z', 'spin2z', 'inclination', 'distmean', 'diststd']
-            scalars = row[gw_params_name].values.astype(np.float32)
-            ds_gw_scalars[gw_idx] = scalars
-            ds_gw_ids[gw_idx] = str(event_id)
-            
-            # Skymap
-            # Apply robust preprocessing (Returns Tensor [6, 19200])
-            gw_mocmap = sample_moc_skymap(f"/fred/oz016/bgao_kn/data/bns_skymap/{event_id}.fits")
-            ds_gw_skymaps[gw_idx] = gw_mocmap.numpy() # Convert back to numpy for HDF5
-            
-            # 2. Process Optical Data
-            # Extract light curves from SNANA FITS
-            lcs = parse_snana_fits(event_id, sim_dir=fits_dir)
-            
-            # Add to buffer
-            for (vals, errs, masks, times) in lcs:
-                opt_buffer_vals.append(vals)
-                opt_buffer_errs.append(errs)
-                opt_buffer_masks.append(masks)
-                opt_buffer_times.append(times)
-                opt_buffer_p_idx.append(gw_idx) # Link to parent GW index
-            
-            # Flush if buffer is full
-            if len(opt_buffer_vals) >= BUFFER_LIMIT:
-                flush_buffer()
-        
-        # Final flush
-        flush_buffer()
-        
-        # Save metadata
-        f.attrs['n_unique_gw'] = n_unique
-        f.attrs['n_total_optical'] = total_optical_count
-        print(f"\nProcessing Complete.")
-        print(f"Unique GW Events: {n_unique}")
-        print(f"Total Light Curves: {total_optical_count}")
-        print(f"Saved to: {output_h5_path}")
 
 # Functions for parsing SNANA FITS files for negative samples
 def parse_snana_fits_neg(head_path, phot_path, type="SN"):

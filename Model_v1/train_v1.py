@@ -215,7 +215,7 @@ def train_with_config(
 
     # Extract config values with defaults
     batch_size = config.get('batch_size', 128)
-    samples_per_gw = config.get('samples_per_gw', 8)
+    samples_per_gw = config.get('samples_per_gw', 4)
     val_split = config.get('val_split', 0.2)
     neg_gw_ratio = config.get('neg_gw_ratio', 0.2)
     use_neg_gw = config.get('use_neg_gw', True)
@@ -263,18 +263,26 @@ def train_with_config(
     args_obj.neg_data_path = neg_data_path
     args_obj.use_neg_gw = use_neg_gw
 
+    # Extract dataloader and training control parameters
+    steps_per_epoch = config.get('steps_per_epoch', 1000)
+    val_steps_per_epoch = config.get('val_steps_per_epoch', 25)
+    val_batch_size = config.get('val_batch_size', batch_size)
+
     # Create data loaders
     if use_neg_gw:
         train_loader, val_loader, steps_per_epoch, _ = create_mixed_gw_dataloaders(
             data_path,
             batch_size=batch_size,
             samples_per_gw=samples_per_gw,
+            val_batch_size=val_batch_size,
+            steps_per_epoch=steps_per_epoch,
+            val_steps_per_epoch=val_steps_per_epoch,
             val_split=val_split,
             split_seed=42,
-            num_workers=8,
+            num_workers=4,
             pin_memory=True,
             persistent_workers=True,
-            prefetch_factor=8,
+            prefetch_factor=4,
             negative_h5_path=neg_data_path,
             negative_group=neg_group,
             cache_in_memory=True,
@@ -284,12 +292,15 @@ def train_with_config(
         train_loader, val_loader, steps_per_epoch, _ = create_train_val_dataloaders(
             data_path,
             batch_size=batch_size,
+            val_batch_size=val_batch_size,
+            steps_per_epoch=steps_per_epoch,
+            val_steps_per_epoch=val_steps_per_epoch,
             val_split=val_split,
             split_seed=42,
-            num_workers=8,
+            num_workers=4,
             pin_memory=True,
             persistent_workers=True,
-            prefetch_factor=8,
+            prefetch_factor=4,
             negative_h5_path=neg_data_path,
             negative_group=neg_group,
             cache_in_memory=True

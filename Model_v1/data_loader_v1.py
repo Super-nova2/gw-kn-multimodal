@@ -74,6 +74,9 @@ class PixelGWRelationalDataset(Dataset):
                     "gw_scalar": f['events/gw_data/scalars'][:],
                     "gw_pixel": f['events/optical_data/gw_pixel_features'][:]
                 }
+                if self.use_neg_gw and 'events/gw_data/skymaps' in f:
+                    print("Caching skymaps in memory...")
+                    self.data_cache["skymaps"] = f['events/gw_data/skymaps'][:]
 
         if self.negative_h5_path is not None:
             with h5py.File(self.negative_h5_path, 'r') as f:
@@ -209,9 +212,12 @@ class PixelGWRelationalDataset(Dataset):
         return credible
 
     def _get_gw_pixel_for_coords(self, gw_idx, opt_coords):
-        if self.h5_file is None:
-            self.h5_file = h5py.File(self.h5_path, 'r')
-        skymap = self.h5_file['events/gw_data/skymaps'][gw_idx]
+        if self.data_cache is not None and 'skymaps' in self.data_cache:
+            skymap = self.data_cache['skymaps'][gw_idx]
+        else:
+            if self.h5_file is None:
+                self.h5_file = h5py.File(self.h5_path, 'r')
+            skymap = self.h5_file['events/gw_data/skymaps'][gw_idx]
         pix_vectors = skymap[0:3]
         opt_vec = self._coords_to_unit_vector(opt_coords)
         scores = np.dot(pix_vectors.T, opt_vec)

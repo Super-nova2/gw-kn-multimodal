@@ -129,13 +129,13 @@ ITC_DECAY_EPOCHS=$(jq -r '.itc_decay_epochs // empty' "$args_file")
 ITC_DECAY_RATIO=$(jq -r '.itc_decay_ratio // empty' "$args_file")
 ITC_LABEL_SMOOTHING=$(jq -r '.itc_label_smoothing // empty' "$args_file")
 ITC_LOSS_TYPE=$(jq -r '.itc_loss_type // empty' "$args_file")
-SUPCON_TEMPERATURE=$(jq -r '.supcon_temperature // empty' "$args_file")
 SUPCON_MARGIN=$(jq -r '.supcon_margin // empty' "$args_file")
 SAMPLES_PER_GW=$(jq -r '.samples_per_gw // empty' "$args_file")
 MIN_LC_PER_GW=$(jq -r '.min_lc_per_gw // empty' "$args_file")
 HARD_NEG_START_EPOCH=$(jq -r '.hard_neg_start_epoch // empty' "$args_file")
 HARD_NEG_RAMP_EPOCHS=$(jq -r '.hard_neg_ramp_epochs // empty' "$args_file")
-HARD_NEG_TOP_K=$(jq -r '.hard_neg_top_k // empty' "$args_file")
+SEMI_HARD=$(jq -r '.semi_hard // false' "$args_file")
+SEMI_HARD_MARGIN=$(jq -r '.semi_hard_margin // empty' "$args_file")
 CLS_START_EPOCH=$(jq -r '.cls_start_epoch // empty' "$args_file")
 MASK_ITC=$(jq -r '.mask_itc // false' "$args_file")
 USE_LIGHTWEIGHT_GW=$(jq -r '.use_lightweight_gw // false' "$args_file")
@@ -146,9 +146,6 @@ OPT_AUG_NOISE=$(jq -r '.opt_aug_noise // empty' "$args_file")
 OPT_AUG_TIME_JITTER=$(jq -r '.opt_aug_time_jitter // empty' "$args_file")
 OPT_AUG_DROPOUT=$(jq -r '.opt_aug_dropout // empty' "$args_file")
 OPT_AUG_BAND_DROPOUT=$(jq -r '.opt_aug_band_dropout // empty' "$args_file")
-USE_NEG_GW=$(jq -r '.use_neg_gw // false' "$args_file")
-NEG_GW_RATIO=$(jq -r '.neg_gw_ratio // empty' "$args_file")
-
 mkdir -p "$CKPT_PATH"
 
 echo "========================================"
@@ -349,9 +346,6 @@ fi
 if [[ -n "$ITC_LOSS_TYPE" && "$ITC_LOSS_TYPE" != "null" ]]; then
     cmd+=(--itc_loss_type "$ITC_LOSS_TYPE")
 fi
-if [[ -n "$SUPCON_TEMPERATURE" && "$SUPCON_TEMPERATURE" != "null" ]]; then
-    cmd+=(--supcon_temperature "$SUPCON_TEMPERATURE")
-fi
 if [[ -n "$SUPCON_MARGIN" && "$SUPCON_MARGIN" != "null" ]]; then
     cmd+=(--supcon_margin "$SUPCON_MARGIN")
 fi
@@ -367,8 +361,11 @@ fi
 if [[ -n "$HARD_NEG_RAMP_EPOCHS" && "$HARD_NEG_RAMP_EPOCHS" != "null" ]]; then
     cmd+=(--hard_neg_ramp_epochs "$HARD_NEG_RAMP_EPOCHS")
 fi
-if [[ -n "$HARD_NEG_TOP_K" && "$HARD_NEG_TOP_K" != "null" ]]; then
-    cmd+=(--hard_neg_top_k "$HARD_NEG_TOP_K")
+if [[ "$SEMI_HARD" == "true" ]]; then
+    cmd+=(--semi_hard)
+fi
+if [[ -n "$SEMI_HARD_MARGIN" && "$SEMI_HARD_MARGIN" != "null" ]]; then
+    cmd+=(--semi_hard_margin "$SEMI_HARD_MARGIN")
 fi
 if [[ -n "$CLS_START_EPOCH" && "$CLS_START_EPOCH" != "null" ]]; then
     cmd+=(--cls_start_epoch "$CLS_START_EPOCH")
@@ -400,13 +397,6 @@ fi
 if [[ -n "$OPT_AUG_BAND_DROPOUT" && "$OPT_AUG_BAND_DROPOUT" != "null" ]]; then
     cmd+=(--opt_aug_band_dropout "$OPT_AUG_BAND_DROPOUT")
 fi
-if [[ "$USE_NEG_GW" == "true" ]]; then
-    cmd+=(--use_neg_gw)
-fi
-if [[ -n "$NEG_GW_RATIO" && "$NEG_GW_RATIO" != "null" ]]; then
-    cmd+=(--neg_gw_ratio "$NEG_GW_RATIO")
-fi
-
 echo "Command: ${cmd[*]}"
 "${cmd[@]}"
 exit_code=$?
