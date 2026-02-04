@@ -537,24 +537,26 @@ class GWMOCResNetEncoder(nn.Module):
         """
         Args:
             gw_scalars: [Batch, D_scalar]
-            skymap_sequence: [Batch, skymap_channels, Length] 
+            skymap_sequence: [Batch, skymap_channels, Length]
                              (e.g., [B, 7, 19200])
         Returns:
             g: [Batch, Final_Dim]
+            H_gw: [Batch, SeqLen, Final_Dim] — spatial feature map for dual fusion
         """
         # Encode Scalars
         h_scalar = self.scalar_enc(gw_scalars)  # [B, scalar_hidden]
-        
+
         # Encode Skymap Sequence
-        h_skymap = self.skymap_enc(skymap_sequence) # [B, resnet_output]
-        
-        # Concatenate
-        combined = torch.cat([h_scalar, h_skymap], dim=1)   # [B, fusion_input_dim]
-        
-        # Fuse
+        h_skymap, skymap_feat = self.skymap_enc(skymap_sequence)  # h_skymap: [B, resnet_output], skymap_feat: [B, 512, 300]
+
+        # Project spatial feature map: [B, 512, 300] -> [B, enc_dim, 300] -> [B, 300, enc_dim]
+        H_gw = self.skymap_seq_proj(skymap_feat).permute(0, 2, 1)
+
+        # Concatenate & Fuse
+        combined = torch.cat([h_scalar, h_skymap], dim=1)  # [B, fusion_input_dim]
         g = self.fusion_head(combined)  # [B, final_output_dim]
-        
-        return g
+
+        return g, H_gw
 
 # ==============================================================================
 # 6. Alignment Branch for Contrastive Learning
@@ -642,9 +644,9 @@ class GWOpticalContrastiveModel(nn.Module):
             gw_indices: [Batch] ID of the GW event (for masking)
         """
         # --- A. Encode Features ---
-        # g: [Batch, enc_dim]
-        g = self.gw_encoder(gw_s, gw_m)
-        
+        # g: [Batch, enc_dim], H_gw: spatial features (discarded for contrastive)
+        g, _H_gw = self.gw_encoder(gw_s, gw_m)
+
         # z_l: [Batch, enc_dim] (We discard H_l for contrastive pre-training)
         z_l, _ = self.optical_encoder(opt_coords, opt_t, opt_v, opt_ref_t, opt_mask, errors_obs=opt_err)
         
@@ -724,45 +726,80 @@ class GWOpticalContrastiveModel(nn.Module):
 # ==============================================================================
 class CrossAttentionFusion(nn.Module):
     """
-    Cross-attention fusion head for GW (query) and optical sequence (key/value).
-    Outputs binary classification logits for matching.
-    """
-    def __init__(self, gw_dim, opt_dim, attn_dim=None, hidden_dim=None, dropout=0.1):
-        super().__init__()
-        self.attn_dim = attn_dim if attn_dim is not None else opt_dim
-        self.hidden_dim = hidden_dim if hidden_dim is not None else self.attn_dim * 2
+    Cross-attention fusion head for GW-optical matching.
 
-        self.q_proj = nn.Linear(gw_dim, self.attn_dim)
-        self.k_proj = nn.Linear(opt_dim, self.attn_dim)
-        self.v_proj = nn.Linear(opt_dim, self.attn_dim)
-        self.out_norm = nn.LayerNorm(self.attn_dim)
+    When dual=False (legacy): GW queries optical → classifier(fused_opt).
+    When dual=True:  GW queries optical + optical CLS queries GW spatial map
+                     + per-pair credible level → classifier(concat).
+    """
+    def __init__(self, gw_dim, opt_dim, attn_dim=None, hidden_dim=None, dropout=0.1, dual=False):
+        super().__init__()
+        self.attn_dim = d = attn_dim if attn_dim is not None else opt_dim
+        self.hidden_dim = hidden_dim if hidden_dim is not None else d * 2
+        self.dual = dual
+
+        # Direction 1: GW → Optical (always used)
+        self.g2o_q = nn.Linear(gw_dim, d)
+        self.g2o_k = nn.Linear(opt_dim, d)
+        self.g2o_v = nn.Linear(opt_dim, d)
+        self.g2o_norm = nn.LayerNorm(d)
+
+        if dual:
+            # Direction 2: Optical CLS → GW spatial map
+            self.o2g_q = nn.Linear(opt_dim, d)
+            self.o2g_k = nn.Linear(gw_dim, d)
+            self.o2g_v = nn.Linear(gw_dim, d)
+            self.o2g_norm = nn.LayerNorm(d)
+            # Classifier input: fused_opt (d) + fused_gw (d) + cred_level (1)
+            cls_input_dim = d * 2 + 1
+        else:
+            cls_input_dim = d
+
         self.classifier = nn.Sequential(
-            nn.Linear(self.attn_dim, self.hidden_dim),
+            nn.Linear(cls_input_dim, self.hidden_dim),
             nn.ReLU(inplace=True),
             nn.Dropout(dropout),
             nn.Linear(self.hidden_dim, 2)
         )
 
-    def forward(self, g_feat, h_l):
+    def forward(self, g_feat, h_l, z_l=None, H_gw=None, cred_level=None):
         """
         Args:
-            g_feat: [Batch, gw_dim]
-            h_l: [Batch, N, opt_dim]
+            g_feat:     [B, gw_dim]     — GW global embedding
+            h_l:        [B, N, opt_dim]  — optical time-series features
+            z_l:        [B, opt_dim]     — optical CLS token (dual mode only)
+            H_gw:       [B, M, gw_dim]  — GW spatial feature map (dual mode only)
+            cred_level: [B, 1]           — per-pair credible level (dual mode only)
         Returns:
-            logits: [Batch, 2]
-            fused: [Batch, attn_dim]
+            logits: [B, 2]
+            fused:  [B, cls_input_dim]
         """
-        q = self.q_proj(g_feat).unsqueeze(1)  # [B, 1, d]
-        k = self.k_proj(h_l)                 # [B, N, d]
-        v = self.v_proj(h_l)                 # [B, N, d]
+        d = self.attn_dim
+        scale = d ** -0.5
 
-        attn_scores = torch.matmul(q, k.transpose(1, 2)) / math.sqrt(self.attn_dim)
-        attn_weights = torch.softmax(attn_scores, dim=-1)
-        fused = torch.matmul(attn_weights, v).squeeze(1)
-        fused = self.out_norm(fused)
+        # Direction 1: GW queries optical
+        q1 = self.g2o_q(g_feat).unsqueeze(1)     # [B, 1, d]
+        k1 = self.g2o_k(h_l)                      # [B, N, d]
+        v1 = self.g2o_v(h_l)                      # [B, N, d]
+        fused_opt = self.g2o_norm(
+            (torch.softmax(q1 @ k1.transpose(1, 2) * scale, dim=-1) @ v1).squeeze(1)
+        )  # [B, d]
 
-        logits = self.classifier(fused)
-        return logits, fused
+        if self.dual:
+            # Direction 2: Optical CLS queries GW spatial map
+            q2 = self.o2g_q(z_l).unsqueeze(1)     # [B, 1, d]
+            k2 = self.o2g_k(H_gw)                  # [B, M, d]
+            v2 = self.o2g_v(H_gw)                  # [B, M, d]
+            fused_gw = self.o2g_norm(
+                (torch.softmax(q2 @ k2.transpose(1, 2) * scale, dim=-1) @ v2).squeeze(1)
+            )  # [B, d]
+
+            combined = torch.cat([fused_opt, fused_gw, cred_level], dim=-1)  # [B, 2d+1]
+        else:
+            combined = fused_opt  # [B, d]
+
+        logits = self.classifier(combined)
+        return logits, combined
 
 
 class GWOpticalALBEFModel(nn.Module):
@@ -789,9 +826,11 @@ class GWOpticalALBEFModel(nn.Module):
         feature_dropout=0.0,
         label_smoothing=0.0,
         itc_label_smoothing=0.0,
-        use_lightweight_gw=False
+        use_lightweight_gw=False,
+        dual_fusion=False
     ):
         super().__init__()
+        self.dual_fusion = dual_fusion
 
         # 根据参数选择GW编码器类型
         if use_lightweight_gw:
@@ -832,12 +871,13 @@ class GWOpticalALBEFModel(nn.Module):
             opt_dim=enc_dim,
             attn_dim=fusion_attn_dim,
             hidden_dim=fusion_hidden_dim,
-            dropout=fusion_dropout
+            dropout=fusion_dropout,
+            dual=dual_fusion
         )
         self.cls_criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
 
     def encode(self, gw_s, gw_m, opt_coords, opt_t, opt_v, opt_ref_t, opt_mask, opt_err):
-        g = self.gw_encoder(gw_s, gw_m)
+        g, H_gw = self.gw_encoder(gw_s, gw_m)  # g: [B, enc_dim], H_gw: [B, SeqLen, enc_dim]
         if self.feature_dropout.p > 0:
             g = self.feature_dropout(g)
         z_l, h_l = self.optical_encoder(
@@ -846,7 +886,7 @@ class GWOpticalALBEFModel(nn.Module):
         if self.feature_dropout.p > 0:
             z_l = self.feature_dropout(z_l)
             h_l = self.feature_dropout(h_l)
-        return g, z_l, h_l
+        return g, z_l, h_l, H_gw
 
     def encode_optical(self, opt_coords, opt_t, opt_v, opt_ref_t, opt_mask, opt_err):
         z_l, h_l = self.optical_encoder(
@@ -964,8 +1004,8 @@ class GWOpticalALBEFModel(nn.Module):
 
         return loss, sim_g2o
 
-    def fusion_logits(self, g_feat, h_l):
-        logits, _ = self.fusion(g_feat, h_l)
+    def fusion_logits(self, g_feat, h_l, z_l=None, H_gw=None, cred_level=None):
+        logits, _ = self.fusion(g_feat, h_l, z_l=z_l, H_gw=H_gw, cred_level=cred_level)
         return logits
 
     @staticmethod
@@ -1059,7 +1099,8 @@ class LightweightSkymapEncoder(nn.Module):
     """
     def __init__(self, in_channels=7, output_dim=128, dropout=0.5):
         super().__init__()
-        self.conv = nn.Sequential(
+        # Conv blocks (without pooling) to preserve spatial feature map
+        self.conv_blocks = nn.Sequential(
             # Block 1: [B, 7, 19200] -> [B, 32, 4800]
             nn.Conv1d(in_channels, 32, kernel_size=7, stride=4, padding=3),
             nn.BatchNorm1d(32),
@@ -1077,10 +1118,9 @@ class LightweightSkymapEncoder(nn.Module):
             nn.BatchNorm1d(128),
             nn.ReLU(),
             nn.Dropout(dropout),
-
-            # Global pooling: [B, 128, 300] -> [B, 128, 1]
-            nn.AdaptiveAvgPool1d(1)
         )
+        # Separate pooling for flexibility
+        self.pool = nn.AdaptiveAvgPool1d(1)
         self.fc = nn.Linear(128, output_dim)
         self._init_weights()
 
@@ -1100,8 +1140,10 @@ class LightweightSkymapEncoder(nn.Module):
 
     def forward(self, x):
         # x: [Batch, in_channels, Length]
-        x = self.conv(x).squeeze(-1)  # [Batch, 128]
-        return self.fc(x)  # [Batch, output_dim]
+        x = self.conv_blocks(x)        # [Batch, 128, 300]
+        feature_map = x                # preserve spatial features
+        pooled = self.pool(x).squeeze(-1)  # [Batch, 128]
+        return self.fc(pooled), feature_map  # (pooled_output, spatial_features)
 
 
 class LightweightGWEncoder(nn.Module):
@@ -1146,6 +1188,14 @@ class LightweightGWEncoder(nn.Module):
             nn.Linear(final_output_dim, final_output_dim)
         )
 
+        # Skymap sequence projection for dual fusion: 128 -> final_output_dim
+        # The conv_blocks output 128-dim features, but enc_dim may differ
+        self.skymap_seq_proj = nn.Sequential(
+            nn.Conv1d(128, final_output_dim, kernel_size=1),
+            nn.BatchNorm1d(final_output_dim),
+            nn.ReLU()
+        )
+
         self._init_weights()
 
     def _init_weights(self):
@@ -1154,9 +1204,14 @@ class LightweightGWEncoder(nn.Module):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.BatchNorm1d):
-                nn.init.constant_(m.weight, 1)
-                nn.init.constant_(m.bias, 0)
+            elif isinstance(m, (nn.BatchNorm1d, nn.Conv1d)):
+                if isinstance(m, nn.Conv1d):
+                    nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                    if m.bias is not None:
+                        nn.init.constant_(m.bias, 0)
+                else:
+                    nn.init.constant_(m.weight, 1)
+                    nn.init.constant_(m.bias, 0)
 
     def forward(self, gw_scalars, skymap_sequence):
         """
@@ -1165,8 +1220,12 @@ class LightweightGWEncoder(nn.Module):
             skymap_sequence: [Batch, skymap_channels, Length]
         Returns:
             g: [Batch, final_output_dim]
+            H_gw: [Batch, SeqLen, final_output_dim] — spatial feature map for dual fusion
         """
         h_scalar = self.scalar_enc(gw_scalars)  # [B, scalar_hidden]
-        h_skymap = self.skymap_enc(skymap_sequence)  # [B, scalar_hidden]
+        h_skymap, skymap_feat = self.skymap_enc(skymap_sequence)  # h_skymap: [B, scalar_hidden], skymap_feat: [B, 128, 300]
+        # Project spatial feature map: [B, 128, 300] -> [B, final_output_dim, 300] -> [B, 300, final_output_dim]
+        H_gw = self.skymap_seq_proj(skymap_feat).permute(0, 2, 1)  # [B, 300, final_output_dim]
         combined = torch.cat([h_scalar, h_skymap], dim=1)  # [B, scalar_hidden * 2]
-        return self.fusion_head(combined)  # [B, final_output_dim]
+        g = self.fusion_head(combined)  # [B, final_output_dim]
+        return g, H_gw

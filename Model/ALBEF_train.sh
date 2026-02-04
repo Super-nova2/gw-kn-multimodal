@@ -139,6 +139,7 @@ SEMI_HARD_MARGIN=$(jq -r '.semi_hard_margin // empty' "$args_file")
 CLS_START_EPOCH=$(jq -r '.cls_start_epoch // empty' "$args_file")
 MASK_ITC=$(jq -r '.mask_itc // false' "$args_file")
 USE_LIGHTWEIGHT_GW=$(jq -r '.use_lightweight_gw // false' "$args_file")
+DUAL_FUSION=$(jq -r '.dual_fusion // false' "$args_file")
 GW_AUG_NOISE=$(jq -r '.gw_aug_noise // empty' "$args_file")
 GW_AUG_JITTER=$(jq -r '.gw_aug_jitter // empty' "$args_file")
 GW_AUG_DROPOUT=$(jq -r '.gw_aug_dropout // empty' "$args_file")
@@ -375,6 +376,9 @@ if [[ "$MASK_ITC" == "true" ]]; then
 fi
 if [[ "$USE_LIGHTWEIGHT_GW" == "true" ]]; then
     cmd+=(--use_lightweight_gw)
+fi
+if [[ "$DUAL_FUSION" == "true" ]]; then
+    cmd+=(--dual_fusion)
 fi
 if [[ -n "$GW_AUG_NOISE" && "$GW_AUG_NOISE" != "null" ]]; then
     cmd+=(--gw_aug_noise "$GW_AUG_NOISE")

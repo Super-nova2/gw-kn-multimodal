@@ -79,6 +79,53 @@ def augment_gw_data(gw_s, gw_m, training=True,
 
     return gw_s, gw_m
 
+
+def compute_credible_level(gw_m, opt_coords):
+    """
+    For each (GW, optical) pair, compute the credible level of the optical
+    transient's sky position in the GW skymap.
+
+    Uses skymap channels 0-2 (x, y, z unit vectors of pixel centers) to find
+    the nearest pixel to the optical RA/Dec, then computes what fraction of
+    the sky has higher or equal probability (dP) than that pixel.
+
+    Args:
+        gw_m: [B, 7, 19200] — skymap channels [x, y, z, dA, dP, distmu, distsigma]
+        opt_coords: [B, 2] — (RA, Dec) in degrees (dataset default). If values
+            look like radians (max |coord| <= ~2π), they are treated as radians.
+    Returns:
+        cred_level: [B, 1] — small = in high-probability region, large = in low-probability region
+    """
+    # NOTE: The dataset stores RA/Dec in degrees (e.g., from SNANA HEAD.FITS),
+    # while some model code paths historically assumed radians. To keep this
+    # function robust, auto-detect units and convert to radians if needed.
+    # Heuristic: if any coord exceeds ~2π in magnitude, it's almost certainly degrees.
+    coords = opt_coords
+    if coords.numel() > 0:
+        max_abs = coords.detach().abs().max()
+        if max_abs > (2 * math.pi + 1e-3):
+            coords = coords * (math.pi / 180.0)
+
+    ra = coords[:, 0]
+    dec = coords[:, 1]
+    opt_xyz = torch.stack([
+        torch.cos(dec) * torch.cos(ra),
+        torch.cos(dec) * torch.sin(ra),
+        torch.sin(dec)
+    ], dim=-1)  # [B, 3]
+
+    pix_xyz = gw_m[:, :3, :]  # [B, 3, 19200]
+    dot = torch.bmm(opt_xyz.unsqueeze(1), pix_xyz).squeeze(1)  # [B, 19200]
+    nearest_idx = dot.argmax(dim=-1)  # [B]
+
+    dP = gw_m[:, 4, :]  # [B, 19200]
+    dP_at_opt = dP[torch.arange(dP.size(0), device=dP.device), nearest_idx]  # [B]
+
+    # Credible level: fraction of pixels with dP >= dP at optical position
+    cred_level = (dP >= dP_at_opt.unsqueeze(-1)).float().mean(dim=-1)  # [B]
+    return cred_level.unsqueeze(-1)  # [B, 1]
+
+
 def augment_optical_data(opt_t, opt_v, opt_mask, opt_err, training=True,
                          time_jitter=0.0, flux_noise=0.0,
                          obs_dropout=0.0, band_dropout=0.0):
@@ -278,7 +325,7 @@ def evaluate(model, val_loader, device, args, epoch, amp_dtype=torch.float32):
             opt_ref_t = ref_time_cache
 
             with autocast(device_type='cuda', dtype=amp_dtype, enabled=(device.type == 'cuda')):
-                g, z_l, h_l = model.encode(
+                g, z_l, h_l, H_gw = model.encode(
                     gw_s, gw_m, opt_coords, opt_t, opt_v, opt_ref_t, opt_mask, opt_err
                 )
                 if args.itc_loss_type == "supcon":
@@ -294,7 +341,10 @@ def evaluate(model, val_loader, device, args, epoch, amp_dtype=torch.float32):
                 feat_g = F.normalize(model.gw_proj(g), p=2, dim=1, eps=1e-8)
                 feat_o = F.normalize(model.opt_proj(z_l), p=2, dim=1, eps=1e-8)
 
-                logits_pos = model.fusion_logits(g, h_l)
+                # Compute per-pair credible level for dual fusion
+                cred_level = compute_credible_level(gw_m, opt_coords) if args.dual_fusion else None
+
+                logits_pos = model.fusion_logits(g, h_l, z_l=z_l, H_gw=H_gw, cred_level=cred_level)
                 labels_pos = torch.ones(batch_size, device=device, dtype=torch.long)
                 labels_neg = torch.zeros(batch_size, device=device, dtype=torch.long)
                 pos_loss = model.cls_criterion(logits_pos, labels_pos)
@@ -320,14 +370,22 @@ def evaluate(model, val_loader, device, args, epoch, amp_dtype=torch.float32):
                     logits_hard = logits_pos.detach()
                 else:
                     h_l_hard = h_l[neg_idx]
-                    logits_hard = model.fusion_logits(g, h_l_hard)
+                    z_l_hard = z_l[neg_idx]
+                    cred_level_hard = (
+                        compute_credible_level(gw_m, opt_coords[neg_idx])
+                        if args.dual_fusion else None
+                    )
+                    logits_hard = model.fusion_logits(
+                        g, h_l_hard, z_l=z_l_hard, H_gw=H_gw, cred_level=cred_level_hard
+                    )
                     hard_loss = model.cls_criterion(logits_hard, labels_neg)
 
                 if has_negatives:
-                    _, h_l_neg = model.encode_optical(
+                    z_l_neg, h_l_neg = model.encode_optical(
                         neg_coords, neg_t, neg_v, opt_ref_t, neg_mask, neg_err
                     )
-                    logits_neg = model.fusion_logits(g, h_l_neg)
+                    cred_level_neg = compute_credible_level(gw_m, neg_coords) if args.dual_fusion else None
+                    logits_neg = model.fusion_logits(g, h_l_neg, z_l=z_l_neg, H_gw=H_gw, cred_level=cred_level_neg)
                     neg_loss = model.cls_criterion(logits_neg, labels_neg)
                 else:
                     neg_loss = None
@@ -555,11 +613,14 @@ def train(args):
         fusion_dropout=args.fusion_dropout,
         label_smoothing=args.label_smoothing,
         itc_label_smoothing=args.itc_label_smoothing,
-        use_lightweight_gw=getattr(args, 'use_lightweight_gw', False)
+        use_lightweight_gw=getattr(args, 'use_lightweight_gw', False),
+        dual_fusion=getattr(args, 'dual_fusion', False)
     ).to(device)
 
     if args.use_lightweight_gw:
         print("Using lightweight GW encoder (~100K params) to prevent overfitting.")
+    if getattr(args, 'dual_fusion', False):
+        print("Using dual cross-attention fusion with per-pair credible level.")
 
     if hasattr(torch, 'compile'):
         model = torch.compile(model)
@@ -676,7 +737,7 @@ def train(args):
             optimizer.zero_grad(set_to_none=True)
 
             with autocast(device_type='cuda', dtype=amp_dtype, enabled=(device.type == 'cuda')):
-                g, z_l, h_l = model.encode(
+                g, z_l, h_l, H_gw = model.encode(
                     gw_s, gw_m, opt_coords, opt_t, opt_v, opt_ref_t, opt_mask, opt_err
                 )
                 if args.itc_loss_type == "supcon":
@@ -688,7 +749,10 @@ def train(args):
                         g, z_l, gw_indices, mask=args.mask_itc
                     )
 
-                logits_pos = model.fusion_logits(g, h_l)
+                # Compute per-pair credible level for dual fusion
+                cred_level = compute_credible_level(gw_m, opt_coords) if args.dual_fusion else None
+
+                logits_pos = model.fusion_logits(g, h_l, z_l=z_l, H_gw=H_gw, cred_level=cred_level)
                 labels_pos = torch.ones(batch_size, device=device, dtype=torch.long)
                 labels_neg = torch.zeros(batch_size, device=device, dtype=torch.long)
                 pos_loss = model.cls_criterion(logits_pos, labels_pos)
@@ -714,14 +778,22 @@ def train(args):
                     logits_hard = logits_pos.detach()
                 else:
                     h_l_hard = h_l[neg_idx]
-                    logits_hard = model.fusion_logits(g, h_l_hard)
+                    z_l_hard = z_l[neg_idx]
+                    cred_level_hard = (
+                        compute_credible_level(gw_m, opt_coords[neg_idx])
+                        if args.dual_fusion else None
+                    )
+                    logits_hard = model.fusion_logits(
+                        g, h_l_hard, z_l=z_l_hard, H_gw=H_gw, cred_level=cred_level_hard
+                    )
                     hard_loss = model.cls_criterion(logits_hard, labels_neg)
 
                 if has_negatives:
-                    _, h_l_neg = model.encode_optical(
+                    z_l_neg, h_l_neg = model.encode_optical(
                         neg_coords, neg_t, neg_v, opt_ref_t, neg_mask, neg_err
                     )
-                    logits_neg = model.fusion_logits(g, h_l_neg)
+                    cred_level_neg = compute_credible_level(gw_m, neg_coords) if args.dual_fusion else None
+                    logits_neg = model.fusion_logits(g, h_l_neg, z_l=z_l_neg, H_gw=H_gw, cred_level=cred_level_neg)
                     neg_loss = model.cls_criterion(logits_neg, labels_neg)
                 else:
                     neg_loss = None
@@ -1038,6 +1110,8 @@ if __name__ == "__main__":
                         help="Epoch to start CLS training. Before this epoch, only ITC loss is used (for staged training)")
     parser.add_argument("--use_lightweight_gw", action='store_true',
                         help="Use lightweight GW encoder (~100K params) instead of ResNet-18 (~11M params) to prevent overfitting on small GW datasets")
+    parser.add_argument("--dual_fusion", action='store_true',
+                        help="Use dual cross-attention fusion (optical→GW + GW→optical) with per-pair credible level")
     # GW数据增强参数
     parser.add_argument("--gw_aug_noise", type=float, default=0.05,
                         help="GW skymap augmentation noise std (default: 0.05)")
