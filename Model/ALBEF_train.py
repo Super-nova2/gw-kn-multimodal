@@ -2,6 +2,7 @@ from data_loader import (
     create_training_dataloader,
     create_train_val_dataloaders,
     create_supcon_dataloaders,
+    build_gw_to_lc_mapping,
 )
 from model import GWOpticalALBEFModel
 from tqdm import tqdm
@@ -650,6 +651,32 @@ def train(args):
         print(f"Resumed from {args.resume} at epoch {start_epoch}.")
     model.train()
     has_negatives = args.neg_data_path is not None
+
+    # Build OOD validation loader from independent dataset (if provided)
+    ood_val_loader = None
+    if getattr(args, 'val_data_path', None) and os.path.exists(args.val_data_path):
+        ood_val_steps = args.ood_val_steps
+        ood_batch_size = args.val_batch_size or args.batch_size
+        # Cap batch size to number of unique GW events in the OOD dataset
+        ood_gw_map = build_gw_to_lc_mapping(args.val_data_path)
+        n_ood_gw = len(ood_gw_map)
+        if ood_batch_size > n_ood_gw:
+            print(f"Reducing OOD val batch_size from {ood_batch_size} to {n_ood_gw} (available GW events)")
+            ood_batch_size = n_ood_gw
+        ood_val_loader = create_training_dataloader(
+            h5_path=args.val_data_path,
+            batch_size=ood_batch_size,
+            steps_per_epoch=ood_val_steps,
+            num_workers=args.num_workers,
+            pin_memory=bool(args.pin_memory),
+            persistent_workers=bool(args.persistent_workers),
+            prefetch_factor=args.prefetch_factor,
+            cache_in_memory=False,
+            negative_h5_path=args.neg_data_path,
+            negative_group=args.neg_group
+        )
+        print(f"OOD validation loader: {args.val_data_path} ({ood_val_steps} steps, batch_size={ood_batch_size})")
+
     apply_freeze_schedule(model, args, start_epoch)
 
     pbar_update_every = 500
@@ -980,6 +1007,31 @@ def train(args):
                             print("Early stopping triggered.")
                             stop_early = True
 
+        # --- OOD (out-of-distribution) validation on independent test set ---
+        if ood_val_loader is not None:
+            ood_metrics = evaluate(model, ood_val_loader, device, args, epoch, amp_dtype=amp_dtype)
+            if ood_metrics is not None:
+                writer.add_scalar('OOD/Epoch_Total_Loss', ood_metrics['total'], epoch)
+                writer.add_scalar('OOD/Epoch_ITC_Loss', ood_metrics['itc'], epoch)
+                writer.add_scalar('OOD/Epoch_CLS_Loss', ood_metrics['cls'], epoch)
+                ood_ret = ood_metrics.get('retrieval', {})
+                for k, v in ood_ret.items():
+                    writer.add_scalar(f'OOD/Retrieval/{k}', v, epoch)
+                ood_cls = ood_metrics.get('classification', {})
+                for k in ('auroc', 'auprc', 'f1_optimal', 'ece', 'acc_total'):
+                    if k in ood_cls:
+                        writer.add_scalar(f'OOD/Classification/{k}', ood_cls[k], epoch)
+                ood_emb = ood_metrics.get('embedding', {})
+                for k, v in ood_emb.items():
+                    writer.add_scalar(f'OOD/Embedding/{k}', v, epoch)
+                ood_r1 = ood_ret.get('g2o_recall_at_1', 0)
+                ood_auroc = ood_cls.get('auroc', 0)
+                ood_align = ood_emb.get('alignment', 0)
+                print(
+                    f"  OOD: R@1={ood_r1:.4f} AUROC={ood_auroc:.4f} align={ood_align:.4f}"
+                )
+                writer.flush()
+
         if not getattr(args, 'skip_epoch_checkpoints', False):
             checkpoint_path = os.path.join(args.ckpt_path, "ALBEF", f"albef_epoch_{epoch+1}.pth")
             os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
@@ -1020,6 +1072,10 @@ if __name__ == "__main__":
     """
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_path", type=str, default="training_data.h5")
+    parser.add_argument("--val_data_path", type=str, default=None,
+                        help="Path to independent OOD validation HDF5 (separate from training data)")
+    parser.add_argument("--ood_val_steps", type=int, default=25,
+                        help="Number of validation steps per epoch for OOD validation")
     parser.add_argument("--neg_data_path", type=str, default=None)
     parser.add_argument("--neg_group", type=str, default="events/optical_data")
     parser.add_argument("--epochs", type=int, default=10)
