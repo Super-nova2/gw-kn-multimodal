@@ -147,6 +147,8 @@ OPT_AUG_NOISE=$(jq -r '.opt_aug_noise // empty' "$args_file")
 OPT_AUG_TIME_JITTER=$(jq -r '.opt_aug_time_jitter // empty' "$args_file")
 OPT_AUG_DROPOUT=$(jq -r '.opt_aug_dropout // empty' "$args_file")
 OPT_AUG_BAND_DROPOUT=$(jq -r '.opt_aug_band_dropout // empty' "$args_file")
+VAL_DATA_PATH=$(jq -r '.val_data_path // empty' "$args_file")
+OOD_VAL_STEPS=$(jq -r '.ood_val_steps // empty' "$args_file")
 mkdir -p "$CKPT_PATH"
 
 echo "========================================"
@@ -175,6 +177,11 @@ if [ "$STAGE_TO_JOBFS" = "true" ]; then
         if [[ -n "$NEG_DATA_PATH" && "$NEG_DATA_PATH" != "null" ]]; then
             cp -f "$NEG_DATA_PATH" "$JOBFS_DIR"/
             NEG_DATA_PATH="$JOBFS_DIR/$(basename "$NEG_DATA_PATH")"
+        fi
+        if [[ -n "$VAL_DATA_PATH" && "$VAL_DATA_PATH" != "null" ]]; then
+            VAL_STAGED_NAME="val_$(basename "$VAL_DATA_PATH")"
+            cp -f "$VAL_DATA_PATH" "$JOBFS_DIR/$VAL_STAGED_NAME"
+            VAL_DATA_PATH="$JOBFS_DIR/$VAL_STAGED_NAME"
         fi
     else
         echo "No local tmp dir found; skip staging."
@@ -400,6 +407,12 @@ if [[ -n "$OPT_AUG_DROPOUT" && "$OPT_AUG_DROPOUT" != "null" ]]; then
 fi
 if [[ -n "$OPT_AUG_BAND_DROPOUT" && "$OPT_AUG_BAND_DROPOUT" != "null" ]]; then
     cmd+=(--opt_aug_band_dropout "$OPT_AUG_BAND_DROPOUT")
+fi
+if [[ -n "$VAL_DATA_PATH" && "$VAL_DATA_PATH" != "null" ]]; then
+    cmd+=(--val_data_path "$VAL_DATA_PATH")
+fi
+if [[ -n "$OOD_VAL_STEPS" && "$OOD_VAL_STEPS" != "null" ]]; then
+    cmd+=(--ood_val_steps "$OOD_VAL_STEPS")
 fi
 echo "Command: ${cmd[*]}"
 "${cmd[@]}"

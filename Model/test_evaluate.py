@@ -61,6 +61,7 @@ def parse_args():
 
     # Data source
     p.add_argument("--test_data_path", type=str, required=True,
+                   default="/fred/oz016/bgao_kn/data/LSST_KN_BNS/combined_dataset_with_neg_gw.h5",
                    help="Independent test HDF5 file")
     p.add_argument("--neg_data_path", type=str,
                    default="/fred/oz016/bgao_kn/data/ELASTICC2_TRAIN/negative_dataset.h5",
@@ -329,7 +330,12 @@ def extract_all_embeddings(model, loader, device, model_args):
             shift = 1
             h_l_neg = torch.roll(h_l, shifts=shift, dims=0)
             z_l_neg = torch.roll(z_l, shifts=shift, dims=0)
-            cred_level_neg = torch.roll(cred_level, shifts=shift, dims=0) if cred_level is not None else None
+            # Recompute credible level for the mismatched pair (current GW + rolled optical coords)
+            if dual:
+                opt_coords_neg = torch.roll(opt_coords, shifts=shift, dims=0)
+                cred_level_neg = compute_credible_level(gw_m, opt_coords_neg)
+            else:
+                cred_level_neg = None
             logits_neg = model.fusion_logits(g, h_l_neg, z_l=z_l_neg, H_gw=H_gw, cred_level=cred_level_neg)
 
             # Similarity matrix for retrieval
@@ -662,10 +668,54 @@ def evaluate_retrieval_gallery_mode(embeddings, gallery_sizes, n_trials=10,
 
 
 def evaluate_classification(embeddings):
-    """Global classification metrics from fusion head (pos + neg pairs)."""
+    """Global classification metrics from fusion head (pos + rolled neg pairs)."""
     logits = embeddings["logits"]
     labels = embeddings["labels"]
     probs = torch.softmax(logits.float(), dim=1)[:, 1]
+    return compute_classification_metrics(probs, labels)
+
+
+def evaluate_classification_triplet(triplet_logits):
+    """Classification metrics using all three pair types from triplet extraction.
+
+    Positive: matched (GW, KN) pairs → label 1
+    Negative: easy neg (GW, nonKN) + semi-hard neg (GW_wrong, KN) → label 0
+
+    This gives a more realistic classification evaluation than roll-by-1,
+    covering both negative scenarios the model will encounter in practice.
+    """
+    all_probs = []
+    all_labels = []
+
+    # Positives
+    if triplet_logits.get("logits_positive") is not None:
+        probs_pos = torch.softmax(triplet_logits["logits_positive"].float(), dim=1)[:, 1]
+        all_probs.append(probs_pos)
+        all_labels.append(torch.ones(len(probs_pos), dtype=torch.long))
+
+    # Easy negatives (GW, nonKN)
+    if triplet_logits.get("logits_easy_neg") is not None:
+        probs_easy = torch.softmax(triplet_logits["logits_easy_neg"].float(), dim=1)[:, 1]
+        all_probs.append(probs_easy)
+        all_labels.append(torch.zeros(len(probs_easy), dtype=torch.long))
+
+    # Semi-hard negatives (GW_wrong, KN)
+    if triplet_logits.get("logits_hard_neg") is not None:
+        probs_hard = torch.softmax(triplet_logits["logits_hard_neg"].float(), dim=1)[:, 1]
+        all_probs.append(probs_hard)
+        all_labels.append(torch.zeros(len(probs_hard), dtype=torch.long))
+
+    if not all_probs:
+        return {}
+
+    probs = torch.cat(all_probs)
+    labels = torch.cat(all_labels)
+
+    n_pos = (labels == 1).sum().item()
+    n_easy = len(probs_easy) if triplet_logits.get("logits_easy_neg") is not None else 0
+    n_hard = len(probs_hard) if triplet_logits.get("logits_hard_neg") is not None else 0
+    print(f"  Triplet classification: {n_pos} pos + {n_easy} easy_neg + {n_hard} hard_neg = {len(probs)} total")
+
     return compute_classification_metrics(probs, labels)
 
 
@@ -1208,7 +1258,7 @@ def main():
         embeddings, gallery_sizes, n_trials=args.gallery_trials
     )
 
-    print("Computing classification metrics...")
+    print("Computing classification metrics (roll-by-1, preliminary)...")
     results["classification"] = evaluate_classification(embeddings)
 
     print("Computing embedding quality metrics...")
@@ -1268,6 +1318,13 @@ def main():
                 )
             else:
                 raise
+
+    # Recompute classification from triplet logits (pos + easy_neg + hard_neg)
+    if triplet_logits is not None:
+        print("\nRecomputing classification metrics from triplet pairs...")
+        triplet_cls = evaluate_classification_triplet(triplet_logits)
+        if triplet_cls:
+            results["classification"] = triplet_cls
 
     # Save and display
     save_results(results, args.output_dir)
