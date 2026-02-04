@@ -17,11 +17,11 @@ New Features:
 
 Usage:
     python test_evaluate.py \\
-        --checkpoint /path/to/albef_best.pth \\
+        --checkpoint /fred/oz016/bgao_kn/data/model/checkpoints/supcon_v2/ALBEF/albef_best.pth \\
         --test_data_path /fred/oz016/bgao_kn/data/LSST_KN_BNS/combined_dataset_with_neg_gw.h5 \\
         --neg_data_path /fred/oz016/bgao_kn/data/ELASTICC2_TRAIN/negative_dataset.h5 \\
         --neg_group ELASTICC2_TRAIN/optical_data \\
-        --output_dir /path/to/eval_results
+        --output_dir eval_results
 """
 
 import argparse
@@ -74,7 +74,7 @@ def parse_args():
 
     # Eval parameters
     p.add_argument("--batch_size", type=int, default=256)
-    p.add_argument("--num_workers", type=int, default=4)
+    p.add_argument("--num_workers", type=int, default=0)
     p.add_argument("--gallery_sizes", type=str, default="100,500,1000",
                    help="Comma-separated gallery sizes for gallery-mode eval")
     p.add_argument("--gallery_trials", type=int, default=10,
@@ -118,6 +118,7 @@ def load_model(args, device):
         "ref_end": _get("ref_end", 0.6),
         "ref_dim": _get("ref_dim", 64),
         "use_lightweight_gw": _get("use_lightweight_gw", False),
+        "dual_fusion": _get("dual_fusion", False),
         "gw_dropout": _get("gw_dropout", 0.0),
         "opt_dropout": _get("opt_dropout", 0.0),
         "proj_dropout": _get("proj_dropout", 0.0),
@@ -149,6 +150,7 @@ def load_model(args, device):
         itc_label_smoothing=model_args["itc_label_smoothing"],
         fusion_attn_dim=model_args["fusion_attn_dim"],
         fusion_hidden_dim=model_args["fusion_hidden_dim"],
+        dual_fusion=model_args["dual_fusion"],
     )
     # Strip _orig_mod. prefix from torch.compile'd checkpoints
     state_dict = ckpt["model_state_dict"]
@@ -306,19 +308,29 @@ def extract_all_embeddings(model, loader, device, model_args):
 
         with autocast(device_type='cuda', dtype=torch.float16,
                       enabled=(device.type == 'cuda')):
-            g, z_l, h_l = model.encode(
+            g, z_l, h_l, H_gw = model.encode(
                 gw_s, gw_m, opt_coords, opt_t, opt_v, opt_ref_t, opt_mask, opt_err
             )
             feat_g = F.normalize(model.gw_proj(g), p=2, dim=1, eps=1e-8)
             feat_o = F.normalize(model.opt_proj(z_l), p=2, dim=1, eps=1e-8)
 
+            # Compute credible level if dual fusion
+            dual = getattr(model, 'dual_fusion', False) if not hasattr(model, '_orig_mod') else getattr(model._orig_mod, 'dual_fusion', False)
+            if dual:
+                from ALBEF_train import compute_credible_level
+                cred_level = compute_credible_level(gw_m, opt_coords)
+            else:
+                cred_level = None
+
             # Positive pairs (matched GW-optical)
-            logits_pos = model.fusion_logits(g, h_l)
+            logits_pos = model.fusion_logits(g, h_l, z_l=z_l, H_gw=H_gw, cred_level=cred_level)
 
             # Negative pairs (shift optical by 1 so each GW pairs with wrong optical)
             shift = 1
             h_l_neg = torch.roll(h_l, shifts=shift, dims=0)
-            logits_neg = model.fusion_logits(g, h_l_neg)
+            z_l_neg = torch.roll(z_l, shifts=shift, dims=0)
+            cred_level_neg = torch.roll(cred_level, shifts=shift, dims=0) if cred_level is not None else None
+            logits_neg = model.fusion_logits(g, h_l_neg, z_l=z_l_neg, H_gw=H_gw, cred_level=cred_level_neg)
 
             # Similarity matrix for retrieval
             temperature = model.log_temp.exp().clamp(
@@ -429,12 +441,20 @@ def extract_triplet_logits(model, loader, device, model_args, neg_optical_data,
         with autocast(device_type='cuda', dtype=torch.float16,
                       enabled=(device.type == 'cuda')):
             # Encode GW and KN optical
-            g, z_l, h_l = model.encode(
+            g, z_l, h_l, H_gw = model.encode(
                 gw_s, gw_m, opt_coords, opt_t, opt_v, ref_time, opt_mask, opt_err
             )
-            
+
+            # Compute credible level if dual fusion
+            _dual = getattr(model, 'dual_fusion', False) if not hasattr(model, '_orig_mod') else getattr(model._orig_mod, 'dual_fusion', False)
+            if _dual:
+                from ALBEF_train import compute_credible_level
+                _cred = compute_credible_level(gw_m, opt_coords)
+            else:
+                _cred = None
+
             # 1. Positive pairs: matched GW-KN
-            logits_pos = model.fusion_logits(g, h_l)
+            logits_pos = model.fusion_logits(g, h_l, z_l=z_l, H_gw=H_gw, cred_level=_cred)
             logits_positive.append(logits_pos.float().cpu())
             
             # 2. Semi-hard negatives: use similarity-based semi-hard negative mining
@@ -454,7 +474,9 @@ def extract_triplet_logits(model, loader, device, model_args, neg_optical_data,
             
             # Get semi-hard negative GW features and compute logits
             g_semihard = g[semi_hard_gw_idx]
-            logits_hard = model.fusion_logits(g_semihard, h_l)
+            H_gw_semihard = H_gw[semi_hard_gw_idx] if H_gw is not None else None
+            _cred_hard = compute_credible_level(gw_m[semi_hard_gw_idx], opt_coords) if _dual else None
+            logits_hard = model.fusion_logits(g_semihard, h_l, z_l=z_l, H_gw=H_gw_semihard, cred_level=_cred_hard)
             logits_hard_neg.append(logits_hard.float().cpu())
             
             # 3. Easy negatives: correct GW paired with non-KN transients
@@ -478,12 +500,12 @@ def extract_triplet_logits(model, loader, device, model_args, neg_optical_data,
                 # Encode negative optical with the same GW
                 ref_time_neg = build_ref_time(batch_size, n_ref, ref_start, ref_end, 
                                               device, neg_t_batch.dtype)
-                _, _, h_l_neg = model.encode(
-                    gw_s, gw_m, neg_c_batch, neg_t_batch, neg_v_batch, 
+                _, z_l_neg, h_l_neg, _ = model.encode(
+                    gw_s, gw_m, neg_c_batch, neg_t_batch, neg_v_batch,
                     ref_time_neg, neg_m_batch, neg_e_batch
                 )
-                
-                logits_easy = model.fusion_logits(g, h_l_neg)
+                _cred_neg = compute_credible_level(gw_m, neg_c_batch) if _dual else None
+                logits_easy = model.fusion_logits(g, h_l_neg, z_l=z_l_neg, H_gw=H_gw, cred_level=_cred_neg)
                 logits_easy_neg.append(logits_easy.float().cpu())
                 easy_neg_types.extend(batch_neg_types)
     
@@ -1160,8 +1182,18 @@ def main():
     loader, dataset = build_test_dataloader(args, saved_args)
     print(f"Test set: {len(loader)} batches")
 
-    # Extract all embeddings
-    embeddings = extract_all_embeddings(model, loader, device, model_args)
+    # Extract all embeddings (retry with single-worker if multiprocessing is blocked)
+    try:
+        embeddings = extract_all_embeddings(model, loader, device, model_args)
+    except PermissionError as e:
+        if args.num_workers > 0:
+            print("WARNING: DataLoader multiprocessing failed (PermissionError). "
+                  "Retrying with num_workers=0.")
+            args.num_workers = 0
+            loader, dataset = build_test_dataloader(args, saved_args)
+            embeddings = extract_all_embeddings(model, loader, device, model_args)
+        else:
+            raise
     n_samples = len(embeddings["feat_g"])
     n_unique_gw = len(torch.unique(embeddings["gw_indices"]))
     print(f"Extracted {n_samples} samples from {n_unique_gw} unique GW events")
@@ -1198,18 +1230,44 @@ def main():
         print("\nExtracting triplet logits for distribution analysis...")
         # Rebuild loader to iterate again
         loader2, _ = build_test_dataloader(args, saved_args)
-        triplet_logits = extract_triplet_logits(
-            model, loader2, device, model_args, neg_optical_data,
-            shuffle_gw=False
-        )
+        try:
+            triplet_logits = extract_triplet_logits(
+                model, loader2, device, model_args, neg_optical_data,
+                shuffle_gw=False
+            )
+        except PermissionError:
+            if args.num_workers > 0:
+                print("WARNING: DataLoader multiprocessing failed (PermissionError). "
+                      "Retrying triplet logits with num_workers=0.")
+                args.num_workers = 0
+                loader2, _ = build_test_dataloader(args, saved_args)
+                triplet_logits = extract_triplet_logits(
+                    model, loader2, device, model_args, neg_optical_data,
+                    shuffle_gw=False
+                )
+            else:
+                raise
         
         # GW-shuffle ablation test
         print("\nExtracting triplet logits with GW-SHUFFLE (ablation test)...")
         loader3, _ = build_test_dataloader(args, saved_args)
-        triplet_logits_shuffle = extract_triplet_logits(
-            model, loader3, device, model_args, neg_optical_data,
-            shuffle_gw=True, shuffle_seed=42
-        )
+        try:
+            triplet_logits_shuffle = extract_triplet_logits(
+                model, loader3, device, model_args, neg_optical_data,
+                shuffle_gw=True, shuffle_seed=42
+            )
+        except PermissionError:
+            if args.num_workers > 0:
+                print("WARNING: DataLoader multiprocessing failed (PermissionError). "
+                      "Retrying GW-shuffle logits with num_workers=0.")
+                args.num_workers = 0
+                loader3, _ = build_test_dataloader(args, saved_args)
+                triplet_logits_shuffle = extract_triplet_logits(
+                    model, loader3, device, model_args, neg_optical_data,
+                    shuffle_gw=True, shuffle_seed=42
+                )
+            else:
+                raise
 
     # Save and display
     save_results(results, args.output_dir)

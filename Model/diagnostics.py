@@ -201,7 +201,7 @@ def check_5_embedding_stats(model, gw_s, gw_m, opt_t, opt_v, opt_mask,
     opt_ref_t = torch.linspace(-0.3, 0.6, n_ref).unsqueeze(0).repeat(B, 1).to(device)
 
     with torch.no_grad():
-        g, z_l, h_l = model.encode(
+        g, z_l, h_l, H_gw = model.encode(
             gw_s.to(device), gw_m.to(device), opt_coords.to(device),
             opt_t.to(device), opt_v.to(device), opt_ref_t,
             opt_mask.to(device), opt_err.to(device)
