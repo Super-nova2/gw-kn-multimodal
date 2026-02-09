@@ -7,7 +7,7 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=150G
 #SBATCH --gres=gpu:1
-#SBATCH --time=72:00:00
+#SBATCH --time=168:00:00
 #SBATCH --partition=gpu
 #SBATCH --tmp=110G
 
@@ -55,12 +55,10 @@ N_TRIALS=$(jq -r '.n_trials' "$args_file")
 STUDY_NAME=$(jq -r '.study_name' "$args_file")
 EPOCHS_PER_TRIAL=$(jq -r '.epochs_per_trial' "$args_file")
 OUTPUT_DIR=$(jq -r '.output_dir' "$args_file")
-N_STARTUP_TRIALS=$(jq -r '.n_startup_trials // 10' "$args_file")
 
 DATA_PATH=$(jq -r '.data_path' "$args_file")
 NEG_DATA_PATH=$(jq -r '.neg_data_path // empty' "$args_file")
 NEG_GROUP=$(jq -r '.neg_group // empty' "$args_file")
-CACHE_IN_MEMORY=$(jq -r '.cache_in_memory // false' "$args_file")
 
 # ─── SLURM Info ────────────────────────────────────────────────────────
 echo "========================================"
@@ -81,7 +79,6 @@ echo "  Trials: $N_TRIALS"
 echo "  Study: $STUDY_NAME"
 echo "  Epochs/trial: $EPOCHS_PER_TRIAL"
 echo "  Output: $OUTPUT_DIR"
-echo "  Startup trials: $N_STARTUP_TRIALS"
 echo ""
 
 # ─── Stage data to local disk ─────────────────────────────────────────
@@ -103,27 +100,32 @@ fi
 mkdir -p logs/hpo
 mkdir -p "$OUTPUT_DIR"
 
+# ─── Build runtime config (inject staged paths + worker count) ───────
+RUNTIME_CONFIG="$OUTPUT_DIR/runtime_hpo_config_${SLURM_JOB_ID}.json"
+jq \
+  --arg data_path "$DATA_PATH" \
+  --arg neg_data_path "$NEG_DATA_PATH" \
+  --arg neg_group "$NEG_GROUP" \
+  --argjson num_workers "${SLURM_CPUS_PER_TASK}" \
+  '
+  .data_path = $data_path
+  | .num_workers = $num_workers
+  | (if ($neg_data_path | length) > 0 and $neg_data_path != "null"
+     then .neg_data_path = $neg_data_path
+     else .
+     end)
+  | (if ($neg_group | length) > 0 and $neg_group != "null"
+     then .neg_group = $neg_group
+     else .
+     end)
+  ' \
+  "$args_file" > "$RUNTIME_CONFIG"
+
 # ─── Build command ─────────────────────────────────────────────────────
 cmd=(
     python -u /fred/oz016/bgao_kn/ML+GW+KN/Model/hpo_optuna.py
-    --n_trials "$N_TRIALS"
-    --study_name "$STUDY_NAME"
-    --output_dir "$OUTPUT_DIR"
-    --epochs_per_trial "$EPOCHS_PER_TRIAL"
-    --n_startup_trials "$N_STARTUP_TRIALS"
-    --data_path "$DATA_PATH"
-    --num_workers "$SLURM_CPUS_PER_TASK"
+    --config "$RUNTIME_CONFIG"
 )
-
-if [[ -n "$NEG_DATA_PATH" && "$NEG_DATA_PATH" != "null" ]]; then
-    cmd+=(--neg_data_path "$NEG_DATA_PATH")
-fi
-if [[ -n "$NEG_GROUP" && "$NEG_GROUP" != "null" ]]; then
-    cmd+=(--neg_group "$NEG_GROUP")
-fi
-if [[ "$CACHE_IN_MEMORY" == "true" ]]; then
-    cmd+=(--cache_in_memory)
-fi
 
 # ─── Run HPO ───────────────────────────────────────────────────────────
 echo "Command: ${cmd[*]}"
@@ -137,9 +139,13 @@ echo "Exit code: $exit_code"
 # ─── Run analysis if HPO succeeded ────────────────────────────────────
 if [ $exit_code -eq 0 ]; then
     echo "Running post-HPO analysis..."
+    STORAGE=$(jq -r '.storage // empty' "$RUNTIME_CONFIG")
+    if [[ -z "$STORAGE" || "$STORAGE" == "null" ]]; then
+        STORAGE="sqlite:///$OUTPUT_DIR/optuna_study.db"
+    fi
     python -u /fred/oz016/bgao_kn/ML+GW+KN/Model/hpo_analyze.py \
         --study_name "$STUDY_NAME" \
-        --storage "sqlite:///$OUTPUT_DIR/optuna_study.db" \
+        --storage "$STORAGE" \
         --output_dir "$OUTPUT_DIR/analysis" \
         --top_k 5
 fi

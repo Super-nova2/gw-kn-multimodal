@@ -972,40 +972,39 @@ def train(args):
                     f"Emb: align={align:.4f}"
                 )
 
-                if args.early_stop_patience > 0:
-                    current_acc = val_metrics.get('classification', {}).get('acc_total', 0)
-                    if best_val is None or current_acc > best_val + args.early_stop_min_delta:
-                        best_val = current_acc
-                        best_val_metrics = {
-                            "best_val_acc_total": current_acc,
-                            "best_val_loss": val_metrics['total'],
-                            "best_epoch": epoch,
-                            "val_itc_loss": val_metrics.get('itc', 0),
-                            "val_cls_loss": val_metrics.get('cls', 0),
-                            "val_recall_at_1": val_metrics.get('retrieval', {}).get('g2o_recall_at_1', 0),
-                            "val_recall_at_5": val_metrics.get('retrieval', {}).get('g2o_recall_at_5', 0),
-                            "val_mrr": val_metrics.get('retrieval', {}).get('g2o_mrr', 0),
-                            "val_auroc": val_metrics.get('classification', {}).get('auroc', 0),
-                            "val_auprc": val_metrics.get('classification', {}).get('auprc', 0),
-                        }
-                        epochs_no_improve = 0
-                        best_ckpt = os.path.join(args.ckpt_path, "ALBEF", "albef_best.pth")
-                        os.makedirs(os.path.dirname(best_ckpt), exist_ok=True)
-                        torch.save({
-                            'epoch': epoch,
-                            'model_state_dict': model.state_dict(),
-                            'optimizer_state_dict': optimizer.state_dict(),
-                            'scaler_state_dict': scaler.state_dict(),
-                            'acc_total': current_acc,
-                            'loss': val_metrics['total'],
-                            'args': vars(args),
-                        }, best_ckpt)
-                        print(f"Saved best checkpoint (acc_total={current_acc:.4f}): {best_ckpt}")
-                    else:
-                        epochs_no_improve += 1
-                        if epochs_no_improve >= args.early_stop_patience:
-                            print("Early stopping triggered.")
-                            stop_early = True
+                current_acc = val_metrics.get('classification', {}).get('acc_total', 0)
+                if best_val is None or current_acc > best_val + args.early_stop_min_delta:
+                    best_val = current_acc
+                    best_val_metrics = {
+                        "best_val_acc_total": current_acc,
+                        "best_val_loss": val_metrics['total'],
+                        "best_epoch": epoch,
+                        "val_itc_loss": val_metrics.get('itc', 0),
+                        "val_cls_loss": val_metrics.get('cls', 0),
+                        "val_recall_at_1": val_metrics.get('retrieval', {}).get('g2o_recall_at_1', 0),
+                        "val_recall_at_5": val_metrics.get('retrieval', {}).get('g2o_recall_at_5', 0),
+                        "val_mrr": val_metrics.get('retrieval', {}).get('g2o_mrr', 0),
+                        "val_auroc": val_metrics.get('classification', {}).get('auroc', 0),
+                        "val_auprc": val_metrics.get('classification', {}).get('auprc', 0),
+                    }
+                    epochs_no_improve = 0
+                    best_ckpt = os.path.join(args.ckpt_path, "ALBEF", "albef_best.pth")
+                    os.makedirs(os.path.dirname(best_ckpt), exist_ok=True)
+                    torch.save({
+                        'epoch': epoch,
+                        'model_state_dict': model.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'scaler_state_dict': scaler.state_dict(),
+                        'acc_total': current_acc,
+                        'loss': val_metrics['total'],
+                        'args': vars(args),
+                    }, best_ckpt)
+                    print(f"Saved best checkpoint (acc_total={current_acc:.4f}): {best_ckpt}")
+                else:
+                    epochs_no_improve += 1
+                    if args.early_stop_patience > 0 and epochs_no_improve >= args.early_stop_patience:
+                        print("Early stopping triggered.")
+                        stop_early = True
 
         # --- OOD (out-of-distribution) validation on independent test set ---
         if ood_val_loader is not None:
