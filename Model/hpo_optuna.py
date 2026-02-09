@@ -1,197 +1,325 @@
 #!/usr/bin/env python3
 """
-Optuna-based hyperparameter optimization for ALBEF GW-Optical training.
+Config-driven Optuna hyperparameter optimization for ALBEF GW-Optical training.
 
-Usage (sequential, within a GPU SLURM job):
-    python hpo_optuna.py --n_trials 50 --study_name albef_hpo_v1
-
-Usage (resume existing study):
-    python hpo_optuna.py --n_trials 50 --study_name albef_hpo_v1 --storage sqlite:///hpo_results/optuna_study.db
+Usage:
+    python hpo_optuna.py --config args/hpo_v1.json
+    python hpo_optuna.py --config args/hpo_v1.json --dry_run
 """
 
 import argparse
 import json
+import math
 import os
 import subprocess
 import sys
 import time
+from typing import Any, Dict
 
 import optuna
-from optuna.samplers import TPESampler
 from optuna.pruners import MedianPruner
+from optuna.samplers import TPESampler
 
 
-# ─── paths ───────────────────────────────────────────────────────────────────
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 TRAIN_SCRIPT = os.path.join(SCRIPT_DIR, "ALBEF_train.py")
-TRAIN_SHELL = os.path.join(SCRIPT_DIR, "ALBEF_train.sh")
+DEFAULT_BASE_TRAIN_CONFIG = os.path.join(SCRIPT_DIR, "args", "ALBEF_supcon.json")
 
-# Default data paths — override with CLI args
-DEFAULT_DATA_PATH = "/fred/oz016/bgao_kn/data/LSST_KN_BNS_AUG/combined_dataset_with_neg_gw.h5"
-DEFAULT_NEG_DATA_PATH = "/fred/oz016/bgao_kn/data/ELASTICC2_TRAIN/negative_dataset.h5"
-DEFAULT_NEG_GROUP = "ELASTICC2_TRAIN/optical_data"
+ALBEF_BOOL_KEYS = {
+    "cache_in_memory",
+    "mask_itc",
+    "semi_hard",
+    "use_lightweight_gw",
+    "dual_fusion",
+    "skip_epoch_checkpoints",
+}
+
+ALBEF_ARG_KEYS = {
+    "data_path",
+    "val_data_path",
+    "ood_val_steps",
+    "neg_data_path",
+    "neg_group",
+    "epochs",
+    "batch_size",
+    "steps_per_epoch",
+    "ckpt_path",
+    "resume",
+    "pretrained",
+    "lr",
+    "weight_decay",
+    "grad_clip_norm",
+    "lr_scheduler",
+    "warmup_epochs",
+    "min_lr",
+    "num_workers",
+    "pin_memory",
+    "persistent_workers",
+    "prefetch_factor",
+    "cache_in_memory",
+    "val_split",
+    "val_batch_size",
+    "val_steps_per_epoch",
+    "split_seed",
+    "early_stop_patience",
+    "early_stop_min_delta",
+    "n_ref",
+    "ref_start",
+    "ref_end",
+    "ref_dim",
+    "enc_dim",
+    "proj_dim",
+    "fusion_attn_dim",
+    "fusion_hidden_dim",
+    "fusion_dropout",
+    "label_smoothing",
+    "temp_init",
+    "temp_final",
+    "temp_min",
+    "temp_max",
+    "temp_schedule",
+    "gw_dropout",
+    "opt_dropout",
+    "proj_dropout",
+    "feature_dropout",
+    "freeze_encoder_epochs",
+    "freeze_itc_epochs",
+    "itc_weight",
+    "cls_weight",
+    "cls_pos_weight",
+    "cls_neg_weight",
+    "cls_extra_neg_weight",
+    "cls_ramp_epochs",
+    "itc_decay_start_epoch",
+    "itc_decay_epochs",
+    "itc_decay_ratio",
+    "itc_label_smoothing",
+    "itc_loss_type",
+    "supcon_margin",
+    "samples_per_gw",
+    "min_lc_per_gw",
+    "mask_itc",
+    "hard_neg_start_epoch",
+    "hard_neg_ramp_epochs",
+    "semi_hard",
+    "semi_hard_margin",
+    "cls_start_epoch",
+    "use_lightweight_gw",
+    "dual_fusion",
+    "gw_aug_noise",
+    "gw_aug_jitter",
+    "gw_aug_dropout",
+    "opt_aug_noise",
+    "opt_aug_time_jitter",
+    "opt_aug_dropout",
+    "opt_aug_band_dropout",
+    "hpo_trial_number",
+    "skip_epoch_checkpoints",
+}
+
+STALE_KEYS = {
+    "supcon_temperature",
+    "stage_to_jobfs",
+    "use_neg_gw",
+    "neg_gw_ratio",
+    "hard_neg_top_k",
+}
+
+DEFAULT_TUNABLE_PARAMS = [
+    "lr",
+    "weight_decay",
+    "warmup_epochs",
+    "enc_dim",
+    "proj_dim",
+    "gw_dropout",
+    "opt_dropout",
+    "fusion_dropout",
+    "proj_dropout",
+    "feature_dropout",
+    "label_smoothing",
+    "itc_weight",
+    "cls_weight",
+    "cls_neg_weight",
+    "cls_extra_neg_weight",
+    "ref_shared_dim",
+    "samples_per_gw",
+    "cls_start_epoch",
+    "semi_hard_margin",
+]
 
 
-def build_trial_config(trial, args):
-    """Sample hyperparameters from Optuna and build a full training config dict."""
+def _resolve_path(path: str) -> str:
+    return os.path.abspath(os.path.expanduser(path))
 
-    # ── Group 1: Training Dynamics ────────────────────────────────────────
-    batch_size = 1024            # Fixed — larger batch benefits contrastive learning
-    val_batch_size = 1024        # Fixed — same as train
-    steps_per_epoch = 1_024_000 // batch_size       # = 1000
-    val_steps_per_epoch = 25600 // val_batch_size  # = 25
 
-    lr = trial.suggest_float("lr", 1e-5, 5e-4, log=True)
-    weight_decay = trial.suggest_float("weight_decay", 1e-4, 0.1, log=True)
-    warmup_epochs = trial.suggest_categorical("warmup_epochs", [0, 3, 5, 10])
+def _load_json(path: str) -> Dict[str, Any]:
+    with open(path) as f:
+        return json.load(f)
 
-    # ── Group 2: Contrastive Learning ─────────────────────────────────────
-    supcon_temperature = trial.suggest_float("supcon_temperature", 0.03, 0.3)
-    supcon_margin = trial.suggest_float("supcon_margin", 0.0, 0.2)
-    samples_per_gw = trial.suggest_categorical("samples_per_gw", [2, 4, 8])
-    neg_gw_ratio = trial.suggest_float("neg_gw_ratio", 0.05, 0.4)
 
-    # ── Group 3: Model Architecture ───────────────────────────────────────
-    enc_dim = trial.suggest_categorical("enc_dim", [64, 128, 256])
-    proj_dim = trial.suggest_categorical("proj_dim", [128, 256, 512])
-    ref_dim = trial.suggest_categorical("ref_dim", [32, 64, 128])
-    n_ref = trial.suggest_categorical("n_ref", [32, 64, 128])
+def _validate_search_space_spec(name: str, spec: Dict[str, Any]) -> None:
+    if not isinstance(spec, dict):
+        raise ValueError(f"search_space['{name}'] must be an object")
+    kind = spec.get("type")
+    if kind not in {"float", "int", "categorical"}:
+        raise ValueError(f"search_space['{name}'].type must be float/int/categorical")
+    if kind == "categorical":
+        choices = spec.get("choices")
+        if not isinstance(choices, list) or not choices:
+            raise ValueError(f"search_space['{name}'].choices must be a non-empty list")
+        return
+    if "low" not in spec or "high" not in spec:
+        raise ValueError(f"search_space['{name}'] must define low/high")
+    if spec["low"] >= spec["high"]:
+        raise ValueError(f"search_space['{name}'] requires low < high")
 
-    # Enforce proj_dim >= enc_dim
-    if proj_dim < enc_dim:
-        proj_dim = enc_dim
 
-    # ── Group 4: Regularization ───────────────────────────────────────────
-    gw_dropout = trial.suggest_float("gw_dropout", 0.05, 0.6)
-    opt_dropout = trial.suggest_float("opt_dropout", 0.05, 0.5)
-    fusion_dropout = trial.suggest_float("fusion_dropout", 0.05, 0.6)
-    proj_dropout = trial.suggest_float("proj_dropout", 0.0, 0.4)
-    label_smoothing = trial.suggest_float("label_smoothing", 0.0, 0.2)
+def load_hpo_config(config_path: str) -> Dict[str, Any]:
+    cfg = _load_json(config_path)
 
-    # ── Group 5: Loss Weights & Scheduling ────────────────────────────────
-    itc_weight = trial.suggest_float("itc_weight", 0.5, 2.0)
-    cls_weight = trial.suggest_float("cls_weight", 0.5, 2.0)
-    cls_ramp_epochs = trial.suggest_categorical("cls_ramp_epochs", [0, 5, 10, 20])
-    cls_neg_weight = trial.suggest_float("cls_neg_weight", 0.2, 1.0)
-    cls_extra_neg_weight = trial.suggest_float("cls_extra_neg_weight", 0.2, 1.0)
+    required = ["study_name", "n_trials", "output_dir", "epochs_per_trial", "search_space"]
+    missing = [k for k in required if k not in cfg]
+    if missing:
+        raise ValueError(f"Missing required config keys: {missing}")
 
-    # ── Build full config ─────────────────────────────────────────────────
-    trial_ckpt = os.path.join(args.output_dir, "results", f"trial_{trial.number}", "checkpoints")
+    cfg["config_path"] = _resolve_path(config_path)
+    cfg["output_dir"] = _resolve_path(cfg["output_dir"])
+    cfg["base_train_config"] = _resolve_path(cfg.get("base_train_config", DEFAULT_BASE_TRAIN_CONFIG))
+
+    if not os.path.exists(cfg["base_train_config"]):
+        raise FileNotFoundError(f"base_train_config not found: {cfg['base_train_config']}")
+
+    cfg.setdefault("n_startup_trials", 10)
+    cfg.setdefault("storage", None)
+    cfg.setdefault("objective_metric", "combined_auroc_g2o_r5")
+    cfg.setdefault("objective_direction", "maximize")
+    cfg.setdefault("tunable_params", list(DEFAULT_TUNABLE_PARAMS))
+    cfg.setdefault("fixed_overrides", {})
+    cfg.setdefault("num_workers", 4)
+
+    if cfg["objective_direction"] not in {"maximize", "minimize"}:
+        raise ValueError("objective_direction must be 'maximize' or 'minimize'")
+
+    if cfg["objective_metric"] != "combined_auroc_g2o_r5":
+        raise ValueError("Only objective_metric='combined_auroc_g2o_r5' is supported")
+
+    if not isinstance(cfg["tunable_params"], list) or not cfg["tunable_params"]:
+        raise ValueError("tunable_params must be a non-empty list")
+
+    valid_tunable_names = (ALBEF_ARG_KEYS - {"hpo_trial_number"}) | {"ref_shared_dim"}
+    unknown_tunable = sorted(set(cfg["tunable_params"]) - valid_tunable_names)
+    if unknown_tunable:
+        raise ValueError(f"Unknown tunable parameter(s): {unknown_tunable}")
+
+    unknown_fixed = sorted(set(cfg["fixed_overrides"].keys()) - (ALBEF_ARG_KEYS - {"hpo_trial_number"}))
+    if unknown_fixed:
+        raise ValueError(f"Unknown fixed_overrides parameter(s): {unknown_fixed}")
+
+    overlap = set(cfg["tunable_params"]) & set(cfg["fixed_overrides"].keys())
+    if overlap:
+        raise ValueError(f"Parameters cannot be both tuned and fixed: {sorted(overlap)}")
+
+    for p in cfg["tunable_params"]:
+        if p not in cfg["search_space"]:
+            raise ValueError(f"Missing search_space for tunable parameter '{p}'")
+        _validate_search_space_spec(p, cfg["search_space"][p])
+
+    # Fill default storage path
+    os.makedirs(cfg["output_dir"], exist_ok=True)
+    if cfg["storage"] is None:
+        db_path = os.path.join(cfg["output_dir"], "optuna_study.db")
+        cfg["storage"] = f"sqlite:///{db_path}"
+
+    return cfg
+
+
+def suggest_from_space(trial: optuna.Trial, name: str, spec: Dict[str, Any]) -> Any:
+    kind = spec["type"]
+    if kind == "categorical":
+        return trial.suggest_categorical(name, spec["choices"])
+    if kind == "float":
+        kwargs = {"log": bool(spec.get("log", False))}
+        if "step" in spec and spec["step"] is not None:
+            kwargs["step"] = spec["step"]
+            kwargs["log"] = False
+        return trial.suggest_float(name, spec["low"], spec["high"], **kwargs)
+    kwargs = {"log": bool(spec.get("log", False))}
+    if "step" in spec and spec["step"] is not None:
+        kwargs["step"] = int(spec["step"])
+    return trial.suggest_int(name, int(spec["low"]), int(spec["high"]), **kwargs)
+
+
+def _filter_train_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    out = {}
+    for key, value in config.items():
+        if key in STALE_KEYS:
+            continue
+        if key in ALBEF_ARG_KEYS:
+            out[key] = value
+    return out
+
+
+def build_trial_config(trial: optuna.Trial, hpo_cfg: Dict[str, Any], base_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    config = dict(base_cfg)
+
+    # Runtime overrides from HPO config
+    for key in ("data_path", "neg_data_path", "neg_group", "val_data_path"):
+        if key in hpo_cfg:
+            config[key] = hpo_cfg[key]
+
+    config["num_workers"] = int(hpo_cfg.get("num_workers", config.get("num_workers", 4)))
+    config["epochs"] = int(hpo_cfg["epochs_per_trial"])
+
+    # Required HPO runtime behavior
+    config["early_stop_patience"] = 0
+    config["skip_epoch_checkpoints"] = True
+
+    # Sample tunable params
+    sampled: Dict[str, Any] = {}
+    for name in hpo_cfg["tunable_params"]:
+        sampled[name] = suggest_from_space(trial, name, hpo_cfg["search_space"][name])
+
+    # Apply sampled values (with tied params)
+    for name, value in sampled.items():
+        if name == "ref_shared_dim":
+            shared = int(value)
+            config["n_ref"] = shared
+            config["ref_dim"] = shared
+        else:
+            config[name] = value
+
+    # Fixed overrides from HPO config
+    config.update(hpo_cfg.get("fixed_overrides", {}))
+
+    # Hard constraints requested by user
+    cls_start = int(config.get("cls_start_epoch", 0))
+    config["hard_neg_start_epoch"] = cls_start + 5
+    config["cls_ramp_epochs"] = 5
+    config["hard_neg_ramp_epochs"] = 5
+
+    # Keep proj head width valid
+    if int(config.get("proj_dim", 0)) < int(config.get("enc_dim", 0)):
+        config["proj_dim"] = int(config["enc_dim"])
+
+    if config["epochs"] < int(config["hard_neg_start_epoch"]):
+        raise ValueError(
+            "epochs_per_trial is smaller than derived hard_neg_start_epoch; "
+            f"got epochs={config['epochs']} and hard_neg_start_epoch={config['hard_neg_start_epoch']}"
+        )
+
+    # Trial-specific checkpoint path
+    trial_ckpt = os.path.join(hpo_cfg["output_dir"], "results", f"trial_{trial.number}", "checkpoints")
     os.makedirs(trial_ckpt, exist_ok=True)
+    config["ckpt_path"] = trial_ckpt
+    config["resume"] = None
+    config["pretrained"] = None
+    config["hpo_trial_number"] = trial.number
 
-    config = {
-        # Data
-        "data_path": args.data_path,
-        "neg_data_path": args.neg_data_path,
-        "neg_group": args.neg_group,
-
-        # Training
-        "epochs": args.epochs_per_trial,
-        "batch_size": batch_size,
-        "steps_per_epoch": steps_per_epoch,
-        "lr": lr,
-        "weight_decay": weight_decay,
-        "grad_clip_norm": 1.0,
-        "lr_scheduler": "cosine",
-        "warmup_epochs": warmup_epochs,
-        "min_lr": 2e-5,
-
-        # Data loading
-        "num_workers": args.num_workers,
-        "pin_memory": 1,
-        "persistent_workers": 1,
-        "prefetch_factor": 4,
-        "stage_to_jobfs": args.stage_to_jobfs,
-        "cache_in_memory": args.cache_in_memory,
-
-        # Validation
-        "val_split": 0.2,
-        "val_batch_size": val_batch_size,
-        "val_steps_per_epoch": val_steps_per_epoch,
-        "split_seed": 42,
-        "early_stop_patience": 10,
-        "early_stop_min_delta": 0.005,
-
-        # Model architecture
-        "enc_dim": enc_dim,
-        "proj_dim": proj_dim,
-        "ref_dim": ref_dim,
-        "n_ref": n_ref,
-        "ref_start": -0.3,
-        "ref_end": 0.6,
-        "fusion_attn_dim": None,
-        "fusion_hidden_dim": None,
-        "use_lightweight_gw": True,
-
-        # Contrastive learning
-        "itc_loss_type": "supcon",
-        "supcon_temperature": supcon_temperature,
-        "supcon_margin": supcon_margin,
-        "samples_per_gw": samples_per_gw,
-        "min_lc_per_gw": 2,
-        "temp_init": 0.1,
-        "temp_final": 0.1,
-        "temp_min": 0.01,
-        "temp_max": 1.0,
-        "temp_schedule": "fixed",
-
-        # Negative GW
-        "use_neg_gw": True,
-        "neg_gw_ratio": neg_gw_ratio,
-        "mask_itc": False,
-
-        # Regularization
-        "gw_dropout": gw_dropout,
-        "opt_dropout": opt_dropout,
-        "fusion_dropout": fusion_dropout,
-        "proj_dropout": proj_dropout,
-        "feature_dropout": 0.0,
-        "label_smoothing": label_smoothing,
-
-        # Loss weights
-        "itc_weight": itc_weight,
-        "cls_weight": cls_weight,
-        "cls_pos_weight": 1.0,
-        "cls_neg_weight": cls_neg_weight,
-        "cls_extra_neg_weight": cls_extra_neg_weight,
-        "cls_ramp_epochs": cls_ramp_epochs,
-        "cls_start_epoch": 0,
-
-        # ITC decay (disabled for HPO)
-        "itc_decay_start_epoch": 0,
-        "itc_decay_epochs": 0,
-        "itc_decay_ratio": 0.0,
-        "itc_label_smoothing": 0.0,
-
-        # Hard negatives — DISABLED during HPO (3x per-step cost)
-        "hard_neg_start_epoch": 999,
-        "hard_neg_ramp_epochs": 0,
-        "hard_neg_top_k": 5,
-
-        # Data augmentation — DISABLED during HPO
-        "gw_aug_noise": 0.0,
-        "gw_aug_jitter": 0.0,
-        "gw_aug_dropout": 0.0,
-        "opt_aug_noise": 0.0,
-        "opt_aug_time_jitter": 0.0,
-        "opt_aug_dropout": 0.0,
-        "opt_aug_band_dropout": 0.0,
-
-        # Checkpoint
-        "ckpt_path": trial_ckpt,
-        "resume": None,
-        "pretrained": None,
-        "skip_epoch_checkpoints": True,
-
-        # HPO metadata
-        "hpo_trial_number": trial.number,
-    }
-
-    return config
+    return _filter_train_config(config)
 
 
-def run_trial_subprocess(config, trial_number, output_dir):
-    """Run a single training trial as a subprocess and return best val_loss."""
+def run_trial_subprocess(config: Dict[str, Any], trial_number: int, output_dir: str) -> Dict[str, Any]:
+    """Run a single training trial as a subprocess and return parsed trial_results.json."""
 
     config_dir = os.path.join(output_dir, "configs")
     os.makedirs(config_dir, exist_ok=True)
@@ -200,14 +328,10 @@ def run_trial_subprocess(config, trial_number, output_dir):
     with open(config_path, "w") as f:
         json.dump(config, f, indent=2)
 
-    # Build command — call ALBEF_train.py directly (not via shell script)
-    # The shell script is for SLURM submission; here we run directly
     cmd = [sys.executable, "-u", TRAIN_SCRIPT]
-
-    # Convert config dict to CLI args
     for key, value in config.items():
         if key == "hpo_trial_number":
-            continue  # Not a CLI arg for ALBEF_train.py (yet)
+            continue
         if value is None:
             continue
         if isinstance(value, bool):
@@ -217,15 +341,13 @@ def run_trial_subprocess(config, trial_number, output_dir):
         cmd.append(f"--{key}")
         cmd.append(str(value))
 
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"Trial {trial_number}: Starting training")
-    print(f"  batch_size={config['batch_size']}, lr={config['lr']:.2e}, "
-          f"enc_dim={config['enc_dim']}, proj_dim={config['proj_dim']}")
-    print(f"  steps_per_epoch={config['steps_per_epoch']}, "
-          f"val_steps_per_epoch={config['val_steps_per_epoch']}")
-    print(f"{'='*60}")
+    print(f"  lr={config.get('lr', 'N/A')}, enc_dim={config.get('enc_dim', 'N/A')}, proj_dim={config.get('proj_dim', 'N/A')}")
+    print(f"  n_ref={config.get('n_ref', 'N/A')}, ref_dim={config.get('ref_dim', 'N/A')}, samples_per_gw={config.get('samples_per_gw', 'N/A')}")
+    print(f"  cls_start_epoch={config.get('cls_start_epoch', 'N/A')}, hard_neg_start_epoch={config.get('hard_neg_start_epoch', 'N/A')}")
+    print(f"{'=' * 60}")
 
-    # Stream subprocess output to log file + print epoch summaries
     log_path = os.path.join(output_dir, "results", f"trial_{trial_number}", "train.log")
     os.makedirs(os.path.dirname(log_path), exist_ok=True)
 
@@ -241,20 +363,20 @@ def run_trial_subprocess(config, trial_number, output_dir):
         )
         for line in proc.stdout:
             log_f.write(line)
-            # Keep last 20 lines for error reporting
             tail_lines.append(line.rstrip())
-            if len(tail_lines) > 20:
+            if len(tail_lines) > 40:
                 tail_lines.pop(0)
-            # Print epoch progress lines to parent stdout
-            if ("Epoch " in line and "Complete" in line) or \
-               "Val Avg Total" in line or \
-               "Retrieval:" in line or \
-               "Early stopping" in line or \
-               "Saved best" in line:
+            if (
+                ("Epoch " in line and "Complete" in line)
+                or "Val Avg Total" in line
+                or "Retrieval:" in line
+                or "Saved best" in line
+                or "Trial results saved" in line
+            ):
                 print(f"  [T{trial_number}] {line.rstrip()}", flush=True)
         proc.wait()
-    elapsed = time.time() - t0
 
+    elapsed = time.time() - t0
     if proc.returncode != 0:
         print(f"Trial {trial_number}: FAILED (exit code {proc.returncode})")
         for line in tail_lines:
@@ -263,118 +385,120 @@ def run_trial_subprocess(config, trial_number, output_dir):
 
     print(f"Trial {trial_number}: Completed in {elapsed:.0f}s")
 
-    # Read result from trial_results.json written by ALBEF_train.py
     result_path = os.path.join(config["ckpt_path"], "ALBEF", "trial_results.json")
     if not os.path.exists(result_path):
-        # Fallback: try to parse from best checkpoint
-        best_ckpt = os.path.join(config["ckpt_path"], "ALBEF", "albef_best.pth")
-        if os.path.exists(best_ckpt):
-            import torch
-            ckpt = torch.load(best_ckpt, map_location="cpu", weights_only=False)
-            return ckpt.get("loss", float("inf"))
-        print(f"Trial {trial_number}: No results found")
-        return float("inf")
+        print(f"Trial {trial_number}: missing {result_path}")
+        raise optuna.TrialPruned("Missing trial_results.json")
 
     with open(result_path) as f:
-        results = json.load(f)
-
-    return results
+        return json.load(f)
 
 
-def objective(trial, args):
-    """Optuna objective: sample hyperparams, run training, return val_loss."""
-
-    config = build_trial_config(trial, args)
-    results = run_trial_subprocess(config, trial.number, args.output_dir)
-
-    if isinstance(results, float):
-        # Fallback: only got val_loss from checkpoint
-        val_loss = results
-    else:
-        val_loss = results.get("best_val_loss", float("inf"))
-
-        # Store secondary metrics as user attributes
-        trial.set_user_attr("best_epoch", results.get("best_epoch", -1))
-        trial.set_user_attr("final_epoch", results.get("final_epoch", -1))
-        trial.set_user_attr("val_recall_at_1", results.get("val_recall_at_1", 0))
-        trial.set_user_attr("val_auroc", results.get("val_auroc", 0))
-        trial.set_user_attr("val_auprc", results.get("val_auprc", 0))
-        trial.set_user_attr("val_itc_acc", results.get("val_itc_acc", 0))
-
-    print(f"Trial {trial.number}: val_loss = {val_loss:.6f}")
-    return val_loss
+def worst_value(direction: str) -> float:
+    return float("-inf") if direction == "maximize" else float("inf")
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Optuna HPO for ALBEF training")
-    parser.add_argument("--n_trials", type=int, default=50,
-                        help="Number of Optuna trials")
-    parser.add_argument("--study_name", type=str, default="albef_hpo_v1",
-                        help="Optuna study name")
-    parser.add_argument("--storage", type=str, default=None,
-                        help="Optuna storage URL (e.g., sqlite:///hpo_results/optuna_study.db)")
-    parser.add_argument("--output_dir", type=str, default="hpo_results",
-                        help="Directory for HPO configs, results, and analysis")
-    parser.add_argument("--epochs_per_trial", type=int, default=30,
-                        help="Max epochs per trial")
-    parser.add_argument("--n_startup_trials", type=int, default=10,
-                        help="Random trials before TPE kicks in")
+def compute_objective_score(results: Dict[str, Any], metric_name: str) -> float:
+    if metric_name != "combined_auroc_g2o_r5":
+        raise ValueError(f"Unsupported objective metric: {metric_name}")
 
-    # Data paths
-    parser.add_argument("--data_path", type=str, default=DEFAULT_DATA_PATH)
-    parser.add_argument("--neg_data_path", type=str, default=DEFAULT_NEG_DATA_PATH)
-    parser.add_argument("--neg_group", type=str, default=DEFAULT_NEG_GROUP)
+    val_auroc = float(results.get("val_auroc", float("nan")))
+    val_recall_at_5 = float(results.get("val_recall_at_5", float("nan")))
+    if math.isnan(val_auroc) or math.isnan(val_recall_at_5):
+        return float("nan")
 
-    # Resource config
-    parser.add_argument("--num_workers", type=int, default=4)
-    parser.add_argument("--stage_to_jobfs", action="store_true")
-    parser.add_argument("--cache_in_memory", action="store_true")
+    return 0.5 * val_auroc + 0.5 * val_recall_at_5
 
+
+def objective(trial: optuna.Trial, hpo_cfg: Dict[str, Any], base_cfg: Dict[str, Any]) -> float:
+    config = build_trial_config(trial, hpo_cfg, base_cfg)
+    results = run_trial_subprocess(config, trial.number, hpo_cfg["output_dir"])
+
+    score = compute_objective_score(results, hpo_cfg["objective_metric"])
+    if math.isnan(score):
+        score = worst_value(hpo_cfg["objective_direction"])
+
+    # Persist useful metrics
+    trial.set_user_attr("objective_score", score)
+    trial.set_user_attr("best_epoch", results.get("best_epoch", -1))
+    trial.set_user_attr("final_epoch", results.get("final_epoch", -1))
+    trial.set_user_attr("val_recall_at_1", results.get("val_recall_at_1", 0.0))
+    trial.set_user_attr("val_recall_at_5", results.get("val_recall_at_5", 0.0))
+    trial.set_user_attr("val_auroc", results.get("val_auroc", 0.0))
+    trial.set_user_attr("val_auprc", results.get("val_auprc", 0.0))
+    trial.set_user_attr("val_itc_acc", results.get("val_itc_acc", 0.0))
+
+    print(
+        f"Trial {trial.number}: objective={score:.6f} "
+        f"(auroc={results.get('val_auroc', float('nan')):.6f}, "
+        f"g2o_r5={results.get('val_recall_at_5', float('nan')):.6f})"
+    )
+    return score
+
+
+def dry_run(hpo_cfg: Dict[str, Any], base_cfg: Dict[str, Any]) -> None:
+    print("Dry run: sampling one trial config without launching training.")
+    sampler = TPESampler(seed=42, n_startup_trials=1)
+    study = optuna.create_study(direction=hpo_cfg["objective_direction"], sampler=sampler)
+    trial = study.ask()
+    config = build_trial_config(trial, hpo_cfg, base_cfg)
+
+    print("\nSampled trial params:")
+    for k, v in sorted(trial.params.items()):
+        print(f"  {k}: {v}")
+
+    print("\nConstraint checks:")
+    print(f"  n_ref == ref_dim: {config.get('n_ref')} == {config.get('ref_dim')}")
+    print(f"  hard_neg_start_epoch = cls_start_epoch + 5: {config.get('hard_neg_start_epoch')} = {config.get('cls_start_epoch')} + 5")
+    print(f"  cls_ramp_epochs = {config.get('cls_ramp_epochs')}")
+    print(f"  hard_neg_ramp_epochs = {config.get('hard_neg_ramp_epochs')}")
+    print(f"  epochs = {config.get('epochs')}")
+
+    print("\nResolved trial training config:")
+    print(json.dumps(config, indent=2))
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Config-driven Optuna HPO for ALBEF training")
+    parser.add_argument("--config", type=str, required=True, help="Path to HPO config JSON")
+    parser.add_argument("--dry_run", action="store_true", help="Validate config and print one sampled trial")
     args = parser.parse_args()
 
-    # Resolve output_dir to absolute path
-    args.output_dir = os.path.abspath(args.output_dir)
-    os.makedirs(args.output_dir, exist_ok=True)
+    hpo_cfg = load_hpo_config(args.config)
+    base_cfg = _load_json(hpo_cfg["base_train_config"])
 
-    # Default storage: SQLite in output_dir
-    if args.storage is None:
-        db_path = os.path.join(args.output_dir, "optuna_study.db")
-        args.storage = f"sqlite:///{db_path}"
+    print(f"Study: {hpo_cfg['study_name']}")
+    print(f"Storage: {hpo_cfg['storage']}")
+    print(f"Output: {hpo_cfg['output_dir']}")
+    print(f"Trials: {hpo_cfg['n_trials']} ({hpo_cfg['epochs_per_trial']} epochs each)")
+    print(f"Objective: {hpo_cfg['objective_metric']} ({hpo_cfg['objective_direction']})")
+    print(f"Config: {hpo_cfg['config_path']}")
 
-    print(f"Study: {args.study_name}")
-    print(f"Storage: {args.storage}")
-    print(f"Output: {args.output_dir}")
-    print(f"Trials: {args.n_trials} ({args.epochs_per_trial} epochs each)")
-    print(f"Data: {args.data_path}")
-    print()
+    if args.dry_run:
+        dry_run(hpo_cfg, base_cfg)
+        return
 
-    # Create Optuna study
-    sampler = TPESampler(
-        n_startup_trials=args.n_startup_trials,
-        seed=42,
-    )
-    pruner = MedianPruner(
-        n_startup_trials=args.n_startup_trials,
-        n_warmup_steps=0,
-    )
+    sampler = TPESampler(n_startup_trials=hpo_cfg["n_startup_trials"], seed=42)
+    pruner = MedianPruner(n_startup_trials=hpo_cfg["n_startup_trials"], n_warmup_steps=0)
 
     study = optuna.create_study(
-        study_name=args.study_name,
-        storage=args.storage,
+        study_name=hpo_cfg["study_name"],
+        storage=hpo_cfg["storage"],
         sampler=sampler,
         pruner=pruner,
-        direction="minimize",
+        direction=hpo_cfg["objective_direction"],
         load_if_exists=True,
     )
 
-    # Run optimization
+    study.set_user_attr("objective_metric", hpo_cfg["objective_metric"])
+    study.set_user_attr("objective_direction", hpo_cfg["objective_direction"])
+
     study.optimize(
-        lambda trial: objective(trial, args),
-        n_trials=args.n_trials,
+        lambda trial: objective(trial, hpo_cfg, base_cfg),
+        n_trials=int(hpo_cfg["n_trials"]),
         catch=(Exception,),
     )
 
-    # Print summary
     print("\n" + "=" * 60)
     print("HPO COMPLETE")
     print("=" * 60)
@@ -382,29 +506,22 @@ def main():
     print(f"Completed: {len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE])}")
     print(f"Pruned/Failed: {len([t for t in study.trials if t.state != optuna.trial.TrialState.COMPLETE])}")
 
-    if study.best_trial:
+    if study.best_trial is not None:
         best = study.best_trial
         print(f"\nBest trial: #{best.number}")
-        print(f"  val_loss: {best.value:.6f}")
-        print(f"  Parameters:")
-        for key, value in best.params.items():
+        print(f"  objective: {best.value:.6f}")
+        print("  parameters:")
+        for key, value in sorted(best.params.items()):
             print(f"    {key}: {value}")
 
-        # Fixed params (not tuned)
-        print(f"\n  Fixed:")
-        print(f"    batch_size: 1024")
-        print(f"    steps_per_epoch: {1_024_000 // 1024}")
-        print(f"    val_steps_per_epoch: {25600 // 1024}")
-
-        # Save best config
-        best_config_path = os.path.join(args.output_dir, "best_config.json")
-        config_path = os.path.join(args.output_dir, "configs", f"trial_{best.number}.json")
+        best_config_path = os.path.join(hpo_cfg["output_dir"], "best_config.json")
+        config_path = os.path.join(hpo_cfg["output_dir"], "configs", f"trial_{best.number}.json")
         if os.path.exists(config_path):
             with open(config_path) as f:
                 best_config = json.load(f)
             with open(best_config_path, "w") as f:
                 json.dump(best_config, f, indent=2)
-            print(f"\n  Best config saved to: {best_config_path}")
+            print(f"\nBest config saved to: {best_config_path}")
 
 
 if __name__ == "__main__":
