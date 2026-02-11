@@ -1,10 +1,10 @@
 #!/bin/bash
-#SBATCH --job-name=LSST_KN_BNS_AUG
+#SBATCH --job-name=LSST_KN_NSBH_AUG
 #SBATCH --time=4:00:00            
 #SBATCH --cpus-per-task=1
 #SBATCH --mem=10G
 #SBATCH --array=127-1147%20   # 22941/1822/268 simulations, each job handles 10 sims, max 20 jobs running simultaneously
-#SBATCH --output=logs/LSST_KN_BNS_AUG/%x_%a.out
+#SBATCH --output=logs/LSST_KN_NSBH_AUG/%x_%a.out
 
 # ml gcc/11.3/0 python/3.10.4
 # ml gsl/2.7 cfitsio/4.2.0
