@@ -1229,3 +1229,99 @@ class LightweightGWEncoder(nn.Module):
         combined = torch.cat([h_scalar, h_skymap], dim=1)  # [B, scalar_hidden * 2]
         g = self.fusion_head(combined)  # [B, final_output_dim]
         return g, H_gw
+
+
+class OpticalKNClassifier(nn.Module):
+    """
+    Optical-only KN classifier built from the existing optical encoder.
+    """
+    def __init__(
+        self,
+        optical_input_dim=6,
+        ref_time_dim=64,
+        enc_dim=128,
+        num_heads=4,
+        k_dim=64,
+        opt_dropout=0.1,
+        feature_dropout=0.0,
+        head_hidden_dim=None,
+        head_dropout=0.2,
+        include_coords=False,
+    ):
+        super().__init__()
+        self.include_coords = bool(include_coords)
+        self.feature_dropout = nn.Dropout(feature_dropout)
+
+        self.optical_encoder = OpticalEncoderWithCLS(
+            input_dim=optical_input_dim,
+            output_dim=enc_dim,
+            num_heads=num_heads,
+            ref_dim=ref_time_dim,
+            k_dim=k_dim,
+            dropout=opt_dropout,
+        )
+
+        hidden = head_hidden_dim if head_hidden_dim is not None else enc_dim
+        self.classifier = nn.Sequential(
+            nn.Linear(enc_dim * 2, hidden),
+            nn.ReLU(inplace=True),
+            nn.Dropout(head_dropout),
+            nn.Linear(hidden, 1),
+        )
+        self._init_head_weights()
+
+    def _init_head_weights(self):
+        for m in self.classifier:
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+
+    def _build_coords(self, opt_coords, opt_t):
+        if self.include_coords and opt_coords is not None:
+            return opt_coords
+        return torch.zeros(opt_t.size(0), 2, dtype=opt_t.dtype, device=opt_t.device)
+
+    def encode_optical(self, opt_coords, opt_t, opt_v, opt_ref_t, opt_mask, opt_err):
+        coords = self._build_coords(opt_coords, opt_t)
+        z_l, h_l = self.optical_encoder(
+            coords, opt_t, opt_v, opt_ref_t, opt_mask, errors_obs=opt_err
+        )
+        if self.feature_dropout.p > 0:
+            z_l = self.feature_dropout(z_l)
+            h_l = self.feature_dropout(h_l)
+        return z_l, h_l
+
+    def forward(self, opt_coords, opt_t, opt_v, opt_ref_t, opt_mask, opt_err):
+        z_l, h_l = self.encode_optical(opt_coords, opt_t, opt_v, opt_ref_t, opt_mask, opt_err)
+        # Concatenate CLS and pooled temporal features for robust single-modal classification.
+        h_pool = h_l.mean(dim=1)
+        feat = torch.cat([z_l, h_pool], dim=1)
+        logits = self.classifier(feat)
+        return logits
+
+    def set_encoder_trainable(self, trainable):
+        for p in self.optical_encoder.parameters():
+            p.requires_grad = bool(trainable)
+
+    def load_optical_encoder_from_albef_state_dict(self, state_dict, strict=False):
+        """
+        Load only optical encoder weights from an ALBEF checkpoint state_dict.
+        """
+        if not isinstance(state_dict, dict):
+            raise TypeError("state_dict must be a dict.")
+
+        cleaned = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
+        prefix = "optical_encoder."
+        optical_state = {
+            k[len(prefix):]: v for k, v in cleaned.items() if k.startswith(prefix)
+        }
+        if not optical_state:
+            raise KeyError("No optical_encoder.* keys found in provided state_dict.")
+
+        missing, unexpected = self.optical_encoder.load_state_dict(optical_state, strict=False)
+        if strict and (missing or unexpected):
+            raise RuntimeError(
+                f"Optical encoder load strict check failed. Missing={missing}, Unexpected={unexpected}"
+            )
+        return missing, unexpected
