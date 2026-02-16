@@ -11,7 +11,7 @@ import warnings
 warnings.filterwarnings("ignore", "Wswiglal-redir-stdio")
 import torch
 from collections import defaultdict
-from typing import List, Iterator
+from typing import List, Iterator, Optional, Tuple
 from torch.utils.data import Dataset, DataLoader, Sampler
 from pathlib import Path
 import subprocess
@@ -973,6 +973,313 @@ def create_mixed_gw_dataloaders(
         prefetch_factor
     )
 
+    return train_loader, val_loader, steps_per_epoch, len(val_sampler)
+
+
+class OpticalBinaryDataset(Dataset):
+    """
+    Optical-only binary dataset (KN vs non-KN).
+
+    Positive samples come from:
+        pos_h5_path/events/optical_data/*
+    Negative samples come from:
+        neg_h5_path/{neg_group}/*
+    """
+    def __init__(
+        self,
+        pos_h5_path: str,
+        neg_h5_path: str,
+        neg_group: str = "ELASTICC2_TRAIN/optical_data",
+        pos_indices: Optional[np.ndarray] = None,
+        neg_indices: Optional[np.ndarray] = None,
+        include_coords: bool = False,
+        cache_in_memory: bool = False,
+    ):
+        super().__init__()
+        self.pos_h5_path = pos_h5_path
+        self.neg_h5_path = neg_h5_path
+        self.neg_group = neg_group
+        self.include_coords = bool(include_coords)
+        self.cache_in_memory = bool(cache_in_memory)
+
+        self.pos_file = None
+        self.neg_file = None
+
+        with h5py.File(self.pos_h5_path, "r") as f:
+            n_pos_total = int(f["events/optical_data/values"].shape[0])
+
+        with h5py.File(self.neg_h5_path, "r") as f:
+            if self.neg_group not in f:
+                raise KeyError(f"Negative group '{self.neg_group}' not found in {self.neg_h5_path}")
+            n_neg_total = int(f[f"{self.neg_group}/values"].shape[0])
+
+        self.pos_indices = (
+            np.arange(n_pos_total, dtype=np.int64)
+            if pos_indices is None
+            else np.asarray(pos_indices, dtype=np.int64)
+        )
+        self.neg_indices = (
+            np.arange(n_neg_total, dtype=np.int64)
+            if neg_indices is None
+            else np.asarray(neg_indices, dtype=np.int64)
+        )
+
+        self.n_pos = int(self.pos_indices.shape[0])
+        self.n_neg = int(self.neg_indices.shape[0])
+        if self.n_pos < 1 or self.n_neg < 1:
+            raise ValueError(
+                f"OpticalBinaryDataset requires both classes. got n_pos={self.n_pos}, n_neg={self.n_neg}"
+            )
+
+        self.length = self.n_pos + self.n_neg
+
+        if self.cache_in_memory:
+            # Avoid caching multi-million samples by default; keep memory predictable.
+            print("OpticalBinaryDataset: cache_in_memory is not supported, using lazy HDF5 loading.")
+            self.cache_in_memory = False
+
+    def __len__(self):
+        return self.length
+
+    def _ensure_files_open(self):
+        if self.pos_file is None:
+            self.pos_file = h5py.File(self.pos_h5_path, "r")
+        if self.neg_file is None:
+            self.neg_file = h5py.File(self.neg_h5_path, "r")
+
+    @staticmethod
+    def _as_tensor(arr):
+        return torch.from_numpy(arr).to(torch.float32)
+
+    def __getitem__(self, idx):
+        if isinstance(idx, np.ndarray):
+            idx = int(idx.item())
+        idx = int(idx)
+        self._ensure_files_open()
+
+        if idx < self.n_pos:
+            real_idx = int(self.pos_indices[idx])
+            grp = "events/optical_data"
+            f = self.pos_file
+            label = 1.0
+        else:
+            real_idx = int(self.neg_indices[idx - self.n_pos])
+            grp = self.neg_group
+            f = self.neg_file
+            label = 0.0
+
+        opt_val = self._as_tensor(f[f"{grp}/values"][real_idx])
+        opt_err = self._as_tensor(f[f"{grp}/errors"][real_idx])
+        opt_mask = self._as_tensor(f[f"{grp}/masks"][real_idx])
+        opt_time = self._as_tensor(f[f"{grp}/times"][real_idx])
+
+        if self.include_coords:
+            opt_coords = self._as_tensor(f[f"{grp}/coordinates"][real_idx])
+        else:
+            opt_coords = torch.zeros(2, dtype=torch.float32)
+
+        target = torch.tensor(label, dtype=torch.float32)
+        return opt_time, opt_val, opt_mask, opt_err, opt_coords, target
+
+    def __del__(self):
+        if self.pos_file is not None:
+            try:
+                self.pos_file.close()
+            except Exception:
+                pass
+        if self.neg_file is not None:
+            try:
+                self.neg_file.close()
+            except Exception:
+                pass
+
+
+class BalancedBinaryBatchSampler(Sampler):
+    """
+    Balanced batch sampler for binary classification.
+    Each batch contains ~50% positives and ~50% negatives.
+    """
+    def __init__(
+        self,
+        n_pos: int,
+        n_neg: int,
+        batch_size: int,
+        steps_per_epoch: int,
+        seed: int = 42,
+        shuffle: bool = True,
+    ):
+        self.n_pos = int(n_pos)
+        self.n_neg = int(n_neg)
+        self.batch_size = int(batch_size)
+        self.steps_per_epoch = int(steps_per_epoch)
+        self.shuffle = bool(shuffle)
+        self.rng = np.random.default_rng(seed)
+
+        if self.n_pos < 1 or self.n_neg < 1:
+            raise ValueError(f"BalancedBinaryBatchSampler requires both classes. got n_pos={n_pos}, n_neg={n_neg}")
+        if self.batch_size < 2:
+            raise ValueError("batch_size must be >= 2 for balanced binary sampling.")
+
+        self.pos_per_batch = self.batch_size // 2
+        self.neg_per_batch = self.batch_size - self.pos_per_batch
+
+    def __iter__(self):
+        for _ in range(self.steps_per_epoch):
+            pos_idx = self.rng.integers(0, self.n_pos, size=self.pos_per_batch, endpoint=False)
+            neg_idx = self.rng.integers(0, self.n_neg, size=self.neg_per_batch, endpoint=False) + self.n_pos
+            batch = np.concatenate([pos_idx, neg_idx], axis=0)
+            if self.shuffle:
+                self.rng.shuffle(batch)
+            yield batch.tolist()
+
+    def __len__(self):
+        return self.steps_per_epoch
+
+
+def split_positive_optical_indices(
+    pos_h5_path: str,
+    val_split: float = 0.1,
+    seed: int = 42
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Split positive optical indices by parent GW event to avoid train/val leakage.
+    """
+    if not (0 < val_split < 1):
+        raise ValueError("val_split must be in (0, 1).")
+
+    with h5py.File(pos_h5_path, "r") as f:
+        parent_gw_idx = f["events/optical_data/parent_gw_idx"][:]
+
+    unique_gw = np.unique(parent_gw_idx)
+    rng = np.random.default_rng(seed)
+    rng.shuffle(unique_gw)
+
+    n_val_gw = max(1, int(len(unique_gw) * val_split))
+    val_gw = unique_gw[:n_val_gw]
+
+    is_val = np.isin(parent_gw_idx, val_gw)
+    val_indices = np.where(is_val)[0].astype(np.int64)
+    train_indices = np.where(~is_val)[0].astype(np.int64)
+    return train_indices, val_indices
+
+
+def split_negative_optical_indices(
+    neg_h5_path: str,
+    neg_group: str = "ELASTICC2_TRAIN/optical_data",
+    val_split: float = 0.1,
+    seed: int = 42
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Split negative optical indices randomly.
+    """
+    if not (0 < val_split < 1):
+        raise ValueError("val_split must be in (0, 1).")
+
+    with h5py.File(neg_h5_path, "r") as f:
+        if neg_group not in f:
+            raise KeyError(f"Negative group '{neg_group}' not found in {neg_h5_path}")
+        n_total = int(f[f"{neg_group}/values"].shape[0])
+
+    rng = np.random.default_rng(seed)
+    perm = rng.permutation(n_total).astype(np.int64)
+
+    n_val = max(1, int(n_total * val_split))
+    if n_total - n_val < 1:
+        n_val = max(0, n_total - 1)
+
+    val_indices = perm[:n_val]
+    train_indices = perm[n_val:]
+    return train_indices, val_indices
+
+
+def create_optical_binary_dataloaders(
+    pos_h5_path: str,
+    neg_h5_path: str,
+    batch_size: int = 256,
+    val_batch_size: int = None,
+    steps_per_epoch: int = None,
+    val_steps_per_epoch: int = None,
+    val_split: float = 0.1,
+    split_seed: int = 42,
+    num_workers: int = 4,
+    pin_memory: bool = True,
+    persistent_workers: bool = True,
+    prefetch_factor: int = 4,
+    neg_group: str = "ELASTICC2_TRAIN/optical_data",
+    include_coords: bool = False,
+    cache_in_memory: bool = False,
+):
+    if cache_in_memory and num_workers > 0:
+        print("cache_in_memory=True with num_workers>0 may increase RAM usage.")
+
+    train_pos_idx, val_pos_idx = split_positive_optical_indices(
+        pos_h5_path, val_split=val_split, seed=split_seed
+    )
+    train_neg_idx, val_neg_idx = split_negative_optical_indices(
+        neg_h5_path, neg_group=neg_group, val_split=val_split, seed=split_seed
+    )
+
+    if val_batch_size is None:
+        val_batch_size = batch_size
+
+    if steps_per_epoch is None:
+        steps_per_epoch = max(1, (2 * min(len(train_pos_idx), len(train_neg_idx))) // batch_size)
+
+    if val_steps_per_epoch is None:
+        val_steps_per_epoch = max(1, (2 * min(len(val_pos_idx), len(val_neg_idx))) // val_batch_size)
+
+    train_dataset = OpticalBinaryDataset(
+        pos_h5_path=pos_h5_path,
+        neg_h5_path=neg_h5_path,
+        neg_group=neg_group,
+        pos_indices=train_pos_idx,
+        neg_indices=train_neg_idx,
+        include_coords=include_coords,
+        cache_in_memory=cache_in_memory,
+    )
+    val_dataset = OpticalBinaryDataset(
+        pos_h5_path=pos_h5_path,
+        neg_h5_path=neg_h5_path,
+        neg_group=neg_group,
+        pos_indices=val_pos_idx,
+        neg_indices=val_neg_idx,
+        include_coords=include_coords,
+        cache_in_memory=cache_in_memory,
+    )
+
+    train_sampler = BalancedBinaryBatchSampler(
+        n_pos=train_dataset.n_pos,
+        n_neg=train_dataset.n_neg,
+        batch_size=batch_size,
+        steps_per_epoch=steps_per_epoch,
+        seed=split_seed,
+        shuffle=True,
+    )
+    val_sampler = BalancedBinaryBatchSampler(
+        n_pos=val_dataset.n_pos,
+        n_neg=val_dataset.n_neg,
+        batch_size=val_batch_size,
+        steps_per_epoch=val_steps_per_epoch,
+        seed=split_seed + 1,
+        shuffle=True,
+    )
+
+    train_loader = _build_dataloader(
+        train_dataset,
+        train_sampler,
+        num_workers,
+        pin_memory,
+        persistent_workers,
+        prefetch_factor,
+    )
+    val_loader = _build_dataloader(
+        val_dataset,
+        val_sampler,
+        num_workers,
+        pin_memory,
+        persistent_workers,
+        prefetch_factor,
+    )
     return train_loader, val_loader, steps_per_epoch, len(val_sampler)
 
 
