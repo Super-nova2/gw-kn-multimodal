@@ -282,6 +282,23 @@ def init_tensorboard_writer(args, save_root):
     return writer
 
 
+def resolve_run_name(args):
+    raw_name = None
+    if args.run_name is not None and str(args.run_name).strip() != "":
+        raw_name = str(args.run_name).strip()
+    else:
+        slurm_job_id = os.environ.get("SLURM_JOB_ID", "").strip()
+        if slurm_job_id != "":
+            raw_name = f"job{slurm_job_id}"
+        else:
+            raw_name = datetime.datetime.now().strftime("run_%Y%m%d_%H%M%S")
+
+    run_name = raw_name.replace("/", "_").replace("\\", "_").replace(" ", "_")
+    if run_name in {"", ".", ".."}:
+        raise ValueError(f"Invalid run_name resolved from '{raw_name}'.")
+    return run_name
+
+
 def build_stage_optimizer(model, args, freeze_encoder):
     if freeze_encoder:
         model.set_encoder_trainable(False)
@@ -370,8 +387,18 @@ def train(args):
     global_epoch = 0
     no_improve = 0
 
-    save_root = Path(args.ckpt_path) / "optical_only"
+    run_name = resolve_run_name(args)
+    args.run_name = run_name
+
+    save_root = Path(args.ckpt_path) / "optical_only" / run_name
     save_root.mkdir(parents=True, exist_ok=True)
+    epoch_ckpt_root = save_root / "epoch_ckpts"
+    epoch_ckpt_root.mkdir(parents=True, exist_ok=True)
+    latest_run_file = save_root.parent / "latest_run.txt"
+    latest_run_file.write_text(f"{run_name}\n", encoding="utf-8")
+
+    print(f"Run name: {run_name}")
+    print(f"Checkpoint directory: {save_root}")
     tb_writer = init_tensorboard_writer(args, save_root)
 
     optimizer = None
@@ -395,6 +422,23 @@ def train(args):
             )
             val_metrics = run_eval(model, val_loader, device, args, criterion, amp_dtype)
             if val_metrics is None:
+                epoch_metrics = {
+                    "stage": stage_name,
+                    "epoch": global_epoch,
+                    "train_loss": train_loss,
+                }
+                save_checkpoint(
+                    str(epoch_ckpt_root / f"optical_only_epoch_{global_epoch:04d}.pth"),
+                    model,
+                    optimizer,
+                    global_epoch,
+                    args,
+                    epoch_metrics,
+                )
+                print(
+                    f"Saved epoch checkpoint: {epoch_ckpt_root / f'optical_only_epoch_{global_epoch:04d}.pth'} "
+                    "(val_metrics unavailable)"
+                )
                 continue
 
             if tb_writer is not None:
@@ -435,6 +479,22 @@ def train(args):
                 f"| recall={val_metrics['op_recall']:.4f} "
                 f"| precision={val_metrics['op_precision']:.4f} "
                 f"| fpr={val_metrics['op_fpr']:.4f}"
+            )
+
+            epoch_metrics = {
+                "stage": stage_name,
+                "epoch": global_epoch,
+                "train_loss": train_loss,
+                "score_auroc_plus_auprc": score,
+                **val_metrics,
+            }
+            save_checkpoint(
+                str(epoch_ckpt_root / f"optical_only_epoch_{global_epoch:04d}.pth"),
+                model,
+                optimizer,
+                global_epoch,
+                args,
+                epoch_metrics,
             )
 
             if improved:
@@ -480,6 +540,8 @@ def train(args):
             break
 
     final_metrics = {
+        "run_name": run_name,
+        "save_root": str(save_root),
         "best_epoch": best_epoch,
         "best_auroc_plus_auprc": best_score,
         "best_precision_at_target_recall": float(best_metrics.get("op_precision", 0.0)) if best_metrics else 0.0,
@@ -559,6 +621,7 @@ def parse_args():
     parser.add_argument("--prefetch_factor", type=int, default=4)
     parser.add_argument("--cache_in_memory", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--run_name", type=str, default=None)
     parser.add_argument("--tb_log_dir", type=str, default=None)
     parser.add_argument("--tb_flush_secs", type=int, default=30)
     parser.add_argument("--disable_tensorboard", action="store_true")
