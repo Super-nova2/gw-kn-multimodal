@@ -7,7 +7,7 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
 #SBATCH --gres=gpu:1
-#SBATCH --time=24:00:00
+#SBATCH --time=6:00:00
 #SBATCH --partition=gpu
 #SBATCH --tmp=110G
 
@@ -122,6 +122,28 @@ SEED=$(jq -r '.seed // empty' "$args_file")
 TB_LOG_DIR=$(jq -r '.tb_log_dir // empty' "$args_file")
 TB_FLUSH_SECS=$(jq -r '.tb_flush_secs // empty' "$args_file")
 DISABLE_TENSORBOARD=$(jq -r '.disable_tensorboard // false' "$args_file")
+RUN_NAME=$(jq -r '.run_name // empty' "$args_file")
+EVAL_BATCH_SIZE=$(jq -r '.eval_batch_size // empty' "$args_file")
+EVAL_NUM_WORKERS=$(jq -r '.eval_num_workers // empty' "$args_file")
+EVAL_MAX_POS_SAMPLES=$(jq -r '.eval_max_pos_samples // empty' "$args_file")
+EVAL_MAX_NEG_SAMPLES=$(jq -r '.eval_max_neg_samples // empty' "$args_file")
+EVAL_SAMPLE_SEED=$(jq -r '.eval_sample_seed // empty' "$args_file")
+EVAL_TARGET_RECALL=$(jq -r '.eval_target_recall // empty' "$args_file")
+EVAL_NO_PLOTS=$(jq -r '.eval_no_plots // false' "$args_file")
+
+if [[ -z "$RUN_NAME" || "$RUN_NAME" == "null" ]]; then
+    if [[ -n "${SLURM_JOB_ID:-}" ]]; then
+        RUN_NAME="job${SLURM_JOB_ID}"
+    else
+        RUN_NAME="run_$(date +%Y%m%d_%H%M%S)"
+    fi
+fi
+RUN_NAME="${RUN_NAME//\//_}"
+RUN_NAME="${RUN_NAME//\\/_}"
+RUN_NAME="${RUN_NAME// /_}"
+if [[ -z "$RUN_NAME" || "$RUN_NAME" == "." || "$RUN_NAME" == ".." ]]; then
+    RUN_NAME="run_$(date +%Y%m%d_%H%M%S)"
+fi
 
 mkdir -p "$CKPT_PATH"
 
@@ -139,6 +161,7 @@ echo "========================================"
 echo ""
 echo "Configuration File: $args_file"
 echo "Checkpoint Path: $CKPT_PATH"
+echo "Run Name: $RUN_NAME"
 echo ""
 
 # Optional: stage large HDF5 to local disk to reduce shared filesystem I/O
@@ -293,13 +316,101 @@ fi
 if [[ "$DISABLE_TENSORBOARD" == "true" ]]; then
     cmd+=(--disable_tensorboard)
 fi
+if [[ -n "$RUN_NAME" && "$RUN_NAME" != "null" ]]; then
+    cmd+=(--run_name "$RUN_NAME")
+fi
 
-echo "Command: ${cmd[*]}"
+echo "Training Command: ${cmd[*]}"
+set +e
 "${cmd[@]}"
-exit_code=$?
+train_exit_code=$?
+set -e
+if [ $train_exit_code -ne 0 ]; then
+    echo "Training script failed with exit code $train_exit_code"
+    echo "------------------------------------------------"
+    echo "End time: $(date)"
+    echo "Exit code: $train_exit_code"
+    exit $train_exit_code
+fi
 
+BEST_CKPT="${CKPT_PATH}/optical_only/${RUN_NAME}/optical_only_best.pth"
+EVAL_OUTPUT_DIR="${CKPT_PATH}/optical_only/eval_results/${RUN_NAME}"
+EVAL_PY="/fred/oz016/bgao_kn/ML+GW+KN/Model/optical_only/test_evaluate_optical_only.py"
+
+if [[ ! -f "$BEST_CKPT" ]]; then
+    echo "Best checkpoint not found after training: $BEST_CKPT"
+    exit 1
+fi
+if [[ ! -f "$EVAL_PY" ]]; then
+    echo "Evaluation script not found: $EVAL_PY"
+    exit 1
+fi
+mkdir -p "$EVAL_OUTPUT_DIR"
+
+eval_cmd=(
+    python -u "$EVAL_PY"
+    --checkpoint "$BEST_CKPT"
+    --config "$args_file"
+    --pos_data_path "$POS_DATA_PATH"
+    --neg_data_path "$NEG_DATA_PATH"
+    --output_dir "$EVAL_OUTPUT_DIR"
+    --device cuda
+)
+
+if [[ -n "$NEG_GROUP" && "$NEG_GROUP" != "null" ]]; then
+    eval_cmd+=(--neg_group "$NEG_GROUP")
+fi
+if [[ -n "$EVAL_BATCH_SIZE" && "$EVAL_BATCH_SIZE" != "null" ]]; then
+    eval_cmd+=(--batch_size "$EVAL_BATCH_SIZE")
+elif [[ -n "$BATCH_SIZE" && "$BATCH_SIZE" != "null" ]]; then
+    eval_cmd+=(--batch_size "$BATCH_SIZE")
+fi
+if [[ -n "$EVAL_NUM_WORKERS" && "$EVAL_NUM_WORKERS" != "null" ]]; then
+    eval_cmd+=(--num_workers "$EVAL_NUM_WORKERS")
+elif [[ -n "$NUM_WORKERS" && "$NUM_WORKERS" != "null" ]]; then
+    eval_cmd+=(--num_workers "$NUM_WORKERS")
+fi
+if [[ -n "$PIN_MEMORY" && "$PIN_MEMORY" != "null" ]]; then
+    eval_cmd+=(--pin_memory "$PIN_MEMORY")
+fi
+if [[ -n "$PERSISTENT_WORKERS" && "$PERSISTENT_WORKERS" != "null" ]]; then
+    eval_cmd+=(--persistent_workers "$PERSISTENT_WORKERS")
+fi
+if [[ -n "$PREFETCH_FACTOR" && "$PREFETCH_FACTOR" != "null" ]]; then
+    eval_cmd+=(--prefetch_factor "$PREFETCH_FACTOR")
+fi
+if [[ -n "$EVAL_MAX_POS_SAMPLES" && "$EVAL_MAX_POS_SAMPLES" != "null" ]]; then
+    eval_cmd+=(--max_pos_samples "$EVAL_MAX_POS_SAMPLES")
+fi
+if [[ -n "$EVAL_MAX_NEG_SAMPLES" && "$EVAL_MAX_NEG_SAMPLES" != "null" ]]; then
+    eval_cmd+=(--max_neg_samples "$EVAL_MAX_NEG_SAMPLES")
+fi
+if [[ -n "$EVAL_SAMPLE_SEED" && "$EVAL_SAMPLE_SEED" != "null" ]]; then
+    eval_cmd+=(--sample_seed "$EVAL_SAMPLE_SEED")
+fi
+if [[ -n "$EVAL_TARGET_RECALL" && "$EVAL_TARGET_RECALL" != "null" ]]; then
+    eval_cmd+=(--target_recall "$EVAL_TARGET_RECALL")
+fi
+if [[ "$EVAL_NO_PLOTS" == "true" ]]; then
+    eval_cmd+=(--no_plots)
+fi
+
+echo "Evaluation Command: ${eval_cmd[*]}"
+set +e
+"${eval_cmd[@]}"
+eval_exit_code=$?
+set -e
+if [ $eval_exit_code -ne 0 ]; then
+    echo "Evaluation script failed with exit code $eval_exit_code"
+    echo "------------------------------------------------"
+    echo "End time: $(date)"
+    echo "Exit code: $eval_exit_code"
+    exit $eval_exit_code
+fi
+
+echo "Evaluation complete. Results saved to: $EVAL_OUTPUT_DIR"
 echo "------------------------------------------------"
 echo "End time: $(date)"
-echo "Exit code: $exit_code"
+echo "Exit code: 0"
 
-exit $exit_code
+exit 0
