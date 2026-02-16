@@ -15,6 +15,36 @@ import os
 
 import optuna
 
+METRIC_SHORT_NAMES = {
+    "val_auroc": "AUROC",
+    "val_auprc": "AUPRC",
+    "val_recall_at_1": "R@1",
+    "val_recall_at_5": "R@5",
+    "val_mrr": "MRR",
+    "val_itc_acc": "ITC_ACC",
+}
+
+
+def _parse_dict_attr(value):
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            return {}
+    return {}
+
+
+def _fmt_attr_value(value, precision=4):
+    if isinstance(value, float):
+        return f"{value:.{precision}f}"
+    if isinstance(value, int):
+        return str(value)
+    return "N/A"
+
 
 def get_objective_context(study):
     metric = study.user_attrs.get("objective_metric", "objective")
@@ -24,7 +54,14 @@ def get_objective_context(study):
     direction = direction.lower()
     if direction not in {"maximize", "minimize"}:
         direction = "minimize"
-    return metric, direction
+    weights = _parse_dict_attr(study.user_attrs.get("objective_weights", {}))
+    min_metrics = _parse_dict_attr(study.user_attrs.get("objective_min_metrics", {}))
+
+    # Backward compatibility for older studies that only had the legacy objective name.
+    if not weights and metric == "combined_auroc_g2o_r5":
+        weights = {"val_auroc": 0.5, "val_recall_at_5": 0.5}
+
+    return metric, direction, weights, min_metrics
 
 
 def rank_trials(completed, direction):
@@ -34,7 +71,7 @@ def rank_trials(completed, direction):
 
 def print_study_summary(study):
     """Print overall study statistics."""
-    metric, direction = get_objective_context(study)
+    metric, direction, weights, min_metrics = get_objective_context(study)
 
     trials = study.trials
     completed = [t for t in trials if t.state == optuna.trial.TrialState.COMPLETE]
@@ -46,6 +83,15 @@ def print_study_summary(study):
     print("=" * 60)
     print(f"Study name: {study.study_name}")
     print(f"Objective: {metric} ({direction})")
+    if weights:
+        total = sum(weights.values())
+        if total > 0:
+            formula = " + ".join(
+                f"{(w / total):.3f}*{k}" for k, w in weights.items()
+            )
+            print(f"Objective formula: {formula}")
+    if min_metrics:
+        print(f"Objective minimum metrics: {min_metrics}")
     print(f"Total trials: {len(trials)}")
     print(f"  Completed: {len(completed)}")
     print(f"  Pruned:    {len(pruned)}")
@@ -70,7 +116,7 @@ def print_study_summary(study):
 
 def print_best_trial(study):
     """Print best trial details."""
-    metric, _ = get_objective_context(study)
+    metric, _, _, _ = get_objective_context(study)
     best = study.best_trial
     print(f"\n{'='*60}")
     print(f"BEST TRIAL: #{best.number}")
@@ -96,7 +142,7 @@ def print_best_trial(study):
 
 def print_top_k(study, k=5):
     """Print top-K trials."""
-    metric, direction = get_objective_context(study)
+    metric, direction, weights, _ = get_objective_context(study)
     completed = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
     ranked = rank_trials(completed, direction)[:k]
 
@@ -107,14 +153,16 @@ def print_top_k(study, k=5):
     for rank, trial in enumerate(ranked, 1):
         enc = trial.params.get("enc_dim", "N/A")
         lr = trial.params.get("lr", None)
-        r5 = trial.user_attrs.get("val_recall_at_5", "N/A")
-        auroc = trial.user_attrs.get("val_auroc", "N/A")
+        metric_keys = list(weights.keys()) if weights else ["val_recall_at_5", "val_auroc", "val_auprc"]
+        metric_parts = []
+        for key in metric_keys:
+            label = METRIC_SHORT_NAMES.get(key, key)
+            metric_parts.append(f"{label}={_fmt_attr_value(trial.user_attrs.get(key, 'N/A'))}")
 
         print(f"\n  Rank {rank}: Trial #{trial.number}")
         print(
             f"    {metric}={trial.value:.6f}  "
-            f"R@5={r5 if isinstance(r5, str) else f'{r5:.4f}'}  "
-            f"AUROC={auroc if isinstance(auroc, str) else f'{auroc:.4f}'}"
+            + "  ".join(metric_parts)
         )
         if lr is None:
             print(f"    enc_dim={enc}")
@@ -196,7 +244,7 @@ def generate_plots(study, output_dir):
 
 def export_top_configs(study, output_dir, config_source_dir, top_k=5):
     """Export top-K trial configs as ready-to-use JSON for full retraining."""
-    metric, direction = get_objective_context(study)
+    metric, direction, _, _ = get_objective_context(study)
 
     export_dir = os.path.join(output_dir, "top_configs")
     os.makedirs(export_dir, exist_ok=True)
@@ -234,7 +282,7 @@ def export_top_configs(study, output_dir, config_source_dir, top_k=5):
 
 def export_results_csv(study, output_dir):
     """Export all trial results to CSV for external analysis."""
-    metric, _ = get_objective_context(study)
+    metric, _, _, _ = get_objective_context(study)
 
     csv_path = os.path.join(output_dir, "all_trials.csv")
 

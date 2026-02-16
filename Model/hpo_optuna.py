@@ -14,7 +14,7 @@ import os
 import subprocess
 import sys
 import time
-from typing import Any, Dict
+from typing import Any, Dict, Tuple
 
 import optuna
 from optuna.pruners import MedianPruner
@@ -27,6 +27,7 @@ DEFAULT_BASE_TRAIN_CONFIG = os.path.join(SCRIPT_DIR, "args", "ALBEF_supcon.json"
 
 ALBEF_BOOL_KEYS = {
     "cache_in_memory",
+    "enable_ood_monitoring",
     "mask_itc",
     "semi_hard",
     "use_lightweight_gw",
@@ -38,6 +39,7 @@ ALBEF_ARG_KEYS = {
     "data_path",
     "val_data_path",
     "ood_val_steps",
+    "enable_ood_monitoring",
     "neg_data_path",
     "neg_group",
     "epochs",
@@ -63,6 +65,7 @@ ALBEF_ARG_KEYS = {
     "split_seed",
     "early_stop_patience",
     "early_stop_min_delta",
+    "best_ckpt_metric",
     "n_ref",
     "ref_start",
     "ref_end",
@@ -147,6 +150,35 @@ DEFAULT_TUNABLE_PARAMS = [
     "semi_hard_margin",
 ]
 
+OBJECTIVE_PRESETS = {
+    # Historical objective used in earlier experiments.
+    "combined_auroc_g2o_r5": {"val_auroc": 0.5, "val_recall_at_5": 0.5},
+    # Pure classification objective.
+    "cls_auroc_auprc": {"val_auroc": 0.5, "val_auprc": 0.5},
+    # Classification-priority objective with retrieval as a soft guard.
+    "cls_priority_auprc_auroc_r5": {"val_auprc": 0.45, "val_auroc": 0.35, "val_recall_at_5": 0.20},
+    # Fully user-defined weighted sum via `objective_weights`.
+    "weighted_sum": None,
+}
+
+SUPPORTED_OBJECTIVE_COMPONENTS = {
+    "val_auroc",
+    "val_auprc",
+    "val_recall_at_1",
+    "val_recall_at_5",
+    "val_mrr",
+    "val_itc_acc",
+}
+
+METRIC_SHORT_NAMES = {
+    "val_auroc": "AUROC",
+    "val_auprc": "AUPRC",
+    "val_recall_at_1": "R@1",
+    "val_recall_at_5": "R@5",
+    "val_mrr": "MRR",
+    "val_itc_acc": "ITC_ACC",
+}
+
 
 def _resolve_path(path: str) -> str:
     return os.path.abspath(os.path.expanduser(path))
@@ -174,6 +206,87 @@ def _validate_search_space_spec(name: str, spec: Dict[str, Any]) -> None:
         raise ValueError(f"search_space['{name}'] requires low < high")
 
 
+def _validate_metric_weights(weights: Dict[str, Any], field_name: str) -> Dict[str, float]:
+    if not isinstance(weights, dict) or not weights:
+        raise ValueError(f"{field_name} must be a non-empty object")
+
+    normalized: Dict[str, float] = {}
+    for key, value in weights.items():
+        if key not in SUPPORTED_OBJECTIVE_COMPONENTS:
+            raise ValueError(
+                f"Unsupported metric '{key}' in {field_name}. "
+                f"Supported: {sorted(SUPPORTED_OBJECTIVE_COMPONENTS)}"
+            )
+        try:
+            value = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{field_name}['{key}'] must be numeric") from exc
+        if value < 0:
+            raise ValueError(f"{field_name}['{key}'] must be >= 0")
+        normalized[key] = value
+
+    if sum(normalized.values()) <= 0:
+        raise ValueError(f"Sum of {field_name} values must be > 0")
+    return normalized
+
+
+def _resolve_objective_weights(cfg: Dict[str, Any]) -> Dict[str, float]:
+    metric_name = cfg["objective_metric"]
+    if metric_name not in OBJECTIVE_PRESETS:
+        raise ValueError(
+            f"Unsupported objective_metric='{metric_name}'. "
+            f"Supported: {sorted(OBJECTIVE_PRESETS.keys())}"
+        )
+
+    custom = cfg.get("objective_weights")
+    if metric_name == "weighted_sum":
+        if custom is None:
+            raise ValueError("objective_metric='weighted_sum' requires objective_weights")
+        return _validate_metric_weights(custom, "objective_weights")
+
+    preset = OBJECTIVE_PRESETS[metric_name]
+    if custom is None:
+        return dict(preset)
+    merged = dict(preset)
+    merged.update(custom)
+    return _validate_metric_weights(merged, "objective_weights")
+
+
+def _resolve_objective_min_metrics(cfg: Dict[str, Any]) -> Dict[str, float]:
+    raw = cfg.get("objective_min_metrics", {})
+    if raw in (None, {}):
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError("objective_min_metrics must be an object")
+    resolved: Dict[str, float] = {}
+    for key, value in raw.items():
+        if key not in SUPPORTED_OBJECTIVE_COMPONENTS:
+            raise ValueError(
+                f"Unsupported metric '{key}' in objective_min_metrics. "
+                f"Supported: {sorted(SUPPORTED_OBJECTIVE_COMPONENTS)}"
+            )
+        try:
+            value = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"objective_min_metrics['{key}'] must be numeric") from exc
+        if value < 0:
+            raise ValueError(f"objective_min_metrics['{key}'] must be >= 0")
+        resolved[key] = value
+    for key, value in resolved.items():
+        if value > 1.0:
+            raise ValueError(f"objective_min_metrics['{key}'] should be <= 1.0, got {value}")
+    return resolved
+
+
+def _objective_formula_str(weights: Dict[str, float]) -> str:
+    total = sum(weights.values())
+    terms = []
+    for key, weight in weights.items():
+        w = weight / total
+        terms.append(f"{w:.3f}*{key}")
+    return " + ".join(terms)
+
+
 def load_hpo_config(config_path: str) -> Dict[str, Any]:
     cfg = _load_json(config_path)
 
@@ -193,6 +306,8 @@ def load_hpo_config(config_path: str) -> Dict[str, Any]:
     cfg.setdefault("storage", None)
     cfg.setdefault("objective_metric", "combined_auroc_g2o_r5")
     cfg.setdefault("objective_direction", "maximize")
+    cfg.setdefault("objective_weights", None)
+    cfg.setdefault("objective_min_metrics", {})
     cfg.setdefault("tunable_params", list(DEFAULT_TUNABLE_PARAMS))
     cfg.setdefault("fixed_overrides", {})
     cfg.setdefault("num_workers", 4)
@@ -200,8 +315,8 @@ def load_hpo_config(config_path: str) -> Dict[str, Any]:
     if cfg["objective_direction"] not in {"maximize", "minimize"}:
         raise ValueError("objective_direction must be 'maximize' or 'minimize'")
 
-    if cfg["objective_metric"] != "combined_auroc_g2o_r5":
-        raise ValueError("Only objective_metric='combined_auroc_g2o_r5' is supported")
+    cfg["objective_weights"] = _resolve_objective_weights(cfg)
+    cfg["objective_min_metrics"] = _resolve_objective_min_metrics(cfg)
 
     if not isinstance(cfg["tunable_params"], list) or not cfg["tunable_params"]:
         raise ValueError("tunable_params must be a non-empty list")
@@ -263,7 +378,16 @@ def build_trial_config(trial: optuna.Trial, hpo_cfg: Dict[str, Any], base_cfg: D
     config = dict(base_cfg)
 
     # Runtime overrides from HPO config
-    for key in ("data_path", "neg_data_path", "neg_group", "val_data_path"):
+    for key in (
+        "data_path",
+        "neg_data_path",
+        "neg_group",
+        "val_data_path",
+        "ood_val_steps",
+        "enable_ood_monitoring",
+        "best_ckpt_metric",
+        "cache_in_memory",
+    ):
         if key in hpo_cfg:
             config[key] = hpo_cfg[key]
 
@@ -335,8 +459,15 @@ def run_trial_subprocess(config: Dict[str, Any], trial_number: int, output_dir: 
         if value is None:
             continue
         if isinstance(value, bool):
-            if value:
+            # Only true CLI flags are passed without an explicit value.
+            # Bool-typed values for non-flag args (e.g., persistent_workers)
+            # must still be serialized as 0/1.
+            if key in ALBEF_BOOL_KEYS:
+                if value:
+                    cmd.append(f"--{key}")
+            else:
                 cmd.append(f"--{key}")
+                cmd.append("1" if value else "0")
             continue
         cmd.append(f"--{key}")
         cmd.append(str(value))
@@ -398,28 +529,64 @@ def worst_value(direction: str) -> float:
     return float("-inf") if direction == "maximize" else float("inf")
 
 
-def compute_objective_score(results: Dict[str, Any], metric_name: str) -> float:
-    if metric_name != "combined_auroc_g2o_r5":
-        raise ValueError(f"Unsupported objective metric: {metric_name}")
-
-    val_auroc = float(results.get("val_auroc", float("nan")))
-    val_recall_at_5 = float(results.get("val_recall_at_5", float("nan")))
-    if math.isnan(val_auroc) or math.isnan(val_recall_at_5):
+def _read_metric(results: Dict[str, Any], key: str) -> float:
+    try:
+        return float(results.get(key, float("nan")))
+    except (TypeError, ValueError):
         return float("nan")
 
-    return 0.5 * val_auroc + 0.5 * val_recall_at_5
+
+def compute_objective_score(results: Dict[str, Any], weights: Dict[str, float]) -> float:
+    weighted_sum = 0.0
+    weight_total = 0.0
+    for key, weight in weights.items():
+        value = _read_metric(results, key)
+        if math.isnan(value):
+            return float("nan")
+        weighted_sum += weight * value
+        weight_total += weight
+    if weight_total <= 0:
+        return float("nan")
+    return weighted_sum / weight_total
+
+
+def check_objective_min_metrics(results: Dict[str, Any], min_metrics: Dict[str, float]) -> Tuple[bool, str]:
+    for key, min_value in min_metrics.items():
+        value = _read_metric(results, key)
+        if math.isnan(value):
+            return False, f"{key}=nan < min({min_value:.6f})"
+        if value < min_value:
+            return False, f"{key}={value:.6f} < min({min_value:.6f})"
+    return True, ""
+
+
+def format_metric_summary(results: Dict[str, Any], metric_keys) -> str:
+    parts = []
+    for key in metric_keys:
+        value = _read_metric(results, key)
+        name = METRIC_SHORT_NAMES.get(key, key)
+        if math.isnan(value):
+            parts.append(f"{name}=nan")
+        else:
+            parts.append(f"{name}={value:.6f}")
+    return ", ".join(parts)
 
 
 def objective(trial: optuna.Trial, hpo_cfg: Dict[str, Any], base_cfg: Dict[str, Any]) -> float:
     config = build_trial_config(trial, hpo_cfg, base_cfg)
     results = run_trial_subprocess(config, trial.number, hpo_cfg["output_dir"])
 
-    score = compute_objective_score(results, hpo_cfg["objective_metric"])
-    if math.isnan(score):
+    score = compute_objective_score(results, hpo_cfg["objective_weights"])
+    passed_min_metrics, min_fail_reason = check_objective_min_metrics(results, hpo_cfg["objective_min_metrics"])
+    if math.isnan(score) or not passed_min_metrics:
         score = worst_value(hpo_cfg["objective_direction"])
 
     # Persist useful metrics
     trial.set_user_attr("objective_score", score)
+    trial.set_user_attr("objective_metric", hpo_cfg["objective_metric"])
+    trial.set_user_attr("objective_min_metrics_passed", int(passed_min_metrics))
+    if not passed_min_metrics:
+        trial.set_user_attr("objective_min_metrics_fail", min_fail_reason)
     trial.set_user_attr("best_epoch", results.get("best_epoch", -1))
     trial.set_user_attr("final_epoch", results.get("final_epoch", -1))
     trial.set_user_attr("val_recall_at_1", results.get("val_recall_at_1", 0.0))
@@ -430,9 +597,10 @@ def objective(trial: optuna.Trial, hpo_cfg: Dict[str, Any], base_cfg: Dict[str, 
 
     print(
         f"Trial {trial.number}: objective={score:.6f} "
-        f"(auroc={results.get('val_auroc', float('nan')):.6f}, "
-        f"g2o_r5={results.get('val_recall_at_5', float('nan')):.6f})"
+        f"({format_metric_summary(results, hpo_cfg['objective_weights'].keys())})"
     )
+    if not passed_min_metrics:
+        print(f"  [T{trial.number}] objective min-metric check failed: {min_fail_reason}")
     return score
 
 
@@ -472,6 +640,9 @@ def main() -> None:
     print(f"Output: {hpo_cfg['output_dir']}")
     print(f"Trials: {hpo_cfg['n_trials']} ({hpo_cfg['epochs_per_trial']} epochs each)")
     print(f"Objective: {hpo_cfg['objective_metric']} ({hpo_cfg['objective_direction']})")
+    print(f"Objective formula: {_objective_formula_str(hpo_cfg['objective_weights'])}")
+    if hpo_cfg["objective_min_metrics"]:
+        print(f"Objective minimum metrics: {hpo_cfg['objective_min_metrics']}")
     print(f"Config: {hpo_cfg['config_path']}")
 
     if args.dry_run:
@@ -492,6 +663,8 @@ def main() -> None:
 
     study.set_user_attr("objective_metric", hpo_cfg["objective_metric"])
     study.set_user_attr("objective_direction", hpo_cfg["objective_direction"])
+    study.set_user_attr("objective_weights", hpo_cfg["objective_weights"])
+    study.set_user_attr("objective_min_metrics", hpo_cfg["objective_min_metrics"])
 
     study.optimize(
         lambda trial: objective(trial, hpo_cfg, base_cfg),
@@ -502,26 +675,32 @@ def main() -> None:
     print("\n" + "=" * 60)
     print("HPO COMPLETE")
     print("=" * 60)
-    print(f"Total trials: {len(study.trials)}")
-    print(f"Completed: {len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE])}")
-    print(f"Pruned/Failed: {len([t for t in study.trials if t.state != optuna.trial.TrialState.COMPLETE])}")
+    total_trials = len(study.trials)
+    completed_trials = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+    failed_trials = [t for t in study.trials if t.state != optuna.trial.TrialState.COMPLETE]
+    print(f"Total trials: {total_trials}")
+    print(f"Completed: {len(completed_trials)}")
+    print(f"Pruned/Failed: {len(failed_trials)}")
 
-    if study.best_trial is not None:
-        best = study.best_trial
-        print(f"\nBest trial: #{best.number}")
-        print(f"  objective: {best.value:.6f}")
-        print("  parameters:")
-        for key, value in sorted(best.params.items()):
-            print(f"    {key}: {value}")
+    if not completed_trials:
+        print("\nNo completed trials. Skipping best-trial export.")
+        sys.exit(2)
 
-        best_config_path = os.path.join(hpo_cfg["output_dir"], "best_config.json")
-        config_path = os.path.join(hpo_cfg["output_dir"], "configs", f"trial_{best.number}.json")
-        if os.path.exists(config_path):
-            with open(config_path) as f:
-                best_config = json.load(f)
-            with open(best_config_path, "w") as f:
-                json.dump(best_config, f, indent=2)
-            print(f"\nBest config saved to: {best_config_path}")
+    best = study.best_trial
+    print(f"\nBest trial: #{best.number}")
+    print(f"  objective: {best.value:.6f}")
+    print("  parameters:")
+    for key, value in sorted(best.params.items()):
+        print(f"    {key}: {value}")
+
+    best_config_path = os.path.join(hpo_cfg["output_dir"], "best_config.json")
+    config_path = os.path.join(hpo_cfg["output_dir"], "configs", f"trial_{best.number}.json")
+    if os.path.exists(config_path):
+        with open(config_path) as f:
+            best_config = json.load(f)
+        with open(best_config_path, "w") as f:
+            json.dump(best_config, f, indent=2)
+        print(f"\nBest config saved to: {best_config_path}")
 
 
 if __name__ == "__main__":

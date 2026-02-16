@@ -10,10 +10,11 @@ Supports:
 
 New Features:
     - Support for external negative samples (non-KN transients)
-    - Logits distribution plot for three pair types:
+    - Logits distribution plot for four pair types:
       * Positive pairs (GW, KN): matched GW-KN optical pairs
-      * Easy negatives (GW, nonKN): GW paired with non-KN transients
-      * Hard negatives (GW_wrong, KN): mismatched GW paired with KN optical
+      * Optical negatives (GW, nonKN): GW paired with non-KN transients
+      * GW negatives (GW_has_kn0, KN): negative-GW paired with KN optical
+      * Semi-hard negatives (GW_wrong, KN): mismatched GW paired with KN optical
 
 Usage:
     python test_evaluate.py \\
@@ -60,7 +61,7 @@ def parse_args():
     p.add_argument("--checkpoint", type=str, required=True)
 
     # Data source
-    p.add_argument("--test_data_path", type=str, required=True,
+    p.add_argument("--test_data_path", type=str,
                    default="/fred/oz016/bgao_kn/data/LSST_KN_BNS/combined_dataset_with_neg_gw.h5",
                    help="Independent test HDF5 file")
     p.add_argument("--neg_data_path", type=str,
@@ -69,7 +70,7 @@ def parse_args():
     p.add_argument("--neg_group", type=str, default="ELASTICC2_TRAIN/optical_data",
                    help="HDF5 group path for negative optical data")
     p.add_argument("--n_neg_samples", type=int, default=5000,
-                   help="Number of negative samples to use for logits distribution")
+                   help="Number of optical negative samples to use for logits distribution")
     p.add_argument("--test_steps", type=int, default=None,
                    help="Number of test sampling steps. If None, auto-computed to match n_neg_samples")
 
@@ -260,6 +261,26 @@ def load_negative_optical_samples(neg_data_path, neg_group, n_samples=5000, seed
     return neg_data
 
 
+def load_negative_gw_indices(test_data_path):
+    """Load GW indices where has_kn == 0 from test HDF5."""
+    if test_data_path is None or not os.path.exists(test_data_path):
+        print(f"WARNING: Test data path not found for GW negatives: {test_data_path}")
+        return np.array([], dtype=np.int64)
+
+    with h5py.File(test_data_path, 'r') as f:
+        if 'events/gw_data/has_kn' not in f:
+            print("WARNING: 'events/gw_data/has_kn' not found. GW negatives will be disabled.")
+            return np.array([], dtype=np.int64)
+        has_kn = f['events/gw_data/has_kn'][:]
+
+    neg_gw_indices = np.where(has_kn == 0)[0].astype(np.int64)
+    if neg_gw_indices.size == 0:
+        print("WARNING: No has_kn=0 GW events found. GW negatives will be disabled.")
+    else:
+        print(f"Loaded {neg_gw_indices.size} GW negatives (has_kn=0).")
+    return neg_gw_indices
+
+
 @torch.no_grad()
 def extract_all_embeddings(model, loader, device, model_args):
     """Run full forward pass, collecting embeddings and predictions.
@@ -367,13 +388,15 @@ def extract_all_embeddings(model, loader, device, model_args):
 
 
 @torch.no_grad()
-def extract_triplet_logits(model, loader, device, model_args, neg_optical_data, 
+def extract_triplet_logits(model, loader, device, model_args, neg_optical_data,
+                           neg_gw_indices,
                            shuffle_gw=False, shuffle_seed=42):
-    """Extract logits for three types of sample pairs:
+    """Extract logits for four types of sample pairs.
     
     1. Positive pairs (GW, KN): matched GW-KN optical pairs
-    2. Easy negatives (GW, nonKN): GW paired with non-KN transients
-    3. Semi-hard negatives (GW_wrong, KN): mismatched GW paired with KN optical
+    2. Optical negatives (GW, nonKN): GW paired with non-KN transients
+    3. GW negatives (GW_has_kn0, KN): negative-GW paired with KN optical
+    4. Semi-hard negatives (GW_wrong, KN): mismatched GW paired with KN optical
        - Uses similarity-based semi-hard negative mining: for each optical,
          select the most similar wrong GW that is still less similar than
          the correct GW (below positive similarity).
@@ -384,16 +407,18 @@ def extract_triplet_logits(model, loader, device, model_args, neg_optical_data,
         device: Torch device
         model_args: Model configuration dict
         neg_optical_data: Dict with negative optical samples from external file
+        neg_gw_indices: Numpy array of has_kn=0 GW indices from test HDF5
         shuffle_gw: If True, randomly shuffle GW within each batch (ablation test)
         shuffle_seed: Random seed for GW shuffling
         
     Returns:
-        dict with logits_positive, logits_easy_neg, logits_hard_neg, and types
+        dict with logits for all pair types and compatibility aliases
     """
     logits_positive = []    # (GW, matched KN)
-    logits_easy_neg = []    # (GW, non-KN transient)
+    logits_optical_neg = [] # (GW, non-KN transient)
+    logits_gw_neg = []      # (GW_has_kn0, KN)
     logits_hard_neg = []    # (wrong GW, KN) - semi-hard
-    easy_neg_types = []     # Type of non-KN transient
+    optical_neg_types = []  # Type of non-KN transient
     
     n_ref = model_args["n_ref"]
     ref_start = model_args["ref_start"]
@@ -406,7 +431,9 @@ def extract_triplet_logits(model, loader, device, model_args, neg_optical_data,
     
     # Pre-process negative optical data if available
     has_neg_optical = neg_optical_data is not None
+    has_neg_gw = neg_gw_indices is not None and len(neg_gw_indices) > 0
     neg_idx = 0
+    gw_neg_rng = np.random.default_rng(shuffle_seed)
     
     if has_neg_optical:
         neg_values = neg_optical_data['values'].to(device)
@@ -416,117 +443,159 @@ def extract_triplet_logits(model, loader, device, model_args, neg_optical_data,
         neg_coords = neg_optical_data['coordinates'].to(device)
         neg_types_list = neg_optical_data.get('types', ['unknown'] * len(neg_values))
         total_neg = len(neg_values)
-    
-    for batch_data in tqdm(loader, desc="Extracting triplet logits"):
-        # Unpack - get positive KN data
-        if len(batch_data) >= 8:
-            gw_s, gw_m, opt_t, opt_v, opt_mask, opt_err, opt_coords, gw_indices = batch_data[:8]
+
+    gw_file = None
+    gw_scalars_ds = None
+    gw_skymaps_ds = None
+    if has_neg_gw:
+        dataset_obj = getattr(loader, "dataset", None)
+        test_h5_path = getattr(dataset_obj, "h5_path", None)
+        if test_h5_path is None:
+            print("WARNING: Cannot locate test HDF5 path from loader.dataset. GW negatives disabled.")
+            has_neg_gw = False
+        elif not os.path.exists(test_h5_path):
+            print(f"WARNING: Test HDF5 path not found for GW negatives: {test_h5_path}")
+            has_neg_gw = False
         else:
-            continue
-            
-        gw_s = gw_s.to(device)
-        gw_m = gw_m.to(device)
-        opt_t = opt_t.to(device)
-        opt_v = opt_v.to(device)
-        opt_mask = opt_mask.to(device)
-        opt_err = opt_err.to(device)
-        opt_coords = opt_coords.to(device)
-        gw_indices_dev = gw_indices.to(device).long()
-        
-        batch_size = gw_s.size(0)
-        
-        # GW shuffle ablation: randomly permute GW within batch
-        if shuffle_gw:
-            perm = torch.randperm(batch_size, generator=shuffle_rng)
-            gw_s = gw_s[perm]
-            gw_m = gw_m[perm]
-            # Note: gw_indices_dev is NOT shuffled to keep semi-hard mining consistent
-        
-        ref_time = build_ref_time(batch_size, n_ref, ref_start, ref_end, device, opt_t.dtype)
-        
-        with autocast(device_type='cuda', dtype=torch.float16,
-                      enabled=(device.type == 'cuda')):
-            # Encode GW and KN optical
-            g, z_l, h_l, H_gw = model.encode(
-                gw_s, gw_m, opt_coords, opt_t, opt_v, ref_time, opt_mask, opt_err
-            )
+            neg_gw_indices = np.asarray(neg_gw_indices, dtype=np.int64)
+            gw_file = h5py.File(test_h5_path, 'r')
+            gw_scalars_ds = gw_file['events/gw_data/scalars']
+            gw_skymaps_ds = gw_file['events/gw_data/skymaps']
 
-            # Compute credible level if dual fusion
-            _dual = getattr(model, 'dual_fusion', False) if not hasattr(model, '_orig_mod') else getattr(model._orig_mod, 'dual_fusion', False)
-            if _dual:
-                from ALBEF_train import compute_credible_level
-                _cred = compute_credible_level(gw_m, opt_coords)
+    try:
+        for batch_data in tqdm(loader, desc="Extracting triplet logits"):
+            # Unpack - get positive KN data
+            if len(batch_data) >= 8:
+                gw_s, gw_m, opt_t, opt_v, opt_mask, opt_err, opt_coords, gw_indices = batch_data[:8]
             else:
-                _cred = None
+                continue
 
-            # 1. Positive pairs: matched GW-KN
-            logits_pos = model.fusion_logits(g, h_l, z_l=z_l, H_gw=H_gw, cred_level=_cred)
-            logits_positive.append(logits_pos.float().cpu())
-            
-            # 2. Semi-hard negatives: use similarity-based semi-hard negative mining
-            # Compute projected features for similarity matrix
-            feat_g = F.normalize(model.gw_proj(g), p=2, dim=1, eps=1e-8)
-            feat_o = F.normalize(model.opt_proj(z_l), p=2, dim=1, eps=1e-8)
-            
-            # Compute similarity matrix (O2G direction: for each optical, find wrong GW)
-            temperature = model.log_temp.exp().clamp(min=model.temp_min, max=model.temp_max)
-            sim_o2g = torch.matmul(feat_o, feat_g.T) / temperature  # [batch_opt, batch_gw]
-            
-            # Sample semi-hard negatives: for each optical, find the most similar 
-            # wrong GW that is still below positive similarity
-            semi_hard_gw_idx = sample_semi_hard_negatives_for_optical(
-                sim_o2g, gw_indices_dev
-            )
-            
-            # Get semi-hard negative GW features and compute logits
-            g_semihard = g[semi_hard_gw_idx]
-            H_gw_semihard = H_gw[semi_hard_gw_idx] if H_gw is not None else None
-            _cred_hard = compute_credible_level(gw_m[semi_hard_gw_idx], opt_coords) if _dual else None
-            logits_hard = model.fusion_logits(g_semihard, h_l, z_l=z_l, H_gw=H_gw_semihard, cred_level=_cred_hard)
-            logits_hard_neg.append(logits_hard.float().cpu())
-            
-            # 3. Easy negatives: correct GW paired with non-KN transients
-            if has_neg_optical:
-                # Get batch of negative optical samples
-                batch_neg_indices = []
-                batch_neg_types = []
-                for i in range(batch_size):
-                    idx = neg_idx % total_neg
-                    batch_neg_indices.append(idx)
-                    batch_neg_types.append(neg_types_list[idx])
-                    neg_idx += 1
-                
-                # Get negative optical data for this batch
-                neg_v_batch = neg_values[batch_neg_indices]
-                neg_t_batch = neg_times[batch_neg_indices]
-                neg_m_batch = neg_masks[batch_neg_indices]
-                neg_e_batch = neg_errors[batch_neg_indices]
-                neg_c_batch = neg_coords[batch_neg_indices]
-                
-                # Encode negative optical with the same GW
-                ref_time_neg = build_ref_time(batch_size, n_ref, ref_start, ref_end, 
-                                              device, neg_t_batch.dtype)
-                _, z_l_neg, h_l_neg, _ = model.encode(
-                    gw_s, gw_m, neg_c_batch, neg_t_batch, neg_v_batch,
-                    ref_time_neg, neg_m_batch, neg_e_batch
+            gw_s = gw_s.to(device)
+            gw_m = gw_m.to(device)
+            opt_t = opt_t.to(device)
+            opt_v = opt_v.to(device)
+            opt_mask = opt_mask.to(device)
+            opt_err = opt_err.to(device)
+            opt_coords = opt_coords.to(device)
+            gw_indices_dev = gw_indices.to(device).long()
+
+            batch_size = gw_s.size(0)
+
+            # GW shuffle ablation: randomly permute GW within batch
+            if shuffle_gw:
+                perm = torch.randperm(batch_size, generator=shuffle_rng)
+                gw_s = gw_s[perm]
+                gw_m = gw_m[perm]
+                # Note: gw_indices_dev is NOT shuffled to keep semi-hard mining consistent
+
+            ref_time = build_ref_time(batch_size, n_ref, ref_start, ref_end, device, opt_t.dtype)
+
+            with autocast(device_type='cuda', dtype=torch.float16,
+                          enabled=(device.type == 'cuda')):
+                # Encode GW and KN optical
+                g, z_l, h_l, H_gw = model.encode(
+                    gw_s, gw_m, opt_coords, opt_t, opt_v, ref_time, opt_mask, opt_err
                 )
-                _cred_neg = compute_credible_level(gw_m, neg_c_batch) if _dual else None
-                logits_easy = model.fusion_logits(g, h_l_neg, z_l=z_l_neg, H_gw=H_gw, cred_level=_cred_neg)
-                logits_easy_neg.append(logits_easy.float().cpu())
-                easy_neg_types.extend(batch_neg_types)
-    
+
+                # Compute credible level if dual fusion
+                _dual = getattr(model, 'dual_fusion', False) if not hasattr(model, '_orig_mod') else getattr(model._orig_mod, 'dual_fusion', False)
+                if _dual:
+                    from ALBEF_train import compute_credible_level
+                    _cred = compute_credible_level(gw_m, opt_coords)
+                else:
+                    _cred = None
+
+                # 1. Positive pairs: matched GW-KN
+                logits_pos = model.fusion_logits(g, h_l, z_l=z_l, H_gw=H_gw, cred_level=_cred)
+                logits_positive.append(logits_pos.float().cpu())
+
+                # 2. Semi-hard negatives: use similarity-based semi-hard negative mining
+                feat_g = F.normalize(model.gw_proj(g), p=2, dim=1, eps=1e-8)
+                feat_o = F.normalize(model.opt_proj(z_l), p=2, dim=1, eps=1e-8)
+                temperature = model.log_temp.exp().clamp(min=model.temp_min, max=model.temp_max)
+                sim_o2g = torch.matmul(feat_o, feat_g.T) / temperature  # [batch_opt, batch_gw]
+
+                semi_hard_gw_idx = sample_semi_hard_negatives_for_optical(
+                    sim_o2g, gw_indices_dev
+                )
+
+                g_semihard = g[semi_hard_gw_idx]
+                H_gw_semihard = H_gw[semi_hard_gw_idx] if H_gw is not None else None
+                _cred_hard = compute_credible_level(gw_m[semi_hard_gw_idx], opt_coords) if _dual else None
+                logits_hard = model.fusion_logits(
+                    g_semihard, h_l, z_l=z_l, H_gw=H_gw_semihard, cred_level=_cred_hard
+                )
+                logits_hard_neg.append(logits_hard.float().cpu())
+
+                # 3. GW negatives: has_kn=0 GW paired with KN optical
+                if has_neg_gw:
+                    sampled_neg_gw = gw_neg_rng.choice(neg_gw_indices, size=batch_size, replace=True)
+                    gw_s_neg_np = np.stack([gw_scalars_ds[int(i)] for i in sampled_neg_gw], axis=0)
+                    gw_m_neg_np = np.stack([gw_skymaps_ds[int(i)] for i in sampled_neg_gw], axis=0)
+
+                    gw_s_neg = torch.from_numpy(gw_s_neg_np).to(device)
+                    gw_m_neg = torch.from_numpy(gw_m_neg_np).to(device)
+
+                    g_gw_neg, z_l_gw_neg, h_l_gw_neg, H_gw_neg = model.encode(
+                        gw_s_neg, gw_m_neg, opt_coords, opt_t, opt_v, ref_time, opt_mask, opt_err
+                    )
+                    _cred_gw_neg = compute_credible_level(gw_m_neg, opt_coords) if _dual else None
+                    logits_gw = model.fusion_logits(
+                        g_gw_neg, h_l_gw_neg, z_l=z_l_gw_neg, H_gw=H_gw_neg, cred_level=_cred_gw_neg
+                    )
+                    logits_gw_neg.append(logits_gw.float().cpu())
+
+                # 4. Optical negatives: correct GW paired with non-KN transients
+                if has_neg_optical:
+                    batch_neg_indices = []
+                    batch_neg_types = []
+                    for _ in range(batch_size):
+                        idx = neg_idx % total_neg
+                        batch_neg_indices.append(idx)
+                        batch_neg_types.append(neg_types_list[idx])
+                        neg_idx += 1
+
+                    neg_v_batch = neg_values[batch_neg_indices]
+                    neg_t_batch = neg_times[batch_neg_indices]
+                    neg_m_batch = neg_masks[batch_neg_indices]
+                    neg_e_batch = neg_errors[batch_neg_indices]
+                    neg_c_batch = neg_coords[batch_neg_indices]
+
+                    ref_time_neg = build_ref_time(batch_size, n_ref, ref_start, ref_end,
+                                                  device, neg_t_batch.dtype)
+                    _, z_l_neg, h_l_neg, _ = model.encode(
+                        gw_s, gw_m, neg_c_batch, neg_t_batch, neg_v_batch,
+                        ref_time_neg, neg_m_batch, neg_e_batch
+                    )
+                    _cred_neg = compute_credible_level(gw_m, neg_c_batch) if _dual else None
+                    logits_optical = model.fusion_logits(
+                        g, h_l_neg, z_l=z_l_neg, H_gw=H_gw, cred_level=_cred_neg
+                    )
+                    logits_optical_neg.append(logits_optical.float().cpu())
+                    optical_neg_types.extend(batch_neg_types)
+    finally:
+        if gw_file is not None:
+            gw_file.close()
+
     result = {
         "logits_positive": torch.cat(logits_positive) if logits_positive else None,
         "logits_hard_neg": torch.cat(logits_hard_neg) if logits_hard_neg else None,
+        "logits_gw_neg": torch.cat(logits_gw_neg) if logits_gw_neg else None,
     }
-    
-    if has_neg_optical and logits_easy_neg:
-        result["logits_easy_neg"] = torch.cat(logits_easy_neg)
-        result["easy_neg_types"] = easy_neg_types
+
+    if has_neg_optical and logits_optical_neg:
+        optical_logits = torch.cat(logits_optical_neg)
+        result["logits_optical_neg"] = optical_logits
+        result["optical_neg_types"] = optical_neg_types
+        # Backward-compatible aliases
+        result["logits_easy_neg"] = optical_logits
+        result["easy_neg_types"] = optical_neg_types
     else:
+        result["logits_optical_neg"] = None
+        result["optical_neg_types"] = []
         result["logits_easy_neg"] = None
         result["easy_neg_types"] = []
-    
+
     return result
 
 
@@ -676,16 +745,21 @@ def evaluate_classification(embeddings):
 
 
 def evaluate_classification_triplet(triplet_logits):
-    """Classification metrics using all three pair types from triplet extraction.
+    """Classification metrics using all pair types from triplet extraction.
 
     Positive: matched (GW, KN) pairs → label 1
-    Negative: easy neg (GW, nonKN) + semi-hard neg (GW_wrong, KN) → label 0
-
-    This gives a more realistic classification evaluation than roll-by-1,
-    covering both negative scenarios the model will encounter in practice.
+    Negative:
+      - optical negatives (GW, nonKN)
+      - GW negatives (GW_has_kn0, KN)
+      - semi-hard negatives (GW_wrong, KN)
+      → label 0
     """
     all_probs = []
     all_labels = []
+    probs_pos = None
+    probs_optical = None
+    probs_gw = None
+    probs_hard = None
 
     # Positives
     if triplet_logits.get("logits_positive") is not None:
@@ -693,11 +767,20 @@ def evaluate_classification_triplet(triplet_logits):
         all_probs.append(probs_pos)
         all_labels.append(torch.ones(len(probs_pos), dtype=torch.long))
 
-    # Easy negatives (GW, nonKN)
-    if triplet_logits.get("logits_easy_neg") is not None:
-        probs_easy = torch.softmax(triplet_logits["logits_easy_neg"].float(), dim=1)[:, 1]
-        all_probs.append(probs_easy)
-        all_labels.append(torch.zeros(len(probs_easy), dtype=torch.long))
+    # Optical negatives (GW, nonKN), with backward-compatible fallback
+    optical_logits = triplet_logits.get("logits_optical_neg")
+    if optical_logits is None:
+        optical_logits = triplet_logits.get("logits_easy_neg")
+    if optical_logits is not None:
+        probs_optical = torch.softmax(optical_logits.float(), dim=1)[:, 1]
+        all_probs.append(probs_optical)
+        all_labels.append(torch.zeros(len(probs_optical), dtype=torch.long))
+
+    # GW negatives (GW_has_kn0, KN)
+    if triplet_logits.get("logits_gw_neg") is not None:
+        probs_gw = torch.softmax(triplet_logits["logits_gw_neg"].float(), dim=1)[:, 1]
+        all_probs.append(probs_gw)
+        all_labels.append(torch.zeros(len(probs_gw), dtype=torch.long))
 
     # Semi-hard negatives (GW_wrong, KN)
     if triplet_logits.get("logits_hard_neg") is not None:
@@ -712,9 +795,13 @@ def evaluate_classification_triplet(triplet_logits):
     labels = torch.cat(all_labels)
 
     n_pos = (labels == 1).sum().item()
-    n_easy = len(probs_easy) if triplet_logits.get("logits_easy_neg") is not None else 0
-    n_hard = len(probs_hard) if triplet_logits.get("logits_hard_neg") is not None else 0
-    print(f"  Triplet classification: {n_pos} pos + {n_easy} easy_neg + {n_hard} hard_neg = {len(probs)} total")
+    n_optical = len(probs_optical) if probs_optical is not None else 0
+    n_gw = len(probs_gw) if probs_gw is not None else 0
+    n_hard = len(probs_hard) if probs_hard is not None else 0
+    print(
+        "  Triplet classification: "
+        f"{n_pos} pos + {n_optical} optical_neg + {n_gw} gw_neg + {n_hard} semi_hard_neg = {len(probs)} total"
+    )
 
     return compute_classification_metrics(probs, labels)
 
@@ -872,16 +959,13 @@ def generate_plots(embeddings, results, output_dir):
 
 
 def generate_logits_distribution_plot(triplet_logits, output_dir):
-    """Generate logits distribution plot for three types of sample pairs.
-    
+    """Generate logits distribution plots for four pair types.
+
     Plot types:
-    1. Positive pairs (GW, KN): matched GW-KN optical pairs
-    2. Easy negatives (GW, nonKN): GW paired with non-KN transients  
-    3. Hard negatives (GW_wrong, KN): mismatched GW paired with KN optical
-    
-    Args:
-        triplet_logits: Dict with logits_positive, logits_easy_neg, logits_hard_neg
-        output_dir: Directory to save plots
+    1. Positive (GW, KN)
+    2. Optical negatives (GW, nonKN)
+    3. GW negatives (GW_has_kn0, KN)
+    4. Semi-hard negatives (GW_wrong, KN)
     """
     try:
         import matplotlib
@@ -896,13 +980,19 @@ def generate_logits_distribution_plot(triplet_logits, output_dir):
     
     # Extract probabilities (class 1 = match probability)
     probs_pos = None
-    probs_easy = None
+    probs_optical = None
+    probs_gw = None
     probs_hard = None
     
     if triplet_logits.get("logits_positive") is not None:
         probs_pos = torch.softmax(triplet_logits["logits_positive"].float(), dim=1)[:, 1].numpy()
-    if triplet_logits.get("logits_easy_neg") is not None:
-        probs_easy = torch.softmax(triplet_logits["logits_easy_neg"].float(), dim=1)[:, 1].numpy()
+    optical_logits = triplet_logits.get("logits_optical_neg")
+    if optical_logits is None:
+        optical_logits = triplet_logits.get("logits_easy_neg")
+    if optical_logits is not None:
+        probs_optical = torch.softmax(optical_logits.float(), dim=1)[:, 1].numpy()
+    if triplet_logits.get("logits_gw_neg") is not None:
+        probs_gw = torch.softmax(triplet_logits["logits_gw_neg"].float(), dim=1)[:, 1].numpy()
     if triplet_logits.get("logits_hard_neg") is not None:
         probs_hard = torch.softmax(triplet_logits["logits_hard_neg"].float(), dim=1)[:, 1].numpy()
     
@@ -915,11 +1005,14 @@ def generate_logits_distribution_plot(triplet_logits, output_dir):
     if probs_pos is not None:
         ax.hist(probs_pos, bins=bins, alpha=alpha, label=f'Positive (GW, KN) n={len(probs_pos)}', 
                 color='#2ecc71', edgecolor='white', linewidth=0.5)
-    if probs_easy is not None:
-        ax.hist(probs_easy, bins=bins, alpha=alpha, label=f'Easy Neg (GW, nonKN) n={len(probs_easy)}',
+    if probs_optical is not None:
+        ax.hist(probs_optical, bins=bins, alpha=alpha, label=f'Optical Negatives (GW, nonKN) n={len(probs_optical)}',
                 color='#3498db', edgecolor='white', linewidth=0.5)
+    if probs_gw is not None:
+        ax.hist(probs_gw, bins=bins, alpha=alpha, label=f'GW Negatives (GW_has_kn0, KN) n={len(probs_gw)}',
+                color='#f39c12', edgecolor='white', linewidth=0.5)
     if probs_hard is not None:
-        ax.hist(probs_hard, bins=bins, alpha=alpha, label=f'Hard Neg (GW_wrong, KN) n={len(probs_hard)}',
+        ax.hist(probs_hard, bins=bins, alpha=alpha, label=f'Semi-Hard Negatives (GW_wrong, KN) n={len(probs_hard)}',
                 color='#e74c3c', edgecolor='white', linewidth=0.5)
     
     ax.set_xlabel('Match Probability (Softmax Output)', fontsize=12)
@@ -951,15 +1044,20 @@ def generate_logits_distribution_plot(triplet_logits, output_dir):
             ax.plot(x_range, kde_pos(x_range), color='#27ae60', linewidth=2.5,
                    label=f'Positive (GW, KN)')
             
-        if probs_easy is not None and len(probs_easy) > 1:
-            kde_easy = stats.gaussian_kde(probs_easy, bw_method=0.05)
-            ax.plot(x_range, kde_easy(x_range), color='#2980b9', linewidth=2.5,
-                   label=f'Easy Neg (GW, nonKN)')
+        if probs_optical is not None and len(probs_optical) > 1:
+            kde_optical = stats.gaussian_kde(probs_optical, bw_method=0.05)
+            ax.plot(x_range, kde_optical(x_range), color='#2980b9', linewidth=2.5,
+                   label='Optical Negatives (GW, nonKN)')
+
+        if probs_gw is not None and len(probs_gw) > 1:
+            kde_gw = stats.gaussian_kde(probs_gw, bw_method=0.05)
+            ax.plot(x_range, kde_gw(x_range), color='#d68910', linewidth=2.5,
+                   label='GW Negatives (GW_has_kn0, KN)')
             
         if probs_hard is not None and len(probs_hard) > 1:
             kde_hard = stats.gaussian_kde(probs_hard, bw_method=0.05)
             ax.plot(x_range, kde_hard(x_range), color='#c0392b', linewidth=2.5,
-                   label=f'Semi-Hard Neg (GW_wrong, KN)')
+                   label='Semi-Hard Negatives (GW_wrong, KN)')
         
         ax.set_xlabel('Match Probability (Softmax Output)', fontsize=12)
         ax.set_ylabel('Density', fontsize=12)
@@ -981,11 +1079,14 @@ def generate_logits_distribution_plot(triplet_logits, output_dir):
     if probs_pos is not None:
         print(f"  Positive (GW, KN):     mean={np.mean(probs_pos):.4f}  std={np.std(probs_pos):.4f}  "
               f"median={np.median(probs_pos):.4f}  n={len(probs_pos)}")
-    if probs_easy is not None:
-        print(f"  Easy Neg (GW, nonKN):  mean={np.mean(probs_easy):.4f}  std={np.std(probs_easy):.4f}  "
-              f"median={np.median(probs_easy):.4f}  n={len(probs_easy)}")
+    if probs_optical is not None:
+        print(f"  Optical Negatives (GW, nonKN): mean={np.mean(probs_optical):.4f}  std={np.std(probs_optical):.4f}  "
+              f"median={np.median(probs_optical):.4f}  n={len(probs_optical)}")
+    if probs_gw is not None:
+        print(f"  GW Negatives (GW_has_kn0, KN): mean={np.mean(probs_gw):.4f}  std={np.std(probs_gw):.4f}  "
+              f"median={np.median(probs_gw):.4f}  n={len(probs_gw)}")
     if probs_hard is not None:
-        print(f"  Hard Neg (GW_wrong, KN): mean={np.mean(probs_hard):.4f}  std={np.std(probs_hard):.4f}  "
+        print(f"  Semi-Hard Negatives (GW_wrong, KN): mean={np.mean(probs_hard):.4f}  std={np.std(probs_hard):.4f}  "
               f"median={np.median(probs_hard):.4f}  n={len(probs_hard)}")
     
     print(f"Logits distribution plots saved to {output_dir}/")
@@ -1018,23 +1119,34 @@ def generate_gw_shuffle_comparison_plot(triplet_logits_normal, triplet_logits_sh
         if logits_dict.get(key) is not None:
             return torch.softmax(logits_dict[key].float(), dim=1)[:, 1].numpy()
         return None
-    
+
+    def get_optical_neg_probs(logits_dict):
+        optical_logits = logits_dict.get("logits_optical_neg")
+        if optical_logits is None:
+            optical_logits = logits_dict.get("logits_easy_neg")
+        if optical_logits is None:
+            return None
+        return torch.softmax(optical_logits.float(), dim=1)[:, 1].numpy()
+
     probs_pos_normal = get_probs(triplet_logits_normal, "logits_positive")
-    probs_easy_normal = get_probs(triplet_logits_normal, "logits_easy_neg")
+    probs_optical_normal = get_optical_neg_probs(triplet_logits_normal)
+    probs_gw_normal = get_probs(triplet_logits_normal, "logits_gw_neg")
     probs_hard_normal = get_probs(triplet_logits_normal, "logits_hard_neg")
-    
+
     probs_pos_shuffle = get_probs(triplet_logits_shuffle, "logits_positive")
-    probs_easy_shuffle = get_probs(triplet_logits_shuffle, "logits_easy_neg")
+    probs_optical_shuffle = get_optical_neg_probs(triplet_logits_shuffle)
+    probs_gw_shuffle = get_probs(triplet_logits_shuffle, "logits_gw_neg")
     probs_hard_shuffle = get_probs(triplet_logits_shuffle, "logits_hard_neg")
-    
+
     # --- Combined KDE comparison plot ---
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    fig, axes = plt.subplots(1, 4, figsize=(20, 5))
     x_range = np.linspace(0, 1, 200)
     
     pair_types = [
         ('Positive (GW, KN)', probs_pos_normal, probs_pos_shuffle, '#27ae60', '#2ecc71'),
-        ('Easy Neg (GW, nonKN)', probs_easy_normal, probs_easy_shuffle, '#2980b9', '#3498db'),
-        ('Semi-Hard Neg (GW_wrong, KN)', probs_hard_normal, probs_hard_shuffle, '#c0392b', '#e74c3c'),
+        ('Optical Negatives (GW, nonKN)', probs_optical_normal, probs_optical_shuffle, '#2980b9', '#3498db'),
+        ('GW Negatives (GW_has_kn0, KN)', probs_gw_normal, probs_gw_shuffle, '#d68910', '#f39c12'),
+        ('Semi-Hard Negatives (GW_wrong, KN)', probs_hard_normal, probs_hard_shuffle, '#c0392b', '#e74c3c'),
     ]
     
     for ax, (title, probs_n, probs_s, color_n, color_s) in zip(axes, pair_types):
@@ -1062,7 +1174,7 @@ def generate_gw_shuffle_comparison_plot(triplet_logits_normal, triplet_logits_sh
                 bbox_inches="tight")
     plt.close(fig)
     
-    # --- All 6 distributions on one plot ---
+    # --- All distributions on one plot ---
     fig, ax = plt.subplots(figsize=(12, 6))
     
     if probs_pos_normal is not None and len(probs_pos_normal) > 1:
@@ -1074,23 +1186,32 @@ def generate_gw_shuffle_comparison_plot(triplet_logits_normal, triplet_logits_sh
         ax.plot(x_range, kde(x_range), color='#27ae60', linewidth=2.5, linestyle='--',
                label='Positive - Shuffle')
     
-    if probs_easy_normal is not None and len(probs_easy_normal) > 1:
-        kde = stats.gaussian_kde(probs_easy_normal, bw_method=0.05)
+    if probs_optical_normal is not None and len(probs_optical_normal) > 1:
+        kde = stats.gaussian_kde(probs_optical_normal, bw_method=0.05)
         ax.plot(x_range, kde(x_range), color='#2980b9', linewidth=2.5,
-               label='Easy Neg - Normal')
-    if probs_easy_shuffle is not None and len(probs_easy_shuffle) > 1:
-        kde = stats.gaussian_kde(probs_easy_shuffle, bw_method=0.05)
+               label='Optical Negatives - Normal')
+    if probs_optical_shuffle is not None and len(probs_optical_shuffle) > 1:
+        kde = stats.gaussian_kde(probs_optical_shuffle, bw_method=0.05)
         ax.plot(x_range, kde(x_range), color='#2980b9', linewidth=2.5, linestyle='--',
-               label='Easy Neg - Shuffle')
+               label='Optical Negatives - Shuffle')
+
+    if probs_gw_normal is not None and len(probs_gw_normal) > 1:
+        kde = stats.gaussian_kde(probs_gw_normal, bw_method=0.05)
+        ax.plot(x_range, kde(x_range), color='#d68910', linewidth=2.5,
+               label='GW Negatives - Normal')
+    if probs_gw_shuffle is not None and len(probs_gw_shuffle) > 1:
+        kde = stats.gaussian_kde(probs_gw_shuffle, bw_method=0.05)
+        ax.plot(x_range, kde(x_range), color='#d68910', linewidth=2.5, linestyle='--',
+               label='GW Negatives - Shuffle')
     
     if probs_hard_normal is not None and len(probs_hard_normal) > 1:
         kde = stats.gaussian_kde(probs_hard_normal, bw_method=0.05)
         ax.plot(x_range, kde(x_range), color='#c0392b', linewidth=2.5,
-               label='Semi-Hard Neg - Normal')
+               label='Semi-Hard Negatives - Normal')
     if probs_hard_shuffle is not None and len(probs_hard_shuffle) > 1:
         kde = stats.gaussian_kde(probs_hard_shuffle, bw_method=0.05)
         ax.plot(x_range, kde(x_range), color='#c0392b', linewidth=2.5, linestyle='--',
-               label='Semi-Hard Neg - Shuffle')
+               label='Semi-Hard Negatives - Shuffle')
     
     ax.set_xlabel('Match Probability (Softmax Output)', fontsize=12)
     ax.set_ylabel('Density', fontsize=12)
@@ -1130,8 +1251,9 @@ def generate_gw_shuffle_comparison_plot(triplet_logits_normal, triplet_logits_sh
             print()
     
     print_comparison("Positive (GW, KN)", probs_pos_normal, probs_pos_shuffle)
-    print_comparison("Easy Neg (GW, nonKN)", probs_easy_normal, probs_easy_shuffle)
-    print_comparison("Semi-Hard Neg (GW_wrong, KN)", probs_hard_normal, probs_hard_shuffle)
+    print_comparison("Optical Negatives (GW, nonKN)", probs_optical_normal, probs_optical_shuffle)
+    print_comparison("GW Negatives (GW_has_kn0, KN)", probs_gw_normal, probs_gw_shuffle)
+    print_comparison("Semi-Hard Negatives (GW_wrong, KN)", probs_hard_normal, probs_hard_shuffle)
     
     print("=" * 70)
     print(f"GW-shuffle comparison plots saved to {output_dir}/")
@@ -1272,17 +1394,18 @@ def main():
             args.neg_group, 
             n_samples=args.n_neg_samples
         )
+    neg_gw_indices = load_negative_gw_indices(args.test_data_path)
 
     # Extract triplet logits for distribution analysis
     triplet_logits = None
     triplet_logits_shuffle = None
-    if neg_optical_data is not None or True:  # Always extract for hard negatives
+    if neg_optical_data is not None or len(neg_gw_indices) > 0 or True:  # Always extract for hard negatives
         print("\nExtracting triplet logits for distribution analysis...")
         # Rebuild loader to iterate again
         loader2, _ = build_test_dataloader(args, saved_args)
         try:
             triplet_logits = extract_triplet_logits(
-                model, loader2, device, model_args, neg_optical_data,
+                model, loader2, device, model_args, neg_optical_data, neg_gw_indices,
                 shuffle_gw=False
             )
         except PermissionError:
@@ -1292,7 +1415,7 @@ def main():
                 args.num_workers = 0
                 loader2, _ = build_test_dataloader(args, saved_args)
                 triplet_logits = extract_triplet_logits(
-                    model, loader2, device, model_args, neg_optical_data,
+                    model, loader2, device, model_args, neg_optical_data, neg_gw_indices,
                     shuffle_gw=False
                 )
             else:
@@ -1303,7 +1426,7 @@ def main():
         loader3, _ = build_test_dataloader(args, saved_args)
         try:
             triplet_logits_shuffle = extract_triplet_logits(
-                model, loader3, device, model_args, neg_optical_data,
+                model, loader3, device, model_args, neg_optical_data, neg_gw_indices,
                 shuffle_gw=True, shuffle_seed=42
             )
         except PermissionError:
@@ -1313,13 +1436,13 @@ def main():
                 args.num_workers = 0
                 loader3, _ = build_test_dataloader(args, saved_args)
                 triplet_logits_shuffle = extract_triplet_logits(
-                    model, loader3, device, model_args, neg_optical_data,
+                    model, loader3, device, model_args, neg_optical_data, neg_gw_indices,
                     shuffle_gw=True, shuffle_seed=42
                 )
             else:
                 raise
 
-    # Recompute classification from triplet logits (pos + easy_neg + hard_neg)
+    # Recompute classification from triplet logits (pos + optical_neg + gw_neg + semi_hard_neg)
     if triplet_logits is not None:
         print("\nRecomputing classification metrics from triplet pairs...")
         triplet_cls = evaluate_classification_triplet(triplet_logits)

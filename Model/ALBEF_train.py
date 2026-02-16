@@ -259,6 +259,25 @@ def clamp_temperature(model, args):
     max_log = math.log(args.temp_max)
     model.log_temp.data.clamp_(min_log, max_log)
 
+def compute_ckpt_selection_score(val_metrics, metric_name):
+    """Compute best-checkpoint selection score from in-domain validation metrics."""
+    cls_m = val_metrics.get('classification', {})
+
+    if metric_name == "auprc":
+        return float(cls_m.get('auprc', 0.0))
+    if metric_name == "auroc":
+        return float(cls_m.get('auroc', 0.0))
+    if metric_name == "f1_optimal":
+        return float(cls_m.get('f1_optimal', 0.0))
+    if metric_name == "acc_total":
+        return float(cls_m.get('acc_total', 0.0))
+    if metric_name == "cls_composite_auprc_auroc":
+        auprc = float(cls_m.get('auprc', 0.0))
+        auroc = float(cls_m.get('auroc', 0.0))
+        return 0.5 * auprc + 0.5 * auroc
+
+    raise ValueError(f"Unsupported best_ckpt_metric: {metric_name}")
+
 def evaluate(model, val_loader, device, args, epoch, amp_dtype=torch.float32):
     from metrics import (compute_retrieval_metrics,
                          compute_classification_metrics,
@@ -652,35 +671,51 @@ def train(args):
     model.train()
     has_negatives = args.neg_data_path is not None
 
-    # Build OOD validation loader from independent dataset (if provided)
+    # Prevent accidental test leakage during HPO by forcing OOD monitor off.
+    if args.hpo_trial_number is not None and getattr(args, "enable_ood_monitoring", False):
+        print("WARNING: Disabling OOD monitoring during HPO trial to avoid test leakage.")
+        args.enable_ood_monitoring = False
+
+    # Build OOD validation loader from independent dataset (opt-in only).
     ood_val_loader = None
-    if getattr(args, 'val_data_path', None) and os.path.exists(args.val_data_path):
-        ood_val_steps = args.ood_val_steps
-        ood_batch_size = args.val_batch_size or args.batch_size
-        # Cap batch size to number of unique GW events in the OOD dataset
-        ood_gw_map = build_gw_to_lc_mapping(args.val_data_path)
-        n_ood_gw = len(ood_gw_map)
-        if ood_batch_size > n_ood_gw:
-            print(f"Reducing OOD val batch_size from {ood_batch_size} to {n_ood_gw} (available GW events)")
-            ood_batch_size = n_ood_gw
-        ood_val_loader = create_training_dataloader(
-            h5_path=args.val_data_path,
-            batch_size=ood_batch_size,
-            steps_per_epoch=ood_val_steps,
-            num_workers=args.num_workers,
-            pin_memory=bool(args.pin_memory),
-            persistent_workers=bool(args.persistent_workers),
-            prefetch_factor=args.prefetch_factor,
-            cache_in_memory=False,
-            negative_h5_path=args.neg_data_path,
-            negative_group=args.neg_group
-        )
-        print(f"OOD validation loader: {args.val_data_path} ({ood_val_steps} steps, batch_size={ood_batch_size})")
+    if getattr(args, 'val_data_path', None):
+        if not os.path.exists(args.val_data_path):
+            print(f"WARNING: val_data_path not found, skip OOD monitoring: {args.val_data_path}")
+        elif not getattr(args, "enable_ood_monitoring", False):
+            print(
+                "OOD monitoring is disabled by default to prevent test leakage. "
+                "Pass --enable_ood_monitoring ONLY when val_data_path is a development set (not final test set)."
+            )
+        else:
+            ood_val_steps = args.ood_val_steps
+            ood_batch_size = args.val_batch_size or args.batch_size
+            # Cap batch size to number of unique GW events in the OOD dataset
+            ood_gw_map = build_gw_to_lc_mapping(args.val_data_path)
+            n_ood_gw = len(ood_gw_map)
+            if ood_batch_size > n_ood_gw:
+                print(f"Reducing OOD val batch_size from {ood_batch_size} to {n_ood_gw} (available GW events)")
+                ood_batch_size = n_ood_gw
+            ood_val_loader = create_training_dataloader(
+                h5_path=args.val_data_path,
+                batch_size=ood_batch_size,
+                steps_per_epoch=ood_val_steps,
+                num_workers=args.num_workers,
+                pin_memory=bool(args.pin_memory),
+                persistent_workers=bool(args.persistent_workers),
+                prefetch_factor=args.prefetch_factor,
+                cache_in_memory=False,
+                negative_h5_path=args.neg_data_path,
+                negative_group=args.neg_group
+            )
+            print(
+                f"OOD validation loader: {args.val_data_path} "
+                f"({ood_val_steps} steps, batch_size={ood_batch_size})"
+            )
 
     apply_freeze_schedule(model, args, start_epoch)
 
     pbar_update_every = 500
-    best_val = None
+    best_val_score = None
     best_val_metrics = {}
     epochs_no_improve = 0
     lr_scheduler = build_lr_scheduler(optimizer, args, steps_per_epoch, global_step)
@@ -972,11 +1007,15 @@ def train(args):
                     f"Emb: align={align:.4f}"
                 )
 
-                current_acc = val_metrics.get('classification', {}).get('acc_total', 0)
-                if best_val is None or current_acc > best_val + args.early_stop_min_delta:
-                    best_val = current_acc
+                current_selection_score = compute_ckpt_selection_score(
+                    val_metrics, args.best_ckpt_metric
+                )
+                if best_val_score is None or current_selection_score > best_val_score + args.early_stop_min_delta:
+                    best_val_score = current_selection_score
                     best_val_metrics = {
-                        "best_val_acc_total": current_acc,
+                        "best_ckpt_metric": args.best_ckpt_metric,
+                        "best_ckpt_score": current_selection_score,
+                        "best_val_acc_total": val_metrics.get('classification', {}).get('acc_total', 0),
                         "best_val_loss": val_metrics['total'],
                         "best_epoch": epoch,
                         "val_itc_loss": val_metrics.get('itc', 0),
@@ -995,11 +1034,16 @@ def train(args):
                         'model_state_dict': model.state_dict(),
                         'optimizer_state_dict': optimizer.state_dict(),
                         'scaler_state_dict': scaler.state_dict(),
-                        'acc_total': current_acc,
+                        'acc_total': val_metrics.get('classification', {}).get('acc_total', 0),
+                        'selection_metric': args.best_ckpt_metric,
+                        'selection_score': current_selection_score,
                         'loss': val_metrics['total'],
                         'args': vars(args),
                     }, best_ckpt)
-                    print(f"Saved best checkpoint (acc_total={current_acc:.4f}): {best_ckpt}")
+                    print(
+                        f"Saved best checkpoint ({args.best_ckpt_metric}="
+                        f"{current_selection_score:.4f}): {best_ckpt}"
+                    )
                 else:
                     epochs_no_improve += 1
                     if args.early_stop_patience > 0 and epochs_no_improve >= args.early_stop_patience:
@@ -1072,9 +1116,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_path", type=str, default="training_data.h5")
     parser.add_argument("--val_data_path", type=str, default=None,
-                        help="Path to independent OOD validation HDF5 (separate from training data)")
+                        help="Path to independent OOD/dev HDF5. Kept OFF during training unless --enable_ood_monitoring is set.")
     parser.add_argument("--ood_val_steps", type=int, default=25,
-                        help="Number of validation steps per epoch for OOD validation")
+                        help="Number of validation steps per epoch for OOD monitoring")
+    parser.add_argument("--enable_ood_monitoring", action='store_true',
+                        help="Opt-in OOD monitoring during training. Do NOT enable when val_data_path is final test set.")
     parser.add_argument("--neg_data_path", type=str, default=None)
     parser.add_argument("--neg_group", type=str, default="events/optical_data")
     parser.add_argument("--epochs", type=int, default=10)
@@ -1100,7 +1146,11 @@ if __name__ == "__main__":
     parser.add_argument("--val_steps_per_epoch", type=int, default=None)
     parser.add_argument("--split_seed", type=int, default=42)
     parser.add_argument("--early_stop_patience", type=int, default=10)
-    parser.add_argument("--early_stop_min_delta", type=float, default=1e-4)
+    parser.add_argument("--early_stop_min_delta", type=float, default=1e-4,
+                        help="Minimum improvement required on best_ckpt_metric to reset early stopping.")
+    parser.add_argument("--best_ckpt_metric", type=str, default="auprc",
+                        choices=["auprc", "auroc", "f1_optimal", "acc_total", "cls_composite_auprc_auroc"],
+                        help="In-domain validation classification metric used for selecting best checkpoint.")
     parser.add_argument("--n_ref", type=int, default=64)
     parser.add_argument("--ref_start", type=float, default=-0.3)
     parser.add_argument("--ref_end", type=float, default=0.6)
