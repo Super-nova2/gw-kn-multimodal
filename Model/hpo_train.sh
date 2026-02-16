@@ -55,6 +55,9 @@ N_TRIALS=$(jq -r '.n_trials' "$args_file")
 STUDY_NAME=$(jq -r '.study_name' "$args_file")
 EPOCHS_PER_TRIAL=$(jq -r '.epochs_per_trial' "$args_file")
 OUTPUT_DIR=$(jq -r '.output_dir' "$args_file")
+OBJECTIVE_METRIC=$(jq -r '.objective_metric // "combined_auroc_g2o_r5"' "$args_file")
+BEST_CKPT_METRIC=$(jq -r '.best_ckpt_metric // "auprc"' "$args_file")
+OOD_MONITORING=$(jq -r '.enable_ood_monitoring // false' "$args_file")
 
 DATA_PATH=$(jq -r '.data_path' "$args_file")
 NEG_DATA_PATH=$(jq -r '.neg_data_path // empty' "$args_file")
@@ -79,6 +82,10 @@ echo "  Trials: $N_TRIALS"
 echo "  Study: $STUDY_NAME"
 echo "  Epochs/trial: $EPOCHS_PER_TRIAL"
 echo "  Output: $OUTPUT_DIR"
+echo "  Objective metric: $OBJECTIVE_METRIC"
+echo "  Best ckpt metric: $BEST_CKPT_METRIC"
+echo "  enable_ood_monitoring (config): $OOD_MONITORING"
+echo "  enable_ood_monitoring (runtime override): false"
 echo ""
 
 # ─── Stage data to local disk ─────────────────────────────────────────
@@ -106,10 +113,13 @@ jq \
   --arg data_path "$DATA_PATH" \
   --arg neg_data_path "$NEG_DATA_PATH" \
   --arg neg_group "$NEG_GROUP" \
+  --arg best_ckpt_metric "$BEST_CKPT_METRIC" \
   --argjson num_workers "${SLURM_CPUS_PER_TASK}" \
   '
   .data_path = $data_path
   | .num_workers = $num_workers
+  | .best_ckpt_metric = $best_ckpt_metric
+  | .enable_ood_monitoring = false
   | (if ($neg_data_path | length) > 0 and $neg_data_path != "null"
      then .neg_data_path = $neg_data_path
      else .
