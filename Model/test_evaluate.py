@@ -1005,16 +1005,16 @@ def generate_logits_distribution_plot(triplet_logits, output_dir):
     
     if probs_pos is not None:
         ax.hist(probs_pos, bins=bins, alpha=alpha, label=f'Positive (GW, KN) n={len(probs_pos)}', 
-                color='#2ecc71', edgecolor='white', linewidth=0.5, histtype='step')
+                edgecolor='#2ecc71', linewidth=3, histtype='step')
     if probs_optical is not None:
         ax.hist(probs_optical, bins=bins, alpha=alpha, label=f'Optical Negatives (GW, nonKN) n={len(probs_optical)}',
-                color='#3498db', edgecolor='white', linewidth=0.5, histtype='step')
+                edgecolor='#3498db', linewidth=3, histtype='step')
     if probs_gw is not None:
         ax.hist(probs_gw, bins=bins, alpha=alpha, label=f'GW Negatives (GW_has_kn0, KN) n={len(probs_gw)}',
-                color='#f39c12', edgecolor='white', linewidth=0.5, histtype='step')
+                edgecolor='#f39c12', linewidth=3, histtype='step')
     if probs_hard is not None:
         ax.hist(probs_hard, bins=bins, alpha=alpha, label=f'Semi-Hard Negatives (GW_wrong, KN) n={len(probs_hard)}',
-                color='#e74c3c', edgecolor='white', linewidth=0.5, histtype='step')
+                edgecolor='#e74c3c', linewidth=3, histtype='step')
     
     ax.set_xlabel('Match Probability (Softmax Output)', fontsize=12)
     ax.set_ylabel('Count', fontsize=12)

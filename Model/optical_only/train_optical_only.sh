@@ -9,7 +9,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --time=6:00:00
 #SBATCH --partition=gpu
-#SBATCH --tmp=110G
+#SBATCH --tmp=160G
 
 set -euo pipefail
 
@@ -130,6 +130,9 @@ EVAL_MAX_NEG_SAMPLES=$(jq -r '.eval_max_neg_samples // empty' "$args_file")
 EVAL_SAMPLE_SEED=$(jq -r '.eval_sample_seed // empty' "$args_file")
 EVAL_TARGET_RECALL=$(jq -r '.eval_target_recall // empty' "$args_file")
 EVAL_NO_PLOTS=$(jq -r '.eval_no_plots // false' "$args_file")
+EVAL_POS_DATA_PATH=$(jq -r '.eval_pos_data_path // "/fred/oz016/bgao_kn/data/LSST_KN_BNS/combined_dataset_with_neg_gw.h5"' "$args_file")
+EVAL_NEG_DATA_PATH=$(jq -r '.eval_neg_data_path // "/fred/oz016/bgao_kn/data/Optical_Negative_dataset/ELASTICC_negative_dataset.h5"' "$args_file")
+EVAL_NEG_GROUP=$(jq -r '.eval_neg_group // "ELASTICC/optical_data"' "$args_file")
 
 if [[ -z "$RUN_NAME" || "$RUN_NAME" == "null" ]]; then
     if [[ -n "${SLURM_JOB_ID:-}" ]]; then
@@ -169,10 +172,19 @@ if [[ "$STAGE_TO_JOBFS" == "true" ]]; then
     JOBFS_DIR="${SLURM_TMPDIR:-${TMPDIR:-${JOBFS:-}}}"
     if [[ -n "$JOBFS_DIR" ]]; then
         echo "Staging datasets to local disk: $JOBFS_DIR"
-        cp -f "$POS_DATA_PATH" "$JOBFS_DIR"/
-        POS_DATA_PATH="$JOBFS_DIR/$(basename "$POS_DATA_PATH")"
-        cp -f "$NEG_DATA_PATH" "$JOBFS_DIR"/
-        NEG_DATA_PATH="$JOBFS_DIR/$(basename "$NEG_DATA_PATH")"
+        TRAIN_POS_LOCAL="$JOBFS_DIR/train_pos_$(basename "$POS_DATA_PATH")"
+        TRAIN_NEG_LOCAL="$JOBFS_DIR/train_neg_$(basename "$NEG_DATA_PATH")"
+        EVAL_POS_LOCAL="$JOBFS_DIR/eval_pos_$(basename "$EVAL_POS_DATA_PATH")"
+        EVAL_NEG_LOCAL="$JOBFS_DIR/eval_neg_$(basename "$EVAL_NEG_DATA_PATH")"
+
+        cp -f "$POS_DATA_PATH" "$TRAIN_POS_LOCAL"
+        POS_DATA_PATH="$TRAIN_POS_LOCAL"
+        cp -f "$NEG_DATA_PATH" "$TRAIN_NEG_LOCAL"
+        NEG_DATA_PATH="$TRAIN_NEG_LOCAL"
+        cp -f "$EVAL_POS_DATA_PATH" "$EVAL_POS_LOCAL"
+        EVAL_POS_DATA_PATH="$EVAL_POS_LOCAL"
+        cp -f "$EVAL_NEG_DATA_PATH" "$EVAL_NEG_LOCAL"
+        EVAL_NEG_DATA_PATH="$EVAL_NEG_LOCAL"
         echo "Staging complete."
     else
         echo "No local tmp dir found; skip staging."
@@ -345,19 +357,37 @@ if [[ ! -f "$EVAL_PY" ]]; then
     echo "Evaluation script not found: $EVAL_PY"
     exit 1
 fi
+if [[ ! -f "$EVAL_POS_DATA_PATH" ]]; then
+    echo "Evaluation positive dataset not found: $EVAL_POS_DATA_PATH"
+    exit 1
+fi
+if [[ ! -f "$EVAL_NEG_DATA_PATH" ]]; then
+    echo "Evaluation negative dataset not found: $EVAL_NEG_DATA_PATH"
+    exit 1
+fi
 mkdir -p "$EVAL_OUTPUT_DIR"
+
+echo "Evaluation POS data: $EVAL_POS_DATA_PATH"
+echo "Evaluation NEG data: $EVAL_NEG_DATA_PATH"
+if [[ -n "$EVAL_NEG_GROUP" && "$EVAL_NEG_GROUP" != "null" ]]; then
+    echo "Evaluation NEG group: $EVAL_NEG_GROUP"
+elif [[ -n "$NEG_GROUP" && "$NEG_GROUP" != "null" ]]; then
+    echo "Evaluation NEG group: $NEG_GROUP (fallback from training args)"
+fi
 
 eval_cmd=(
     python -u "$EVAL_PY"
     --checkpoint "$BEST_CKPT"
     --config "$args_file"
-    --pos_data_path "$POS_DATA_PATH"
-    --neg_data_path "$NEG_DATA_PATH"
+    --pos_data_path "$EVAL_POS_DATA_PATH"
+    --neg_data_path "$EVAL_NEG_DATA_PATH"
     --output_dir "$EVAL_OUTPUT_DIR"
     --device cuda
 )
 
-if [[ -n "$NEG_GROUP" && "$NEG_GROUP" != "null" ]]; then
+if [[ -n "$EVAL_NEG_GROUP" && "$EVAL_NEG_GROUP" != "null" ]]; then
+    eval_cmd+=(--neg_group "$EVAL_NEG_GROUP")
+elif [[ -n "$NEG_GROUP" && "$NEG_GROUP" != "null" ]]; then
     eval_cmd+=(--neg_group "$NEG_GROUP")
 fi
 if [[ -n "$EVAL_BATCH_SIZE" && "$EVAL_BATCH_SIZE" != "null" ]]; then
