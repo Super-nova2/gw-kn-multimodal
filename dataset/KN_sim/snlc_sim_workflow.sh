@@ -14,6 +14,7 @@ args_file=$1
 
 sim_name=$(jq -r '.SIM_NAME' $args_file)
 gw_type=$(jq -r '.GW_type' $args_file)
+skymap_path=$(jq -r '.skymap_path' $args_file)
 opsim_db=$(jq -r '.OpsimDB' $args_file)
 nside=$(jq -r '.Nside' $args_file)
 data_dir=$(jq -r '.DATA_DIR' $args_file)
@@ -64,6 +65,7 @@ echo "Processing simulation ids: ${group_ids[@]}"
 
 python /fred/oz016/bgao_kn/ML+GW+KN/dataset/KN_sim/gen_SNANA_doc.py --sim_name ${sim_name} \
     --GW_type ${gw_type} \
+    --skymap_path ${skymap_path} \
     --sim_ids "${group_ids[@]}" \
     --GW_params ${inj_file} \
     --Opsim ${opsim_db} \

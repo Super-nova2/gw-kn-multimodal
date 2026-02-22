@@ -13,11 +13,11 @@ fi
 
 
 # Configurable resource knobs (override via env if needed)
-TIME_LIMIT=${TIME_LIMIT:-8:00:00}
+TIME_LIMIT=${TIME_LIMIT:-4:00:00}
 CPUS_PER_TASK=${CPUS_PER_TASK:-1}
-MEM_PER_TASK=${MEM_PER_TASK:-16G}
+MEM_PER_TASK=${MEM_PER_TASK:-10G}
 BATCH_SIZE=${BATCH_SIZE:-20}          # must match batch size in snlc_sim_workflow.sh
-MAX_ARRAY_CONCURRENCY=${MAX_ARRAY_CONCURRENCY:-10}
+MAX_ARRAY_CONCURRENCY=${MAX_ARRAY_CONCURRENCY:-20}
 
 sim_name=$(jq -r '.SIM_NAME' "${args_file}")
 inj_file=$(jq -r '.injections_file' "${args_file}")
