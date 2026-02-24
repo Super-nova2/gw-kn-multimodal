@@ -95,7 +95,7 @@ def get_NLIBID(simlib_file):
                 break
     return nlibid
 
-def gen_input(injections, text, sim_id):
+def gen_input(injections, text, sim_id, GW_type="bns"):
     """
     Generate SIMGEN INPUT file content by modifying the template text with GW parameters.
     """
@@ -131,12 +131,13 @@ def gen_input(injections, text, sim_id):
         text,
         flags=re.MULTILINE
     )
-    text = re.sub(
-        r"^(GENPEAK_PHI:\s*)\S+.*$",
-        rf"\1 {phi[0]}",
-        text,
-        flags=re.MULTILINE
-    )
+    if GW_type=="bns":
+        text = re.sub(
+            r"^(GENPEAK_PHI:\s*)\S+.*$",
+            rf"\1 {phi[0]}",
+            text,
+            flags=re.MULTILINE
+        )
     text = re.sub(
         r"^(GENPEAK_MEJDYN:\s*)\S+.*$",
         rf"\1 {mej_dyn[0]}",
@@ -244,7 +245,7 @@ for sim_id in sim_ids:
     )
 
     # modify other parameters based on GW parameters and simlib file
-    text = gen_input(injections, text, sim_id)
+    text = gen_input(injections, text, sim_id, GW_type=args.GW_type)
     # save to file
     with open(input_dir + f"SIMGEN_{sim_name}_{sim_id}.INPUT", "w", encoding="utf-8") as f:
         f.write(text)

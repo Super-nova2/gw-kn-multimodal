@@ -1,0 +1,207 @@
+#!/bin/bash
+
+#SBATCH --job-name=GW_BNS_NSBH_Dataset
+#SBATCH --output=logs/data/%x_%j.out
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=1
+#SBATCH --mem=8G
+#SBATCH --time=6:00:00
+
+set -euo pipefail
+
+PROFILE="${PROFILE:-test_aug}"          # test_aug | final_train
+DATASET_MODE="${DATASET_MODE:-train}"   # train | test
+
+BUFFER_LIMIT="${BUFFER_LIMIT:-10000}"
+SEED="${SEED:-42}"
+
+BNS_MAX_LC_PER_GW="${BNS_MAX_LC_PER_GW:-1000}"
+NSBH_MAX_LC_PER_GW="${NSBH_MAX_LC_PER_GW:-1000}"
+
+BNS_MAX_NEG_GW="${BNS_MAX_NEG_GW:-}"
+NSBH_MAX_NEG_GW="${NSBH_MAX_NEG_GW:-}"
+BNS_MAX_POS_GW="${BNS_MAX_POS_GW:-}"
+NSBH_MAX_POS_GW="${NSBH_MAX_POS_GW:-}"
+NSBH_MAX_NEG_TYPE1_GW="${NSBH_MAX_NEG_TYPE1_GW:-}"
+NSBH_MAX_NEG_TYPE2_GW="${NSBH_MAX_NEG_TYPE2_GW:-}"
+NSBH_MEJ_COL="${NSBH_MEJ_COL:-mej_tot}"
+NSBH_TYPE1_THRESHOLD="${NSBH_TYPE1_THRESHOLD:-0.0}"
+NSBH_REQUIRE_SUCCESS_FOR_MEJ_POS="${NSBH_REQUIRE_SUCCESS_FOR_MEJ_POS:-1}"
+
+set_profile_defaults() {
+    case "$PROFILE" in
+        test_aug)
+            BNS_FULL_CATALOG_PATH="${BNS_FULL_CATALOG_PATH:-/fred/oz016/bgao_kn/data/LSST_KN_BNS/gw_catalog.csv}"
+            BNS_SKYMAP_DIR="${BNS_SKYMAP_DIR:-/fred/oz016/bgao_kn/data/skymap/bns_skymap}"
+            BNS_SIM_ROOT="${BNS_SIM_ROOT:-/fred/oz016/bgao_kn/SNANA/SNDATA_ROOT/SIM/LSST_KN_BNS}"
+            BNS_SIM_NAME="${BNS_SIM_NAME:-LSST_KN_BNS}"
+            BNS_SUCCESS_IDS_PATH="${BNS_SUCCESS_IDS_PATH:-}"
+
+            NSBH_FULL_CATALOG_PATH="${NSBH_FULL_CATALOG_PATH:-/fred/oz016/bgao_kn/ML+GW+KN/dataset/O5_sim_nsbh_aug/injections_full.csv}"
+            NSBH_SKYMAP_DIR="${NSBH_SKYMAP_DIR:-/fred/oz016/bgao_kn/data/skymap/nsbh_skymap}"
+            NSBH_SIM_ROOT="${NSBH_SIM_ROOT:-/fred/oz016/bgao_kn/SNANA/SNDATA_ROOT/SIM/LSST_KN_NSBH_AUG}"
+            NSBH_SIM_NAME="${NSBH_SIM_NAME:-LSST_KN_NSBH_AUG}"
+            NSBH_SUCCESS_IDS_PATH="${NSBH_SUCCESS_IDS_PATH:-/fred/oz016/bgao_kn/data/LSST_KN_NSBH_AUG/success_sim_ids.txt}"
+
+            OUTPUT_H5_PATH="${OUTPUT_H5_PATH:-/fred/oz016/bgao_kn/data/LSST_KN_BNS_NSBH_AUG/combined_dataset_with_neg_gw_${DATASET_MODE}.h5}"
+            ;;
+        final_train)
+            BNS_FULL_CATALOG_PATH="${BNS_FULL_CATALOG_PATH:-/fred/oz016/bgao_kn/ML+GW+KN/dataset/O5_sim_bns_aug/injections_final.csv}"
+            BNS_SKYMAP_DIR="${BNS_SKYMAP_DIR:-/fred/oz016/bgao_kn/data/skymap/bns_skymap}"
+            # Keep overridable because BNS_AUG raw SNANA outputs may be compressed/offline.
+            BNS_SIM_ROOT="${BNS_SIM_ROOT:-/fred/oz016/bgao_kn/SNANA/SNDATA_ROOT/SIM/LSST_KN_BNS_AUG}"
+            BNS_SIM_NAME="${BNS_SIM_NAME:-LSST_KN_BNS_AUG}"
+            BNS_SUCCESS_IDS_PATH="${BNS_SUCCESS_IDS_PATH:-/fred/oz016/bgao_kn/data/LSST_KN_BNS_AUG/success_sim_ids.txt}"
+
+            NSBH_FULL_CATALOG_PATH="${NSBH_FULL_CATALOG_PATH:-/fred/oz016/bgao_kn/ML+GW+KN/dataset/O5_sim_nsbh_train/injections_full.csv}"
+            NSBH_SKYMAP_DIR="${NSBH_SKYMAP_DIR:-/fred/oz016/bgao_kn/data/skymap/nsbh_skymap_train}"
+            NSBH_SIM_ROOT="${NSBH_SIM_ROOT:-/fred/oz016/bgao_kn/SNANA/SNDATA_ROOT/SIM}"
+            NSBH_SIM_NAME="${NSBH_SIM_NAME:-LSST_KN_NSBH_TRAIN}"
+            NSBH_SUCCESS_IDS_PATH="${NSBH_SUCCESS_IDS_PATH:-/fred/oz016/bgao_kn/data/LSST_KN_NSBH_TRAIN/success_sim_ids.txt}"
+
+            OUTPUT_H5_PATH="${OUTPUT_H5_PATH:-/fred/oz016/bgao_kn/data/LSST_KN_BNS_AUG_NSBH_TRAIN/combined_dataset_with_neg_gw_${DATASET_MODE}.h5}"
+            ;;
+        *)
+            echo "Unsupported PROFILE='$PROFILE'. Use PROFILE=test_aug or PROFILE=final_train."
+            exit 1
+            ;;
+    esac
+}
+
+require_file() {
+    local p="$1"
+    if [[ ! -f "$p" ]]; then
+        echo "Required file not found: $p"
+        exit 1
+    fi
+}
+
+require_dir() {
+    local p="$1"
+    if [[ ! -d "$p" ]]; then
+        echo "Required directory not found: $p"
+        exit 1
+    fi
+}
+
+append_optional_arg() {
+    local flag="$1"
+    local val="$2"
+    if [[ -n "$val" ]]; then
+        cmd+=("$flag" "$val")
+    fi
+}
+
+set_profile_defaults
+
+if [[ "$DATASET_MODE" != "train" && "$DATASET_MODE" != "test" ]]; then
+    echo "DATASET_MODE must be train or test, got: $DATASET_MODE"
+    exit 1
+fi
+
+if [[ -z "${SLURM_JOB_ID:-}" ]]; then
+    if ! command -v sbatch >/dev/null 2>&1; then
+        echo "sbatch not found; run inside a Slurm allocation or install Slurm tools."
+        exit 1
+    fi
+
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    script_path="${script_dir}/$(basename "${BASH_SOURCE[0]}")"
+
+    mkdir -p logs/data
+
+    sbatch_opts=()
+    if [[ -n "${JOB_NAME:-}" ]]; then
+        sbatch_opts+=(--job-name="${JOB_NAME}")
+    fi
+    if [[ -n "${OUTPUT_LOG:-}" ]]; then
+        sbatch_opts+=(--output="${OUTPUT_LOG}")
+    fi
+    if [[ -n "${TIME_LIMIT:-}" ]]; then
+        sbatch_opts+=(--time="${TIME_LIMIT}")
+    fi
+    if [[ -n "${PARTITION:-}" ]]; then
+        sbatch_opts+=(--partition="${PARTITION}")
+    fi
+    if [[ -n "${CPUS_PER_TASK:-}" ]]; then
+        sbatch_opts+=(--cpus-per-task="${CPUS_PER_TASK}")
+    fi
+    if [[ -n "${MEM_PER_TASK:-}" ]]; then
+        sbatch_opts+=(--mem="${MEM_PER_TASK}")
+    fi
+    if [[ -n "${NODES:-}" ]]; then
+        sbatch_opts+=(--nodes="${NODES}")
+    fi
+    if [[ -n "${NTASKS:-}" ]]; then
+        sbatch_opts+=(--ntasks="${NTASKS}")
+    fi
+    if [[ -n "${CHDIR:-}" ]]; then
+        sbatch_opts+=(--chdir="${CHDIR}")
+    fi
+
+    echo "Submitting job with: sbatch ${sbatch_opts[*]} ${script_path}"
+    sbatch "${sbatch_opts[@]}" "${script_path}"
+    exit 0
+fi
+
+require_file "$BNS_FULL_CATALOG_PATH"
+require_file "$NSBH_FULL_CATALOG_PATH"
+require_dir "$BNS_SKYMAP_DIR"
+require_dir "$NSBH_SKYMAP_DIR"
+require_dir "$BNS_SIM_ROOT"
+require_dir "$NSBH_SIM_ROOT"
+
+if [[ -n "${BNS_SUCCESS_IDS_PATH:-}" && ! -f "$BNS_SUCCESS_IDS_PATH" ]]; then
+    echo "WARNING: BNS success ids file not found, skip filtering: $BNS_SUCCESS_IDS_PATH"
+    BNS_SUCCESS_IDS_PATH=""
+fi
+
+if [[ "${NSBH_REQUIRE_SUCCESS_FOR_MEJ_POS}" == "1" ]]; then
+    if [[ -z "${NSBH_SUCCESS_IDS_PATH:-}" ]]; then
+        echo "NSBH_SUCCESS_IDS_PATH is required when NSBH_REQUIRE_SUCCESS_FOR_MEJ_POS=1."
+        exit 1
+    fi
+    require_file "$NSBH_SUCCESS_IDS_PATH"
+elif [[ -n "${NSBH_SUCCESS_IDS_PATH:-}" && ! -f "$NSBH_SUCCESS_IDS_PATH" ]]; then
+    echo "WARNING: NSBH success ids file not found, skip filtering: $NSBH_SUCCESS_IDS_PATH"
+    NSBH_SUCCESS_IDS_PATH=""
+fi
+
+mkdir -p "$(dirname "$OUTPUT_H5_PATH")"
+
+py_script="/fred/oz016/bgao_kn/ML+GW+KN/Model/script/create_dataset_with_neg_gw_bns_nsbh_fast.py"
+
+cmd=(
+    python -u "$py_script"
+    --output_h5_path "$OUTPUT_H5_PATH"
+    --dataset_mode "$DATASET_MODE"
+    --buffer_limit "$BUFFER_LIMIT"
+    --seed "$SEED"
+    --bns_full_catalog_path "$BNS_FULL_CATALOG_PATH"
+    --bns_skymap_dir "$BNS_SKYMAP_DIR"
+    --bns_sim_root "$BNS_SIM_ROOT"
+    --bns_sim_name "$BNS_SIM_NAME"
+    --bns_max_lc_per_gw "$BNS_MAX_LC_PER_GW"
+    --nsbh_full_catalog_path "$NSBH_FULL_CATALOG_PATH"
+    --nsbh_skymap_dir "$NSBH_SKYMAP_DIR"
+    --nsbh_sim_root "$NSBH_SIM_ROOT"
+    --nsbh_sim_name "$NSBH_SIM_NAME"
+    --nsbh_max_lc_per_gw "$NSBH_MAX_LC_PER_GW"
+    --nsbh_mej_col "$NSBH_MEJ_COL"
+    --nsbh_type1_threshold "$NSBH_TYPE1_THRESHOLD"
+    --nsbh_require_success_for_mej_pos "$NSBH_REQUIRE_SUCCESS_FOR_MEJ_POS"
+)
+
+append_optional_arg --bns_success_ids_path "${BNS_SUCCESS_IDS_PATH:-}"
+append_optional_arg --nsbh_success_ids_path "${NSBH_SUCCESS_IDS_PATH:-}"
+append_optional_arg --bns_max_neg_gw "${BNS_MAX_NEG_GW:-}"
+append_optional_arg --nsbh_max_neg_gw "${NSBH_MAX_NEG_GW:-}"
+append_optional_arg --bns_max_pos_gw "${BNS_MAX_POS_GW:-}"
+append_optional_arg --nsbh_max_pos_gw "${NSBH_MAX_POS_GW:-}"
+append_optional_arg --nsbh_max_neg_type1_gw "${NSBH_MAX_NEG_TYPE1_GW:-}"
+append_optional_arg --nsbh_max_neg_type2_gw "${NSBH_MAX_NEG_TYPE2_GW:-}"
+
+echo "PROFILE=$PROFILE DATASET_MODE=$DATASET_MODE"
+echo "Output H5: $OUTPUT_H5_PATH"
+"${cmd[@]}"

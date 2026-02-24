@@ -14,6 +14,7 @@ logs/
 eval_results/
 *.png
 PRD/
+*.h5
 
 ./dataset/KN_sim/notebook/
 dataset/O5_sim_bns/*.ipynb
