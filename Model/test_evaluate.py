@@ -29,6 +29,7 @@ import argparse
 import json
 import os
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 
 import h5py
@@ -90,10 +91,59 @@ def parse_args():
     # Output
     p.add_argument("--output_dir", type=str, default="eval_results")
     p.add_argument("--device", type=str, default="cuda")
+    p.add_argument(
+        "--amp_dtype",
+        type=str,
+        default="auto",
+        choices=["auto", "bf16", "fp16", "fp32"],
+        help=(
+            "Autocast precision for CUDA eval. "
+            "'auto' uses bf16 when supported, otherwise disables AMP (fp32)."
+        ),
+    )
     p.add_argument("--no_plots", action="store_true",
                    help="Skip generating plots (useful on headless machines)")
 
     return p.parse_args()
+
+
+def _autocast_context(device, amp_dtype, enabled):
+    """CUDA autocast context, or no-op context when disabled."""
+    if device.type != "cuda" or not enabled:
+        return nullcontext()
+    return autocast(device_type="cuda", dtype=amp_dtype)
+
+
+def _resolve_eval_amp(amp_dtype_arg, device):
+    """Resolve eval AMP dtype/enable flag from CLI and device capability."""
+    if device.type != "cuda":
+        return torch.float32, False
+
+    mode = str(amp_dtype_arg).lower()
+    if mode == "auto":
+        if torch.cuda.is_bf16_supported():
+            return torch.bfloat16, True
+        return torch.float32, False
+    if mode == "bf16":
+        if torch.cuda.is_bf16_supported():
+            return torch.bfloat16, True
+        print("WARNING: --amp_dtype=bf16 requested but bf16 is unsupported on this GPU. Falling back to fp32.")
+        return torch.float32, False
+    if mode == "fp16":
+        return torch.float16, True
+    if mode == "fp32":
+        return torch.float32, False
+    raise ValueError(f"Unsupported --amp_dtype value: {amp_dtype_arg}")
+
+
+def _amp_dtype_name(dtype):
+    if dtype == torch.float16:
+        return "fp16"
+    if dtype == torch.bfloat16:
+        return "bf16"
+    if dtype == torch.float32:
+        return "fp32"
+    return str(dtype)
 
 
 def load_model(args, device):
@@ -282,8 +332,79 @@ def load_negative_gw_indices(test_data_path):
     return neg_gw_indices
 
 
+def _normalize_source_type(raw_value):
+    """Normalize source labels from HDF5 values to stable lowercase strings."""
+    if isinstance(raw_value, (bytes, np.bytes_)):
+        raw_value = raw_value.decode("utf-8", errors="ignore")
+    label = str(raw_value).strip().lower()
+    if label in ("", "none", "nan"):
+        return "unknown"
+    return label
+
+
+def _lookup_source_type(gw_idx, gw_source_types):
+    """Safe source lookup by GW index."""
+    if gw_source_types is None:
+        return "unknown"
+    idx = int(gw_idx)
+    if idx < 0 or idx >= len(gw_source_types):
+        return "unknown"
+    return gw_source_types[idx]
+
+
+def load_gw_source_types(test_data_path):
+    """Load per-GW source_type labels from test HDF5 for by-source metrics."""
+    if test_data_path is None or not os.path.exists(test_data_path):
+        print(f"WARNING: Test data path not found for source_type: {test_data_path}")
+        return None
+
+    with h5py.File(test_data_path, 'r') as f:
+        if 'events/gw_data/source_type' not in f:
+            print("WARNING: 'events/gw_data/source_type' not found. classification_by_source will be skipped.")
+            return None
+        raw_source_types = f['events/gw_data/source_type'][:]
+
+    source_types = [_normalize_source_type(v) for v in raw_source_types]
+    uniq, counts = np.unique(np.asarray(source_types, dtype=object), return_counts=True)
+    source_summary = ", ".join(f"{u}={int(c)}" for u, c in zip(uniq, counts))
+    print(f"Loaded GW source_type labels: {source_summary}")
+    return source_types
+
+
+def _is_dual_fusion_model(model):
+    """Return whether current model uses dual fusion branch."""
+    if hasattr(model, "_orig_mod"):
+        return bool(getattr(model._orig_mod, "dual_fusion", False))
+    return bool(getattr(model, "dual_fusion", False))
+
+
+def _count_non_finite(tensor):
+    """Return number of NaN/Inf entries in a tensor."""
+    return int((~torch.isfinite(tensor)).sum().item())
+
+
+def _collect_non_finite(named_tensors):
+    """Collect non-finite counts for a mapping of {name: tensor}."""
+    bad = {}
+    for name, tensor in named_tensors.items():
+        n_bad = _count_non_finite(tensor)
+        if n_bad > 0:
+            bad[name] = n_bad
+    return bad
+
+
+def _filter_finite_embedding_rows(feat_g, feat_o, gw_indices):
+    """Drop rows where GW/optical embeddings contain NaN/Inf."""
+    finite_mask = torch.isfinite(feat_g).all(dim=1) & torch.isfinite(feat_o).all(dim=1)
+    n_drop = int((~finite_mask).sum().item())
+    if n_drop == 0:
+        return feat_g, feat_o, gw_indices, n_drop
+    return feat_g[finite_mask], feat_o[finite_mask], gw_indices[finite_mask], n_drop
+
+
 @torch.no_grad()
-def extract_all_embeddings(model, loader, device, model_args):
+def extract_all_embeddings(model, loader, device, model_args, gw_source_types=None,
+                           amp_dtype=torch.float32, amp_enabled=False):
     """Run full forward pass, collecting embeddings and predictions.
 
     For classification evaluation, both matched (positive) and mismatched
@@ -298,11 +419,16 @@ def extract_all_embeddings(model, loader, device, model_args):
     all_labels = []     # 1 for matched, 0 for mismatched
     all_sim_blocks = []
     all_gw_idx_blocks = []
+    all_h_l_cls = []    # optical sequence features for fusion logits
+    all_z_l_cls = []    # optical cls token (dual fusion)
+    all_opt_coords = [] # optical coordinates (dual fusion credible level)
+    all_gw_source_labels = []
 
     ref_time_cache = None
     n_ref = model_args["n_ref"]
     ref_start = model_args["ref_start"]
     ref_end = model_args["ref_end"]
+    dual = _is_dual_fusion_model(model)
 
     for batch_data in tqdm(loader, desc="Extracting embeddings"):
         # Unpack
@@ -320,6 +446,10 @@ def extract_all_embeddings(model, loader, device, model_args):
         opt_err = opt_err.to(device)
         opt_coords = opt_coords.to(device)
         gw_indices = gw_indices.to(device).long()
+        batch_sources = None
+        if gw_source_types is not None:
+            gw_indices_cpu = gw_indices.detach().cpu().numpy().tolist()
+            batch_sources = [_lookup_source_type(gw_idx, gw_source_types) for gw_idx in gw_indices_cpu]
 
         batch_size = gw_s.size(0)
         if (ref_time_cache is None or ref_time_cache.shape[0] != batch_size
@@ -329,42 +459,74 @@ def extract_all_embeddings(model, loader, device, model_args):
             )
         opt_ref_t = ref_time_cache
 
-        with autocast(device_type='cuda', dtype=torch.float16,
-                      enabled=(device.type == 'cuda')):
-            g, z_l, h_l, H_gw = model.encode(
-                gw_s, gw_m, opt_coords, opt_t, opt_v, opt_ref_t, opt_mask, opt_err
+        def _forward_pass(use_amp):
+            with _autocast_context(device, amp_dtype, enabled=(use_amp and amp_enabled)):
+                g, z_l, h_l, H_gw = model.encode(
+                    gw_s, gw_m, opt_coords, opt_t, opt_v, opt_ref_t, opt_mask, opt_err
+                )
+                feat_g = F.normalize(model.gw_proj(g), p=2, dim=1, eps=1e-8)
+                feat_o = F.normalize(model.opt_proj(z_l), p=2, dim=1, eps=1e-8)
+
+                # Compute credible level if dual fusion
+                if dual:
+                    from ALBEF_train import compute_credible_level
+                    cred_level = compute_credible_level(gw_m, opt_coords)
+                else:
+                    cred_level = None
+
+                # Positive pairs (matched GW-optical)
+                logits_pos = model.fusion_logits(g, h_l, z_l=z_l, H_gw=H_gw, cred_level=cred_level)
+
+                # Negative pairs (shift optical by 1 so each GW pairs with wrong optical)
+                shift = 1
+                h_l_neg = torch.roll(h_l, shifts=shift, dims=0)
+                z_l_neg = torch.roll(z_l, shifts=shift, dims=0)
+                # Recompute credible level for mismatched pair (current GW + rolled optical coords)
+                if dual:
+                    opt_coords_neg = torch.roll(opt_coords, shifts=shift, dims=0)
+                    cred_level_neg = compute_credible_level(gw_m, opt_coords_neg)
+                else:
+                    cred_level_neg = None
+                logits_neg = model.fusion_logits(g, h_l_neg, z_l=z_l_neg, H_gw=H_gw, cred_level=cred_level_neg)
+
+                # Similarity matrix for retrieval
+                temperature = model.log_temp.exp().clamp(
+                    min=model.temp_min, max=model.temp_max
+                )
+                sim_g2o = torch.matmul(feat_g, feat_o.T) / temperature
+            return g, z_l, h_l, feat_g, feat_o, logits_pos, logits_neg, sim_g2o
+
+        g, z_l, h_l, feat_g, feat_o, logits_pos, logits_neg, sim_g2o = _forward_pass(use_amp=True)
+        non_finite = _collect_non_finite({
+            "feat_g": feat_g,
+            "feat_o": feat_o,
+            "logits_pos": logits_pos,
+            "logits_neg": logits_neg,
+            "sim_g2o": sim_g2o,
+        })
+
+        # AMP on very large batches can occasionally produce non-finite values.
+        # Retry once in FP32 for this batch before continuing.
+        if non_finite and device.type == "cuda" and amp_enabled:
+            bad_str = ", ".join(f"{k}={v}" for k, v in non_finite.items())
+            print(
+                "WARNING: Non-finite values detected in AMP forward pass "
+                f"(batch_size={batch_size}): {bad_str}. Retrying this batch in FP32."
             )
-            feat_g = F.normalize(model.gw_proj(g), p=2, dim=1, eps=1e-8)
-            feat_o = F.normalize(model.opt_proj(z_l), p=2, dim=1, eps=1e-8)
-
-            # Compute credible level if dual fusion
-            dual = getattr(model, 'dual_fusion', False) if not hasattr(model, '_orig_mod') else getattr(model._orig_mod, 'dual_fusion', False)
-            if dual:
-                from ALBEF_train import compute_credible_level
-                cred_level = compute_credible_level(gw_m, opt_coords)
-            else:
-                cred_level = None
-
-            # Positive pairs (matched GW-optical)
-            logits_pos = model.fusion_logits(g, h_l, z_l=z_l, H_gw=H_gw, cred_level=cred_level)
-
-            # Negative pairs (shift optical by 1 so each GW pairs with wrong optical)
-            shift = 1
-            h_l_neg = torch.roll(h_l, shifts=shift, dims=0)
-            z_l_neg = torch.roll(z_l, shifts=shift, dims=0)
-            # Recompute credible level for the mismatched pair (current GW + rolled optical coords)
-            if dual:
-                opt_coords_neg = torch.roll(opt_coords, shifts=shift, dims=0)
-                cred_level_neg = compute_credible_level(gw_m, opt_coords_neg)
-            else:
-                cred_level_neg = None
-            logits_neg = model.fusion_logits(g, h_l_neg, z_l=z_l_neg, H_gw=H_gw, cred_level=cred_level_neg)
-
-            # Similarity matrix for retrieval
-            temperature = model.log_temp.exp().clamp(
-                min=model.temp_min, max=model.temp_max
-            )
-            sim_g2o = torch.matmul(feat_g, feat_o.T) / temperature
+            g, z_l, h_l, feat_g, feat_o, logits_pos, logits_neg, sim_g2o = _forward_pass(use_amp=False)
+            non_finite = _collect_non_finite({
+                "feat_g": feat_g,
+                "feat_o": feat_o,
+                "logits_pos": logits_pos,
+                "logits_neg": logits_neg,
+                "sim_g2o": sim_g2o,
+            })
+            if non_finite:
+                bad_str = ", ".join(f"{k}={v}" for k, v in non_finite.items())
+                print(
+                    "WARNING: Non-finite values remain after FP32 retry: "
+                    f"{bad_str}. Downstream metrics/plots will filter invalid rows."
+                )
 
         all_feat_g.append(feat_g.float().cpu())
         all_feat_o.append(feat_o.float().cpu())
@@ -376,6 +538,11 @@ def extract_all_embeddings(model, loader, device, model_args):
         all_labels.append(torch.zeros(batch_size, dtype=torch.long))
         all_sim_blocks.append(sim_g2o.float().cpu())
         all_gw_idx_blocks.append(gw_indices.cpu())
+        all_h_l_cls.append(h_l.float().cpu())
+        all_z_l_cls.append(z_l.float().cpu())
+        all_opt_coords.append(opt_coords.float().cpu())
+        if batch_sources is not None:
+            all_gw_source_labels.extend(batch_sources)
 
     return {
         "feat_g": torch.cat(all_feat_g),
@@ -385,13 +552,20 @@ def extract_all_embeddings(model, loader, device, model_args):
         "labels": torch.cat(all_labels),
         "sim_blocks": all_sim_blocks,
         "gw_idx_blocks": all_gw_idx_blocks,
+        "h_l_cls": torch.cat(all_h_l_cls),
+        "z_l_cls": torch.cat(all_z_l_cls),
+        "opt_coords": torch.cat(all_opt_coords),
+        "dual_fusion": dual,
+        "gw_source_labels": np.asarray(all_gw_source_labels, dtype=object) if all_gw_source_labels else None,
     }
 
 
 @torch.no_grad()
 def extract_triplet_logits(model, loader, device, model_args, neg_optical_data,
                            neg_gw_indices,
-                           shuffle_gw=False, shuffle_seed=42):
+                           gw_source_types=None,
+                           shuffle_gw=False, shuffle_seed=42,
+                           amp_dtype=torch.float32, amp_enabled=False):
     """Extract logits for four types of sample pairs.
     
     1. Positive pairs (GW, KN): matched GW-KN optical pairs
@@ -409,17 +583,22 @@ def extract_triplet_logits(model, loader, device, model_args, neg_optical_data,
         model_args: Model configuration dict
         neg_optical_data: Dict with negative optical samples from external file
         neg_gw_indices: Numpy array of has_kn=0 GW indices from test HDF5
+        gw_source_types: Optional list of source_type labels indexed by GW ID
         shuffle_gw: If True, randomly shuffle GW within each batch (ablation test)
         shuffle_seed: Random seed for GW shuffling
         
     Returns:
-        dict with logits for all pair types and compatibility aliases
+        dict with logits for all pair types and source labels
     """
     logits_positive = []    # (GW, matched KN)
     logits_optical_neg = [] # (GW, non-KN transient)
     logits_gw_neg = []      # (GW_has_kn0, KN)
     logits_hard_neg = []    # (wrong GW, KN) - semi-hard
     optical_neg_types = []  # Type of non-KN transient
+    source_positive = []    # source_type for positive pairs
+    source_optical_neg = [] # source_type for optical negatives
+    source_gw_neg = []      # source_type for GW negatives
+    source_hard_neg = []    # source_type for semi-hard negatives
     
     n_ref = model_args["n_ref"]
     ref_start = model_args["ref_start"]
@@ -479,6 +658,11 @@ def extract_triplet_logits(model, loader, device, model_args, neg_optical_data,
             opt_err = opt_err.to(device)
             opt_coords = opt_coords.to(device)
             gw_indices_dev = gw_indices.to(device).long()
+            gw_indices_cpu = gw_indices_dev.detach().cpu().numpy().tolist()
+            if gw_source_types is not None:
+                batch_sources = [_lookup_source_type(gw_idx, gw_source_types) for gw_idx in gw_indices_cpu]
+            else:
+                batch_sources = None
 
             batch_size = gw_s.size(0)
 
@@ -491,8 +675,7 @@ def extract_triplet_logits(model, loader, device, model_args, neg_optical_data,
 
             ref_time = build_ref_time(batch_size, n_ref, ref_start, ref_end, device, opt_t.dtype)
 
-            with autocast(device_type='cuda', dtype=torch.float16,
-                          enabled=(device.type == 'cuda')):
+            with _autocast_context(device, amp_dtype, enabled=amp_enabled):
                 # Encode GW and KN optical
                 g, z_l, h_l, H_gw = model.encode(
                     gw_s, gw_m, opt_coords, opt_t, opt_v, ref_time, opt_mask, opt_err
@@ -509,6 +692,8 @@ def extract_triplet_logits(model, loader, device, model_args, neg_optical_data,
                 # 1. Positive pairs: matched GW-KN
                 logits_pos = model.fusion_logits(g, h_l, z_l=z_l, H_gw=H_gw, cred_level=_cred)
                 logits_positive.append(logits_pos.float().cpu())
+                if batch_sources is not None:
+                    source_positive.extend(batch_sources)
 
                 # 2. Semi-hard negatives: use similarity-based semi-hard negative mining
                 feat_g = F.normalize(model.gw_proj(g), p=2, dim=1, eps=1e-8)
@@ -527,6 +712,14 @@ def extract_triplet_logits(model, loader, device, model_args, neg_optical_data,
                     g_semihard, h_l, z_l=z_l, H_gw=H_gw_semihard, cred_level=_cred_hard
                 )
                 logits_hard_neg.append(logits_hard.float().cpu())
+                if batch_sources is not None:
+                    semi_hard_idx_cpu = semi_hard_gw_idx.detach().cpu().numpy().tolist()
+                    for hard_idx in semi_hard_idx_cpu:
+                        hard_idx = int(hard_idx)
+                        if 0 <= hard_idx < len(batch_sources):
+                            source_hard_neg.append(batch_sources[hard_idx])
+                        else:
+                            source_hard_neg.append("unknown")
 
                 # 3. GW negatives: has_kn=0 GW paired with KN optical
                 if has_neg_gw:
@@ -545,6 +738,11 @@ def extract_triplet_logits(model, loader, device, model_args, neg_optical_data,
                         g_gw_neg, h_l_gw_neg, z_l=z_l_gw_neg, H_gw=H_gw_neg, cred_level=_cred_gw_neg
                     )
                     logits_gw_neg.append(logits_gw.float().cpu())
+                    if gw_source_types is not None:
+                        source_gw_neg.extend(
+                            _lookup_source_type(gw_idx, gw_source_types)
+                            for gw_idx in sampled_neg_gw.tolist()
+                        )
 
                 # 4. Optical negatives: correct GW paired with non-KN transients
                 if has_neg_optical:
@@ -574,6 +772,8 @@ def extract_triplet_logits(model, loader, device, model_args, neg_optical_data,
                     )
                     logits_optical_neg.append(logits_optical.float().cpu())
                     optical_neg_types.extend(batch_neg_types)
+                    if batch_sources is not None:
+                        source_optical_neg.extend(batch_sources)
     finally:
         if gw_file is not None:
             gw_file.close()
@@ -582,6 +782,10 @@ def extract_triplet_logits(model, loader, device, model_args, neg_optical_data,
         "logits_positive": torch.cat(logits_positive) if logits_positive else None,
         "logits_hard_neg": torch.cat(logits_hard_neg) if logits_hard_neg else None,
         "logits_gw_neg": torch.cat(logits_gw_neg) if logits_gw_neg else None,
+        "source_positive": source_positive,
+        "source_optical_neg": source_optical_neg,
+        "source_gw_neg": source_gw_neg,
+        "source_hard_neg": source_hard_neg,
     }
 
     if has_neg_optical and logits_optical_neg:
@@ -621,7 +825,9 @@ def sample_semi_hard_negatives_for_optical(sim_o2g, gw_indices):
     Returns:
         semi_hard_idx: Indices of semi-hard negative GW for each optical sample [batch]
     """
-    sim = sim_o2g.detach()
+    # In eval we run under autocast, so sim_o2g may be fp16 on CUDA.
+    # Use fp32 here to safely apply large mask values (e.g. -1e9).
+    sim = sim_o2g.detach().float()
     batch_size = sim.size(0)
     device = sim.device
     
@@ -675,55 +881,179 @@ def evaluate_retrieval_batch_mode(embeddings, ks=(1, 5, 10)):
     return avg
 
 
-def evaluate_retrieval_gallery_mode(embeddings, gallery_sizes, n_trials=10,
-                                    seed=42):
-    """
-    Realistic retrieval: for each test GW, build a candidate pool of N optical
-    samples (1 correct + N-1 distractors) and rank by cosine similarity.
-    """
-    feat_g = embeddings["feat_g"]
-    feat_o = embeddings["feat_o"]
-    gw_indices = embeddings["gw_indices"]
+@torch.no_grad()
+def _build_gallery_query_cache(model, unique_gw_ids, test_data_path, device,
+                               amp_dtype=torch.float32, amp_enabled=False):
+    """Cache GW-side classification features once per GW event for gallery eval."""
+    if test_data_path is None or not os.path.exists(test_data_path):
+        raise FileNotFoundError(f"test_data_path not found for gallery logits eval: {test_data_path}")
 
-    unique_gw = torch.unique(gw_indices)
+    core_model = model._orig_mod if hasattr(model, "_orig_mod") else model
+    dual = _is_dual_fusion_model(model)
+    cache = {}
+
+    with h5py.File(test_data_path, 'r') as f:
+        gw_scalars_ds = f['events/gw_data/scalars']
+        gw_skymaps_ds = f['events/gw_data/skymaps']
+
+        for gw_id in tqdm(unique_gw_ids, desc="Caching GW query features"):
+            gw_id = int(gw_id)
+            gw_s = torch.from_numpy(gw_scalars_ds[gw_id]).unsqueeze(0).to(device)
+            gw_m = torch.from_numpy(gw_skymaps_ds[gw_id]).unsqueeze(0).to(device)
+
+            with _autocast_context(device, amp_dtype, enabled=amp_enabled):
+                g, H_gw = core_model.gw_encoder(gw_s, gw_m)
+                feature_dropout = getattr(core_model, "feature_dropout", None)
+                if feature_dropout is not None and getattr(feature_dropout, "p", 0.0) > 0:
+                    g = feature_dropout(g)
+                    H_gw = feature_dropout(H_gw)
+
+            item = {"g": g.float().cpu().squeeze(0)}
+            if dual:
+                item["H_gw"] = H_gw.float().cpu().squeeze(0)
+                item["gw_m"] = gw_m.float().cpu().squeeze(0)
+            cache[gw_id] = item
+
+    return cache
+
+
+def _compute_credible_level_single_gw(gw_m_single, opt_coords):
+    """Credible level for one GW skymap against multiple optical coordinates."""
+    import math
+
+    coords = opt_coords
+    if coords.numel() > 0:
+        max_abs = coords.detach().abs().max()
+        if max_abs > (2 * math.pi + 1e-3):
+            coords = coords * (math.pi / 180.0)
+
+    ra = coords[:, 0]
+    dec = coords[:, 1]
+    opt_xyz = torch.stack([
+        torch.cos(dec) * torch.cos(ra),
+        torch.cos(dec) * torch.sin(ra),
+        torch.sin(dec)
+    ], dim=-1)  # [B, 3]
+
+    pix_xyz = gw_m_single[:3, :]  # [3, 19200]
+    dot = torch.matmul(opt_xyz, pix_xyz)  # [B, 19200]
+    nearest_idx = dot.argmax(dim=-1)  # [B]
+
+    dP = gw_m_single[4, :]  # [19200]
+    dP_at_opt = dP[nearest_idx]  # [B]
+    cred_level = (dP.unsqueeze(0) >= dP_at_opt.unsqueeze(-1)).float().mean(dim=-1)
+    return cred_level.unsqueeze(-1)  # [B, 1]
+
+
+@torch.no_grad()
+def _score_gallery_candidates_with_logits(model, query_cache, candidate_indices,
+                                          embeddings, device, dual,
+                                          logits_chunk_size=1024,
+                                          amp_dtype=torch.float32, amp_enabled=False):
+    """Score (GW query, optical candidate) pairs with fusion logits."""
+    if len(candidate_indices) == 0:
+        return np.array([], dtype=np.float32)
+
+    h_l_all = embeddings["h_l_cls"]
+    z_l_all = embeddings["z_l_cls"]
+    opt_coords_all = embeddings["opt_coords"]
+
+    g_query = query_cache["g"].to(device)
+    if dual:
+        H_query = query_cache["H_gw"].to(device)
+        gw_m_query = query_cache["gw_m"].to(device)
+
+    scores = []
+    candidate_indices = np.asarray(candidate_indices, dtype=np.int64)
+
+    for start in range(0, len(candidate_indices), logits_chunk_size):
+        chunk_np = candidate_indices[start:start + logits_chunk_size]
+        chunk_idx = torch.from_numpy(chunk_np).long()
+
+        h_chunk = h_l_all.index_select(0, chunk_idx).to(device)
+        batch_size = h_chunk.size(0)
+        g_chunk = g_query.unsqueeze(0).expand(batch_size, -1)
+
+        if dual:
+            z_chunk = z_l_all.index_select(0, chunk_idx).to(device)
+            opt_coords_chunk = opt_coords_all.index_select(0, chunk_idx).to(device)
+            H_chunk = H_query.unsqueeze(0).expand(batch_size, -1, -1)
+            cred_chunk = _compute_credible_level_single_gw(gw_m_query, opt_coords_chunk)
+        else:
+            z_chunk = None
+            H_chunk = None
+            cred_chunk = None
+
+        with _autocast_context(device, amp_dtype, enabled=amp_enabled):
+            logits = model.fusion_logits(
+                g_chunk, h_chunk, z_l=z_chunk, H_gw=H_chunk, cred_level=cred_chunk
+            )
+        probs = torch.softmax(logits.float(), dim=1)[:, 1]
+        scores.append(probs.cpu())
+
+    return torch.cat(scores).numpy()
+
+
+@torch.no_grad()
+def evaluate_retrieval_gallery_mode(model, embeddings, gallery_sizes, test_data_path,
+                                    device, n_trials=10, seed=42,
+                                    amp_dtype=torch.float32, amp_enabled=False):
+    """
+    Gallery retrieval with classification branch logits.
+
+    For each GW query event, build candidate pool of size N
+    (1 correct optical + N-1 distractors), score each pair by fusion-head
+    positive probability, then compute Recall@K and MRR.
+    """
+    gw_indices = embeddings["gw_indices"]
+    unique_gw = torch.unique(gw_indices).cpu().tolist()
     rng = np.random.default_rng(seed)
+    dual = bool(embeddings.get("dual_fusion", _is_dual_fusion_model(model)))
+
+    if "h_l_cls" not in embeddings or "z_l_cls" not in embeddings:
+        raise KeyError("Missing classification features in embeddings for gallery logits eval.")
+
+    print("Building GW query cache for logits-based gallery retrieval...")
+    gw_query_cache = _build_gallery_query_cache(
+        model, unique_gw, test_data_path, device,
+        amp_dtype=amp_dtype, amp_enabled=amp_enabled
+    )
 
     results = {}
     for N in gallery_sizes:
         recalls = {1: [], 5: [], 10: []}
         mrrs = []
 
-        for trial in range(n_trials):
+        for _ in range(n_trials):
             for gw_id in unique_gw:
                 gw_mask = gw_indices == gw_id
                 other_mask = gw_indices != gw_id
 
-                if gw_mask.sum() == 0 or other_mask.sum() == 0:
+                if int(gw_mask.sum().item()) == 0 or int(other_mask.sum().item()) == 0:
                     continue
 
-                # Pick one GW embedding as query
                 gw_idxs = torch.where(gw_mask)[0]
-                query_idx = gw_idxs[rng.integers(len(gw_idxs))]
-                query = feat_g[query_idx]
+                correct_idx = int(gw_idxs[rng.integers(len(gw_idxs))].item())
 
-                # Pick one correct optical
-                correct_idx = gw_idxs[rng.integers(len(gw_idxs))]
-                correct_opt = feat_o[correct_idx]
-
-                # Pick N-1 distractors from other events
-                other_idxs = torch.where(other_mask)[0].numpy()
+                other_idxs = torch.where(other_mask)[0].cpu().numpy()
                 n_distract = min(N - 1, len(other_idxs))
-                distract_idxs = rng.choice(other_idxs, size=n_distract,
-                                           replace=False)
-                distract_opt = feat_o[distract_idxs]
+                if n_distract > 0:
+                    distract_idxs = rng.choice(other_idxs, size=n_distract, replace=False)
+                else:
+                    distract_idxs = np.array([], dtype=np.int64)
 
-                # Build gallery: correct at position 0
-                gallery = torch.cat([correct_opt.unsqueeze(0), distract_opt])
-                sims = torch.matmul(gallery, query)
-                ranked = sims.argsort(descending=True)
+                gallery_indices = np.concatenate(
+                    ([correct_idx], np.asarray(distract_idxs, dtype=np.int64))
+                )
+                probs = _score_gallery_candidates_with_logits(
+                    model, gw_query_cache[int(gw_id)], gallery_indices,
+                    embeddings, device, dual,
+                    amp_dtype=amp_dtype, amp_enabled=amp_enabled
+                )
+                ranked = np.argsort(-probs)
 
-                # Position of the correct answer (index 0) in ranking
-                correct_rank = (ranked == 0).nonzero(as_tuple=True)[0].item()
+                # Correct optical is inserted at gallery index 0.
+                correct_rank = int(np.where(ranked == 0)[0][0])
 
                 for k in recalls:
                     recalls[k].append(1.0 if correct_rank < k else 0.0)
@@ -807,12 +1137,174 @@ def evaluate_classification_triplet(triplet_logits):
     return compute_classification_metrics(probs, labels)
 
 
+def evaluate_classification_triplet_by_source(triplet_logits):
+    """Per-source classification metrics from triplet pairs (bns/nsbh)."""
+    source_keys = (
+        "source_positive",
+        "source_optical_neg",
+        "source_gw_neg",
+        "source_hard_neg",
+    )
+    has_source = any(len(triplet_logits.get(k, [])) > 0 for k in source_keys)
+    if not has_source:
+        print("WARNING: source_type labels unavailable. Skipping classification_by_source.")
+        return {}
+
+    per_source = {}
+
+    def ensure_bucket(source):
+        source = _normalize_source_type(source)
+        if source not in per_source:
+            per_source[source] = {
+                "probs": [],
+                "labels": [],
+                "pair_type_counts": {
+                    "n_total": 0,
+                    "n_positive": 0,
+                    "n_optical_neg": 0,
+                    "n_gw_neg": 0,
+                    "n_hard_neg": 0,
+                },
+            }
+        return per_source[source]
+
+    def add_pair_type(logits, sources, label, count_key, pair_name):
+        if logits is None:
+            return
+
+        probs = torch.softmax(logits.float(), dim=1)[:, 1]
+        if sources is None:
+            print(f"WARNING: Missing source labels for {pair_name}. Skipping this pair type.")
+            return
+
+        if len(sources) != len(probs):
+            n = min(len(sources), len(probs))
+            print(
+                f"WARNING: source label length mismatch for {pair_name}: "
+                f"{len(sources)} labels vs {len(probs)} logits. Truncating to {n}."
+            )
+            if n <= 0:
+                return
+            probs = probs[:n]
+            sources = sources[:n]
+
+        src_np = np.array([_normalize_source_type(s) for s in sources], dtype=object)
+        for src in np.unique(src_np):
+            mask_np = src_np == src
+            mask = torch.from_numpy(mask_np)
+            src_probs = probs[mask]
+            if src_probs.numel() == 0:
+                continue
+            bucket = ensure_bucket(src)
+            bucket["probs"].append(src_probs)
+            bucket["labels"].append(
+                torch.full((src_probs.numel(),), label, dtype=torch.long)
+            )
+            bucket["pair_type_counts"][count_key] += int(src_probs.numel())
+
+    add_pair_type(
+        triplet_logits.get("logits_positive"),
+        triplet_logits.get("source_positive"),
+        label=1,
+        count_key="n_positive",
+        pair_name="positive",
+    )
+
+    optical_logits = triplet_logits.get("logits_optical_neg")
+    if optical_logits is None:
+        optical_logits = triplet_logits.get("logits_easy_neg")
+    add_pair_type(
+        optical_logits,
+        triplet_logits.get("source_optical_neg"),
+        label=0,
+        count_key="n_optical_neg",
+        pair_name="optical_neg",
+    )
+
+    add_pair_type(
+        triplet_logits.get("logits_gw_neg"),
+        triplet_logits.get("source_gw_neg"),
+        label=0,
+        count_key="n_gw_neg",
+        pair_name="gw_neg",
+    )
+
+    add_pair_type(
+        triplet_logits.get("logits_hard_neg"),
+        triplet_logits.get("source_hard_neg"),
+        label=0,
+        count_key="n_hard_neg",
+        pair_name="hard_neg",
+    )
+
+    results = {}
+    for source in sorted(per_source):
+        bucket = per_source[source]
+        if not bucket["probs"]:
+            continue
+
+        probs = torch.cat(bucket["probs"])
+        labels = torch.cat(bucket["labels"])
+        counts = bucket["pair_type_counts"]
+        counts["n_total"] = (
+            counts["n_positive"]
+            + counts["n_optical_neg"]
+            + counts["n_gw_neg"]
+            + counts["n_hard_neg"]
+        )
+
+        metrics = compute_classification_metrics(probs, labels)
+        tp = float(metrics.get("tp", 0))
+        fp = float(metrics.get("fp", 0))
+        fn = float(metrics.get("fn", 0))
+        precision_conf = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        recall_conf = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        f1_conf = (
+            2.0 * precision_conf * recall_conf / (precision_conf + recall_conf)
+            if (precision_conf + recall_conf) > 0 else 0.0
+        )
+        metrics["precision_confusion"] = precision_conf
+        metrics["recall_confusion"] = recall_conf
+        metrics["f1_confusion"] = f1_conf
+
+        results[source] = {
+            "metrics": metrics,
+            "pair_type_counts": counts,
+        }
+
+    if results:
+        summary = ", ".join(
+            f"{src}:n={vals['pair_type_counts']['n_total']}" for src, vals in results.items()
+        )
+        print(f"  Triplet classification by source: {summary}")
+
+    return results
+
+
 def evaluate_embeddings(embeddings):
     """Embedding quality metrics."""
+    feat_g = embeddings["feat_g"]
+    feat_o = embeddings["feat_o"]
+    gw_indices = embeddings["gw_indices"]
+    feat_g, feat_o, gw_indices, n_drop = _filter_finite_embedding_rows(
+        feat_g, feat_o, gw_indices
+    )
+    if n_drop > 0:
+        print(f"WARNING: Dropping {n_drop} non-finite embedding rows before quality metrics.")
+    if feat_g.size(0) < 2:
+        print("WARNING: Not enough finite embedding rows for quality metrics; returning zeros.")
+        return {
+            "alignment": 0.0,
+            "uniformity_gw": 0.0,
+            "uniformity_opt": 0.0,
+            "inter_modal_gap": 0.0,
+            "intra_sim": 0.0,
+            "inter_sim": 0.0,
+        }
     return compute_embedding_metrics(
-        embeddings["feat_g"],
-        embeddings["feat_o"],
-        embeddings["gw_indices"],
+        feat_g,
+        feat_o,
+        gw_indices,
     )
 
 
@@ -833,10 +1325,20 @@ def generate_plots(embeddings, results, output_dir):
     labels = embeddings["labels"]
     probs = torch.softmax(logits.float(), dim=1)[:, 1].numpy()
     labels_np = labels.numpy()
+    finite_cls = np.isfinite(probs) & np.isfinite(labels_np)
+    n_bad_cls = int((~finite_cls).sum())
+    if n_bad_cls > 0:
+        print(f"WARNING: Dropping {n_bad_cls} non-finite classification samples before plotting.")
+        probs = probs[finite_cls]
+        labels_np = labels_np[finite_cls]
+    if len(probs) == 0:
+        print("WARNING: No finite classification samples available. Skipping ROC/PR/calibration plots.")
+        probs = np.array([], dtype=np.float32)
+        labels_np = np.array([], dtype=np.int64)
 
-    sorted_idx = np.argsort(-probs)
-    sorted_labels = labels_np[sorted_idx]
-    n_pos = sorted_labels.sum()
+    sorted_idx = np.argsort(-probs) if len(probs) > 0 else np.array([], dtype=np.int64)
+    sorted_labels = labels_np[sorted_idx] if len(sorted_idx) > 0 else np.array([], dtype=np.int64)
+    n_pos = sorted_labels.sum() if len(sorted_labels) > 0 else 0
     n_neg = len(sorted_labels) - n_pos
 
     if n_pos > 0 and n_neg > 0:
@@ -924,22 +1426,96 @@ def generate_plots(embeddings, results, output_dir):
     # --- 5. t-SNE of embeddings ---
     try:
         from sklearn.manifold import TSNE
-        n_sample = min(2000, len(embeddings["feat_g"]))
-        perm = np.random.RandomState(42).permutation(len(embeddings["feat_g"]))[:n_sample]
+        n_total = len(embeddings["feat_g"])
+        n_sample = min(2000, n_total)
+        if n_sample < 2:
+            raise ValueError("Not enough samples for t-SNE.")
+
+        perm = np.random.RandomState(42).permutation(n_total)[:n_sample]
         fg = embeddings["feat_g"][perm].numpy()
         fo = embeddings["feat_o"][perm].numpy()
         gi = embeddings["gw_indices"][perm].numpy()
+        source_labels = None
+        source_all = embeddings.get("gw_source_labels")
+        if source_all is not None and len(source_all) == n_total:
+            source_labels = np.asarray(source_all, dtype=object)[perm]
+
+        finite_embed = np.isfinite(fg).all(axis=1) & np.isfinite(fo).all(axis=1)
+        n_drop_embed = int((~finite_embed).sum())
+        if n_drop_embed > 0:
+            print(f"WARNING: Dropping {n_drop_embed} non-finite embedding samples before t-SNE.")
+            fg = fg[finite_embed]
+            fo = fo[finite_embed]
+            gi = gi[finite_embed]
+            if source_labels is not None:
+                source_labels = source_labels[finite_embed]
+            n_sample = len(fg)
+
+        if n_sample < 5:
+            raise ValueError("Not enough finite samples for t-SNE.")
 
         combined = np.concatenate([fg, fo])
-        tsne = TSNE(n_components=2, random_state=42, perplexity=30)
+        if not np.isfinite(combined).all():
+            raise ValueError("Combined t-SNE input still contains non-finite values.")
+
+        perplexity = min(30, max(5, combined.shape[0] - 1))
+        tsne = TSNE(n_components=2, random_state=42, perplexity=perplexity)
         coords = tsne.fit_transform(combined)
 
         fig, ax = plt.subplots(figsize=(10, 8))
-        # Color by GW event, shape by modality
+        # Color by GW event, shape by modality.
+        # Prefer a balanced BNS/NSBH subset to avoid index-order bias.
         unique_events = np.unique(gi)
-        colors = plt.cm.tab20(np.linspace(0, 1, min(20, len(unique_events))))
+        max_events_plot = min(20, len(unique_events))
+        selected_events = np.array(unique_events[:max_events_plot])
+        norm_sources = None
 
-        for i, ev in enumerate(unique_events[:20]):
+        if source_labels is not None:
+            norm_sources = np.array([_normalize_source_type(s) for s in source_labels], dtype=object)
+            event_to_source = {}
+            for ev in unique_events:
+                ev_idx = np.where(gi == ev)[0]
+                if len(ev_idx) > 0:
+                    event_to_source[int(ev)] = norm_sources[ev_idx[0]]
+
+            bns_events = [int(ev) for ev in unique_events if event_to_source.get(int(ev)) == "bns"]
+            nsbh_events = [int(ev) for ev in unique_events if event_to_source.get(int(ev)) == "nsbh"]
+            other_events = [
+                int(ev) for ev in unique_events
+                if event_to_source.get(int(ev)) not in {"bns", "nsbh"}
+            ]
+            rng_events = np.random.RandomState(42)
+            bns_events = rng_events.permutation(bns_events).tolist()
+            nsbh_events = rng_events.permutation(nsbh_events).tolist()
+            other_events = rng_events.permutation(other_events).tolist()
+
+            target_bns = max_events_plot // 2
+            target_nsbh = max_events_plot - target_bns
+            selected = []
+            selected.extend(bns_events[:min(target_bns, len(bns_events))])
+            selected.extend(nsbh_events[:min(target_nsbh, len(nsbh_events))])
+
+            if len(selected) < max_events_plot:
+                remaining_pool = (
+                    bns_events[min(target_bns, len(bns_events)):] +
+                    nsbh_events[min(target_nsbh, len(nsbh_events)):] +
+                    other_events
+                )
+                need = max_events_plot - len(selected)
+                selected.extend(remaining_pool[:need])
+
+            if selected:
+                selected_events = np.array(rng_events.permutation(selected).tolist(), dtype=unique_events.dtype)
+                n_bns_sel = int(sum(event_to_source.get(int(ev), "unknown") == "bns" for ev in selected_events))
+                n_nsbh_sel = int(sum(event_to_source.get(int(ev), "unknown") == "nsbh" for ev in selected_events))
+                print(
+                    f"t-SNE event subset (first plot): n={len(selected_events)} "
+                    f"[bns={n_bns_sel}, nsbh={n_nsbh_sel}]"
+                )
+
+        colors = plt.cm.tab20(np.linspace(0, 1, max(1, len(selected_events))))
+
+        for i, ev in enumerate(selected_events):
             mask = gi == ev
             c = colors[i % len(colors)]
             idx_gw = np.where(mask)[0]
@@ -953,8 +1529,46 @@ def generate_plots(embeddings, results, output_dir):
         fig.savefig(os.path.join(output_dir, "tsne_embeddings.png"), dpi=150,
                     bbox_inches="tight")
         plt.close(fig)
+
+        # --- 6. t-SNE of GW embeddings by source_type (BNS/NSBH) ---
+        if source_labels is not None:
+            if norm_sources is None:
+                norm_sources = np.array([_normalize_source_type(s) for s in source_labels], dtype=object)
+            unique_sources = sorted(np.unique(norm_sources))
+            if len(unique_sources) > 0:
+                fig, ax = plt.subplots(figsize=(8, 7))
+                source_palette = {
+                    "bns": "#1f77b4",
+                    "nsbh": "#d62728",
+                    "unknown": "#7f7f7f",
+                }
+                fallback_colors = plt.cm.Set2(np.linspace(0, 1, max(3, len(unique_sources))))
+                for i, src in enumerate(unique_sources):
+                    mask = norm_sources == src
+                    idx = np.where(mask)[0]
+                    if len(idx) == 0:
+                        continue
+                    color = source_palette.get(src, fallback_colors[i % len(fallback_colors)])
+                    ax.scatter(
+                        coords[idx, 0], coords[idx, 1],
+                        c=[color], marker="o", s=36, alpha=0.85,
+                        label=f"{src} (n={len(idx)})"
+                    )
+
+                ax.set_title("t-SNE of GW Embeddings by Source Type")
+                ax.set_xlabel("t-SNE 1")
+                ax.set_ylabel("t-SNE 2")
+                ax.legend(loc="best", fontsize=10)
+                ax.grid(True, alpha=0.2)
+                fig.savefig(os.path.join(output_dir, "tsne_gw_by_source.png"),
+                            dpi=150, bbox_inches="tight")
+                plt.close(fig)
+        else:
+            print("source labels unavailable in embeddings, skipping source-type t-SNE plot.")
     except ImportError:
         print("sklearn not available, skipping t-SNE plot")
+    except ValueError as e:
+        print(f"Skipping t-SNE plot: {e}")
 
     print(f"Plots saved to {output_dir}/")
 
@@ -1327,6 +1941,27 @@ def print_summary(results):
         fn = cls.get('fn', 0)
         print(f"  Confusion (t=0.5): TP={tp} FP={fp} TN={tn} FN={fn}")
 
+    cls_by_src = results.get("classification_by_source", {})
+    if cls_by_src:
+        print("\n--- Classification by Source ---")
+        for src in sorted(cls_by_src):
+            src_block = cls_by_src.get(src, {})
+            src_metrics = src_block.get("metrics", {})
+            src_counts = src_block.get("pair_type_counts", {})
+            print(f"  [{src}] AUROC={src_metrics.get('auroc', 0):.4f}  "
+                  f"AUPRC={src_metrics.get('auprc', 0):.4f}  "
+                  f"F1={src_metrics.get('f1_optimal', 0):.4f} "
+                  f"(t={src_metrics.get('f1_threshold', 0):.2f})  "
+                  f"ECE={src_metrics.get('ece', 0):.4f}")
+            print(f"    Confusion@0.5: Precision={src_metrics.get('precision_confusion', 0):.4f}  "
+                  f"Recall={src_metrics.get('recall_confusion', 0):.4f}  "
+                  f"F1={src_metrics.get('f1_confusion', 0):.4f}")
+            print(f"    n_total={src_counts.get('n_total', 0)} "
+                  f"(pos={src_counts.get('n_positive', 0)}, "
+                  f"optical_neg={src_counts.get('n_optical_neg', 0)}, "
+                  f"gw_neg={src_counts.get('n_gw_neg', 0)}, "
+                  f"hard_neg={src_counts.get('n_hard_neg', 0)})")
+
     # Embedding
     emb = results.get("embedding", {})
     if emb:
@@ -1345,6 +1980,14 @@ def main():
     args = parse_args()
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     gallery_sizes = [int(s) for s in args.gallery_sizes.split(",")]
+    amp_dtype, amp_enabled = _resolve_eval_amp(args.amp_dtype, device)
+    if device.type == "cuda":
+        if amp_enabled:
+            print(f"Evaluation precision: AMP enabled ({_amp_dtype_name(amp_dtype)})")
+        else:
+            print("Evaluation precision: fp32 (AMP disabled)")
+    else:
+        print("Evaluation precision: fp32 (CPU)")
 
     os.makedirs(args.output_dir, exist_ok=True)
 
@@ -1354,17 +1997,26 @@ def main():
     # Build test dataloader
     loader, dataset = build_test_dataloader(args, saved_args)
     print(f"Test set: {len(loader)} batches")
+    gw_source_types = load_gw_source_types(args.test_data_path)
 
     # Extract all embeddings (retry with single-worker if multiprocessing is blocked)
     try:
-        embeddings = extract_all_embeddings(model, loader, device, model_args)
+        embeddings = extract_all_embeddings(
+            model, loader, device, model_args,
+            gw_source_types=gw_source_types,
+            amp_dtype=amp_dtype, amp_enabled=amp_enabled
+        )
     except PermissionError as e:
         if args.num_workers > 0:
             print("WARNING: DataLoader multiprocessing failed (PermissionError). "
                   "Retrying with num_workers=0.")
             args.num_workers = 0
             loader, dataset = build_test_dataloader(args, saved_args)
-            embeddings = extract_all_embeddings(model, loader, device, model_args)
+            embeddings = extract_all_embeddings(
+                model, loader, device, model_args,
+                gw_source_types=gw_source_types,
+                amp_dtype=amp_dtype, amp_enabled=amp_enabled
+            )
         else:
             raise
     n_samples = len(embeddings["feat_g"])
@@ -1378,7 +2030,9 @@ def main():
 
     print("Computing gallery-mode retrieval metrics...")
     results["retrieval_gallery"] = evaluate_retrieval_gallery_mode(
-        embeddings, gallery_sizes, n_trials=args.gallery_trials
+        model, embeddings, gallery_sizes, args.test_data_path,
+        device=device, n_trials=args.gallery_trials,
+        amp_dtype=amp_dtype, amp_enabled=amp_enabled
     )
 
     print("Computing classification metrics (roll-by-1, preliminary)...")
@@ -1407,7 +2061,9 @@ def main():
         try:
             triplet_logits = extract_triplet_logits(
                 model, loader2, device, model_args, neg_optical_data, neg_gw_indices,
-                shuffle_gw=False
+                gw_source_types=gw_source_types,
+                shuffle_gw=False,
+                amp_dtype=amp_dtype, amp_enabled=amp_enabled
             )
         except PermissionError:
             if args.num_workers > 0:
@@ -1417,7 +2073,9 @@ def main():
                 loader2, _ = build_test_dataloader(args, saved_args)
                 triplet_logits = extract_triplet_logits(
                     model, loader2, device, model_args, neg_optical_data, neg_gw_indices,
-                    shuffle_gw=False
+                    gw_source_types=gw_source_types,
+                    shuffle_gw=False,
+                    amp_dtype=amp_dtype, amp_enabled=amp_enabled
                 )
             else:
                 raise
@@ -1428,7 +2086,9 @@ def main():
         try:
             triplet_logits_shuffle = extract_triplet_logits(
                 model, loader3, device, model_args, neg_optical_data, neg_gw_indices,
-                shuffle_gw=True, shuffle_seed=42
+                gw_source_types=gw_source_types,
+                shuffle_gw=True, shuffle_seed=42,
+                amp_dtype=amp_dtype, amp_enabled=amp_enabled
             )
         except PermissionError:
             if args.num_workers > 0:
@@ -1438,7 +2098,9 @@ def main():
                 loader3, _ = build_test_dataloader(args, saved_args)
                 triplet_logits_shuffle = extract_triplet_logits(
                     model, loader3, device, model_args, neg_optical_data, neg_gw_indices,
-                    shuffle_gw=True, shuffle_seed=42
+                    gw_source_types=gw_source_types,
+                    shuffle_gw=True, shuffle_seed=42,
+                    amp_dtype=amp_dtype, amp_enabled=amp_enabled
                 )
             else:
                 raise
@@ -1449,6 +2111,9 @@ def main():
         triplet_cls = evaluate_classification_triplet(triplet_logits)
         if triplet_cls:
             results["classification"] = triplet_cls
+        triplet_cls_by_source = evaluate_classification_triplet_by_source(triplet_logits)
+        if triplet_cls_by_source:
+            results["classification_by_source"] = triplet_cls_by_source
 
     # Save and display
     save_results(results, args.output_dir)

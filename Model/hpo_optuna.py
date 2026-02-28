@@ -23,7 +23,7 @@ from optuna.samplers import TPESampler
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 TRAIN_SCRIPT = os.path.join(SCRIPT_DIR, "ALBEF_train.py")
-DEFAULT_BASE_TRAIN_CONFIG = os.path.join(SCRIPT_DIR, "args", "ALBEF_supcon.json")
+DEFAULT_BASE_TRAIN_CONFIG = os.path.join(SCRIPT_DIR, "args", "ALBEF_BNS_NSBH.json")
 
 ALBEF_BOOL_KEYS = {
     "cache_in_memory",
@@ -37,8 +37,8 @@ ALBEF_BOOL_KEYS = {
 
 ALBEF_ARG_KEYS = {
     "data_path",
-    "val_data_path",
-    "ood_val_steps",
+    "test_data_path",
+    "test_steps",
     "enable_ood_monitoring",
     "neg_data_path",
     "neg_group",
@@ -47,7 +47,6 @@ ALBEF_ARG_KEYS = {
     "steps_per_epoch",
     "ckpt_path",
     "resume",
-    "pretrained",
     "lr",
     "weight_decay",
     "grad_clip_norm",
@@ -85,8 +84,6 @@ ALBEF_ARG_KEYS = {
     "opt_dropout",
     "proj_dropout",
     "feature_dropout",
-    "freeze_encoder_epochs",
-    "freeze_itc_epochs",
     "itc_weight",
     "cls_weight",
     "cls_pos_weight",
@@ -123,6 +120,11 @@ ALBEF_ARG_KEYS = {
 STALE_KEYS = {
     "supcon_temperature",
     "stage_to_jobfs",
+    "val_data_path",
+    "ood_val_steps",
+    "pretrained",
+    "freeze_encoder_epochs",
+    "freeze_itc_epochs",
     "use_neg_gw",
     "neg_gw_ratio",
     "hard_neg_top_k",
@@ -287,6 +289,15 @@ def _objective_formula_str(weights: Dict[str, float]) -> str:
     return " + ".join(terms)
 
 
+def _validate_existing_file(path_value: Any, field_name: str) -> str:
+    if not isinstance(path_value, str) or not path_value.strip():
+        raise ValueError(f"{field_name} must be a non-empty string path")
+    resolved = _resolve_path(path_value)
+    if not os.path.exists(resolved):
+        raise FileNotFoundError(f"{field_name} not found: {resolved}")
+    return resolved
+
+
 def load_hpo_config(config_path: str) -> Dict[str, Any]:
     cfg = _load_json(config_path)
 
@@ -317,6 +328,13 @@ def load_hpo_config(config_path: str) -> Dict[str, Any]:
 
     cfg["objective_weights"] = _resolve_objective_weights(cfg)
     cfg["objective_min_metrics"] = _resolve_objective_min_metrics(cfg)
+
+    if "data_path" in cfg:
+        cfg["data_path"] = _validate_existing_file(cfg["data_path"], "data_path")
+    if "neg_data_path" in cfg and cfg["neg_data_path"] not in (None, ""):
+        cfg["neg_data_path"] = _validate_existing_file(cfg["neg_data_path"], "neg_data_path")
+    if "test_data_path" in cfg and cfg["test_data_path"] not in (None, ""):
+        cfg["test_data_path"] = _validate_existing_file(cfg["test_data_path"], "test_data_path")
 
     if not isinstance(cfg["tunable_params"], list) or not cfg["tunable_params"]:
         raise ValueError("tunable_params must be a non-empty list")
@@ -382,8 +400,8 @@ def build_trial_config(trial: optuna.Trial, hpo_cfg: Dict[str, Any], base_cfg: D
         "data_path",
         "neg_data_path",
         "neg_group",
-        "val_data_path",
-        "ood_val_steps",
+        "test_data_path",
+        "test_steps",
         "enable_ood_monitoring",
         "best_ckpt_metric",
         "cache_in_memory",
@@ -436,7 +454,6 @@ def build_trial_config(trial: optuna.Trial, hpo_cfg: Dict[str, Any], base_cfg: D
     os.makedirs(trial_ckpt, exist_ok=True)
     config["ckpt_path"] = trial_ckpt
     config["resume"] = None
-    config["pretrained"] = None
     config["hpo_trial_number"] = trial.number
 
     return _filter_train_config(config)

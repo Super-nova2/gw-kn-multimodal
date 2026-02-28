@@ -6,11 +6,11 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=1
 #SBATCH --mem=8G
-#SBATCH --time=6:00:00
+#SBATCH --time=8:00:00
 
 set -euo pipefail
 
-PROFILE="${PROFILE:-test_aug}"          # test_aug | final_train
+PROFILE="${PROFILE:-final_train}"          # test_aug | final_train
 DATASET_MODE="${DATASET_MODE:-train}"   # train | test
 
 BUFFER_LIMIT="${BUFFER_LIMIT:-10000}"
@@ -32,11 +32,11 @@ NSBH_REQUIRE_SUCCESS_FOR_MEJ_POS="${NSBH_REQUIRE_SUCCESS_FOR_MEJ_POS:-1}"
 set_profile_defaults() {
     case "$PROFILE" in
         test_aug)
-            BNS_FULL_CATALOG_PATH="${BNS_FULL_CATALOG_PATH:-/fred/oz016/bgao_kn/data/LSST_KN_BNS/gw_catalog.csv}"
-            BNS_SKYMAP_DIR="${BNS_SKYMAP_DIR:-/fred/oz016/bgao_kn/data/skymap/bns_skymap}"
+            BNS_FULL_CATALOG_PATH="${BNS_FULL_CATALOG_PATH:-/fred/oz016/bgao_kn/ML+GW+KN/dataset/O5_sim_bns/injections_final.csv}"
+            BNS_SKYMAP_DIR="${BNS_SKYMAP_DIR:-/fred/oz016/bgao_kn/data/skymap/bns_skymap_v0}"
             BNS_SIM_ROOT="${BNS_SIM_ROOT:-/fred/oz016/bgao_kn/SNANA/SNDATA_ROOT/SIM/LSST_KN_BNS}"
             BNS_SIM_NAME="${BNS_SIM_NAME:-LSST_KN_BNS}"
-            BNS_SUCCESS_IDS_PATH="${BNS_SUCCESS_IDS_PATH:-}"
+            BNS_SUCCESS_IDS_PATH="${BNS_SUCCESS_IDS_PATH:-/fred/oz016/bgao_kn/data/LSST_KN_BNS/success_sim_ids.txt}"
 
             NSBH_FULL_CATALOG_PATH="${NSBH_FULL_CATALOG_PATH:-/fred/oz016/bgao_kn/ML+GW+KN/dataset/O5_sim_nsbh_aug/injections_full.csv}"
             NSBH_SKYMAP_DIR="${NSBH_SKYMAP_DIR:-/fred/oz016/bgao_kn/data/skymap/nsbh_skymap}"
@@ -44,7 +44,7 @@ set_profile_defaults() {
             NSBH_SIM_NAME="${NSBH_SIM_NAME:-LSST_KN_NSBH_AUG}"
             NSBH_SUCCESS_IDS_PATH="${NSBH_SUCCESS_IDS_PATH:-/fred/oz016/bgao_kn/data/LSST_KN_NSBH_AUG/success_sim_ids.txt}"
 
-            OUTPUT_H5_PATH="${OUTPUT_H5_PATH:-/fred/oz016/bgao_kn/data/LSST_KN_BNS_NSBH_AUG/combined_dataset_with_neg_gw_${DATASET_MODE}.h5}"
+            OUTPUT_H5_PATH="${OUTPUT_H5_PATH:-/fred/oz016/bgao_kn/data/BNS_NSBH_dataset/combined_dataset_${DATASET_MODE}.h5}"
             ;;
         final_train)
             BNS_FULL_CATALOG_PATH="${BNS_FULL_CATALOG_PATH:-/fred/oz016/bgao_kn/ML+GW+KN/dataset/O5_sim_bns_aug/injections_final.csv}"
@@ -56,11 +56,11 @@ set_profile_defaults() {
 
             NSBH_FULL_CATALOG_PATH="${NSBH_FULL_CATALOG_PATH:-/fred/oz016/bgao_kn/ML+GW+KN/dataset/O5_sim_nsbh_train/injections_full.csv}"
             NSBH_SKYMAP_DIR="${NSBH_SKYMAP_DIR:-/fred/oz016/bgao_kn/data/skymap/nsbh_skymap_train}"
-            NSBH_SIM_ROOT="${NSBH_SIM_ROOT:-/fred/oz016/bgao_kn/SNANA/SNDATA_ROOT/SIM}"
+            NSBH_SIM_ROOT="${NSBH_SIM_ROOT:-/fred/oz016/bgao_kn/SNANA/SNDATA_ROOT/SIM/LSST_KN_NSBH_TRAIN}"
             NSBH_SIM_NAME="${NSBH_SIM_NAME:-LSST_KN_NSBH_TRAIN}"
             NSBH_SUCCESS_IDS_PATH="${NSBH_SUCCESS_IDS_PATH:-/fred/oz016/bgao_kn/data/LSST_KN_NSBH_TRAIN/success_sim_ids.txt}"
 
-            OUTPUT_H5_PATH="${OUTPUT_H5_PATH:-/fred/oz016/bgao_kn/data/LSST_KN_BNS_AUG_NSBH_TRAIN/combined_dataset_with_neg_gw_${DATASET_MODE}.h5}"
+            OUTPUT_H5_PATH="${OUTPUT_H5_PATH:-/fred/oz016/bgao_kn/data/BNS_NSBH_dataset/combined_dataset_${DATASET_MODE}.h5}"
             ;;
         *)
             echo "Unsupported PROFILE='$PROFILE'. Use PROFILE=test_aug or PROFILE=final_train."
@@ -170,7 +170,7 @@ fi
 
 mkdir -p "$(dirname "$OUTPUT_H5_PATH")"
 
-py_script="/fred/oz016/bgao_kn/ML+GW+KN/Model/script/create_dataset_with_neg_gw_bns_nsbh_fast.py"
+py_script="/fred/oz016/bgao_kn/ML+GW+KN/Model/script/create_dataset_bns_nsbh.py"
 
 cmd=(
     python -u "$py_script"
