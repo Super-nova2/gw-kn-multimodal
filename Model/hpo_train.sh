@@ -5,11 +5,11 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=150G
+#SBATCH --mem=200G
 #SBATCH --gres=gpu:1
 #SBATCH --time=168:00:00
 #SBATCH --partition=gpu
-#SBATCH --tmp=110G
+#SBATCH --tmp=180G
 
 set -euo pipefail
 

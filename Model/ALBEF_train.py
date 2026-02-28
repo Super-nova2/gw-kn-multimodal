@@ -208,24 +208,6 @@ def compute_hard_neg_ratio(args, epoch):
     progress = (epoch - args.hard_neg_start_epoch + 1) / float(args.hard_neg_ramp_epochs)
     return min(1.0, progress)
 
-def set_requires_grad(module, requires_grad):
-    for param in module.parameters():
-        param.requires_grad = requires_grad
-
-def apply_freeze_schedule(model, args, epoch):
-    freeze_enc = args.freeze_encoder_epochs > 0 and epoch < args.freeze_encoder_epochs
-    freeze_itc = args.freeze_itc_epochs > 0 and epoch < args.freeze_itc_epochs
-
-    set_requires_grad(model.gw_encoder, not freeze_enc)
-    set_requires_grad(model.optical_encoder, not freeze_enc)
-
-    set_requires_grad(model.gw_proj, not freeze_itc)
-    set_requires_grad(model.opt_proj, not freeze_itc)
-    if args.temp_schedule == "learned":
-        model.log_temp.requires_grad_(not freeze_itc)
-    else:
-        model.log_temp.requires_grad_(False)
-
 def compute_weighted_cls_loss(pos_loss, hard_loss, neg_loss, has_negatives, args):
     pos_weight = args.cls_pos_weight
     neg_weight = args.cls_neg_weight
@@ -628,18 +610,18 @@ def train(args):
         temp_max=args.temp_max,
         gw_dropout=args.gw_dropout,
         opt_dropout=args.opt_dropout,
-        proj_dropout=getattr(args, 'proj_dropout', 0.0),
+        proj_dropout=args.proj_dropout,
         feature_dropout=args.feature_dropout,
         fusion_dropout=args.fusion_dropout,
         label_smoothing=args.label_smoothing,
         itc_label_smoothing=args.itc_label_smoothing,
-        use_lightweight_gw=getattr(args, 'use_lightweight_gw', False),
-        dual_fusion=getattr(args, 'dual_fusion', False)
+        use_lightweight_gw=args.use_lightweight_gw,
+        dual_fusion=args.dual_fusion
     ).to(device)
 
     if args.use_lightweight_gw:
         print("Using lightweight GW encoder (~100K params) to prevent overfitting.")
-    if getattr(args, 'dual_fusion', False):
+    if args.dual_fusion:
         print("Using dual cross-attention fusion with per-pair credible level.")
 
     if hasattr(torch, 'compile'):
@@ -649,15 +631,7 @@ def train(args):
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     start_epoch = 0
     global_step = 0
-    if args.resume is not None and args.pretrained is not None:
-        raise ValueError("resume and pretrained are mutually exclusive.")
-    if args.pretrained is not None:
-        if not os.path.exists(args.pretrained):
-            raise FileNotFoundError(f"Pretrained checkpoint not found: {args.pretrained}")
-        ckpt = torch.load(args.pretrained, map_location=device)
-        model.load_state_dict(ckpt["model_state_dict"], strict=True)
-        print(f"Loaded pretrained weights from {args.pretrained}.")
-    elif args.resume is not None:
+    if args.resume is not None:
         if not os.path.exists(args.resume):
             raise FileNotFoundError(f"Resume checkpoint not found: {args.resume}")
         ckpt = torch.load(args.resume, map_location=device)
@@ -676,29 +650,29 @@ def train(args):
         print("WARNING: Disabling OOD monitoring during HPO trial to avoid test leakage.")
         args.enable_ood_monitoring = False
 
-    # Build OOD validation loader from independent dataset (opt-in only).
+    # Build OOD monitoring loader from independent dataset (opt-in only).
     ood_val_loader = None
-    if getattr(args, 'val_data_path', None):
-        if not os.path.exists(args.val_data_path):
-            print(f"WARNING: val_data_path not found, skip OOD monitoring: {args.val_data_path}")
+    if getattr(args, 'test_data_path', None):
+        if not os.path.exists(args.test_data_path):
+            print(f"WARNING: test_data_path not found, skip OOD monitoring: {args.test_data_path}")
         elif not getattr(args, "enable_ood_monitoring", False):
             print(
                 "OOD monitoring is disabled by default to prevent test leakage. "
-                "Pass --enable_ood_monitoring ONLY when val_data_path is a development set (not final test set)."
+                "Pass --enable_ood_monitoring ONLY when test_data_path is a development set (not final test set)."
             )
         else:
-            ood_val_steps = args.ood_val_steps
+            ood_test_steps = args.test_steps
             ood_batch_size = args.val_batch_size or args.batch_size
             # Cap batch size to number of unique GW events in the OOD dataset
-            ood_gw_map = build_gw_to_lc_mapping(args.val_data_path)
+            ood_gw_map = build_gw_to_lc_mapping(args.test_data_path)
             n_ood_gw = len(ood_gw_map)
             if ood_batch_size > n_ood_gw:
-                print(f"Reducing OOD val batch_size from {ood_batch_size} to {n_ood_gw} (available GW events)")
+                print(f"Reducing OOD test batch_size from {ood_batch_size} to {n_ood_gw} (available GW events)")
                 ood_batch_size = n_ood_gw
             ood_val_loader = create_training_dataloader(
-                h5_path=args.val_data_path,
+                h5_path=args.test_data_path,
                 batch_size=ood_batch_size,
-                steps_per_epoch=ood_val_steps,
+                steps_per_epoch=ood_test_steps,
                 num_workers=args.num_workers,
                 pin_memory=bool(args.pin_memory),
                 persistent_workers=bool(args.persistent_workers),
@@ -708,11 +682,9 @@ def train(args):
                 negative_group=args.neg_group
             )
             print(
-                f"OOD validation loader: {args.val_data_path} "
-                f"({ood_val_steps} steps, batch_size={ood_batch_size})"
+                f"OOD test loader: {args.test_data_path} "
+                f"({ood_test_steps} steps, batch_size={ood_batch_size})"
             )
-
-    apply_freeze_schedule(model, args, start_epoch)
 
     pbar_update_every = 500
     best_val_score = None
@@ -727,7 +699,6 @@ def train(args):
 
         ref_time_cache = None
         apply_temperature_schedule(model, args, epoch)
-        apply_freeze_schedule(model, args, epoch)
         cls_weight = compute_cls_weight(args, epoch)
         itc_weight = compute_itc_weight(args, epoch)
         hard_neg_ratio = compute_hard_neg_ratio(args, epoch)
@@ -1115,12 +1086,12 @@ if __name__ == "__main__":
     """
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_path", type=str, default="training_data.h5")
-    parser.add_argument("--val_data_path", type=str, default=None,
-                        help="Path to independent OOD/dev HDF5. Kept OFF during training unless --enable_ood_monitoring is set.")
-    parser.add_argument("--ood_val_steps", type=int, default=25,
-                        help="Number of validation steps per epoch for OOD monitoring")
+    parser.add_argument("--test_data_path", type=str, default=None,
+                        help="Path to independent OOD/dev HDF5 used for optional OOD monitoring.")
+    parser.add_argument("--test_steps", type=int, default=25,
+                        help="Number of OOD monitoring steps per epoch")
     parser.add_argument("--enable_ood_monitoring", action='store_true',
-                        help="Opt-in OOD monitoring during training. Do NOT enable when val_data_path is final test set.")
+                        help="Opt-in OOD monitoring during training. Do NOT enable when test_data_path is final test set.")
     parser.add_argument("--neg_data_path", type=str, default=None)
     parser.add_argument("--neg_group", type=str, default="events/optical_data")
     parser.add_argument("--epochs", type=int, default=10)
@@ -1128,8 +1099,6 @@ if __name__ == "__main__":
     parser.add_argument("--steps_per_epoch", type=int, default=None)
     parser.add_argument("--ckpt_path", type=str, default=None)
     parser.add_argument("--resume", type=str, default=None)
-    parser.add_argument("--pretrained", type=str, default=None,
-                        help="Load model weights from checkpoint without optimizer state")
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-4, help="Weight decay for AdamW optimizer")
     parser.add_argument("--grad_clip_norm", type=float, default=1.0, help="Max norm for gradient clipping (0 to disable)")
@@ -1172,10 +1141,6 @@ if __name__ == "__main__":
                         help="Projection head dropout to prevent ITC overfitting (default: 0.0)")
     parser.add_argument("--feature_dropout", type=float, default=0.0,
                         help="Dropout applied to encoder features before ITC/CLS heads")
-    parser.add_argument("--freeze_encoder_epochs", type=int, default=0,
-                        help="Freeze GW/optical encoders for N initial epochs")
-    parser.add_argument("--freeze_itc_epochs", type=int, default=0,
-                        help="Freeze ITC projection heads/temp for N initial epochs")
     parser.add_argument("--itc_weight", type=float, default=1.0)
     parser.add_argument("--cls_weight", type=float, default=1.0)
     parser.add_argument("--cls_pos_weight", type=float, default=1.0,

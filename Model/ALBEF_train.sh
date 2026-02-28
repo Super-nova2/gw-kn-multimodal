@@ -1,15 +1,15 @@
 #!/bin/bash
 
-#SBATCH --job-name=ALBEF_anti_overfit
+#SBATCH --job-name=ALBEF_bns_nsbh
 #SBATCH --output=logs/train/%x_%j.out
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=150G
+#SBATCH --mem=200G
 #SBATCH --gres=gpu:1
 #SBATCH --time=24:00:00
 #SBATCH --partition=gpu
-#SBATCH --tmp=110G
+#SBATCH --tmp=180G
 
 set -euo pipefail
 
@@ -76,7 +76,6 @@ NEG_GROUP=$(jq -r '.neg_group // empty' "$args_file")
 CKPT_PATH=$(jq -r '.ckpt_path' "$args_file")
 STAGE_TO_JOBFS=$(jq -r '.stage_to_jobfs // false' "$args_file")
 RESUME=$(jq -r '.resume // empty' "$args_file")
-PRETRAINED=$(jq -r '.pretrained // empty' "$args_file")
 EPOCHS=$(jq -r '.epochs' "$args_file")
 BATCH_SIZE=$(jq -r '.batch_size' "$args_file")
 LR=$(jq -r '.lr' "$args_file")
@@ -116,8 +115,6 @@ OPT_DROPOUT=$(jq -r '.opt_dropout // empty' "$args_file")
 PROJ_DROPOUT=$(jq -r '.proj_dropout // empty' "$args_file")
 LABEL_SMOOTHING=$(jq -r '.label_smoothing // empty' "$args_file")
 FEATURE_DROPOUT=$(jq -r '.feature_dropout // empty' "$args_file")
-FREEZE_ENCODER_EPOCHS=$(jq -r '.freeze_encoder_epochs // empty' "$args_file")
-FREEZE_ITC_EPOCHS=$(jq -r '.freeze_itc_epochs // empty' "$args_file")
 ITC_WEIGHT=$(jq -r '.itc_weight // empty' "$args_file")
 CLS_WEIGHT=$(jq -r '.cls_weight // empty' "$args_file")
 CLS_POS_WEIGHT=$(jq -r '.cls_pos_weight // empty' "$args_file")
@@ -147,8 +144,8 @@ OPT_AUG_NOISE=$(jq -r '.opt_aug_noise // empty' "$args_file")
 OPT_AUG_TIME_JITTER=$(jq -r '.opt_aug_time_jitter // empty' "$args_file")
 OPT_AUG_DROPOUT=$(jq -r '.opt_aug_dropout // empty' "$args_file")
 OPT_AUG_BAND_DROPOUT=$(jq -r '.opt_aug_band_dropout // empty' "$args_file")
-VAL_DATA_PATH=$(jq -r '.val_data_path // empty' "$args_file")
-OOD_VAL_STEPS=$(jq -r '.ood_val_steps // empty' "$args_file")
+TEST_DATA_PATH=$(jq -r '.test_data_path // empty' "$args_file")
+TEST_STEPS=$(jq -r '.test_steps // empty' "$args_file")
 mkdir -p "$CKPT_PATH"
 
 echo "========================================"
@@ -178,10 +175,10 @@ if [ "$STAGE_TO_JOBFS" = "true" ]; then
             cp -f "$NEG_DATA_PATH" "$JOBFS_DIR"/
             NEG_DATA_PATH="$JOBFS_DIR/$(basename "$NEG_DATA_PATH")"
         fi
-        if [[ -n "$VAL_DATA_PATH" && "$VAL_DATA_PATH" != "null" ]]; then
-            VAL_STAGED_NAME="val_$(basename "$VAL_DATA_PATH")"
-            cp -f "$VAL_DATA_PATH" "$JOBFS_DIR/$VAL_STAGED_NAME"
-            VAL_DATA_PATH="$JOBFS_DIR/$VAL_STAGED_NAME"
+        if [[ -n "$TEST_DATA_PATH" && "$TEST_DATA_PATH" != "null" ]]; then
+            TEST_STAGED_NAME="test_$(basename "$TEST_DATA_PATH")"
+            cp -f "$TEST_DATA_PATH" "$JOBFS_DIR/$TEST_STAGED_NAME"
+            TEST_DATA_PATH="$JOBFS_DIR/$TEST_STAGED_NAME"
         fi
     else
         echo "No local tmp dir found; skip staging."
@@ -209,9 +206,6 @@ if [[ -n "$STEPS_PER_EPOCH" && "$STEPS_PER_EPOCH" != "null" ]]; then
 fi
 if [[ -n "$RESUME" && "$RESUME" != "null" ]]; then
     cmd+=(--resume "$RESUME")
-fi
-if [[ -n "$PRETRAINED" && "$PRETRAINED" != "null" ]]; then
-    cmd+=(--pretrained "$PRETRAINED")
 fi
 if [[ -n "$LR_SCHEDULER" && "$LR_SCHEDULER" != "null" ]]; then
     cmd+=(--lr_scheduler "$LR_SCHEDULER")
@@ -315,12 +309,6 @@ fi
 if [[ -n "$FEATURE_DROPOUT" && "$FEATURE_DROPOUT" != "null" ]]; then
     cmd+=(--feature_dropout "$FEATURE_DROPOUT")
 fi
-if [[ -n "$FREEZE_ENCODER_EPOCHS" && "$FREEZE_ENCODER_EPOCHS" != "null" ]]; then
-    cmd+=(--freeze_encoder_epochs "$FREEZE_ENCODER_EPOCHS")
-fi
-if [[ -n "$FREEZE_ITC_EPOCHS" && "$FREEZE_ITC_EPOCHS" != "null" ]]; then
-    cmd+=(--freeze_itc_epochs "$FREEZE_ITC_EPOCHS")
-fi
 if [[ -n "$ITC_WEIGHT" && "$ITC_WEIGHT" != "null" ]]; then
     cmd+=(--itc_weight "$ITC_WEIGHT")
 fi
@@ -408,11 +396,11 @@ fi
 if [[ -n "$OPT_AUG_BAND_DROPOUT" && "$OPT_AUG_BAND_DROPOUT" != "null" ]]; then
     cmd+=(--opt_aug_band_dropout "$OPT_AUG_BAND_DROPOUT")
 fi
-if [[ -n "$VAL_DATA_PATH" && "$VAL_DATA_PATH" != "null" ]]; then
-    cmd+=(--val_data_path "$VAL_DATA_PATH")
+if [[ -n "$TEST_DATA_PATH" && "$TEST_DATA_PATH" != "null" ]]; then
+    cmd+=(--test_data_path "$TEST_DATA_PATH")
 fi
-if [[ -n "$OOD_VAL_STEPS" && "$OOD_VAL_STEPS" != "null" ]]; then
-    cmd+=(--ood_val_steps "$OOD_VAL_STEPS")
+if [[ -n "$TEST_STEPS" && "$TEST_STEPS" != "null" ]]; then
+    cmd+=(--test_steps "$TEST_STEPS")
 fi
 echo "Command: ${cmd[*]}"
 "${cmd[@]}"
