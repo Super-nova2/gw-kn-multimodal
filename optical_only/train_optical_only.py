@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Train an optical-only KN classifier using the existing optical encoder.
+Train optical-only KN classifier with first-detection time-zero and time-offset modeling.
 
-Two-stage schedule:
-1) Freeze optical encoder, train new classifier head.
-2) Unfreeze optical encoder and fine-tune with a smaller encoder LR.
+Key additions versus baseline train script:
+1) Optional empirical-CDF offset sampling in training.
+2) Optional quantile-ensemble offset inference in validation (average logits).
 """
 
 import argparse
@@ -14,19 +14,23 @@ import json
 import os
 import sys
 from pathlib import Path
+from typing import Dict, List, Optional
 
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.amp import GradScaler, autocast
+
 try:
     from torch.utils.tensorboard import SummaryWriter
 except Exception:  # pragma: no cover - runtime environment dependent
     SummaryWriter = None
+
 from tqdm import tqdm
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-MODEL_DIR = SCRIPT_DIR.parent
+MODEL_DIR = SCRIPT_DIR.parent / "Model"
 if str(MODEL_DIR) not in sys.path:
     sys.path.insert(0, str(MODEL_DIR))
 
@@ -35,9 +39,127 @@ from metrics import compute_classification_metrics
 from model import OpticalKNClassifier
 
 
+def parse_quantiles(text: str) -> List[float]:
+    vals: List[float] = []
+    for part in str(text).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        q = float(part)
+        if q < 0.0 or q > 1.0:
+            raise ValueError(f"Invalid quantile {q}; expected in [0, 1].")
+        vals.append(q)
+    if not vals:
+        raise ValueError("offset_eval_quantiles produced empty list.")
+    return vals
+
+
+class TimeOffsetPolicy:
+    def __init__(self, args):
+        self.enabled = bool(args.time_offset_enable)
+        self.scale_divisor = float(args.offset_scale_days_divisor)
+        if self.scale_divisor <= 0:
+            raise ValueError("offset_scale_days_divisor must be > 0.")
+
+        self.train_sampling = str(args.offset_train_sampling).strip().lower()
+        self.eval_mode = str(args.offset_eval_mode).strip().lower()
+        self.eval_offsets_days: List[float] = [0.0]
+
+        seed = int(args.seed if args.offset_seed is None else args.offset_seed)
+        self.rng = np.random.default_rng(seed)
+        self.samples: Optional[np.ndarray] = None
+        self.sample_bank: Optional[np.ndarray] = None
+        self.info: Dict[str, object] = {
+            "enabled": bool(self.enabled),
+            "scale_divisor": float(self.scale_divisor),
+            "train_sampling": self.train_sampling,
+            "eval_mode": self.eval_mode,
+            "seed": int(seed),
+        }
+
+        if not self.enabled:
+            self.info["eval_offsets_days"] = [0.0]
+            return
+
+        dist_path = args.offset_dist_npz
+        if dist_path is None:
+            raise ValueError("time_offset_enable=true requires --offset_dist_npz.")
+
+        dist_path = Path(dist_path)
+        if not dist_path.exists():
+            raise FileNotFoundError(f"Offset distribution file not found: {dist_path}")
+
+        dist_key = str(args.offset_dist_key)
+        with np.load(dist_path, allow_pickle=False) as npz:
+            if dist_key not in npz:
+                raise KeyError(
+                    f"offset_dist_key '{dist_key}' not found in {dist_path}. "
+                    f"Available keys: {list(npz.keys())}"
+                )
+            raw = np.asarray(npz[dist_key], dtype=np.float64).reshape(-1)
+
+        raw = raw[np.isfinite(raw)]
+        if raw.size == 0:
+            raise ValueError(f"Offset distribution is empty after filtering NaN/Inf: {dist_path}:{dist_key}")
+
+        self.samples = raw.astype(np.float32, copy=False)
+
+        bank_size = max(1, min(int(args.offset_bank_size), int(self.samples.shape[0])))
+        if bank_size < int(self.samples.shape[0]):
+            bank_idx = self.rng.integers(0, int(self.samples.shape[0]), size=bank_size, endpoint=False)
+            self.sample_bank = self.samples[bank_idx].astype(np.float32, copy=False)
+        else:
+            self.sample_bank = self.samples
+
+        if self.train_sampling != "empirical_cdf":
+            raise ValueError(f"Unsupported offset_train_sampling: {self.train_sampling}")
+
+        if self.eval_mode == "quantile_ensemble":
+            quantiles = parse_quantiles(args.offset_eval_quantiles)
+            q_vals = np.quantile(self.samples.astype(np.float64), np.asarray(quantiles, dtype=np.float64))
+            self.eval_offsets_days = [float(v) for v in q_vals.tolist()]
+        elif self.eval_mode == "median":
+            self.eval_offsets_days = [float(np.quantile(self.samples.astype(np.float64), 0.5))]
+        elif self.eval_mode == "zero":
+            self.eval_offsets_days = [0.0]
+        else:
+            raise ValueError(f"Unsupported offset_eval_mode: {self.eval_mode}")
+
+        self.info.update(
+            {
+                "dist_path": str(dist_path),
+                "dist_key": dist_key,
+                "dist_count": int(self.samples.shape[0]),
+                "dist_min_days": float(np.min(self.samples)),
+                "dist_max_days": float(np.max(self.samples)),
+                "dist_mean_days": float(np.mean(self.samples)),
+                "dist_std_days": float(np.std(self.samples)),
+                "bank_size": int(self.sample_bank.shape[0]),
+                "eval_offsets_days": [float(v) for v in self.eval_offsets_days],
+            }
+        )
+
+    def sample_train_offsets(self, batch_size: int) -> np.ndarray:
+        if not self.enabled:
+            return np.zeros((int(batch_size),), dtype=np.float32)
+        if self.sample_bank is None:
+            raise RuntimeError("time offset sample bank is not initialized")
+        idx = self.rng.integers(0, int(self.sample_bank.shape[0]), size=int(batch_size), endpoint=False)
+        return self.sample_bank[idx].astype(np.float32, copy=False)
+
+    def describe(self) -> Dict[str, object]:
+        return dict(self.info)
+
+
 def build_ref_time(batch_size, n_ref, ref_start, ref_end, device, dtype):
     ref = torch.linspace(ref_start, ref_end, n_ref, dtype=dtype, device=device)
     return ref.unsqueeze(0).repeat(batch_size, 1)
+
+
+def apply_time_offsets(opt_t, opt_mask, delta_days, scale_divisor):
+    valid = (opt_mask.sum(dim=-1) > 0).to(dtype=opt_t.dtype)
+    shift = (delta_days.to(device=opt_t.device, dtype=opt_t.dtype) / float(scale_divisor)).unsqueeze(1)
+    return opt_t - shift * valid
 
 
 def augment_optical_data(
@@ -131,7 +253,46 @@ def select_threshold_for_target_recall(probs, labels, target_recall=0.98):
     return best
 
 
-def run_eval(model, loader, device, args, criterion, amp_dtype):
+def forward_logits_with_offsets(
+    model,
+    opt_coords,
+    opt_t,
+    opt_v,
+    ref_time,
+    opt_mask,
+    opt_err,
+    device,
+    amp_dtype,
+    args,
+    offset_policy,
+    training,
+):
+    if not offset_policy.enabled:
+        with autocast(device_type="cuda", dtype=amp_dtype, enabled=(device.type == "cuda")):
+            logits = model(opt_coords, opt_t, opt_v, ref_time, opt_mask, opt_err).squeeze(-1)
+        return logits.float()
+
+    if training:
+        delta_np = offset_policy.sample_train_offsets(opt_t.size(0))
+        delta_days = torch.from_numpy(delta_np).to(device=device, dtype=torch.float32)
+        shifted_opt_t = apply_time_offsets(opt_t, opt_mask, delta_days, args.offset_scale_days_divisor)
+        with autocast(device_type="cuda", dtype=amp_dtype, enabled=(device.type == "cuda")):
+            logits = model(opt_coords, shifted_opt_t, opt_v, ref_time, opt_mask, opt_err).squeeze(-1)
+        return logits.float()
+
+    logits_sum = None
+    for off_days in offset_policy.eval_offsets_days:
+        delta_days = torch.full((opt_t.size(0),), float(off_days), device=device, dtype=torch.float32)
+        shifted_opt_t = apply_time_offsets(opt_t, opt_mask, delta_days, args.offset_scale_days_divisor)
+        with autocast(device_type="cuda", dtype=amp_dtype, enabled=(device.type == "cuda")):
+            logits = model(opt_coords, shifted_opt_t, opt_v, ref_time, opt_mask, opt_err).squeeze(-1)
+        logits = logits.float()
+        logits_sum = logits if logits_sum is None else logits_sum + logits
+
+    return logits_sum / float(max(1, len(offset_policy.eval_offsets_days)))
+
+
+def run_eval(model, loader, device, args, criterion, amp_dtype, offset_policy):
     model.eval()
     losses = 0.0
     n_batches = 0
@@ -159,11 +320,23 @@ def run_eval(model, loader, device, args, criterion, amp_dtype):
                     batch_size, args.n_ref, args.ref_start, args.ref_end, device, opt_t.dtype
                 )
 
-            with autocast(device_type="cuda", dtype=amp_dtype, enabled=(device.type == "cuda")):
-                logits = model(opt_coords, opt_t, opt_v, ref_time_cache, opt_mask, opt_err).squeeze(-1)
-                loss = criterion(logits, labels)
+            logits = forward_logits_with_offsets(
+                model=model,
+                opt_coords=opt_coords,
+                opt_t=opt_t,
+                opt_v=opt_v,
+                ref_time=ref_time_cache,
+                opt_mask=opt_mask,
+                opt_err=opt_err,
+                device=device,
+                amp_dtype=amp_dtype,
+                args=args,
+                offset_policy=offset_policy,
+                training=False,
+            )
+            loss = criterion(logits, labels)
 
-            probs = torch.sigmoid(logits.float())
+            probs = torch.sigmoid(logits)
             losses += loss.item()
             n_batches += 1
             all_probs.append(probs.detach().cpu())
@@ -189,10 +362,11 @@ def run_eval(model, loader, device, args, criterion, amp_dtype):
         "op_precision": op["precision"],
         "op_fpr": op["fpr"],
         "op_meets_target_recall": bool(op["meets_target_recall"]),
+        "offset_eval_count": int(len(offset_policy.eval_offsets_days)),
     }
 
 
-def train_one_epoch(model, loader, optimizer, device, args, criterion, scaler, amp_dtype):
+def train_one_epoch(model, loader, optimizer, device, args, criterion, scaler, amp_dtype, offset_policy):
     model.train()
     total_loss = 0.0
     n_batches = 0
@@ -231,9 +405,21 @@ def train_one_epoch(model, loader, optimizer, device, args, criterion, scaler, a
             )
 
         optimizer.zero_grad(set_to_none=True)
-        with autocast(device_type="cuda", dtype=amp_dtype, enabled=(device.type == "cuda")):
-            logits = model(opt_coords, opt_t, opt_v, ref_time_cache, opt_mask, opt_err).squeeze(-1)
-            loss = criterion(logits, labels)
+        logits = forward_logits_with_offsets(
+            model=model,
+            opt_coords=opt_coords,
+            opt_t=opt_t,
+            opt_v=opt_v,
+            ref_time=ref_time_cache,
+            opt_mask=opt_mask,
+            opt_err=opt_err,
+            device=device,
+            amp_dtype=amp_dtype,
+            args=args,
+            offset_policy=offset_policy,
+            training=True,
+        )
+        loss = criterion(logits, labels)
 
         scaler.scale(loss).backward()
         if args.grad_clip_norm > 0:
@@ -320,6 +506,7 @@ def build_stage_optimizer(model, args, freeze_encoder):
 
 def train(args):
     torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type == "cuda":
@@ -332,6 +519,9 @@ def train(args):
         amp_dtype = torch.float32
         scaler = GradScaler(enabled=False)
         print(f"Running on device: {device} | No AMP (CPU)")
+
+    offset_policy = TimeOffsetPolicy(args)
+    print(f"Time offset policy: {json.dumps(offset_policy.describe(), indent=2)}")
 
     train_loader, val_loader, steps_per_epoch, val_steps = create_optical_binary_dataloaders(
         pos_h5_path=args.pos_data_path,
@@ -418,9 +608,17 @@ def train(args):
         for _ in range(stage_epochs):
             global_epoch += 1
             train_loss = train_one_epoch(
-                model, train_loader, optimizer, device, args, criterion, scaler, amp_dtype
+                model,
+                train_loader,
+                optimizer,
+                device,
+                args,
+                criterion,
+                scaler,
+                amp_dtype,
+                offset_policy,
             )
-            val_metrics = run_eval(model, val_loader, device, args, criterion, amp_dtype)
+            val_metrics = run_eval(model, val_loader, device, args, criterion, amp_dtype, offset_policy)
             if val_metrics is None:
                 epoch_metrics = {
                     "stage": stage_name,
@@ -478,7 +676,8 @@ def train(args):
                 f"| thr={val_metrics['op_threshold']:.3f} "
                 f"| recall={val_metrics['op_recall']:.4f} "
                 f"| precision={val_metrics['op_precision']:.4f} "
-                f"| fpr={val_metrics['op_fpr']:.4f}"
+                f"| fpr={val_metrics['op_fpr']:.4f} "
+                f"| eval_k={val_metrics['offset_eval_count']}"
             )
 
             epoch_metrics = {
@@ -536,7 +735,11 @@ def train(args):
                 torch.cuda.empty_cache()
             gc.collect()
 
-        if stage_name == "stage2_finetune" and args.early_stop_patience > 0 and no_improve >= args.early_stop_patience:
+        if (
+            stage_name == "stage2_finetune"
+            and args.early_stop_patience > 0
+            and no_improve >= args.early_stop_patience
+        ):
             break
 
     final_metrics = {
@@ -545,9 +748,10 @@ def train(args):
         "best_epoch": best_epoch,
         "best_auroc_plus_auprc": best_score,
         "best_precision_at_target_recall": float(best_metrics.get("op_precision", 0.0)) if best_metrics else 0.0,
+        "time_offset": offset_policy.describe(),
         **best_metrics,
     }
-    with open(save_root / "train_summary.json", "w") as f:
+    with open(save_root / "train_summary.json", "w", encoding="utf-8") as f:
         json.dump(final_metrics, f, indent=2)
 
     if optimizer is not None:
@@ -626,6 +830,16 @@ def parse_args():
     parser.add_argument("--tb_flush_secs", type=int, default=30)
     parser.add_argument("--disable_tensorboard", action="store_true")
 
+    parser.add_argument("--time_offset_enable", action="store_true")
+    parser.add_argument("--offset_dist_npz", type=str, default=None)
+    parser.add_argument("--offset_dist_key", type=str, default="delta_days_combined")
+    parser.add_argument("--offset_train_sampling", type=str, default="empirical_cdf")
+    parser.add_argument("--offset_eval_mode", type=str, default="quantile_ensemble")
+    parser.add_argument("--offset_eval_quantiles", type=str, default="0.1,0.3,0.5,0.7,0.9")
+    parser.add_argument("--offset_scale_days_divisor", type=float, default=100.0)
+    parser.add_argument("--offset_seed", type=int, default=None)
+    parser.add_argument("--offset_bank_size", type=int, default=1000000)
+
     pre_args, _ = parser.parse_known_args()
     if pre_args.config is not None:
         config_path = Path(pre_args.config)
@@ -637,7 +851,10 @@ def parse_args():
             raise ValueError("Config JSON must be an object.")
         parser.set_defaults(**config)
 
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.offset_seed is None:
+        args.offset_seed = int(args.seed)
+    return args
 
 
 if __name__ == "__main__":
@@ -649,9 +866,15 @@ if __name__ == "__main__":
         raise FileNotFoundError(f"Positive data file not found: {args.pos_data_path}")
     if not os.path.exists(args.neg_data_path):
         raise FileNotFoundError(f"Negative data file not found: {args.neg_data_path}")
+    if bool(args.time_offset_enable):
+        if args.offset_dist_npz is None:
+            raise ValueError("time_offset_enable=true requires --offset_dist_npz.")
+        if not os.path.exists(args.offset_dist_npz):
+            raise FileNotFoundError(f"Offset distribution file not found: {args.offset_dist_npz}")
+
     os.makedirs(args.ckpt_path, exist_ok=True)
 
     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{ts}] Starting optical-only KN training")
+    print(f"[{ts}] Starting optical-only KN training (fd_t0)")
     print(json.dumps(vars(args), indent=2))
     train(args)

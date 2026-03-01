@@ -57,9 +57,13 @@ KCOR_FILE:    $SNDATA_ROOT/kcor/LSST/baseline_1.9/kcor_LSST.fits
 # Effic vs. SNR for detetctions
 SEARCHEFF_PIPELINE_LOGIC_FILE: $SNDATA_ROOT/models/searcheff/SEARCHEFF_PIPELINE_LOGIC.DAT   # 2 detections at any bands
 SEARCHEFF_PIPELINE_FILE: $SNDATA_ROOT/models/searcheff/SEARCHEFF_PIPELINE_LSST_Heaviside.DAT  # SNR > 5 = detection
-APPLY_SEARCHEFF_OPT:  1
+APPLY_SEARCHEFF_OPT:  0   # No filtering, keep write mask into output
 
-# NEWMJD_DIF: 7.0000e-03   # min MJD dif to count NEW MJD(10 min)
+# Apply selection cut
+APPLY_CUTWIN_OPT: 1 # implement selection cuts
+CUTWIN_NEPOCH: 2 +5 # require 1 epoch with SNR>5
+
+NEWMJD_DIF: 7.0000e-03   # min MJD dif to count NEW MJD(10 min)
 
 # convert SED into binary 
 SIMSED_USE_BINARY:  1   # speed up the initialization of SED files

@@ -134,6 +134,16 @@ EVAL_POS_DATA_PATH=$(jq -r '.eval_pos_data_path // "/fred/oz016/bgao_kn/data/LSS
 EVAL_NEG_DATA_PATH=$(jq -r '.eval_neg_data_path // "/fred/oz016/bgao_kn/data/Optical_Negative_dataset/ELASTICC_negative_dataset.h5"' "$args_file")
 EVAL_NEG_GROUP=$(jq -r '.eval_neg_group // "ELASTICC/optical_data"' "$args_file")
 
+TIME_OFFSET_ENABLE=$(jq -r '.time_offset_enable // false' "$args_file")
+OFFSET_DIST_NPZ=$(jq -r '.offset_dist_npz // empty' "$args_file")
+OFFSET_DIST_KEY=$(jq -r '.offset_dist_key // empty' "$args_file")
+OFFSET_TRAIN_SAMPLING=$(jq -r '.offset_train_sampling // empty' "$args_file")
+OFFSET_EVAL_MODE=$(jq -r '.offset_eval_mode // empty' "$args_file")
+OFFSET_EVAL_QUANTILES=$(jq -r '.offset_eval_quantiles // empty' "$args_file")
+OFFSET_SCALE_DAYS_DIVISOR=$(jq -r '.offset_scale_days_divisor // empty' "$args_file")
+OFFSET_SEED=$(jq -r '.offset_seed // empty' "$args_file")
+OFFSET_BANK_SIZE=$(jq -r '.offset_bank_size // empty' "$args_file")
+
 if [[ -z "$RUN_NAME" || "$RUN_NAME" == "null" ]]; then
     if [[ -n "${SLURM_JOB_ID:-}" ]]; then
         RUN_NAME="job${SLURM_JOB_ID}"
@@ -176,6 +186,7 @@ if [[ "$STAGE_TO_JOBFS" == "true" ]]; then
         TRAIN_NEG_LOCAL="$JOBFS_DIR/train_neg_$(basename "$NEG_DATA_PATH")"
         EVAL_POS_LOCAL="$JOBFS_DIR/eval_pos_$(basename "$EVAL_POS_DATA_PATH")"
         EVAL_NEG_LOCAL="$JOBFS_DIR/eval_neg_$(basename "$EVAL_NEG_DATA_PATH")"
+        OFFSET_DIST_LOCAL=""
 
         cp -f "$POS_DATA_PATH" "$TRAIN_POS_LOCAL"
         POS_DATA_PATH="$TRAIN_POS_LOCAL"
@@ -185,6 +196,11 @@ if [[ "$STAGE_TO_JOBFS" == "true" ]]; then
         EVAL_POS_DATA_PATH="$EVAL_POS_LOCAL"
         cp -f "$EVAL_NEG_DATA_PATH" "$EVAL_NEG_LOCAL"
         EVAL_NEG_DATA_PATH="$EVAL_NEG_LOCAL"
+        if [[ "$TIME_OFFSET_ENABLE" == "true" && -n "$OFFSET_DIST_NPZ" && "$OFFSET_DIST_NPZ" != "null" ]]; then
+            OFFSET_DIST_LOCAL="$JOBFS_DIR/offset_dist_$(basename "$OFFSET_DIST_NPZ")"
+            cp -f "$OFFSET_DIST_NPZ" "$OFFSET_DIST_LOCAL"
+            OFFSET_DIST_NPZ="$OFFSET_DIST_LOCAL"
+        fi
         echo "Staging complete."
     else
         echo "No local tmp dir found; skip staging."
@@ -192,7 +208,7 @@ if [[ "$STAGE_TO_JOBFS" == "true" ]]; then
 fi
 
 cmd=(
-    python -u /fred/oz016/bgao_kn/ML+GW+KN/Model/optical_only/train_optical_only.py
+    python -u /fred/oz016/bgao_kn/ML+GW+KN/optical_only/train_optical_only.py
     --pos_data_path "$POS_DATA_PATH"
     --neg_data_path "$NEG_DATA_PATH"
     --ckpt_path "$CKPT_PATH"
@@ -331,6 +347,33 @@ fi
 if [[ -n "$RUN_NAME" && "$RUN_NAME" != "null" ]]; then
     cmd+=(--run_name "$RUN_NAME")
 fi
+if [[ "$TIME_OFFSET_ENABLE" == "true" ]]; then
+    cmd+=(--time_offset_enable)
+fi
+if [[ -n "$OFFSET_DIST_NPZ" && "$OFFSET_DIST_NPZ" != "null" ]]; then
+    cmd+=(--offset_dist_npz "$OFFSET_DIST_NPZ")
+fi
+if [[ -n "$OFFSET_DIST_KEY" && "$OFFSET_DIST_KEY" != "null" ]]; then
+    cmd+=(--offset_dist_key "$OFFSET_DIST_KEY")
+fi
+if [[ -n "$OFFSET_TRAIN_SAMPLING" && "$OFFSET_TRAIN_SAMPLING" != "null" ]]; then
+    cmd+=(--offset_train_sampling "$OFFSET_TRAIN_SAMPLING")
+fi
+if [[ -n "$OFFSET_EVAL_MODE" && "$OFFSET_EVAL_MODE" != "null" ]]; then
+    cmd+=(--offset_eval_mode "$OFFSET_EVAL_MODE")
+fi
+if [[ -n "$OFFSET_EVAL_QUANTILES" && "$OFFSET_EVAL_QUANTILES" != "null" ]]; then
+    cmd+=(--offset_eval_quantiles "$OFFSET_EVAL_QUANTILES")
+fi
+if [[ -n "$OFFSET_SCALE_DAYS_DIVISOR" && "$OFFSET_SCALE_DAYS_DIVISOR" != "null" ]]; then
+    cmd+=(--offset_scale_days_divisor "$OFFSET_SCALE_DAYS_DIVISOR")
+fi
+if [[ -n "$OFFSET_SEED" && "$OFFSET_SEED" != "null" ]]; then
+    cmd+=(--offset_seed "$OFFSET_SEED")
+fi
+if [[ -n "$OFFSET_BANK_SIZE" && "$OFFSET_BANK_SIZE" != "null" ]]; then
+    cmd+=(--offset_bank_size "$OFFSET_BANK_SIZE")
+fi
 
 echo "Training Command: ${cmd[*]}"
 set +e
@@ -347,7 +390,7 @@ fi
 
 BEST_CKPT="${CKPT_PATH}/optical_only/${RUN_NAME}/optical_only_best.pth"
 EVAL_OUTPUT_DIR="${CKPT_PATH}/optical_only/eval_results/${RUN_NAME}"
-EVAL_PY="/fred/oz016/bgao_kn/ML+GW+KN/Model/optical_only/test_evaluate_optical_only.py"
+EVAL_PY="/fred/oz016/bgao_kn/ML+GW+KN/optical_only/test_evaluate_optical_only.py"
 
 if [[ ! -f "$BEST_CKPT" ]]; then
     echo "Best checkpoint not found after training: $BEST_CKPT"
@@ -423,6 +466,24 @@ if [[ -n "$EVAL_TARGET_RECALL" && "$EVAL_TARGET_RECALL" != "null" ]]; then
 fi
 if [[ "$EVAL_NO_PLOTS" == "true" ]]; then
     eval_cmd+=(--no_plots)
+fi
+if [[ "$TIME_OFFSET_ENABLE" == "true" ]]; then
+    eval_cmd+=(--time_offset_enable)
+fi
+if [[ -n "$OFFSET_DIST_NPZ" && "$OFFSET_DIST_NPZ" != "null" ]]; then
+    eval_cmd+=(--offset_dist_npz "$OFFSET_DIST_NPZ")
+fi
+if [[ -n "$OFFSET_DIST_KEY" && "$OFFSET_DIST_KEY" != "null" ]]; then
+    eval_cmd+=(--offset_dist_key "$OFFSET_DIST_KEY")
+fi
+if [[ -n "$OFFSET_EVAL_MODE" && "$OFFSET_EVAL_MODE" != "null" ]]; then
+    eval_cmd+=(--offset_eval_mode "$OFFSET_EVAL_MODE")
+fi
+if [[ -n "$OFFSET_EVAL_QUANTILES" && "$OFFSET_EVAL_QUANTILES" != "null" ]]; then
+    eval_cmd+=(--offset_eval_quantiles "$OFFSET_EVAL_QUANTILES")
+fi
+if [[ -n "$OFFSET_SCALE_DAYS_DIVISOR" && "$OFFSET_SCALE_DAYS_DIVISOR" != "null" ]]; then
+    eval_cmd+=(--offset_scale_days_divisor "$OFFSET_SCALE_DAYS_DIVISOR")
 fi
 
 echo "Evaluation Command: ${eval_cmd[*]}"
