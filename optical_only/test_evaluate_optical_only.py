@@ -1,11 +1,8 @@
 #!/usr/bin/env python3
 """
-Evaluation script for optical-only KN classifier.
+Evaluation script for optical-only KN classifier (fd_t0 variant).
 
-Notes:
-  - By default this can evaluate on the same dataset used in training
-    (data leakage may exist; intentionally ignored for now).
-  - Metrics follow the project classification utilities (AUROC, AUPRC, F1, ECE).
+Supports optional K-quantile time-offset ensemble with logits averaging.
 """
 
 import argparse
@@ -13,6 +10,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from typing import Dict, List, Optional
 
 import numpy as np
 import torch
@@ -23,7 +21,7 @@ from tqdm import tqdm
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-MODEL_DIR = SCRIPT_DIR.parent
+MODEL_DIR = SCRIPT_DIR.parent / "Model"
 if str(MODEL_DIR) not in sys.path:
     sys.path.insert(0, str(MODEL_DIR))
 
@@ -32,14 +30,29 @@ from metrics import compute_classification_metrics
 from model import OpticalKNClassifier
 
 
+def parse_quantiles(text: str) -> List[float]:
+    vals: List[float] = []
+    for part in str(text).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        q = float(part)
+        if q < 0.0 or q > 1.0:
+            raise ValueError(f"Invalid quantile {q}; expected in [0, 1].")
+        vals.append(q)
+    if not vals:
+        raise ValueError("offset_eval_quantiles produced empty list.")
+    return vals
+
+
 def parse_args():
-    p = argparse.ArgumentParser(description="Evaluate optical-only KN classifier")
+    p = argparse.ArgumentParser(description="Evaluate optical-only KN classifier (fd_t0)")
     p.add_argument("--checkpoint", type=str, required=True)
     p.add_argument("--config", type=str, default=None, help="Optional JSON config for path fallback.")
 
-    p.add_argument("--pos_data_path", type=str, default="/fred/oz016/bgao_kn/data/LSST_KN_BNS/combined_dataset_with_neg_gw.h5")
-    p.add_argument("--neg_data_path", type=str, default="/fred/oz016/bgao_kn/data/ELASTICC2_TRAIN/negative_dataset.h5")
-    p.add_argument("--neg_group", type=str, default="ELASTICC2_TRAIN/optical_data")
+    p.add_argument("--pos_data_path", type=str, default=None)
+    p.add_argument("--neg_data_path", type=str, default=None)
+    p.add_argument("--neg_group", type=str, default=None)
 
     p.add_argument("--batch_size", type=int, default=1024)
     p.add_argument("--num_workers", type=int, default=0)
@@ -52,9 +65,18 @@ def parse_args():
     p.add_argument("--sample_seed", type=int, default=42)
 
     p.add_argument("--target_recall", type=float, default=None)
-    p.add_argument("--output_dir", type=str, default="eval_results/optical_only")
+    p.add_argument("--output_dir", type=str, default="eval_results/optical_only_fd_t0")
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--no_plots", action="store_true")
+
+    p.add_argument("--time_offset_enable", action="store_true", default=None)
+    p.add_argument("--offset_dist_npz", type=str, default=None)
+    p.add_argument("--offset_dist_key", type=str, default=None)
+    p.add_argument("--offset_eval_mode", type=str, default=None)
+    p.add_argument("--offset_eval_quantiles", type=str, default=None)
+    p.add_argument("--offset_scale_days_divisor", type=float, default=None)
+    p.add_argument("--offset_seed", type=int, default=None)
+
     return p.parse_args()
 
 
@@ -81,6 +103,12 @@ def choose_value(cli_value, config_dict, ckpt_args, key, default=None):
 def build_ref_time(batch_size, n_ref, ref_start, ref_end, device, dtype):
     ref = torch.linspace(ref_start, ref_end, n_ref, dtype=dtype, device=device)
     return ref.unsqueeze(0).repeat(batch_size, 1)
+
+
+def apply_time_offsets(opt_t, opt_mask, delta_days, scale_divisor):
+    valid = (opt_mask.sum(dim=-1) > 0).to(dtype=opt_t.dtype)
+    shift = (delta_days.to(device=opt_t.device, dtype=opt_t.dtype) / float(scale_divisor)).unsqueeze(1)
+    return opt_t - shift * valid
 
 
 def select_threshold_for_target_recall(probs, labels, target_recall=0.98):
@@ -129,6 +157,75 @@ def select_threshold_for_target_recall(probs, labels, target_recall=0.98):
     return best
 
 
+class EvalTimeOffsetPolicy:
+    def __init__(
+        self,
+        enabled: bool,
+        dist_npz: Optional[str],
+        dist_key: str,
+        eval_mode: str,
+        eval_quantiles: str,
+        scale_divisor: float,
+    ):
+        self.enabled = bool(enabled)
+        self.scale_divisor = float(scale_divisor)
+        if self.scale_divisor <= 0:
+            raise ValueError("offset_scale_days_divisor must be > 0.")
+
+        self.eval_mode = str(eval_mode).strip().lower()
+        self.eval_offsets_days: List[float] = [0.0]
+        self.info: Dict[str, object] = {
+            "enabled": self.enabled,
+            "scale_divisor": self.scale_divisor,
+            "eval_mode": self.eval_mode,
+        }
+
+        if not self.enabled:
+            self.info["eval_offsets_days"] = [0.0]
+            return
+
+        if dist_npz is None:
+            raise ValueError("time_offset_enable=true requires offset_dist_npz.")
+        npz_path = Path(dist_npz)
+        if not npz_path.exists():
+            raise FileNotFoundError(f"Offset distribution file not found: {npz_path}")
+
+        with np.load(npz_path, allow_pickle=False) as npz:
+            if dist_key not in npz:
+                raise KeyError(
+                    f"offset_dist_key '{dist_key}' not found in {npz_path}. "
+                    f"Available keys: {list(npz.keys())}"
+                )
+            values = np.asarray(npz[dist_key], dtype=np.float64).reshape(-1)
+        values = values[np.isfinite(values)]
+        if values.size == 0:
+            raise ValueError(f"Offset distribution is empty after filtering NaN/Inf: {npz_path}:{dist_key}")
+
+        if self.eval_mode == "quantile_ensemble":
+            q = parse_quantiles(eval_quantiles)
+            q_vals = np.quantile(values, np.asarray(q, dtype=np.float64))
+            self.eval_offsets_days = [float(v) for v in q_vals.tolist()]
+        elif self.eval_mode == "median":
+            self.eval_offsets_days = [float(np.quantile(values, 0.5))]
+        elif self.eval_mode == "zero":
+            self.eval_offsets_days = [0.0]
+        else:
+            raise ValueError(f"Unsupported offset_eval_mode: {self.eval_mode}")
+
+        self.info.update(
+            {
+                "dist_path": str(npz_path),
+                "dist_key": str(dist_key),
+                "dist_count": int(values.shape[0]),
+                "dist_min_days": float(np.min(values)),
+                "dist_max_days": float(np.max(values)),
+                "dist_mean_days": float(np.mean(values)),
+                "dist_std_days": float(np.std(values)),
+                "eval_offsets_days": [float(v) for v in self.eval_offsets_days],
+            }
+        )
+
+
 def load_model(checkpoint_path, device, config_dict):
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     ckpt_args = ckpt.get("args", {})
@@ -172,7 +269,11 @@ def build_eval_dataset(args, ckpt_args, config_dict):
     pos_data_path = choose_value(args.pos_data_path, config_dict, ckpt_args, "pos_data_path", default=None)
     neg_data_path = choose_value(args.neg_data_path, config_dict, ckpt_args, "neg_data_path", default=None)
     neg_group = choose_value(
-        args.neg_group, config_dict, ckpt_args, "neg_group", default="ELASTICC2_TRAIN/optical_data"
+        args.neg_group,
+        config_dict,
+        ckpt_args,
+        "neg_group",
+        default="ELASTICC2_TRAIN/optical_data",
     )
     include_coords = bool(choose_value(None, config_dict, ckpt_args, "include_coords", default=False))
 
@@ -249,7 +350,7 @@ def build_eval_loader(dataset, args):
 
 
 @torch.no_grad()
-def run_evaluation(model, loader, device, n_ref, ref_start, ref_end, target_recall):
+def run_evaluation(model, loader, device, n_ref, ref_start, ref_end, target_recall, offset_policy):
     criterion = nn.BCEWithLogitsLoss()
 
     if device.type == "cuda":
@@ -281,11 +382,24 @@ def run_evaluation(model, loader, device, n_ref, ref_start, ref_end, target_reca
         ):
             ref_time_cache = build_ref_time(batch_size, n_ref, ref_start, ref_end, device, opt_t.dtype)
 
-        with autocast(device_type="cuda", dtype=amp_dtype, enabled=(device.type == "cuda")):
-            logits = model(opt_coords, opt_t, opt_v, ref_time_cache, opt_mask, opt_err).squeeze(-1)
-            loss = criterion(logits, labels)
+        if not offset_policy.enabled:
+            with autocast(device_type="cuda", dtype=amp_dtype, enabled=(device.type == "cuda")):
+                logits = model(opt_coords, opt_t, opt_v, ref_time_cache, opt_mask, opt_err).squeeze(-1)
+            logits = logits.float()
+        else:
+            logits_accum = None
+            for off_days in offset_policy.eval_offsets_days:
+                delta_days = torch.full((batch_size,), float(off_days), device=device, dtype=torch.float32)
+                shifted_opt_t = apply_time_offsets(opt_t, opt_mask, delta_days, offset_policy.scale_divisor)
+                with autocast(device_type="cuda", dtype=amp_dtype, enabled=(device.type == "cuda")):
+                    logits_i = model(opt_coords, shifted_opt_t, opt_v, ref_time_cache, opt_mask, opt_err).squeeze(-1)
+                logits_i = logits_i.float()
+                logits_accum = logits_i if logits_accum is None else logits_accum + logits_i
+            logits = logits_accum / float(max(1, len(offset_policy.eval_offsets_days)))
 
-        probs = torch.sigmoid(logits.float())
+        loss = criterion(logits, labels)
+        probs = torch.sigmoid(logits)
+
         total_loss += loss.item()
         n_batches += 1
         all_probs.append(probs.detach().cpu())
@@ -308,6 +422,7 @@ def run_evaluation(model, loader, device, n_ref, ref_start, ref_end, target_reca
         "op_fpr": op["fpr"],
         "op_meets_target_recall": bool(op["meets_target_recall"]),
         "target_recall": float(target_recall),
+        "offset_eval_count": int(len(offset_policy.eval_offsets_days)),
     }
     return results, probs.numpy(), labels.numpy()
 
@@ -326,7 +441,6 @@ def generate_plots(probs, labels, results, output_dir):
     probs = np.asarray(probs, dtype=np.float64)
     labels = np.asarray(labels, dtype=np.int64)
 
-    # ROC
     sorted_idx = np.argsort(-probs)
     sorted_labels = labels[sorted_idx]
     n_pos = int(sorted_labels.sum())
@@ -345,7 +459,6 @@ def generate_plots(probs, labels, results, output_dir):
         fig.savefig(os.path.join(output_dir, "roc_curve.png"), dpi=150, bbox_inches="tight")
         plt.close(fig)
 
-    # PR
     if n_pos > 0:
         tp_cum = np.cumsum(sorted_labels)
         ranks = np.arange(1, len(sorted_labels) + 1)
@@ -359,7 +472,6 @@ def generate_plots(probs, labels, results, output_dir):
         fig.savefig(os.path.join(output_dir, "pr_curve.png"), dpi=150, bbox_inches="tight")
         plt.close(fig)
 
-    # Calibration
     n_bins = 10
     edges = np.linspace(0.0, 1.0, n_bins + 1)
     bin_accs = []
@@ -384,7 +496,6 @@ def generate_plots(probs, labels, results, output_dir):
         fig.savefig(os.path.join(output_dir, "calibration.png"), dpi=150, bbox_inches="tight")
         plt.close(fig)
 
-    # Logits/probability distribution (NO BOTTOM FILL)
     pos_probs = probs[labels == 1]
     neg_probs = probs[labels == 0]
     fig, ax = plt.subplots(figsize=(10, 6))
@@ -445,6 +556,45 @@ def main():
         choose_value(args.target_recall, config_dict, ckpt_args, "target_recall", default=0.98)
     )
 
+    offset_enabled = bool(
+        choose_value(args.time_offset_enable, config_dict, ckpt_args, "time_offset_enable", default=False)
+    )
+    offset_dist_npz = choose_value(args.offset_dist_npz, config_dict, ckpt_args, "offset_dist_npz", default=None)
+    offset_dist_key = str(
+        choose_value(args.offset_dist_key, config_dict, ckpt_args, "offset_dist_key", default="delta_days_combined")
+    )
+    offset_eval_mode = str(
+        choose_value(args.offset_eval_mode, config_dict, ckpt_args, "offset_eval_mode", default="quantile_ensemble")
+    )
+    offset_eval_quantiles = str(
+        choose_value(
+            args.offset_eval_quantiles,
+            config_dict,
+            ckpt_args,
+            "offset_eval_quantiles",
+            default="0.1,0.3,0.5,0.7,0.9",
+        )
+    )
+    offset_scale_days_divisor = float(
+        choose_value(
+            args.offset_scale_days_divisor,
+            config_dict,
+            ckpt_args,
+            "offset_scale_days_divisor",
+            default=100.0,
+        )
+    )
+
+    offset_policy = EvalTimeOffsetPolicy(
+        enabled=offset_enabled,
+        dist_npz=offset_dist_npz,
+        dist_key=offset_dist_key,
+        eval_mode=offset_eval_mode,
+        eval_quantiles=offset_eval_quantiles,
+        scale_divisor=offset_scale_days_divisor,
+    )
+    print(f"Time offset policy: {json.dumps(offset_policy.info, indent=2)}")
+
     metrics, probs, labels = run_evaluation(
         model=model,
         loader=loader,
@@ -453,6 +603,7 @@ def main():
         ref_start=ref_start,
         ref_end=ref_end,
         target_recall=target_recall,
+        offset_policy=offset_policy,
     )
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -468,6 +619,7 @@ def main():
             "ref_start": ref_start,
             "ref_end": ref_end,
             "batch_size": int(args.batch_size),
+            "time_offset": offset_policy.info,
             **data_meta,
         },
     }
@@ -476,7 +628,7 @@ def main():
     with open(out_json, "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2)
 
-    print("\n=== Optical-only Evaluation Summary ===")
+    print("\n=== Optical-only Evaluation Summary (fd_t0) ===")
     print(f"loss: {metrics['loss']:.4f}")
     print(f"AUROC: {metrics.get('auroc', 0.0):.4f}")
     print(f"AUPRC: {metrics.get('auprc', 0.0):.4f}")
