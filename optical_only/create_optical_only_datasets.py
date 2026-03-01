@@ -18,6 +18,7 @@ where t0 is first-detection MJD (+ optional fixed offset in days).
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 import os
 import re
 from pathlib import Path
@@ -111,7 +112,7 @@ def format_realization(
     ra: float,
     dec: float,
     t0_mjd: float,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
     rel_times = (mjd - float(t0_mjd)) / 100.0
 
     if len(mjd) > MAX_LC_LENGTH:
@@ -141,7 +142,7 @@ def format_realization(
         raise ValueError("realization has no valid band after formatting")
 
     coords = np.array([ra, dec], dtype=np.float32)
-    return val_mat, err_mat, mask_mat, time_vec, coords
+    return val_mat, err_mat, mask_mat, time_vec, coords, float(t0_mjd)
 
 
 def iter_event_dirs(base_dir: Path, sim_name: str) -> List[Path]:
@@ -154,7 +155,7 @@ def parse_kn_event(
     snr_threshold: float,
     min_nobs: int,
     fixed_offset_days: float,
-) -> Tuple[List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]], Dict[str, int]]:
+) -> Tuple[List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]], Dict[str, int]]:
     prefix = event_dir.name
     head_path = event_dir / f"{prefix}_HEAD.FITS"
     phot_path = event_dir / f"{prefix}_PHOT.FITS"
@@ -167,7 +168,7 @@ def parse_kn_event(
         "drop_no_detection": 0,
         "drop_empty_or_invalid": 0,
     }
-    out: List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
+    out: List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]] = []
 
     if not (head_path.exists() and phot_path.exists() and readme_path.exists()):
         return out, stats
@@ -252,6 +253,24 @@ def parse_kn_event(
     return out, stats
 
 
+def _parse_kn_event_worker(
+    event_dir_str: str,
+    sim_name: str,
+    snr_threshold: float,
+    min_nobs: int,
+    fixed_offset_days: float,
+) -> Tuple[str, List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]], Dict[str, int]]:
+    event_dir = Path(event_dir_str)
+    lcs, stats = parse_kn_event(
+        event_dir=event_dir,
+        sim_name=sim_name,
+        snr_threshold=snr_threshold,
+        min_nobs=min_nobs,
+        fixed_offset_days=fixed_offset_days,
+    )
+    return event_dir.name, lcs, stats
+
+
 def infer_transient_type(folder_name: str) -> Optional[str]:
     name = folder_name.lower()
     if "kn" in name:
@@ -292,7 +311,7 @@ def parse_negative_file(
     snr_threshold: float,
     min_nobs: int,
     fixed_offset_days: float,
-) -> Tuple[List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]], Dict[str, int]]:
+) -> Tuple[List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]], Dict[str, int]]:
     stats = {
         "n_realizations_total": 0,
         "n_realizations_kept": 0,
@@ -300,7 +319,7 @@ def parse_negative_file(
         "drop_no_detection": 0,
         "drop_empty_or_invalid": 0,
     }
-    out: List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
+    out: List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]] = []
 
     try:
         with fits.open(head_path, memmap=False) as hdul_head, fits.open(
@@ -381,6 +400,62 @@ def parse_negative_file(
     return out, stats
 
 
+def _parse_negative_file_worker(
+    head_path_str: str,
+    phot_path_str: str,
+    transient_type: str,
+    snr_threshold: float,
+    min_nobs: int,
+    fixed_offset_days: float,
+) -> Tuple[str, List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]], Dict[str, int]]:
+    lcs, stats = parse_negative_file(
+        head_path=Path(head_path_str),
+        phot_path=Path(phot_path_str),
+        transient_type=transient_type,
+        snr_threshold=snr_threshold,
+        min_nobs=min_nobs,
+        fixed_offset_days=fixed_offset_days,
+    )
+    return transient_type, lcs, stats
+
+
+def _parallel_map_with_fallback(
+    fn,
+    iterables: Optional[Tuple[Iterable, ...]] = None,
+    worker_count: int = 1,
+    chunksize: int = 1,
+    total: int = 0,
+    desc: str = "",
+    arg_rows: Optional[List[Tuple]] = None,
+):
+    # Accept both call styles:
+    # 1) iterables=(col1, col2, ...)
+    # 2) arg_rows=[(a1,b1,...), (a2,b2,...), ...]
+    if arg_rows is not None:
+        if len(arg_rows) == 0:
+            return
+        cols = list(zip(*arg_rows))
+        iterables = tuple([list(col) for col in cols])
+
+    if iterables is None:
+        raise TypeError("Either iterables or arg_rows must be provided.")
+
+    try:
+        with ProcessPoolExecutor(max_workers=worker_count) as executor:
+            mapped = executor.map(fn, *iterables, chunksize=chunksize)
+            for item in tqdm(mapped, total=total, desc=desc):
+                yield item
+    except (PermissionError, OSError, RuntimeError) as exc:
+        print(
+            f"[WARN] ProcessPool unavailable ({exc}); "
+            f"fallback to ThreadPoolExecutor with {worker_count} workers."
+        )
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            mapped = executor.map(fn, *iterables)
+            for item in tqdm(mapped, total=total, desc=desc):
+                yield item
+
+
 def _create_optical_group(
     grp,
     chunk_size: int,
@@ -413,6 +488,13 @@ def _create_optical_group(
         dtype="f4",
         chunks=(chunk_size, MAX_LC_LENGTH),
     )
+    ds_zero_time_mjd_base = grp.create_dataset(
+        "zero_time_mjd_base",
+        (0,),
+        maxshape=(None,),
+        dtype="f8",
+        chunks=(chunk_size,),
+    )
     ds_coords = grp.create_dataset(
         "coordinates",
         (0, 2),
@@ -420,7 +502,7 @@ def _create_optical_group(
         dtype="f4",
         chunks=(chunk_size, 2),
     )
-    return ds_values, ds_errors, ds_masks, ds_times, ds_coords
+    return ds_values, ds_errors, ds_masks, ds_times, ds_zero_time_mjd_base, ds_coords
 
 
 def create_positive_h5(
@@ -435,6 +517,7 @@ def create_positive_h5(
     max_events_per_source: Optional[int],
     max_lcs_per_event: Optional[int],
     buffer_limit: int,
+    num_workers: int,
 ) -> None:
     output_h5.parent.mkdir(parents=True, exist_ok=True)
     dt_str = h5py.string_dtype(encoding="utf-8")
@@ -448,7 +531,9 @@ def create_positive_h5(
         )
 
         opt_grp = f.create_group("events/optical_data")
-        ds_values, ds_errors, ds_masks, ds_times, ds_coords = _create_optical_group(opt_grp, chunk_size)
+        ds_values, ds_errors, ds_masks, ds_times, ds_zero_time_mjd_base, ds_coords = _create_optical_group(
+            opt_grp, chunk_size
+        )
         ds_parent = opt_grp.create_dataset(
             "parent_gw_idx",
             (0,),
@@ -463,6 +548,7 @@ def create_positive_h5(
         b_errs: List[np.ndarray] = []
         b_masks: List[np.ndarray] = []
         b_times: List[np.ndarray] = []
+        b_zero_time_mjd_base: List[float] = []
         b_coords: List[np.ndarray] = []
         b_parent: List[int] = []
 
@@ -488,12 +574,14 @@ def create_positive_h5(
             ds_errors.resize(new_size, axis=0)
             ds_masks.resize(new_size, axis=0)
             ds_times.resize(new_size, axis=0)
+            ds_zero_time_mjd_base.resize(new_size, axis=0)
             ds_coords.resize(new_size, axis=0)
             ds_parent.resize(new_size, axis=0)
             ds_values[cur:new_size] = np.asarray(b_vals, dtype=np.float32)
             ds_errors[cur:new_size] = np.asarray(b_errs, dtype=np.float32)
             ds_masks[cur:new_size] = np.asarray(b_masks, dtype=np.float32)
             ds_times[cur:new_size] = np.asarray(b_times, dtype=np.float32)
+            ds_zero_time_mjd_base[cur:new_size] = np.asarray(b_zero_time_mjd_base, dtype=np.float64)
             ds_coords[cur:new_size] = np.asarray(b_coords, dtype=np.float32)
             ds_parent[cur:new_size] = np.asarray(b_parent, dtype=np.int32)
 
@@ -502,8 +590,51 @@ def create_positive_h5(
             b_errs.clear()
             b_masks.clear()
             b_times.clear()
+            b_zero_time_mjd_base.clear()
             b_coords.clear()
             b_parent.clear()
+
+        worker_count = max(1, int(num_workers))
+
+        def consume_positive_result(
+            event_name: str,
+            source_tag: str,
+            lcs: List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]],
+            event_stats: Dict[str, int],
+            key_written: str,
+        ) -> None:
+            nonlocal gw_count
+            stats["drop_nobs"] += int(event_stats["drop_nobs"])
+            stats["drop_no_detection"] += int(event_stats["drop_no_detection"])
+            stats["drop_empty_or_invalid"] += int(event_stats["drop_empty_or_invalid"])
+
+            if len(lcs) == 0:
+                return
+
+            if max_lcs_per_event is not None and len(lcs) > int(max_lcs_per_event):
+                n_drop = len(lcs) - int(max_lcs_per_event)
+                stats["drop_lcs_over_event_cap"] += int(n_drop)
+                lcs = lcs[: int(max_lcs_per_event)]
+
+            gw_idx = gw_count
+            ds_gw_ids.resize(gw_count + 1, axis=0)
+            ds_gw_source.resize(gw_count + 1, axis=0)
+            ds_gw_ids[gw_idx] = event_name
+            ds_gw_source[gw_idx] = source_tag
+            gw_count += 1
+            stats[key_written] += 1
+
+            for vals, errs, masks, times, coords, zero_time_mjd_base in lcs:
+                b_vals.append(vals)
+                b_errs.append(errs)
+                b_masks.append(masks)
+                b_times.append(times)
+                b_zero_time_mjd_base.append(float(zero_time_mjd_base))
+                b_coords.append(coords)
+                b_parent.append(gw_idx)
+
+            if len(b_vals) >= int(buffer_limit):
+                flush()
 
         for source_tag, sim_root, sim_name in [
             ("bns", bns_sim_root, bns_sim_name),
@@ -516,46 +647,51 @@ def create_positive_h5(
             key_total = f"{source_tag}_events_total"
             key_written = f"{source_tag}_events_written"
             stats[key_total] = int(len(event_dirs))
-
-            for event_dir in tqdm(event_dirs, desc=f"Positive {source_tag.upper()}"):
-                lcs, event_stats = parse_kn_event(
-                    event_dir=event_dir,
-                    sim_name=sim_name,
-                    snr_threshold=snr_threshold,
-                    min_nobs=min_nobs,
-                    fixed_offset_days=fixed_offset_days,
-                )
-
-                stats["drop_nobs"] += int(event_stats["drop_nobs"])
-                stats["drop_no_detection"] += int(event_stats["drop_no_detection"])
-                stats["drop_empty_or_invalid"] += int(event_stats["drop_empty_or_invalid"])
-
-                if len(lcs) == 0:
-                    continue
-
-                if max_lcs_per_event is not None and len(lcs) > int(max_lcs_per_event):
-                    n_drop = len(lcs) - int(max_lcs_per_event)
-                    stats["drop_lcs_over_event_cap"] += int(n_drop)
-                    lcs = lcs[: int(max_lcs_per_event)]
-
-                gw_idx = gw_count
-                ds_gw_ids.resize(gw_count + 1, axis=0)
-                ds_gw_source.resize(gw_count + 1, axis=0)
-                ds_gw_ids[gw_idx] = event_dir.name
-                ds_gw_source[gw_idx] = source_tag
-                gw_count += 1
-                stats[key_written] += 1
-
-                for vals, errs, masks, times, coords in lcs:
-                    b_vals.append(vals)
-                    b_errs.append(errs)
-                    b_masks.append(masks)
-                    b_times.append(times)
-                    b_coords.append(coords)
-                    b_parent.append(gw_idx)
-
-                if len(b_vals) >= int(buffer_limit):
-                    flush()
+            if worker_count == 1 or len(event_dirs) <= 1:
+                for event_dir in tqdm(event_dirs, desc=f"Positive {source_tag.upper()}"):
+                    lcs, event_stats = parse_kn_event(
+                        event_dir=event_dir,
+                        sim_name=sim_name,
+                        snr_threshold=snr_threshold,
+                        min_nobs=min_nobs,
+                        fixed_offset_days=fixed_offset_days,
+                    )
+                    consume_positive_result(
+                        event_name=event_dir.name,
+                        source_tag=source_tag,
+                        lcs=lcs,
+                        event_stats=event_stats,
+                        key_written=key_written,
+                    )
+            else:
+                event_dir_strs = [str(p) for p in event_dirs]
+                n_rows = len(event_dir_strs)
+                chunksize = max(1, n_rows // (worker_count * 8))
+                arg_rows = [
+                    (
+                        event_dir_strs[i],
+                        sim_name,
+                        float(snr_threshold),
+                        int(min_nobs),
+                        float(fixed_offset_days),
+                    )
+                    for i in range(n_rows)
+                ]
+                for event_name, lcs, event_stats in _parallel_map_with_fallback(
+                    _parse_kn_event_worker,
+                    arg_rows=arg_rows,
+                    worker_count=worker_count,
+                    chunksize=chunksize,
+                    total=n_rows,
+                    desc=f"Positive {source_tag.upper()}",
+                ):
+                    consume_positive_result(
+                        event_name=event_name,
+                        source_tag=source_tag,
+                        lcs=lcs,
+                        event_stats=event_stats,
+                        key_written=key_written,
+                    )
 
         flush()
 
@@ -572,6 +708,10 @@ def create_positive_h5(
         f.attrs["snr_threshold"] = float(snr_threshold)
         f.attrs["detection_photflags"] = "nonzero"
         f.attrs["fixed_offset_days"] = float(fixed_offset_days)
+        f.attrs["num_workers"] = int(worker_count)
+        f.attrs["time_zero_base_semantics"] = "first_detection_mjd_plus_fixed_offset_days"
+        f.attrs["time_unit"] = "mjd_days"
+        f.attrs["runtime_offset_applied"] = 1
         if max_lcs_per_event is not None:
             f.attrs["max_lcs_per_event"] = int(max_lcs_per_event)
 
@@ -587,6 +727,7 @@ def create_negative_h5(
     fixed_offset_days: float,
     max_negative_heads: Optional[int],
     buffer_limit: int,
+    num_workers: int,
 ) -> None:
     output_h5.parent.mkdir(parents=True, exist_ok=True)
     chunk_size = 1024
@@ -594,7 +735,9 @@ def create_negative_h5(
 
     with h5py.File(output_h5, "w") as f:
         grp = f.create_group(neg_group)
-        ds_values, ds_errors, ds_masks, ds_times, ds_coords = _create_optical_group(grp, chunk_size)
+        ds_values, ds_errors, ds_masks, ds_times, ds_zero_time_mjd_base, ds_coords = _create_optical_group(
+            grp, chunk_size
+        )
         ds_types = grp.create_dataset("types", (0,), maxshape=(None,), dtype=dt_str, chunks=(chunk_size,))
 
         total_optical = 0
@@ -602,6 +745,7 @@ def create_negative_h5(
         b_errs: List[np.ndarray] = []
         b_masks: List[np.ndarray] = []
         b_times: List[np.ndarray] = []
+        b_zero_time_mjd_base: List[float] = []
         b_coords: List[np.ndarray] = []
         b_types: List[str] = []
 
@@ -624,12 +768,14 @@ def create_negative_h5(
             ds_errors.resize(new_size, axis=0)
             ds_masks.resize(new_size, axis=0)
             ds_times.resize(new_size, axis=0)
+            ds_zero_time_mjd_base.resize(new_size, axis=0)
             ds_coords.resize(new_size, axis=0)
             ds_types.resize(new_size, axis=0)
             ds_values[cur:new_size] = np.asarray(b_vals, dtype=np.float32)
             ds_errors[cur:new_size] = np.asarray(b_errs, dtype=np.float32)
             ds_masks[cur:new_size] = np.asarray(b_masks, dtype=np.float32)
             ds_times[cur:new_size] = np.asarray(b_times, dtype=np.float32)
+            ds_zero_time_mjd_base[cur:new_size] = np.asarray(b_zero_time_mjd_base, dtype=np.float64)
             ds_coords[cur:new_size] = np.asarray(b_coords, dtype=np.float32)
             ds_types[cur:new_size] = np.asarray(b_types, dtype=object)
 
@@ -638,45 +784,94 @@ def create_negative_h5(
             b_errs.clear()
             b_masks.clear()
             b_times.clear()
+            b_zero_time_mjd_base.clear()
             b_coords.clear()
             b_types.clear()
+
+        worker_count = max(1, int(num_workers))
+
+        def consume_negative_result(
+            transient_type: str,
+            lcs: List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]],
+            file_stats: Dict[str, int],
+        ) -> None:
+            stats["head_files_used"] += 1
+            stats["drop_nobs"] += int(file_stats["drop_nobs"])
+            stats["drop_no_detection"] += int(file_stats["drop_no_detection"])
+            stats["drop_empty_or_invalid"] += int(file_stats["drop_empty_or_invalid"])
+
+            for vals, errs, masks, times, coords, zero_time_mjd_base in lcs:
+                b_vals.append(vals)
+                b_errs.append(errs)
+                b_masks.append(masks)
+                b_times.append(times)
+                b_zero_time_mjd_base.append(float(zero_time_mjd_base))
+                b_coords.append(coords)
+                b_types.append(transient_type)
+
+            if len(b_vals) >= int(buffer_limit):
+                flush()
 
         head_files = iter_negative_head_files(neg_sim_root)
         if max_negative_heads is not None:
             head_files = head_files[: int(max_negative_heads)]
         stats["head_files_total"] = int(len(head_files))
 
-        for head_path in tqdm(head_files, desc="Negative HEAD files"):
+        tasks: List[Tuple[str, str, str]] = []
+        for head_path in head_files:
             transient_type = infer_transient_type(head_path.parent.name)
             if transient_type is None:
                 continue
             phot_path = find_pair_phot_file(head_path)
             if phot_path is None:
                 continue
+            tasks.append((str(head_path), str(phot_path), transient_type))
 
-            lcs, file_stats = parse_negative_file(
-                head_path=head_path,
-                phot_path=phot_path,
-                transient_type=transient_type,
-                snr_threshold=snr_threshold,
-                min_nobs=min_nobs,
-                fixed_offset_days=fixed_offset_days,
-            )
-            stats["head_files_used"] += 1
-            stats["drop_nobs"] += int(file_stats["drop_nobs"])
-            stats["drop_no_detection"] += int(file_stats["drop_no_detection"])
-            stats["drop_empty_or_invalid"] += int(file_stats["drop_empty_or_invalid"])
-
-            for vals, errs, masks, times, coords in lcs:
-                b_vals.append(vals)
-                b_errs.append(errs)
-                b_masks.append(masks)
-                b_times.append(times)
-                b_coords.append(coords)
-                b_types.append(transient_type)
-
-            if len(b_vals) >= int(buffer_limit):
-                flush()
+        if worker_count == 1 or len(tasks) <= 1:
+            for head_path_str, phot_path_str, transient_type in tqdm(tasks, desc="Negative HEAD files"):
+                lcs, file_stats = parse_negative_file(
+                    head_path=Path(head_path_str),
+                    phot_path=Path(phot_path_str),
+                    transient_type=transient_type,
+                    snr_threshold=snr_threshold,
+                    min_nobs=min_nobs,
+                    fixed_offset_days=fixed_offset_days,
+                )
+                consume_negative_result(
+                    transient_type=transient_type,
+                    lcs=lcs,
+                    file_stats=file_stats,
+                )
+        else:
+            head_path_strs = [t[0] for t in tasks]
+            phot_path_strs = [t[1] for t in tasks]
+            transient_types = [t[2] for t in tasks]
+            n_rows = len(tasks)
+            chunksize = max(1, n_rows // (worker_count * 8))
+            arg_rows = [
+                (
+                    head_path_strs[i],
+                    phot_path_strs[i],
+                    transient_types[i],
+                    float(snr_threshold),
+                    int(min_nobs),
+                    float(fixed_offset_days),
+                )
+                for i in range(n_rows)
+            ]
+            for transient_type, lcs, file_stats in _parallel_map_with_fallback(
+                _parse_negative_file_worker,
+                arg_rows=arg_rows,
+                worker_count=worker_count,
+                chunksize=chunksize,
+                total=n_rows,
+                desc="Negative HEAD files",
+            ):
+                consume_negative_result(
+                    transient_type=transient_type,
+                    lcs=lcs,
+                    file_stats=file_stats,
+                )
 
         flush()
 
@@ -691,6 +886,10 @@ def create_negative_h5(
         f.attrs["snr_threshold"] = float(snr_threshold)
         f.attrs["detection_photflags"] = "nonzero"
         f.attrs["fixed_offset_days"] = float(fixed_offset_days)
+        f.attrs["num_workers"] = int(worker_count)
+        f.attrs["time_zero_base_semantics"] = "first_detection_mjd_plus_fixed_offset_days"
+        f.attrs["time_unit"] = "mjd_days"
+        f.attrs["runtime_offset_applied"] = 1
 
     print(f"[NEG] Saved: {output_h5}")
 
@@ -733,6 +932,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--min_nobs", type=int, default=5)
     p.add_argument("--snr_threshold", type=float, default=5.0)
     p.add_argument("--fixed_offset_days", type=float, default=0.0)
+    p.add_argument(
+        "--num_workers",
+        type=int,
+        default=1,
+        help="Number of worker processes for FITS parsing. 1 means serial.",
+    )
     return p
 
 
@@ -764,6 +969,7 @@ def main():
             max_events_per_source=args.max_events_per_source,
             max_lcs_per_event=args.max_lcs_per_event,
             buffer_limit=int(args.buffer_limit),
+            num_workers=int(args.num_workers),
         )
 
     if build_neg:
@@ -780,6 +986,7 @@ def main():
             fixed_offset_days=float(args.fixed_offset_days),
             max_negative_heads=args.max_negative_heads,
             buffer_limit=int(args.buffer_limit),
+            num_workers=int(args.num_workers),
         )
 
 
