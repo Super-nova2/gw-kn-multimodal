@@ -31,6 +31,7 @@ import os
 import sys
 from contextlib import nullcontext
 from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
 import h5py
 from matplotlib.pyplot import hist
@@ -103,8 +104,416 @@ def parse_args():
     )
     p.add_argument("--no_plots", action="store_true",
                    help="Skip generating plots (useful on headless machines)")
+    p.add_argument("--neg_time_offset_enable", action="store_true", default=None,
+                   help="Enable time offsets for external non-KN optical negatives in evaluation.")
+    p.add_argument("--neg_offset_dist_npz", type=str, default=None,
+                   help="NPZ path for negative time-offset distribution.")
+    p.add_argument("--neg_offset_dist_key", type=str, default=None,
+                   help="Key in NPZ for negative offset distribution.")
+    p.add_argument("--neg_offset_eval_mode", type=str, default=None,
+                   help="Eval offset mode: quantile_ensemble|median|zero.")
+    p.add_argument("--neg_offset_eval_quantiles", type=str, default=None,
+                   help="Comma-separated quantiles for quantile_ensemble mode.")
+    p.add_argument("--neg_offset_scale_days_divisor", type=float, default=None,
+                   help="Convert day offsets to model time unit by dividing this value.")
+    p.add_argument("--cls_time_delta_enable", action="store_true", default=None,
+                   help="Override checkpoint config to enable classification time-delta feature.")
+    p.add_argument("--cls_time_delta_scale_days", type=float, default=None,
+                   help="Override checkpoint scale_days for classification time delta.")
+    p.add_argument("--cls_time_delta_clip", type=float, default=None,
+                   help="Override checkpoint clip for classification time delta.")
+    p.add_argument("--cls_time_delta_force_zero", action="store_true", default=None,
+                   help="Force classification time-delta input to zero in eval (keep checkpoint model structure).")
+    p.add_argument("--nonkn_cls_base_field", type=str, default=None,
+                   help="Negative dataset field name used for classification extra-negative dt.")
+    p.add_argument("--report_dt_bins", dest="report_dt_bins", action="store_true", default=None,
+                   help="Report |dt| bucketed classification metrics from triplet logits.")
+    p.add_argument("--no_report_dt_bins", dest="report_dt_bins", action="store_false",
+                   help="Disable |dt| bucketed classification metrics.")
+    p.add_argument("--dt_bin_edges", type=str, default=None,
+                   help="Comma-separated |dt| edges in days, e.g. '0,30,90,180,365,730,1460,inf'.")
+    p.add_argument("--report_dt_macro", dest="report_dt_macro", action="store_true", default=None,
+                   help="Report macro-averaged |dt| bin metrics (bins with both pos/neg only).")
+    p.add_argument("--no_report_dt_macro", dest="report_dt_macro", action="store_false",
+                   help="Disable macro-averaged |dt| bin metrics.")
+    p.add_argument("--dt_match_strategy", type=str, default=None, choices=["none", "window", "quantile"],
+                   help="Time-delta matching strategy for negatives: none|window|quantile.")
+    p.add_argument("--dt_match_window_days", type=float, default=None,
+                   help="Window (days) for |dt| matching when strategy=window/quantile.")
+    p.add_argument("--dt_match_quantiles", type=str, default=None,
+                   help="Comma-separated quantiles for |dt| matching when strategy=quantile.")
+    p.add_argument("--dt_match_target", type=str, default=None, choices=["positive", "all"],
+                   help="Target |dt| distribution: positive|all (all defaults to positive).")
+    p.add_argument("--dt_match_apply_to", type=str, default=None,
+                   help="Comma-separated targets: gw_neg,hard_neg,optical_neg (or 'all').")
+    p.add_argument("--pos_time_offsets_days", type=str, default=None,
+                   help="Comma-separated positive time offsets (days) for shortcut probe, e.g. '0,1,3,7,30,90'.")
 
     return p.parse_args()
+
+
+def parse_quantiles(text: str) -> List[float]:
+    vals: List[float] = []
+    for part in str(text).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        q = float(part)
+        if q < 0.0 or q > 1.0:
+            raise ValueError(f"Invalid quantile {q}; expected in [0, 1].")
+        vals.append(q)
+    if not vals:
+        raise ValueError("neg_offset_eval_quantiles produced empty list.")
+    return vals
+
+
+def parse_day_windows(text: str) -> List[float]:
+    vals: List[float] = []
+    for part in str(text).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        v = float(part)
+        if v <= 0:
+            raise ValueError(f"Invalid window value {v}; expected > 0.")
+        vals.append(v)
+    if not vals:
+        return []
+    vals = sorted(set(vals))
+    return vals
+
+
+def parse_dt_bin_edges(text: str) -> List[float]:
+    vals: List[float] = []
+    for part in str(text).split(","):
+        part = part.strip().lower()
+        if not part:
+            continue
+        if part in ("inf", "+inf", "infinity", "+infinity"):
+            vals.append(float("inf"))
+        else:
+            vals.append(float(part))
+    if len(vals) < 2:
+        raise ValueError("dt_bin_edges must contain at least two edges.")
+    for i in range(1, len(vals)):
+        if not (vals[i] > vals[i - 1]):
+            raise ValueError("dt_bin_edges must be strictly increasing.")
+    return vals
+
+
+def parse_day_offsets(text: str) -> List[float]:
+    vals: List[float] = []
+    for part in str(text).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        vals.append(float(part))
+    return vals
+
+
+def parse_dt_match_apply_to(text: str) -> List[str]:
+    allowed = {"gw_neg", "hard_neg", "optical_neg", "all"}
+    items = [p.strip().lower() for p in str(text).split(",") if p.strip()]
+    if not items:
+        return []
+    unknown = [i for i in items if i not in allowed]
+    if unknown:
+        raise ValueError(f"dt_match_apply_to contains invalid entries: {unknown}")
+    if "all" in items:
+        return ["gw_neg", "hard_neg", "optical_neg"]
+    # Preserve a stable order
+    ordered = []
+    for key in ("gw_neg", "hard_neg", "optical_neg"):
+        if key in items:
+            ordered.append(key)
+    return ordered
+
+
+def choose_value(cli_value, ckpt_args, key, default=None):
+    if cli_value is not None:
+        return cli_value
+    if isinstance(ckpt_args, dict) and key in ckpt_args and ckpt_args[key] is not None:
+        return ckpt_args[key]
+    return default
+
+
+def apply_time_offsets(opt_t, opt_mask, delta_days, scale_divisor):
+    valid = (opt_mask.sum(dim=-1) > 0).to(dtype=opt_t.dtype)
+    shift = (delta_days.to(device=opt_t.device, dtype=opt_t.dtype) / float(scale_divisor)).unsqueeze(1)
+    return opt_t - shift * valid
+
+
+def compute_time_delta_days(opt_zero_time_mjd, gw_anchor_time_mjd):
+    dt = opt_zero_time_mjd.to(torch.float32) - gw_anchor_time_mjd.to(torch.float32)
+    dt = torch.where(torch.isfinite(dt), dt, torch.zeros_like(dt))
+    return dt
+
+
+def _init_dt_stats():
+    return {
+        "positive": {"sum": 0.0, "sum_sq": 0.0, "count": 0, "nonfinite": 0},
+        "optical_negative": {"sum": 0.0, "sum_sq": 0.0, "count": 0, "nonfinite": 0},
+        "gw_negative": {"sum": 0.0, "sum_sq": 0.0, "count": 0, "nonfinite": 0},
+        "hard_negative": {"sum": 0.0, "sum_sq": 0.0, "count": 0, "nonfinite": 0},
+    }
+
+
+def _accumulate_dt_stats(stats, key, dt_days):
+    finite = torch.isfinite(dt_days)
+    n_nonfinite = int((~finite).sum().item())
+    stats[key]["nonfinite"] += n_nonfinite
+    if not finite.any():
+        return
+    vals = dt_days[finite].to(torch.float32)
+    stats[key]["sum"] += float(vals.sum().item())
+    stats[key]["sum_sq"] += float((vals * vals).sum().item())
+    stats[key]["count"] += int(vals.numel())
+
+
+def _finalize_dt_stats(stats):
+    out = {}
+    for key, entry in stats.items():
+        count = int(entry["count"])
+        if count <= 0:
+            out[key] = {"mean_days": 0.0, "std_days": 0.0, "count": 0, "nonfinite": int(entry["nonfinite"])}
+            continue
+        mean = entry["sum"] / float(count)
+        var = max(0.0, entry["sum_sq"] / float(count) - mean * mean)
+        out[key] = {
+            "mean_days": float(mean),
+            "std_days": float(var ** 0.5),
+            "count": count,
+            "nonfinite": int(entry["nonfinite"]),
+        }
+    return out
+
+
+def _summarize_dt_distribution(dt_days, signed_quantiles=(0.05, 0.5, 0.95), abs_quantiles=(0.5, 0.9, 0.95)):
+    if dt_days is None:
+        return {}
+    vals = torch.as_tensor(dt_days, dtype=torch.float32).flatten()
+    finite = torch.isfinite(vals)
+    n_nonfinite = int((~finite).sum().item())
+    if not finite.any():
+        return {"count": 0, "nonfinite": n_nonfinite}
+    v = vals[finite]
+    out = {
+        "count": int(v.numel()),
+        "nonfinite": n_nonfinite,
+        "mean_days": float(v.mean().item()),
+        "std_days": float(torch.std(v, unbiased=False).item()) if v.numel() > 1 else 0.0,
+        "min_days": float(v.min().item()),
+        "max_days": float(v.max().item()),
+    }
+    if signed_quantiles:
+        q = torch.tensor(list(signed_quantiles), device=v.device, dtype=v.dtype)
+        q_vals = torch.quantile(v, q)
+        out["quantiles_days"] = {
+            f"p{int(float(qi) * 100)}": float(q_vals[i].item()) for i, qi in enumerate(signed_quantiles)
+        }
+    abs_v = v.abs()
+    abs_out = {
+        "mean_days": float(abs_v.mean().item()),
+        "std_days": float(torch.std(abs_v, unbiased=False).item()) if abs_v.numel() > 1 else 0.0,
+        "min_days": float(abs_v.min().item()),
+        "max_days": float(abs_v.max().item()),
+    }
+    if abs_quantiles:
+        q = torch.tensor(list(abs_quantiles), device=abs_v.device, dtype=abs_v.dtype)
+        q_vals = torch.quantile(abs_v, q)
+        abs_out["quantiles_days"] = {
+            f"p{int(float(qi) * 100)}": float(q_vals[i].item()) for i, qi in enumerate(abs_quantiles)
+        }
+    out["abs"] = abs_out
+    return out
+
+
+def compute_dt_bin_metrics(probs, labels, abs_dt_days, edges):
+    """
+    Compute classification metrics in |dt| buckets.
+    Buckets are [e_i, e_{i+1}) except last bucket [e_{n-2}, e_{n-1}].
+    """
+    if probs is None or labels is None or abs_dt_days is None:
+        return {}
+    if len(probs) == 0:
+        return {}
+    edges = list(edges)
+    out = {
+        "edges_days": [float(e) if np.isfinite(e) else "inf" for e in edges],
+        "bins": [],
+    }
+    finite = torch.isfinite(abs_dt_days) & torch.isfinite(probs) & torch.isfinite(labels.to(torch.float32))
+    if not finite.any():
+        return out
+    p = probs[finite]
+    y = labels[finite]
+    d = abs_dt_days[finite]
+    for i in range(len(edges) - 1):
+        lo = edges[i]
+        hi = edges[i + 1]
+        if np.isfinite(hi):
+            mask = (d >= float(lo)) & (d < float(hi))
+            label = f"[{lo},{hi})"
+        else:
+            mask = d >= float(lo)
+            label = f"[{lo},inf)"
+        n = int(mask.sum().item())
+        if n <= 0:
+            out["bins"].append({"range": label, "n": 0})
+            continue
+        n_pos = int((y[mask] == 1).sum().item())
+        n_neg = int((y[mask] == 0).sum().item())
+        preds = (p[mask] >= 0.5).long()
+        tp = int(((preds == 1) & (y[mask] == 1)).sum().item())
+        fp = int(((preds == 1) & (y[mask] == 0)).sum().item())
+        tn = int(((preds == 0) & (y[mask] == 0)).sum().item())
+        fn = int(((preds == 0) & (y[mask] == 1)).sum().item())
+        precision = float(tp / (tp + fp)) if (tp + fp) > 0 else 0.0
+        recall = float(tp / (tp + fn)) if (tp + fn) > 0 else 0.0
+        f1_conf = float(2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
+        entry = {
+            "range": label,
+            "n": n,
+            "n_pos": n_pos,
+            "n_neg": n_neg,
+            "precision": precision,
+            "recall": recall,
+            "f1_confusion": f1_conf,
+            "tp": tp,
+            "fp": fp,
+            "tn": tn,
+            "fn": fn,
+        }
+        if n_pos > 0 and n_neg > 0:
+            m = compute_classification_metrics(p[mask], y[mask])
+            entry.update(
+                {
+                    "auroc": float(m.get("auroc", 0.0)),
+                    "auprc": float(m.get("auprc", 0.0)),
+                    "f1_optimal": float(m.get("f1_optimal", 0.0)),
+                    "ece": float(m.get("ece", 0.0)),
+                }
+            )
+        out["bins"].append(entry)
+    return out
+
+
+def compute_dt_macro_metrics(dt_bins: Dict[str, object]) -> Dict[str, float]:
+    """Macro-average metrics over |dt| bins that contain both pos and neg."""
+    out: Dict[str, float] = {}
+    bins = dt_bins.get("bins", []) if isinstance(dt_bins, dict) else []
+    if not bins:
+        return out
+    eligible = [b for b in bins if b.get("n_pos", 0) > 0 and b.get("n_neg", 0) > 0]
+    if not eligible:
+        out["bins_used"] = 0
+        out["bins_total"] = len(bins)
+        return out
+    for key in ("auroc", "auprc", "f1_optimal", "ece"):
+        vals = [float(b.get(key, 0.0)) for b in eligible if key in b]
+        if vals:
+            out[key] = float(np.mean(vals))
+    out["bins_used"] = int(len(eligible))
+    out["bins_total"] = int(len(bins))
+    return out
+
+
+class EvalNegativeTimeOffsetPolicy:
+    def __init__(
+        self,
+        enabled: bool,
+        dist_npz: Optional[str],
+        dist_key: str,
+        eval_mode: str,
+        eval_quantiles: str,
+        scale_divisor: float,
+        seed: int,
+        bank_size: int,
+    ):
+        self.enabled = bool(enabled)
+        self.scale_divisor = float(scale_divisor)
+        if self.scale_divisor <= 0:
+            raise ValueError("neg_offset_scale_days_divisor must be > 0.")
+
+        self.eval_mode = str(eval_mode).strip().lower()
+        self.eval_offsets_days: List[float] = [0.0]
+        self.rng = np.random.default_rng(int(seed))
+        self.sample_bank: Optional[np.ndarray] = None
+        self.info: Dict[str, object] = {
+            "enabled": self.enabled,
+            "scale_divisor": self.scale_divisor,
+            "eval_mode": self.eval_mode,
+            "seed": int(seed),
+        }
+
+        if not self.enabled:
+            self.info["eval_offsets_days"] = [0.0]
+            return
+
+        if dist_npz is None:
+            raise ValueError("neg_time_offset_enable=true requires neg_offset_dist_npz.")
+        npz_path = Path(dist_npz)
+        if not npz_path.exists():
+            raise FileNotFoundError(f"Negative offset distribution file not found: {npz_path}")
+
+        with np.load(npz_path, allow_pickle=False) as npz:
+            if dist_key not in npz:
+                raise KeyError(
+                    f"neg_offset_dist_key '{dist_key}' not found in {npz_path}. "
+                    f"Available keys: {list(npz.keys())}"
+                )
+            values = np.asarray(npz[dist_key], dtype=np.float64).reshape(-1)
+
+        values = values[np.isfinite(values)]
+        if values.size == 0:
+            raise ValueError(
+                f"Negative offset distribution is empty after filtering NaN/Inf: "
+                f"{npz_path}:{dist_key}"
+            )
+
+        samples = values.astype(np.float32, copy=False)
+        bank_size = max(1, int(bank_size))
+        if bank_size < int(samples.shape[0]):
+            bank_idx = self.rng.integers(0, int(samples.shape[0]), size=bank_size, endpoint=False)
+            self.sample_bank = samples[bank_idx].astype(np.float32, copy=False)
+        else:
+            self.sample_bank = samples
+
+        if self.eval_mode == "quantile_ensemble":
+            q = parse_quantiles(eval_quantiles)
+            q_vals = np.quantile(values, np.asarray(q, dtype=np.float64))
+            self.eval_offsets_days = [float(v) for v in q_vals.tolist()]
+        elif self.eval_mode == "median":
+            self.eval_offsets_days = [float(np.quantile(values, 0.5))]
+        elif self.eval_mode == "zero":
+            self.eval_offsets_days = [0.0]
+        else:
+            raise ValueError(
+                f"Unsupported neg_offset_eval_mode='{self.eval_mode}'. "
+                "Expected one of: quantile_ensemble|median|zero."
+            )
+
+        self.info.update(
+            {
+                "dist_path": str(npz_path),
+                "dist_key": str(dist_key),
+                "dist_count": int(values.shape[0]),
+                "dist_min_days": float(np.min(values)),
+                "dist_max_days": float(np.max(values)),
+                "dist_mean_days": float(np.mean(values)),
+                "dist_std_days": float(np.std(values)),
+                "bank_size": int(self.sample_bank.shape[0]) if self.sample_bank is not None else 0,
+                "eval_offsets_days": [float(v) for v in self.eval_offsets_days],
+            }
+        )
+
+    def sample_offsets(self, batch_size: int) -> np.ndarray:
+        if not self.enabled:
+            return np.zeros((int(batch_size),), dtype=np.float32)
+        if self.sample_bank is None:
+            raise RuntimeError("Negative time offset sample bank is not initialized.")
+        idx = self.rng.integers(0, int(self.sample_bank.shape[0]), size=int(batch_size), endpoint=False)
+        return self.sample_bank[idx].astype(np.float32, copy=False)
 
 
 def _autocast_context(device, amp_dtype, enabled):
@@ -163,6 +572,29 @@ def load_model(args, device):
     def _get(key, default):
         return saved_args.get(key, default)
 
+    cls_time_delta_enable_trained = bool(_get("cls_time_delta_enable", False))
+    cls_time_delta_enable_requested = bool(
+        choose_value(
+            args.cls_time_delta_enable,
+            saved_args,
+            "cls_time_delta_enable",
+            default=cls_time_delta_enable_trained,
+        )
+    )
+    if cls_time_delta_enable_requested != cls_time_delta_enable_trained:
+        print(
+            "WARNING: Ignoring cls_time_delta_enable override in eval to avoid checkpoint "
+            "shape mismatch. Using checkpoint value "
+            f"{cls_time_delta_enable_trained}."
+        )
+    cls_time_delta_enable = cls_time_delta_enable_trained
+    cls_time_delta_scale_days = float(
+        choose_value(args.cls_time_delta_scale_days, saved_args, "cls_time_delta_scale_days", default=30.0)
+    )
+    cls_time_delta_clip = float(
+        choose_value(args.cls_time_delta_clip, saved_args, "cls_time_delta_clip", default=10.0)
+    )
+
     model_args = {
         "enc_dim": _get("enc_dim", 128),
         "proj_dim": _get("proj_dim", 256),
@@ -184,6 +616,21 @@ def load_model(args, device):
         "itc_label_smoothing": _get("itc_label_smoothing", 0.0),
         "fusion_attn_dim": _get("fusion_attn_dim", None),
         "fusion_hidden_dim": _get("fusion_hidden_dim", None),
+        "time_compat_weight": _get("time_compat_weight", 0.6),
+        "time_compat_tau_days": _get("time_compat_tau_days", 30.0),
+        "time_compat_power": _get("time_compat_power", 2.0),
+        "time_compat_max_penalty": _get("time_compat_max_penalty", 8.0),
+        "cls_time_delta_enable": cls_time_delta_enable,
+        "cls_time_delta_scale_days": cls_time_delta_scale_days,
+        "cls_time_delta_clip": cls_time_delta_clip,
+        "nonkn_cls_base_field": str(
+            choose_value(
+                args.nonkn_cls_base_field,
+                saved_args,
+                "nonkn_cls_base_field",
+                default="zero_time_mjd_cls_base",
+            )
+        ),
     }
 
     model = GWOpticalALBEFModel(
@@ -204,6 +651,13 @@ def load_model(args, device):
         fusion_attn_dim=model_args["fusion_attn_dim"],
         fusion_hidden_dim=model_args["fusion_hidden_dim"],
         dual_fusion=model_args["dual_fusion"],
+        time_compat_weight=model_args["time_compat_weight"],
+        time_compat_tau_days=model_args["time_compat_tau_days"],
+        time_compat_power=model_args["time_compat_power"],
+        time_compat_max_penalty=model_args["time_compat_max_penalty"],
+        cls_time_delta_enable=model_args["cls_time_delta_enable"],
+        cls_time_delta_scale_days=model_args["cls_time_delta_scale_days"],
+        cls_time_delta_clip=model_args["cls_time_delta_clip"],
     )
     # Strip _orig_mod. prefix from torch.compile'd checkpoints
     state_dict = ckpt["model_state_dict"]
@@ -217,7 +671,16 @@ def load_model(args, device):
     return model, model_args, saved_args
 
 
-def build_test_dataloader(args, saved_args):
+def build_test_dataloader(
+    args,
+    saved_args,
+    return_zero_time_mjd=False,
+    nonkn_cls_base_field="zero_time_mjd_cls_base",
+    extra_negative_timeaware_enable=False,
+    extra_negative_timeaware_windows_days=None,
+    extra_negative_timeaware_min_candidates=1,
+    extra_negative_timeaware_seed=42,
+):
     """Build test dataloader from independent test HDF5.
     
     The number of steps is controlled by args.test_steps. If None,
@@ -230,6 +693,12 @@ def build_test_dataloader(args, saved_args):
         args.test_data_path,
         negative_h5_path=args.neg_data_path,
         negative_group=args.neg_group,
+        return_zero_time_mjd=bool(return_zero_time_mjd),
+        nonkn_cls_base_field=str(nonkn_cls_base_field),
+        extra_negative_timeaware_enable=bool(extra_negative_timeaware_enable),
+        extra_negative_timeaware_windows_days=extra_negative_timeaware_windows_days,
+        extra_negative_timeaware_min_candidates=int(extra_negative_timeaware_min_candidates),
+        extra_negative_timeaware_seed=int(extra_negative_timeaware_seed),
     )
     gw_to_lc = build_gw_to_lc_mapping(args.test_data_path)
     n_gw = len(gw_to_lc)
@@ -266,7 +735,15 @@ def build_ref_time(batch_size, n_ref, ref_start, ref_end, device, dtype):
     return ref.unsqueeze(0).repeat(batch_size, 1)
 
 
-def load_negative_optical_samples(neg_data_path, neg_group, n_samples=5000, seed=42):
+def load_negative_optical_samples(
+    neg_data_path,
+    neg_group,
+    n_samples=5000,
+    seed=42,
+    require_zero_time_mjd_base=False,
+    require_zero_time_mjd_cls_base=False,
+    nonkn_cls_base_field="zero_time_mjd_cls_base",
+):
     """Load negative optical samples (non-KN transients) from external HDF5 file.
     
     Args:
@@ -287,6 +764,16 @@ def load_negative_optical_samples(neg_data_path, neg_group, n_samples=5000, seed
     with h5py.File(neg_data_path, 'r') as f:
         grp = f[neg_group]
         total_samples = grp['values'].shape[0]
+        has_zero_time_mjd_base = 'zero_time_mjd_base' in grp
+        has_zero_time_mjd_cls_base = str(nonkn_cls_base_field) in grp
+        if require_zero_time_mjd_base and not has_zero_time_mjd_base:
+            raise KeyError(
+                f"cls_time_delta_enable=true requires '{neg_group}/zero_time_mjd_base' in {neg_data_path}"
+            )
+        if require_zero_time_mjd_cls_base and not has_zero_time_mjd_cls_base:
+            raise KeyError(
+                f"cls_time_delta_enable=true requires '{neg_group}/{nonkn_cls_base_field}' in {neg_data_path}"
+            )
         
         # Randomly sample indices
         n_samples = min(n_samples, total_samples)
@@ -303,6 +790,10 @@ def load_negative_optical_samples(neg_data_path, neg_group, n_samples=5000, seed
             'errors': torch.from_numpy(grp['errors'][sample_indices]),
             'coordinates': torch.from_numpy(grp['coordinates'][sample_indices]),
         }
+        if has_zero_time_mjd_base:
+            neg_data['zero_time_mjd_base'] = torch.from_numpy(grp['zero_time_mjd_base'][sample_indices])
+        if has_zero_time_mjd_cls_base:
+            neg_data['zero_time_mjd_cls_base'] = torch.from_numpy(grp[str(nonkn_cls_base_field)][sample_indices])
         
         # Load types if available
         if 'types' in grp:
@@ -310,6 +801,235 @@ def load_negative_optical_samples(neg_data_path, neg_group, n_samples=5000, seed
                                  else grp['types'][i] for i in sample_indices]
         
     return neg_data
+
+
+class EvalTimeAwareExtraNegativeSampler:
+    """
+    Time-aware extra-negative sampler using sorted cls-base times and ring windows.
+
+    Windows/min-candidates reuse hard-negative configuration from saved args.
+    """
+    def __init__(self, neg_zero_time_mjd_cls_base: torch.Tensor, windows_days: List[float], min_candidates: int):
+        times = np.asarray(
+            neg_zero_time_mjd_cls_base.detach().cpu().numpy(), dtype=np.float64
+        ).reshape(-1)
+        self.total = int(times.shape[0])
+        self.windows_days = sorted(set(float(w) for w in windows_days if float(w) > 0))
+        self.min_candidates = max(1, int(min_candidates))
+        self.enabled = False
+        self._sorted_times = None
+        self._sorted_to_orig = None
+        self._level_probs = np.zeros((0,), dtype=np.float64)
+
+        if self.total <= 0 or len(self.windows_days) == 0:
+            return
+
+        valid = np.isfinite(times)
+        if not valid.any():
+            return
+        valid_idx = np.nonzero(valid)[0].astype(np.int64, copy=False)
+        valid_times = times[valid]
+        order = np.argsort(valid_times, kind="mergesort")
+        self._sorted_times = valid_times[order]
+        self._sorted_to_orig = valid_idx[order]
+
+        weights = np.asarray([0.5 ** i for i in range(len(self.windows_days))], dtype=np.float64)
+        wsum = float(weights.sum())
+        if wsum <= 0:
+            self._level_probs = np.full((len(self.windows_days),), 1.0 / float(len(self.windows_days)), dtype=np.float64)
+        else:
+            self._level_probs = weights / wsum
+        self.enabled = True
+
+    def _uniform(self) -> int:
+        return int(np.random.randint(0, self.total))
+
+    def sample_one(self, anchor_mjd: float) -> Tuple[int, bool]:
+        if (not self.enabled) or (not np.isfinite(anchor_mjd)):
+            return self._uniform(), False
+
+        times = self._sorted_times
+        sorted_to_orig = self._sorted_to_orig
+        windows = self.windows_days
+        lefts = np.searchsorted(times, anchor_mjd - np.asarray(windows, dtype=np.float64), side="left")
+        rights = np.searchsorted(times, anchor_mjd + np.asarray(windows, dtype=np.float64), side="right")
+
+        eligible = []
+        for i in range(len(windows)):
+            outer_l = int(lefts[i])
+            outer_r = int(rights[i])
+            if i == 0:
+                count = max(0, outer_r - outer_l)
+            else:
+                inner_l = int(lefts[i - 1])
+                inner_r = int(rights[i - 1])
+                count = max(0, inner_l - outer_l) + max(0, outer_r - inner_r)
+            if count >= self.min_candidates:
+                eligible.append(i)
+
+        if not eligible:
+            return self._uniform(), False
+
+        pri = self._level_probs[np.asarray(eligible, dtype=np.int64)]
+        pri_sum = float(pri.sum())
+        if pri_sum <= 0:
+            pri = np.full((len(eligible),), 1.0 / float(len(eligible)), dtype=np.float64)
+        else:
+            pri = pri / pri_sum
+        picked = int(np.random.choice(np.asarray(eligible, dtype=np.int64), p=pri))
+
+        outer_l = int(lefts[picked])
+        outer_r = int(rights[picked])
+        if picked == 0:
+            count = max(0, outer_r - outer_l)
+            if count <= 0:
+                return self._uniform(), False
+            sorted_idx = outer_l + int(np.random.randint(0, count))
+            return int(sorted_to_orig[sorted_idx]), True
+
+        inner_l = int(lefts[picked - 1])
+        inner_r = int(rights[picked - 1])
+        left_count = max(0, inner_l - outer_l)
+        right_count = max(0, outer_r - inner_r)
+        count = left_count + right_count
+        if count <= 0:
+            return self._uniform(), False
+
+        draw = int(np.random.randint(0, count))
+        if draw < left_count:
+            sorted_idx = outer_l + draw
+        else:
+            sorted_idx = inner_r + (draw - left_count)
+        return int(sorted_to_orig[sorted_idx]), True
+
+    def sample_batch(self, anchor_times_mjd: torch.Tensor):
+        anchor_np = np.asarray(anchor_times_mjd.detach().cpu().numpy(), dtype=np.float64).reshape(-1)
+        out = np.empty((anchor_np.shape[0],), dtype=np.int64)
+        used = 0
+        fallback = 0
+        for i, a in enumerate(anchor_np):
+            idx, ok = self.sample_one(float(a))
+            out[i] = int(idx)
+            if ok:
+                used += 1
+            else:
+                fallback += 1
+        return out.tolist(), int(used), int(fallback)
+
+
+class DtMatchSampler:
+    """Sample target |dt| values based on positive-pair distribution."""
+    def __init__(
+        self,
+        strategy: str,
+        window_days: float,
+        quantiles: Optional[List[float]],
+        target: str,
+        apply_to: List[str],
+        seed: int = 42,
+    ):
+        self.strategy = str(strategy).strip().lower()
+        self.window_days = float(window_days)
+        self.quantiles = list(quantiles or [])
+        self.target = str(target).strip().lower()
+        self.apply_to = list(apply_to or [])
+        self.enabled = self.strategy in ("window", "quantile")
+        self._rng = np.random.default_rng(int(seed))
+
+    def sample_targets(self, dt_pos: Optional[torch.Tensor]) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        if not self.enabled or dt_pos is None:
+            return None, None
+        if dt_pos.numel() == 0:
+            return None, None
+        dt_pos_f = dt_pos.to(torch.float32)
+        abs_pos = dt_pos_f.abs()
+        if self.strategy == "quantile":
+            if not self.quantiles:
+                return None, None
+            abs_cpu = abs_pos.detach().cpu().numpy()
+            qvals = np.quantile(abs_cpu, np.asarray(self.quantiles, dtype=np.float64))
+            if qvals.ndim == 0:
+                qvals = np.array([float(qvals)], dtype=np.float64)
+            idx = self._rng.integers(0, len(qvals), size=abs_pos.numel())
+            target_abs = torch.as_tensor(qvals[idx], device=dt_pos.device, dtype=torch.float32)
+        else:
+            target_abs = abs_pos
+        sign = torch.sign(dt_pos_f)
+        sign = torch.where(sign == 0, torch.ones_like(sign), sign)
+        target_signed = target_abs * sign
+        return target_abs, target_signed
+
+
+class NegTimeIndex:
+    """Index of negative-GW times for fast window sampling around target |dt|."""
+    def __init__(self, times: torch.Tensor, indices: np.ndarray):
+        self.enabled = False
+        self._sorted_times = None
+        self._sorted_to_orig = None
+        if times is None or indices is None or len(indices) == 0:
+            return
+        t = np.asarray(times.detach().cpu().numpy(), dtype=np.float64).reshape(-1)
+        idx = np.asarray(indices, dtype=np.int64).reshape(-1)
+        if t.shape[0] <= 0 or idx.shape[0] <= 0:
+            return
+        valid = np.isfinite(t)
+        if not valid.any():
+            return
+        t = t[valid]
+        idx = idx[valid]
+        order = np.argsort(t, kind="mergesort")
+        self._sorted_times = t[order]
+        self._sorted_to_orig = idx[order]
+        self.enabled = True
+
+    def _uniform(self) -> int:
+        total = len(self._sorted_to_orig) if self._sorted_to_orig is not None else 0
+        if total <= 0:
+            return 0
+        return int(self._sorted_to_orig[np.random.randint(0, total)])
+
+    def sample_one(self, anchor_time: float, target_abs: float, window_days: float) -> Tuple[int, bool]:
+        if (not self.enabled) or (not np.isfinite(anchor_time)) or (not np.isfinite(target_abs)):
+            return self._uniform(), False
+        if window_days <= 0:
+            return self._uniform(), False
+        times = self._sorted_times
+        sorted_to_orig = self._sorted_to_orig
+        t_abs = float(abs(target_abs))
+        centers = [anchor_time - t_abs, anchor_time + t_abs]
+        if t_abs <= 0:
+            centers = [anchor_time]
+        ranges = []
+        for c in centers:
+            l = int(np.searchsorted(times, c - window_days, side="left"))
+            r = int(np.searchsorted(times, c + window_days, side="right"))
+            if r > l:
+                ranges.append((l, r))
+        if not ranges:
+            return self._uniform(), False
+        counts = [r - l for l, r in ranges]
+        total = int(sum(counts))
+        draw = int(np.random.randint(0, total))
+        for (l, r), cnt in zip(ranges, counts):
+            if draw < cnt:
+                return int(sorted_to_orig[l + draw]), True
+            draw -= cnt
+        return self._uniform(), False
+
+    def sample_batch(self, anchor_times: torch.Tensor, target_abs: torch.Tensor, window_days: float) -> Tuple[np.ndarray, int, int]:
+        anchor_np = np.asarray(anchor_times.detach().cpu().numpy(), dtype=np.float64).reshape(-1)
+        target_np = np.asarray(target_abs.detach().cpu().numpy(), dtype=np.float64).reshape(-1)
+        out = np.empty((anchor_np.shape[0],), dtype=np.int64)
+        used = 0
+        fallback = 0
+        for i, (a, t) in enumerate(zip(anchor_np, target_np)):
+            idx, ok = self.sample_one(float(a), float(t), float(window_days))
+            out[i] = int(idx)
+            if ok:
+                used += 1
+            else:
+                fallback += 1
+        return out, int(used), int(fallback)
 
 
 def load_negative_gw_indices(test_data_path):
@@ -330,6 +1050,33 @@ def load_negative_gw_indices(test_data_path):
     else:
         print(f"Loaded {neg_gw_indices.size} GW negatives (has_kn=0).")
     return neg_gw_indices
+
+
+def load_gw_event_time_mjd_table(test_data_path, device, required=False):
+    ds_path = "events/gw_data/event_time_mjd"
+    if test_data_path is None or not os.path.exists(test_data_path):
+        if required:
+            raise FileNotFoundError(f"test_data_path not found for event_time_mjd: {test_data_path}")
+        print(f"WARNING: Test data path not found for event_time_mjd: {test_data_path}")
+        return None
+    with h5py.File(test_data_path, "r") as f:
+        n_gw = int(f["events/gw_data/scalars"].shape[0])
+        if ds_path not in f:
+            if required:
+                raise KeyError(f"Required field missing: {ds_path} in {test_data_path}")
+            print(f"WARNING: '{ds_path}' missing in {test_data_path}.")
+            return None
+        arr = np.asarray(f[ds_path][:], dtype=np.float32)
+    if arr.shape[0] != n_gw:
+        if required:
+            raise ValueError(
+                f"event_time_mjd length mismatch in {test_data_path}: got {arr.shape[0]}, expected {n_gw}"
+            )
+        print(
+            f"WARNING: event_time_mjd length mismatch in {test_data_path}: got {arr.shape[0]}, expected {n_gw}"
+        )
+        return None
+    return torch.from_numpy(arr).to(device=device)
 
 
 def _normalize_source_type(raw_value):
@@ -404,7 +1151,8 @@ def _filter_finite_embedding_rows(feat_g, feat_o, gw_indices):
 
 @torch.no_grad()
 def extract_all_embeddings(model, loader, device, model_args, gw_source_types=None,
-                           amp_dtype=torch.float32, amp_enabled=False):
+                           amp_dtype=torch.float32, amp_enabled=False,
+                           gw_event_time_mjd_table=None):
     """Run full forward pass, collecting embeddings and predictions.
 
     For classification evaluation, both matched (positive) and mismatched
@@ -429,14 +1177,34 @@ def extract_all_embeddings(model, loader, device, model_args, gw_source_types=No
     ref_start = model_args["ref_start"]
     ref_end = model_args["ref_end"]
     dual = _is_dual_fusion_model(model)
+    use_cls_time_delta = bool(model_args.get("cls_time_delta_enable", False))
 
     for batch_data in tqdm(loader, desc="Extracting embeddings"):
         # Unpack
-        if len(batch_data) == 13:
-            (gw_s, gw_m, opt_t, opt_v, opt_mask, opt_err, opt_coords,
-             gw_indices, neg_t, neg_v, neg_mask, neg_err, neg_coords) = batch_data
+        if len(batch_data) >= 16:
+            (
+                gw_s, gw_m, opt_t, opt_v, opt_mask, opt_err, opt_coords,
+                gw_indices, neg_t, neg_v, neg_mask, neg_err, neg_coords,
+                opt_zero_time_mjd_base, _neg_zero_time_mjd_base, _neg_zero_time_mjd_cls_base,
+            ) = batch_data[:16]
+        elif len(batch_data) == 15:
+            (
+                gw_s, gw_m, opt_t, opt_v, opt_mask, opt_err, opt_coords,
+                gw_indices, neg_t, neg_v, neg_mask, neg_err, neg_coords,
+                opt_zero_time_mjd_base, _neg_zero_time_mjd_base,
+            ) = batch_data
+        elif len(batch_data) == 13:
+            (
+                gw_s, gw_m, opt_t, opt_v, opt_mask, opt_err, opt_coords,
+                gw_indices, neg_t, neg_v, neg_mask, neg_err, neg_coords,
+            ) = batch_data
+            opt_zero_time_mjd_base = None
         else:
-            gw_s, gw_m, opt_t, opt_v, opt_mask, opt_err, opt_coords, gw_indices = batch_data[:8]
+            if len(batch_data) >= 9:
+                gw_s, gw_m, opt_t, opt_v, opt_mask, opt_err, opt_coords, gw_indices, opt_zero_time_mjd_base = batch_data[:9]
+            else:
+                gw_s, gw_m, opt_t, opt_v, opt_mask, opt_err, opt_coords, gw_indices = batch_data[:8]
+                opt_zero_time_mjd_base = None
 
         gw_s = gw_s.to(device)
         gw_m = gw_m.to(device)
@@ -446,6 +1214,11 @@ def extract_all_embeddings(model, loader, device, model_args, gw_source_types=No
         opt_err = opt_err.to(device)
         opt_coords = opt_coords.to(device)
         gw_indices = gw_indices.to(device).long()
+        batch_event_time_mjd = None
+        if gw_event_time_mjd_table is not None:
+            batch_event_time_mjd = gw_event_time_mjd_table[gw_indices]
+        if use_cls_time_delta and opt_zero_time_mjd_base is not None:
+            opt_zero_time_mjd_base = opt_zero_time_mjd_base.to(device).to(torch.float32)
         batch_sources = None
         if gw_source_types is not None:
             gw_indices_cpu = gw_indices.detach().cpu().numpy().tolist()
@@ -475,7 +1248,12 @@ def extract_all_embeddings(model, loader, device, model_args, gw_source_types=No
                     cred_level = None
 
                 # Positive pairs (matched GW-optical)
-                logits_pos = model.fusion_logits(g, h_l, z_l=z_l, H_gw=H_gw, cred_level=cred_level)
+                dt_pos = None
+                if use_cls_time_delta and opt_zero_time_mjd_base is not None and batch_event_time_mjd is not None:
+                    dt_pos = compute_time_delta_days(opt_zero_time_mjd_base, batch_event_time_mjd)
+                logits_pos = model.fusion_logits(
+                    g, h_l, z_l=z_l, H_gw=H_gw, cred_level=cred_level, time_delta_days=dt_pos
+                )
 
                 # Negative pairs (shift optical by 1 so each GW pairs with wrong optical)
                 shift = 1
@@ -487,7 +1265,14 @@ def extract_all_embeddings(model, loader, device, model_args, gw_source_types=No
                     cred_level_neg = compute_credible_level(gw_m, opt_coords_neg)
                 else:
                     cred_level_neg = None
-                logits_neg = model.fusion_logits(g, h_l_neg, z_l=z_l_neg, H_gw=H_gw, cred_level=cred_level_neg)
+                dt_neg = None
+                if use_cls_time_delta and opt_zero_time_mjd_base is not None and batch_event_time_mjd is not None:
+                    dt_neg = compute_time_delta_days(
+                        torch.roll(opt_zero_time_mjd_base, shifts=shift, dims=0), batch_event_time_mjd
+                    )
+                logits_neg = model.fusion_logits(
+                    g, h_l_neg, z_l=z_l_neg, H_gw=H_gw, cred_level=cred_level_neg, time_delta_days=dt_neg
+                )
 
                 # Similarity matrix for retrieval
                 temperature = model.log_temp.exp().clamp(
@@ -565,7 +1350,14 @@ def extract_triplet_logits(model, loader, device, model_args, neg_optical_data,
                            neg_gw_indices,
                            gw_source_types=None,
                            shuffle_gw=False, shuffle_seed=42,
-                           amp_dtype=torch.float32, amp_enabled=False):
+                           amp_dtype=torch.float32, amp_enabled=False,
+                           neg_offset_policy: Optional[EvalNegativeTimeOffsetPolicy] = None,
+                           gw_event_time_mjd_table=None,
+                           dt_matcher: Optional[DtMatchSampler] = None,
+                           neg_gw_time_index: Optional[NegTimeIndex] = None,
+                           pos_time_offsets_days: Optional[List[float]] = None,
+                           extra_negative_timeaware_windows_days: Optional[List[float]] = None,
+                           extra_negative_timeaware_min_candidates: int = 1):
     """Extract logits for four types of sample pairs.
     
     1. Positive pairs (GW, KN): matched GW-KN optical pairs
@@ -586,6 +1378,9 @@ def extract_triplet_logits(model, loader, device, model_args, neg_optical_data,
         gw_source_types: Optional list of source_type labels indexed by GW ID
         shuffle_gw: If True, randomly shuffle GW within each batch (ablation test)
         shuffle_seed: Random seed for GW shuffling
+        dt_matcher: Optional DtMatchSampler for |dt| matching
+        neg_gw_time_index: Optional NegTimeIndex for time-matched GW negatives
+        pos_time_offsets_days: Optional list of positive time offsets for shortcut probe
         
     Returns:
         dict with logits for all pair types and source labels
@@ -599,6 +1394,22 @@ def extract_triplet_logits(model, loader, device, model_args, neg_optical_data,
     source_optical_neg = [] # source_type for optical negatives
     source_gw_neg = []      # source_type for GW negatives
     source_hard_neg = []    # source_type for semi-hard negatives
+    use_cls_time_delta = bool(model_args.get("cls_time_delta_enable", False))
+    dt_stats = _init_dt_stats()
+    dt_positive_all = []
+    dt_optical_all = []
+    dt_gw_all = []
+    dt_hard_all = []
+
+    pos_time_offsets = [float(v) for v in (pos_time_offsets_days or []) if np.isfinite(float(v))]
+    logits_positive_shifted = {str(v): [] for v in pos_time_offsets}
+    dt_matcher_active = bool(
+        dt_matcher is not None
+        and dt_matcher.enabled
+        and use_cls_time_delta
+        and gw_event_time_mjd_table is not None
+    )
+    dt_match_targets = set(dt_matcher.apply_to) if dt_matcher_active else set()
     
     n_ref = model_args["n_ref"]
     ref_start = model_args["ref_start"]
@@ -614,6 +1425,9 @@ def extract_triplet_logits(model, loader, device, model_args, neg_optical_data,
     has_neg_gw = neg_gw_indices is not None and len(neg_gw_indices) > 0
     neg_idx = 0
     gw_neg_rng = np.random.default_rng(shuffle_seed)
+    timeaware_sampler = None
+    timeaware_used_total = 0
+    timeaware_fallback_total = 0
     
     if has_neg_optical:
         neg_values = neg_optical_data['values'].to(device)
@@ -621,8 +1435,24 @@ def extract_triplet_logits(model, loader, device, model_args, neg_optical_data,
         neg_masks = neg_optical_data['masks'].to(device)
         neg_errors = neg_optical_data['errors'].to(device)
         neg_coords = neg_optical_data['coordinates'].to(device)
+        neg_zero_time_mjd_cls_base = None
+        if use_cls_time_delta:
+            if 'zero_time_mjd_cls_base' not in neg_optical_data:
+                raise KeyError("cls_time_delta_enable=true requires zero_time_mjd_cls_base in neg_optical_data.")
+            neg_zero_time_mjd_cls_base = neg_optical_data['zero_time_mjd_cls_base'].to(device).to(torch.float32)
         neg_types_list = neg_optical_data.get('types', ['unknown'] * len(neg_values))
         total_neg = len(neg_values)
+        if (
+            use_cls_time_delta
+            and extra_negative_timeaware_windows_days is not None
+            and len(extra_negative_timeaware_windows_days) > 0
+            and neg_zero_time_mjd_cls_base is not None
+        ):
+            timeaware_sampler = EvalTimeAwareExtraNegativeSampler(
+                neg_zero_time_mjd_cls_base=neg_zero_time_mjd_cls_base,
+                windows_days=extra_negative_timeaware_windows_days,
+                min_candidates=int(extra_negative_timeaware_min_candidates),
+            )
 
     gw_file = None
     gw_scalars_ds = None
@@ -645,8 +1475,29 @@ def extract_triplet_logits(model, loader, device, model_args, neg_optical_data,
     try:
         for batch_data in tqdm(loader, desc="Extracting triplet logits"):
             # Unpack - get positive KN data
-            if len(batch_data) >= 8:
+            if len(batch_data) >= 16:
+                (
+                    gw_s, gw_m, opt_t, opt_v, opt_mask, opt_err, opt_coords, gw_indices,
+                    _neg_t, _neg_v, _neg_mask, _neg_err, _neg_coords,
+                    opt_zero_time_mjd_base, _neg_zero_time_mjd_base, _neg_zero_time_mjd_cls_base,
+                ) = batch_data[:16]
+            elif len(batch_data) >= 15:
+                (
+                    gw_s, gw_m, opt_t, opt_v, opt_mask, opt_err, opt_coords, gw_indices,
+                    _neg_t, _neg_v, _neg_mask, _neg_err, _neg_coords,
+                    opt_zero_time_mjd_base, _neg_zero_time_mjd_base,
+                ) = batch_data[:15]
+            elif len(batch_data) >= 13:
+                (
+                    gw_s, gw_m, opt_t, opt_v, opt_mask, opt_err, opt_coords, gw_indices,
+                    _neg_t, _neg_v, _neg_mask, _neg_err, _neg_coords,
+                ) = batch_data[:13]
+                opt_zero_time_mjd_base = None
+            elif len(batch_data) >= 9:
+                gw_s, gw_m, opt_t, opt_v, opt_mask, opt_err, opt_coords, gw_indices, opt_zero_time_mjd_base = batch_data[:9]
+            elif len(batch_data) >= 8:
                 gw_s, gw_m, opt_t, opt_v, opt_mask, opt_err, opt_coords, gw_indices = batch_data[:8]
+                opt_zero_time_mjd_base = None
             else:
                 continue
 
@@ -658,6 +1509,13 @@ def extract_triplet_logits(model, loader, device, model_args, neg_optical_data,
             opt_err = opt_err.to(device)
             opt_coords = opt_coords.to(device)
             gw_indices_dev = gw_indices.to(device).long()
+            batch_event_time_mjd = None
+            if gw_event_time_mjd_table is not None:
+                batch_event_time_mjd = gw_event_time_mjd_table[gw_indices_dev]
+            if use_cls_time_delta:
+                if opt_zero_time_mjd_base is None:
+                    raise RuntimeError("cls_time_delta_enable=true but loader did not return opt_zero_time_mjd_base.")
+                opt_zero_time_mjd_base = opt_zero_time_mjd_base.to(device).to(torch.float32)
             gw_indices_cpu = gw_indices_dev.detach().cpu().numpy().tolist()
             if gw_source_types is not None:
                 batch_sources = [_lookup_source_type(gw_idx, gw_source_types) for gw_idx in gw_indices_cpu]
@@ -672,6 +1530,12 @@ def extract_triplet_logits(model, loader, device, model_args, neg_optical_data,
                 gw_s = gw_s[perm]
                 gw_m = gw_m[perm]
                 # Note: gw_indices_dev is NOT shuffled to keep semi-hard mining consistent
+                if batch_event_time_mjd is not None:
+                    batch_event_time_mjd_anchor = batch_event_time_mjd[perm]
+                else:
+                    batch_event_time_mjd_anchor = None
+            else:
+                batch_event_time_mjd_anchor = batch_event_time_mjd
 
             ref_time = build_ref_time(batch_size, n_ref, ref_start, ref_end, device, opt_t.dtype)
 
@@ -690,8 +1554,33 @@ def extract_triplet_logits(model, loader, device, model_args, neg_optical_data,
                     _cred = None
 
                 # 1. Positive pairs: matched GW-KN
-                logits_pos = model.fusion_logits(g, h_l, z_l=z_l, H_gw=H_gw, cred_level=_cred)
+                dt_pos = None
+                if use_cls_time_delta and batch_event_time_mjd_anchor is not None:
+                    dt_pos = compute_time_delta_days(opt_zero_time_mjd_base, batch_event_time_mjd_anchor)
+                    _accumulate_dt_stats(dt_stats, "positive", dt_pos)
+                    dt_positive_all.append(dt_pos.detach().cpu())
+                target_abs_dt = None
+                target_dt = None
+                if dt_matcher_active and dt_pos is not None:
+                    target_abs_dt, target_dt = dt_matcher.sample_targets(dt_pos)
+                logits_pos = model.fusion_logits(
+                    g, h_l, z_l=z_l, H_gw=H_gw, cred_level=_cred, time_delta_days=dt_pos
+                )
                 logits_positive.append(logits_pos.float().cpu())
+                if pos_time_offsets and use_cls_time_delta and batch_event_time_mjd_anchor is not None:
+                    for off in pos_time_offsets:
+                        key = str(off)
+                        if abs(off) <= 1e-12:
+                            logits_positive_shifted[key].append(logits_pos.float().cpu())
+                            continue
+                        dt_pos_shift = compute_time_delta_days(
+                            opt_zero_time_mjd_base,
+                            batch_event_time_mjd_anchor + float(off),
+                        )
+                        logits_shift = model.fusion_logits(
+                            g, h_l, z_l=z_l, H_gw=H_gw, cred_level=_cred, time_delta_days=dt_pos_shift
+                        )
+                        logits_positive_shifted[key].append(logits_shift.float().cpu())
                 if batch_sources is not None:
                     source_positive.extend(batch_sources)
 
@@ -701,15 +1590,37 @@ def extract_triplet_logits(model, loader, device, model_args, neg_optical_data,
                 temperature = model.log_temp.exp().clamp(min=model.temp_min, max=model.temp_max)
                 sim_o2g = torch.matmul(feat_o, feat_g.T) / temperature  # [batch_opt, batch_gw]
 
+                allowed_mask = None
+                if (
+                    dt_matcher_active
+                    and "hard_neg" in dt_match_targets
+                    and target_abs_dt is not None
+                    and dt_matcher.window_days > 0
+                    and opt_zero_time_mjd_base is not None
+                    and batch_event_time_mjd_anchor is not None
+                ):
+                    abs_dt_mat = (opt_zero_time_mjd_base.unsqueeze(1) - batch_event_time_mjd_anchor.unsqueeze(0)).abs()
+                    lower = (target_abs_dt - dt_matcher.window_days).unsqueeze(1)
+                    upper = (target_abs_dt + dt_matcher.window_days).unsqueeze(1)
+                    allowed_mask = (abs_dt_mat >= lower) & (abs_dt_mat <= upper)
+
                 semi_hard_gw_idx = sample_semi_hard_negatives_for_optical(
-                    sim_o2g, gw_indices_dev
+                    sim_o2g, gw_indices_dev, allowed_mask=allowed_mask
                 )
 
                 g_semihard = g[semi_hard_gw_idx]
                 H_gw_semihard = H_gw[semi_hard_gw_idx] if H_gw is not None else None
                 _cred_hard = compute_credible_level(gw_m[semi_hard_gw_idx], opt_coords) if _dual else None
+                dt_hard = None
+                if use_cls_time_delta and batch_event_time_mjd_anchor is not None:
+                    dt_hard = compute_time_delta_days(
+                        opt_zero_time_mjd_base, batch_event_time_mjd_anchor[semi_hard_gw_idx]
+                    )
+                    _accumulate_dt_stats(dt_stats, "hard_negative", dt_hard)
+                    dt_hard_all.append(dt_hard.detach().cpu())
                 logits_hard = model.fusion_logits(
-                    g_semihard, h_l, z_l=z_l, H_gw=H_gw_semihard, cred_level=_cred_hard
+                    g_semihard, h_l, z_l=z_l, H_gw=H_gw_semihard, cred_level=_cred_hard,
+                    time_delta_days=dt_hard,
                 )
                 logits_hard_neg.append(logits_hard.float().cpu())
                 if batch_sources is not None:
@@ -723,7 +1634,20 @@ def extract_triplet_logits(model, loader, device, model_args, neg_optical_data,
 
                 # 3. GW negatives: has_kn=0 GW paired with KN optical
                 if has_neg_gw:
-                    sampled_neg_gw = gw_neg_rng.choice(neg_gw_indices, size=batch_size, replace=True)
+                    sampled_neg_gw = None
+                    if (
+                        dt_matcher_active
+                        and "gw_neg" in dt_match_targets
+                        and neg_gw_time_index is not None
+                        and getattr(neg_gw_time_index, "enabled", False)
+                        and target_abs_dt is not None
+                        and opt_zero_time_mjd_base is not None
+                    ):
+                        sampled_neg_gw, _, _ = neg_gw_time_index.sample_batch(
+                            opt_zero_time_mjd_base, target_abs_dt, dt_matcher.window_days
+                        )
+                    if sampled_neg_gw is None:
+                        sampled_neg_gw = gw_neg_rng.choice(neg_gw_indices, size=batch_size, replace=True)
                     gw_s_neg_np = np.stack([gw_scalars_ds[int(i)] for i in sampled_neg_gw], axis=0)
                     gw_m_neg_np = np.stack([gw_skymaps_ds[int(i)] for i in sampled_neg_gw], axis=0)
 
@@ -734,8 +1658,16 @@ def extract_triplet_logits(model, loader, device, model_args, neg_optical_data,
                         gw_s_neg, gw_m_neg, opt_coords, opt_t, opt_v, ref_time, opt_mask, opt_err
                     )
                     _cred_gw_neg = compute_credible_level(gw_m_neg, opt_coords) if _dual else None
+                    dt_gw_neg = None
+                    if use_cls_time_delta and gw_event_time_mjd_table is not None:
+                        sampled_neg_gw_tensor = torch.from_numpy(sampled_neg_gw).to(device=device, dtype=torch.long)
+                        sampled_neg_gw_time = gw_event_time_mjd_table[sampled_neg_gw_tensor]
+                        dt_gw_neg = compute_time_delta_days(opt_zero_time_mjd_base, sampled_neg_gw_time)
+                        _accumulate_dt_stats(dt_stats, "gw_negative", dt_gw_neg)
+                        dt_gw_all.append(dt_gw_neg.detach().cpu())
                     logits_gw = model.fusion_logits(
-                        g_gw_neg, h_l_gw_neg, z_l=z_l_gw_neg, H_gw=H_gw_neg, cred_level=_cred_gw_neg
+                        g_gw_neg, h_l_gw_neg, z_l=z_l_gw_neg, H_gw=H_gw_neg, cred_level=_cred_gw_neg,
+                        time_delta_days=dt_gw_neg,
                     )
                     logits_gw_neg.append(logits_gw.float().cpu())
                     if gw_source_types is not None:
@@ -746,13 +1678,19 @@ def extract_triplet_logits(model, loader, device, model_args, neg_optical_data,
 
                 # 4. Optical negatives: correct GW paired with non-KN transients
                 if has_neg_optical:
-                    batch_neg_indices = []
-                    batch_neg_types = []
-                    for _ in range(batch_size):
-                        idx = neg_idx % total_neg
-                        batch_neg_indices.append(idx)
-                        batch_neg_types.append(neg_types_list[idx])
-                        neg_idx += 1
+                    if timeaware_sampler is not None and timeaware_sampler.enabled and batch_event_time_mjd_anchor is not None:
+                        batch_neg_indices, used_cnt, fallback_cnt = timeaware_sampler.sample_batch(
+                            batch_event_time_mjd_anchor
+                        )
+                        timeaware_used_total += int(used_cnt)
+                        timeaware_fallback_total += int(fallback_cnt)
+                    else:
+                        batch_neg_indices = []
+                        for _ in range(batch_size):
+                            idx = neg_idx % total_neg
+                            batch_neg_indices.append(idx)
+                            neg_idx += 1
+                    batch_neg_types = [neg_types_list[idx] for idx in batch_neg_indices]
 
                     neg_v_batch = neg_values[batch_neg_indices]
                     neg_t_batch = neg_times[batch_neg_indices]
@@ -762,14 +1700,45 @@ def extract_triplet_logits(model, loader, device, model_args, neg_optical_data,
 
                     ref_time_neg = build_ref_time(batch_size, n_ref, ref_start, ref_end,
                                                   device, neg_t_batch.dtype)
-                    _, z_l_neg, h_l_neg, _ = model.encode(
-                        gw_s, gw_m, neg_c_batch, neg_t_batch, neg_v_batch,
-                        ref_time_neg, neg_m_batch, neg_e_batch
-                    )
                     _cred_neg = compute_credible_level(gw_m, neg_c_batch) if _dual else None
-                    logits_optical = model.fusion_logits(
-                        g, h_l_neg, z_l=z_l_neg, H_gw=H_gw, cred_level=_cred_neg
-                    )
+                    if neg_offset_policy is not None and neg_offset_policy.enabled:
+                        delta_np = neg_offset_policy.sample_offsets(batch_size)
+                        delta_days = torch.from_numpy(delta_np).to(device=device, dtype=torch.float32)
+                        shifted_neg_t_batch = apply_time_offsets(
+                            neg_t_batch, neg_m_batch, delta_days, neg_offset_policy.scale_divisor
+                        )
+                        _, z_l_neg_i, h_l_neg_i, _ = model.encode(
+                            gw_s, gw_m, neg_c_batch, shifted_neg_t_batch, neg_v_batch,
+                            ref_time_neg, neg_m_batch, neg_e_batch
+                        )
+                        dt_optical = None
+                        if use_cls_time_delta and batch_event_time_mjd_anchor is not None:
+                            dt_optical = compute_time_delta_days(
+                                neg_zero_time_mjd_cls_base[batch_neg_indices] - delta_days,
+                                batch_event_time_mjd_anchor,
+                            )
+                            _accumulate_dt_stats(dt_stats, "optical_negative", dt_optical)
+                            dt_optical_all.append(dt_optical.detach().cpu())
+                        logits_optical = model.fusion_logits(
+                            g, h_l_neg_i, z_l=z_l_neg_i, H_gw=H_gw, cred_level=_cred_neg,
+                            time_delta_days=dt_optical,
+                        )
+                    else:
+                        _, z_l_neg, h_l_neg, _ = model.encode(
+                            gw_s, gw_m, neg_c_batch, neg_t_batch, neg_v_batch,
+                            ref_time_neg, neg_m_batch, neg_e_batch
+                        )
+                        dt_optical = None
+                        if use_cls_time_delta and batch_event_time_mjd_anchor is not None:
+                            dt_optical = compute_time_delta_days(
+                                neg_zero_time_mjd_cls_base[batch_neg_indices], batch_event_time_mjd_anchor
+                            )
+                            _accumulate_dt_stats(dt_stats, "optical_negative", dt_optical)
+                            dt_optical_all.append(dt_optical.detach().cpu())
+                        logits_optical = model.fusion_logits(
+                            g, h_l_neg, z_l=z_l_neg, H_gw=H_gw, cred_level=_cred_neg,
+                            time_delta_days=dt_optical,
+                        )
                     logits_optical_neg.append(logits_optical.float().cpu())
                     optical_neg_types.extend(batch_neg_types)
                     if batch_sources is not None:
@@ -780,12 +1749,30 @@ def extract_triplet_logits(model, loader, device, model_args, neg_optical_data,
 
     result = {
         "logits_positive": torch.cat(logits_positive) if logits_positive else None,
+        "logits_positive_shifted": {
+            k: torch.cat(v) if v else None for k, v in logits_positive_shifted.items()
+        } if logits_positive_shifted else {},
         "logits_hard_neg": torch.cat(logits_hard_neg) if logits_hard_neg else None,
         "logits_gw_neg": torch.cat(logits_gw_neg) if logits_gw_neg else None,
         "source_positive": source_positive,
         "source_optical_neg": source_optical_neg,
         "source_gw_neg": source_gw_neg,
         "source_hard_neg": source_hard_neg,
+        "time_delta_meta": {
+            "enabled": use_cls_time_delta,
+            "stats": _finalize_dt_stats(dt_stats),
+        },
+        "dt_positive_days": torch.cat(dt_positive_all) if dt_positive_all else None,
+        "dt_optical_negative_days": torch.cat(dt_optical_all) if dt_optical_all else None,
+        "dt_gw_negative_days": torch.cat(dt_gw_all) if dt_gw_all else None,
+        "dt_hard_negative_days": torch.cat(dt_hard_all) if dt_hard_all else None,
+        "timeaware_extra_negative_meta": {
+            "enabled": bool(timeaware_sampler is not None and timeaware_sampler.enabled),
+            "windows_days": [float(v) for v in (extra_negative_timeaware_windows_days or [])],
+            "min_candidates": int(extra_negative_timeaware_min_candidates),
+            "selected_count": int(timeaware_used_total),
+            "fallback_count": int(timeaware_fallback_total),
+        },
     }
 
     if has_neg_optical and logits_optical_neg:
@@ -804,7 +1791,7 @@ def extract_triplet_logits(model, loader, device, model_args, neg_optical_data,
     return result
 
 
-def sample_semi_hard_negatives_for_optical(sim_o2g, gw_indices):
+def sample_semi_hard_negatives_for_optical(sim_o2g, gw_indices, allowed_mask=None):
     """
     Sample semi-hard negative GW indices for each optical sample.
     
@@ -821,6 +1808,7 @@ def sample_semi_hard_negatives_for_optical(sim_o2g, gw_indices):
     Args:
         sim_o2g: Similarity matrix [batch_opt, batch_gw], Optical-to-GW similarities
         gw_indices: GW event indices for each sample [batch]
+        allowed_mask: Optional boolean mask [batch, batch] of allowed negatives
         
     Returns:
         semi_hard_idx: Indices of semi-hard negative GW for each optical sample [batch]
@@ -840,6 +1828,8 @@ def sample_semi_hard_negatives_for_optical(sim_o2g, gw_indices):
     
     # Mask out same-event pairs from negative candidates
     neg_sim = sim.masked_fill(same_event, -1e9)
+    if allowed_mask is not None:
+        neg_sim = neg_sim.masked_fill(~allowed_mask, -1e9)
     
     # For each optical, find negatives with sim < pos_sim
     # Then select the one with maximum similarity (semi-hard)
@@ -1075,7 +2065,7 @@ def evaluate_classification(embeddings):
     return compute_classification_metrics(probs, labels)
 
 
-def evaluate_classification_triplet(triplet_logits):
+def evaluate_classification_triplet(triplet_logits, report_dt_bins=False, dt_bin_edges=None, report_dt_macro=False):
     """Classification metrics using all pair types from triplet extraction.
 
     Positive: matched (GW, KN) pairs → label 1
@@ -1091,12 +2081,16 @@ def evaluate_classification_triplet(triplet_logits):
     probs_optical = None
     probs_gw = None
     probs_hard = None
+    all_abs_dt = []
 
     # Positives
     if triplet_logits.get("logits_positive") is not None:
         probs_pos = torch.softmax(triplet_logits["logits_positive"].float(), dim=1)[:, 1]
         all_probs.append(probs_pos)
         all_labels.append(torch.ones(len(probs_pos), dtype=torch.long))
+        dt_pos = triplet_logits.get("dt_positive_days")
+        if dt_pos is not None and len(dt_pos) == len(probs_pos):
+            all_abs_dt.append(dt_pos.abs().to(torch.float32))
 
     # Optical negatives (GW, nonKN), with backward-compatible fallback
     optical_logits = triplet_logits.get("logits_optical_neg")
@@ -1106,18 +2100,27 @@ def evaluate_classification_triplet(triplet_logits):
         probs_optical = torch.softmax(optical_logits.float(), dim=1)[:, 1]
         all_probs.append(probs_optical)
         all_labels.append(torch.zeros(len(probs_optical), dtype=torch.long))
+        dt_opt = triplet_logits.get("dt_optical_negative_days")
+        if dt_opt is not None and len(dt_opt) == len(probs_optical):
+            all_abs_dt.append(dt_opt.abs().to(torch.float32))
 
     # GW negatives (GW_has_kn0, KN)
     if triplet_logits.get("logits_gw_neg") is not None:
         probs_gw = torch.softmax(triplet_logits["logits_gw_neg"].float(), dim=1)[:, 1]
         all_probs.append(probs_gw)
         all_labels.append(torch.zeros(len(probs_gw), dtype=torch.long))
+        dt_gw = triplet_logits.get("dt_gw_negative_days")
+        if dt_gw is not None and len(dt_gw) == len(probs_gw):
+            all_abs_dt.append(dt_gw.abs().to(torch.float32))
 
     # Semi-hard negatives (GW_wrong, KN)
     if triplet_logits.get("logits_hard_neg") is not None:
         probs_hard = torch.softmax(triplet_logits["logits_hard_neg"].float(), dim=1)[:, 1]
         all_probs.append(probs_hard)
         all_labels.append(torch.zeros(len(probs_hard), dtype=torch.long))
+        dt_h = triplet_logits.get("dt_hard_negative_days")
+        if dt_h is not None and len(dt_h) == len(probs_hard):
+            all_abs_dt.append(dt_h.abs().to(torch.float32))
 
     if not all_probs:
         return {}
@@ -1134,7 +2137,14 @@ def evaluate_classification_triplet(triplet_logits):
         f"{n_pos} pos + {n_optical} optical_neg + {n_gw} gw_neg + {n_hard} semi_hard_neg = {len(probs)} total"
     )
 
-    return compute_classification_metrics(probs, labels)
+    metrics = compute_classification_metrics(probs, labels)
+    if report_dt_bins and dt_bin_edges is not None and all_abs_dt:
+        abs_dt = torch.cat(all_abs_dt)
+        if len(abs_dt) == len(probs):
+            metrics["dt_bins"] = compute_dt_bin_metrics(probs, labels, abs_dt, dt_bin_edges)
+            if report_dt_macro:
+                metrics["dt_macro"] = compute_dt_macro_metrics(metrics["dt_bins"])
+    return metrics
 
 
 def evaluate_classification_triplet_by_source(triplet_logits):
@@ -1927,6 +2937,26 @@ def print_summary(results):
             mrr = gal.get(f"gallery_{s}_mrr", 0)
             print(f"  Pool={s:5d}  R@1={r1:.4f}  R@5={r5:.4f}  MRR={mrr:.4f}")
 
+    td_meta = results.get("meta", {}).get("time_delta", {})
+    dt_dist = td_meta.get("distributions", {}) if isinstance(td_meta, dict) else {}
+    if dt_dist:
+        print("\n--- Time-Delta Distributions ---")
+        for key in ("positive", "optical_negative", "gw_negative", "hard_negative"):
+            entry = dt_dist.get(key, {})
+            if not entry:
+                continue
+            q = entry.get("quantiles_days", {})
+            abs_q = entry.get("abs", {}).get("quantiles_days", {})
+            print(
+                f"  {key}: n={entry.get('count',0)} "
+                f"mean={entry.get('mean_days',0):.3f} "
+                f"std={entry.get('std_days',0):.3f} "
+                f"p50={q.get('p50',0):.3f} "
+                f"| abs p50={abs_q.get('p50',0):.3f} "
+                f"p90={abs_q.get('p90',0):.3f} "
+                f"p95={abs_q.get('p95',0):.3f}"
+            )
+
     # Classification
     cls = results.get("classification", {})
     if cls:
@@ -1940,6 +2970,59 @@ def print_summary(results):
         tn = cls.get('tn', 0)
         fn = cls.get('fn', 0)
         print(f"  Confusion (t=0.5): TP={tp} FP={fp} TN={tn} FN={fn}")
+        dt_bins = cls.get("dt_bins", {})
+        if dt_bins:
+            print("  |dt| bins:")
+            for b in dt_bins.get("bins", []):
+                if int(b.get("n", 0)) <= 0:
+                    continue
+                if "auroc" in b and "auprc" in b:
+                    print(
+                        f"    {b.get('range','?')}: n={b.get('n',0)} "
+                        f"(pos={b.get('n_pos',0)}, neg={b.get('n_neg',0)}) "
+                        f"AUROC={b.get('auroc',0):.4f} AUPRC={b.get('auprc',0):.4f}"
+                    )
+                else:
+                    print(
+                        f"    {b.get('range','?')}: n={b.get('n',0)} "
+                        f"(pos={b.get('n_pos',0)}, neg={b.get('n_neg',0)}) "
+                        f"Precision={b.get('precision',0):.4f} "
+                        f"Recall={b.get('recall',0):.4f} "
+                        f"F1={b.get('f1_confusion',0):.4f}"
+                    )
+        dt_macro = cls.get("dt_macro", {})
+        if dt_macro:
+            print(
+                "  |dt| macro: "
+                f"AUROC={dt_macro.get('auroc',0):.4f} "
+                f"AUPRC={dt_macro.get('auprc',0):.4f} "
+                f"F1={dt_macro.get('f1_optimal',0):.4f} "
+                f"(bins_used={dt_macro.get('bins_used',0)}/{dt_macro.get('bins_total',0)})"
+            )
+
+    cls_shuffle = results.get("classification_gw_shuffle", {})
+    if cls_shuffle:
+        print("\n--- Classification (GW-Shuffle) ---")
+        print(f"  AUROC={cls_shuffle.get('auroc', 0):.4f}  "
+              f"AUPRC={cls_shuffle.get('auprc', 0):.4f}  "
+              f"F1={cls_shuffle.get('f1_optimal', 0):.4f} (t={cls_shuffle.get('f1_threshold', 0):.2f})  "
+              f"ECE={cls_shuffle.get('ece', 0):.4f}")
+
+    cls_shift = results.get("classification_time_shift", {})
+    if cls_shift:
+        print("\n--- Classification (Pos Time-Shift) ---")
+        def _sort_key(k):
+            try:
+                return float(k)
+            except Exception:
+                return 0.0
+        for key in sorted(cls_shift.keys(), key=_sort_key):
+            m = cls_shift.get(key, {})
+            print(
+                f"  shift={key}d AUROC={m.get('auroc',0):.4f} "
+                f"AUPRC={m.get('auprc',0):.4f} "
+                f"F1={m.get('f1_optimal',0):.4f} (t={m.get('f1_threshold',0):.2f})"
+            )
 
     cls_by_src = results.get("classification_by_source", {})
     if cls_by_src:
@@ -1993,29 +3076,206 @@ def main():
 
     # Load model
     model, model_args, saved_args = load_model(args, device)
+    cls_time_delta_enable = bool(model_args.get("cls_time_delta_enable", False))
+    cls_time_delta_force_zero = bool(
+        choose_value(
+            args.cls_time_delta_force_zero,
+            saved_args,
+            "cls_time_delta_force_zero",
+            default=False,
+        )
+    )
+    cls_time_delta_input_enabled = cls_time_delta_enable and (not cls_time_delta_force_zero)
+    runtime_model_args = dict(model_args)
+    runtime_model_args["cls_time_delta_enable"] = cls_time_delta_input_enabled
+    nonkn_cls_base_field = str(model_args.get("nonkn_cls_base_field", "zero_time_mjd_cls_base"))
+    if cls_time_delta_enable:
+        print(
+            "Classification time-delta feature enabled: "
+            f"scale_days={model_args.get('cls_time_delta_scale_days', 30.0)}, "
+            f"clip={model_args.get('cls_time_delta_clip', 10.0)}"
+        )
+        if cls_time_delta_force_zero:
+            print("Classification time-delta input is forced to zero for this evaluation run.")
+    else:
+        print("Classification time-delta feature disabled.")
+    neg_time_offset_enable = bool(
+        choose_value(
+            args.neg_time_offset_enable, saved_args, "neg_time_offset_enable", default=False
+        )
+    )
+    neg_offset_dist_npz = choose_value(
+        args.neg_offset_dist_npz, saved_args, "neg_offset_dist_npz", default=None
+    )
+    neg_offset_dist_key = str(
+        choose_value(args.neg_offset_dist_key, saved_args, "neg_offset_dist_key", default="delta_days_combined")
+    )
+    neg_offset_eval_mode = str(
+        choose_value(args.neg_offset_eval_mode, saved_args, "neg_offset_eval_mode", default="quantile_ensemble")
+    )
+    neg_offset_eval_quantiles = str(
+        choose_value(
+            args.neg_offset_eval_quantiles,
+            saved_args,
+            "neg_offset_eval_quantiles",
+            default="0.1,0.3,0.5,0.7,0.9",
+        )
+    )
+    neg_offset_scale_days_divisor = float(
+        choose_value(
+            args.neg_offset_scale_days_divisor,
+            saved_args,
+            "neg_offset_scale_days_divisor",
+            default=100.0,
+        )
+    )
+    report_dt_bins = bool(
+        choose_value(args.report_dt_bins, saved_args, "report_dt_bins", default=True)
+    )
+    report_dt_macro = bool(
+        choose_value(args.report_dt_macro, saved_args, "report_dt_macro", default=True)
+    )
+    dt_bin_edges_text = str(
+        choose_value(
+            args.dt_bin_edges,
+            saved_args,
+            "dt_bin_edges",
+            default="0,30,90,180,365,730,1460,inf",
+        )
+    )
+    dt_bin_edges = parse_dt_bin_edges(dt_bin_edges_text)
+    dt_match_strategy = str(
+        choose_value(args.dt_match_strategy, saved_args, "dt_match_strategy", default="window")
+    ).strip().lower()
+    dt_match_window_days = float(
+        choose_value(args.dt_match_window_days, saved_args, "dt_match_window_days", default=30.0)
+    )
+    dt_match_quantiles_text = str(
+        choose_value(args.dt_match_quantiles, saved_args, "dt_match_quantiles", default="0.1,0.3,0.5,0.7,0.9")
+    )
+    dt_match_target = str(
+        choose_value(args.dt_match_target, saved_args, "dt_match_target", default="positive")
+    ).strip().lower()
+    if dt_match_target == "all":
+        dt_match_target = "positive"
+    dt_match_apply_to = parse_dt_match_apply_to(
+        choose_value(
+            args.dt_match_apply_to,
+            saved_args,
+            "dt_match_apply_to",
+            default="gw_neg,hard_neg,optical_neg",
+        )
+    )
+    pos_time_offsets_text = str(
+        choose_value(args.pos_time_offsets_days, saved_args, "pos_time_offsets_days", default="0,1,3,7,30,90")
+    )
+    pos_time_offsets_days = parse_day_offsets(pos_time_offsets_text)
+    hardneg_windows_text = str(
+        choose_value(
+            None,
+            saved_args,
+            "hardneg_time_window_days",
+            default="30,60,120",
+        )
+    )
+    hardneg_windows_days = parse_day_windows(hardneg_windows_text)
+    hardneg_min_candidates = int(
+        choose_value(
+            None,
+            saved_args,
+            "hardneg_min_candidates",
+            default=4,
+        )
+    )
+    eval_extra_neg_timeaware_enable = bool(
+        cls_time_delta_input_enabled
+        and args.neg_data_path
+        and len(hardneg_windows_days) > 0
+    )
+    neg_offset_policy = EvalNegativeTimeOffsetPolicy(
+        enabled=neg_time_offset_enable,
+        dist_npz=neg_offset_dist_npz,
+        dist_key=neg_offset_dist_key,
+        eval_mode=neg_offset_eval_mode,
+        eval_quantiles=neg_offset_eval_quantiles,
+        scale_divisor=neg_offset_scale_days_divisor,
+        seed=int(choose_value(None, saved_args, "seed", default=42)),
+        bank_size=int(choose_value(None, saved_args, "neg_offset_bank_size", default=1000000)),
+    )
+    if neg_offset_policy.enabled:
+        print("Negative time-offset policy enabled:")
+    else:
+        print("Negative time-offset policy disabled.")
+    print(json.dumps(neg_offset_policy.info, indent=2))
+    if eval_extra_neg_timeaware_enable:
+        print(
+            "Extra-negative time-aware eval sampling enabled "
+            f"(windows={hardneg_windows_days}, min_candidates={hardneg_min_candidates})."
+        )
+    else:
+        print("Extra-negative time-aware eval sampling disabled.")
+    gw_event_time_mjd_table = load_gw_event_time_mjd_table(
+        args.test_data_path, device, required=cls_time_delta_input_enabled
+    )
+    dt_matcher = DtMatchSampler(
+        strategy=dt_match_strategy,
+        window_days=dt_match_window_days,
+        quantiles=parse_quantiles(dt_match_quantiles_text) if dt_match_strategy == "quantile" else [],
+        target=dt_match_target,
+        apply_to=dt_match_apply_to,
+        seed=int(choose_value(None, saved_args, "split_seed", default=42)),
+    )
+    if dt_match_strategy == "none":
+        dt_matcher.enabled = False
+    if not cls_time_delta_input_enabled or gw_event_time_mjd_table is None:
+        dt_matcher.enabled = False
+    if dt_matcher.enabled:
+        print(
+            "DT match enabled: "
+            f"strategy={dt_matcher.strategy}, window_days={dt_matcher.window_days}, "
+            f"target={dt_matcher.target}, apply_to={dt_matcher.apply_to}"
+        )
+    else:
+        print("DT match disabled.")
 
     # Build test dataloader
-    loader, dataset = build_test_dataloader(args, saved_args)
+    loader, dataset = build_test_dataloader(
+        args, saved_args, return_zero_time_mjd=cls_time_delta_input_enabled,
+        nonkn_cls_base_field=nonkn_cls_base_field,
+        extra_negative_timeaware_enable=eval_extra_neg_timeaware_enable,
+        extra_negative_timeaware_windows_days=hardneg_windows_days,
+        extra_negative_timeaware_min_candidates=hardneg_min_candidates,
+        extra_negative_timeaware_seed=int(choose_value(None, saved_args, "split_seed", default=42)),
+    )
     print(f"Test set: {len(loader)} batches")
     gw_source_types = load_gw_source_types(args.test_data_path)
 
     # Extract all embeddings (retry with single-worker if multiprocessing is blocked)
     try:
         embeddings = extract_all_embeddings(
-            model, loader, device, model_args,
+            model, loader, device, runtime_model_args,
             gw_source_types=gw_source_types,
-            amp_dtype=amp_dtype, amp_enabled=amp_enabled
+            amp_dtype=amp_dtype, amp_enabled=amp_enabled,
+            gw_event_time_mjd_table=gw_event_time_mjd_table,
         )
     except PermissionError as e:
         if args.num_workers > 0:
             print("WARNING: DataLoader multiprocessing failed (PermissionError). "
                   "Retrying with num_workers=0.")
             args.num_workers = 0
-            loader, dataset = build_test_dataloader(args, saved_args)
+            loader, dataset = build_test_dataloader(
+                args, saved_args, return_zero_time_mjd=cls_time_delta_input_enabled,
+                nonkn_cls_base_field=nonkn_cls_base_field,
+                extra_negative_timeaware_enable=eval_extra_neg_timeaware_enable,
+                extra_negative_timeaware_windows_days=hardneg_windows_days,
+                extra_negative_timeaware_min_candidates=hardneg_min_candidates,
+                extra_negative_timeaware_seed=int(choose_value(None, saved_args, "split_seed", default=42)),
+            )
             embeddings = extract_all_embeddings(
-                model, loader, device, model_args,
+                model, loader, device, runtime_model_args,
                 gw_source_types=gw_source_types,
-                amp_dtype=amp_dtype, amp_enabled=amp_enabled
+                amp_dtype=amp_dtype, amp_enabled=amp_enabled,
+                gw_event_time_mjd_table=gw_event_time_mjd_table,
             )
         else:
             raise
@@ -2025,6 +3285,36 @@ def main():
 
     # Compute all metrics
     results = {}
+    results["meta"] = {
+        "time_offset": neg_offset_policy.info,
+        "time_delta": {
+            "enabled": cls_time_delta_enable,
+            "input_enabled": cls_time_delta_input_enabled,
+            "forced_zero_input": cls_time_delta_force_zero,
+            "nonkn_cls_base_field": nonkn_cls_base_field,
+            "scale_days": float(model_args.get("cls_time_delta_scale_days", 30.0)),
+            "clip": float(model_args.get("cls_time_delta_clip", 10.0)),
+        },
+        "dt_bins": {
+            "enabled": bool(report_dt_bins),
+            "macro_enabled": bool(report_dt_macro),
+            "edges_days": [float(e) if np.isfinite(e) else "inf" for e in dt_bin_edges],
+        },
+        "dt_match": {
+            "enabled": bool(dt_matcher.enabled),
+            "strategy": dt_matcher.strategy,
+            "window_days": float(dt_matcher.window_days),
+            "quantiles": [float(q) for q in (dt_matcher.quantiles or [])],
+            "target": dt_matcher.target,
+            "apply_to": list(dt_matcher.apply_to),
+        },
+        "pos_time_offsets_days": [float(v) for v in pos_time_offsets_days],
+    }
+    results["meta"]["time_offset"]["timeaware_extra_negative"] = {
+        "enabled": bool(eval_extra_neg_timeaware_enable),
+        "windows_days": [float(v) for v in hardneg_windows_days],
+        "min_candidates": int(hardneg_min_candidates),
+    }
     print("\nComputing batch-mode retrieval metrics...")
     results["retrieval_batch"] = evaluate_retrieval_batch_mode(embeddings)
 
@@ -2047,9 +3337,25 @@ def main():
         neg_optical_data = load_negative_optical_samples(
             args.neg_data_path, 
             args.neg_group, 
-            n_samples=args.n_neg_samples
+            n_samples=args.n_neg_samples,
+            require_zero_time_mjd_base=cls_time_delta_input_enabled,
+            require_zero_time_mjd_cls_base=cls_time_delta_input_enabled,
+            nonkn_cls_base_field=nonkn_cls_base_field,
         )
     neg_gw_indices = load_negative_gw_indices(args.test_data_path)
+    neg_gw_time_index = None
+    if (
+        dt_matcher.enabled
+        and "gw_neg" in dt_matcher.apply_to
+        and gw_event_time_mjd_table is not None
+        and len(neg_gw_indices) > 0
+    ):
+        try:
+            neg_gw_time_index = NegTimeIndex(
+                gw_event_time_mjd_table[neg_gw_indices], neg_gw_indices
+            )
+        except Exception as e:
+            print(f"WARNING: Failed to build DT match index for GW negatives: {e}")
 
     # Extract triplet logits for distribution analysis
     triplet_logits = None
@@ -2057,63 +3363,184 @@ def main():
     if neg_optical_data is not None or len(neg_gw_indices) > 0 or True:  # Always extract for hard negatives
         print("\nExtracting triplet logits for distribution analysis...")
         # Rebuild loader to iterate again
-        loader2, _ = build_test_dataloader(args, saved_args)
+        loader2, _ = build_test_dataloader(
+            args, saved_args, return_zero_time_mjd=cls_time_delta_input_enabled,
+            nonkn_cls_base_field=nonkn_cls_base_field,
+            extra_negative_timeaware_enable=eval_extra_neg_timeaware_enable,
+            extra_negative_timeaware_windows_days=hardneg_windows_days,
+            extra_negative_timeaware_min_candidates=hardneg_min_candidates,
+            extra_negative_timeaware_seed=int(choose_value(None, saved_args, "split_seed", default=42)),
+        )
         try:
             triplet_logits = extract_triplet_logits(
-                model, loader2, device, model_args, neg_optical_data, neg_gw_indices,
+                model, loader2, device, runtime_model_args, neg_optical_data, neg_gw_indices,
                 gw_source_types=gw_source_types,
                 shuffle_gw=False,
-                amp_dtype=amp_dtype, amp_enabled=amp_enabled
+                amp_dtype=amp_dtype, amp_enabled=amp_enabled,
+                neg_offset_policy=neg_offset_policy,
+                gw_event_time_mjd_table=gw_event_time_mjd_table,
+                dt_matcher=dt_matcher,
+                neg_gw_time_index=neg_gw_time_index,
+                pos_time_offsets_days=pos_time_offsets_days,
+                extra_negative_timeaware_windows_days=hardneg_windows_days,
+                extra_negative_timeaware_min_candidates=hardneg_min_candidates,
             )
         except PermissionError:
             if args.num_workers > 0:
                 print("WARNING: DataLoader multiprocessing failed (PermissionError). "
                       "Retrying triplet logits with num_workers=0.")
                 args.num_workers = 0
-                loader2, _ = build_test_dataloader(args, saved_args)
+                loader2, _ = build_test_dataloader(
+                    args, saved_args, return_zero_time_mjd=cls_time_delta_input_enabled,
+                    nonkn_cls_base_field=nonkn_cls_base_field,
+                    extra_negative_timeaware_enable=eval_extra_neg_timeaware_enable,
+                    extra_negative_timeaware_windows_days=hardneg_windows_days,
+                    extra_negative_timeaware_min_candidates=hardneg_min_candidates,
+                    extra_negative_timeaware_seed=int(choose_value(None, saved_args, "split_seed", default=42)),
+                )
                 triplet_logits = extract_triplet_logits(
-                    model, loader2, device, model_args, neg_optical_data, neg_gw_indices,
+                    model, loader2, device, runtime_model_args, neg_optical_data, neg_gw_indices,
                     gw_source_types=gw_source_types,
                     shuffle_gw=False,
-                    amp_dtype=amp_dtype, amp_enabled=amp_enabled
+                    amp_dtype=amp_dtype, amp_enabled=amp_enabled,
+                    neg_offset_policy=neg_offset_policy,
+                    gw_event_time_mjd_table=gw_event_time_mjd_table,
+                    dt_matcher=dt_matcher,
+                    neg_gw_time_index=neg_gw_time_index,
+                    pos_time_offsets_days=pos_time_offsets_days,
+                    extra_negative_timeaware_windows_days=hardneg_windows_days,
+                    extra_negative_timeaware_min_candidates=hardneg_min_candidates,
                 )
             else:
                 raise
         
         # GW-shuffle ablation test
         print("\nExtracting triplet logits with GW-SHUFFLE (ablation test)...")
-        loader3, _ = build_test_dataloader(args, saved_args)
+        loader3, _ = build_test_dataloader(
+            args, saved_args, return_zero_time_mjd=cls_time_delta_input_enabled,
+            nonkn_cls_base_field=nonkn_cls_base_field,
+            extra_negative_timeaware_enable=eval_extra_neg_timeaware_enable,
+            extra_negative_timeaware_windows_days=hardneg_windows_days,
+            extra_negative_timeaware_min_candidates=hardneg_min_candidates,
+            extra_negative_timeaware_seed=int(choose_value(None, saved_args, "split_seed", default=42)),
+        )
         try:
             triplet_logits_shuffle = extract_triplet_logits(
-                model, loader3, device, model_args, neg_optical_data, neg_gw_indices,
+                model, loader3, device, runtime_model_args, neg_optical_data, neg_gw_indices,
                 gw_source_types=gw_source_types,
                 shuffle_gw=True, shuffle_seed=42,
-                amp_dtype=amp_dtype, amp_enabled=amp_enabled
+                amp_dtype=amp_dtype, amp_enabled=amp_enabled,
+                neg_offset_policy=neg_offset_policy,
+                gw_event_time_mjd_table=gw_event_time_mjd_table,
+                dt_matcher=dt_matcher,
+                neg_gw_time_index=neg_gw_time_index,
+                pos_time_offsets_days=pos_time_offsets_days,
+                extra_negative_timeaware_windows_days=hardneg_windows_days,
+                extra_negative_timeaware_min_candidates=hardneg_min_candidates,
             )
         except PermissionError:
             if args.num_workers > 0:
                 print("WARNING: DataLoader multiprocessing failed (PermissionError). "
                       "Retrying GW-shuffle logits with num_workers=0.")
                 args.num_workers = 0
-                loader3, _ = build_test_dataloader(args, saved_args)
+                loader3, _ = build_test_dataloader(
+                    args, saved_args, return_zero_time_mjd=cls_time_delta_input_enabled,
+                    nonkn_cls_base_field=nonkn_cls_base_field,
+                    extra_negative_timeaware_enable=eval_extra_neg_timeaware_enable,
+                    extra_negative_timeaware_windows_days=hardneg_windows_days,
+                    extra_negative_timeaware_min_candidates=hardneg_min_candidates,
+                    extra_negative_timeaware_seed=int(choose_value(None, saved_args, "split_seed", default=42)),
+                )
                 triplet_logits_shuffle = extract_triplet_logits(
-                    model, loader3, device, model_args, neg_optical_data, neg_gw_indices,
+                    model, loader3, device, runtime_model_args, neg_optical_data, neg_gw_indices,
                     gw_source_types=gw_source_types,
                     shuffle_gw=True, shuffle_seed=42,
-                    amp_dtype=amp_dtype, amp_enabled=amp_enabled
+                    amp_dtype=amp_dtype, amp_enabled=amp_enabled,
+                    neg_offset_policy=neg_offset_policy,
+                    gw_event_time_mjd_table=gw_event_time_mjd_table,
+                    dt_matcher=dt_matcher,
+                    neg_gw_time_index=neg_gw_time_index,
+                    pos_time_offsets_days=pos_time_offsets_days,
+                    extra_negative_timeaware_windows_days=hardneg_windows_days,
+                    extra_negative_timeaware_min_candidates=hardneg_min_candidates,
                 )
             else:
                 raise
 
     # Recompute classification from triplet logits (pos + optical_neg + gw_neg + semi_hard_neg)
     if triplet_logits is not None:
+        td_meta = triplet_logits.get("time_delta_meta")
+        if td_meta is not None:
+            results["meta"]["time_delta"].update(td_meta)
+        dt_distributions = {}
+        dt_pos = triplet_logits.get("dt_positive_days")
+        dt_opt = triplet_logits.get("dt_optical_negative_days")
+        dt_gw = triplet_logits.get("dt_gw_negative_days")
+        dt_hard = triplet_logits.get("dt_hard_negative_days")
+        for key, tensor in (
+            ("positive", dt_pos),
+            ("optical_negative", dt_opt),
+            ("gw_negative", dt_gw),
+            ("hard_negative", dt_hard),
+        ):
+            summary = _summarize_dt_distribution(tensor)
+            if summary:
+                dt_distributions[key] = summary
+        if dt_distributions:
+            results["meta"]["time_delta"]["distributions"] = dt_distributions
+        ta_meta = triplet_logits.get("timeaware_extra_negative_meta")
+        if ta_meta is not None:
+            dt_opt = triplet_logits.get("dt_optical_negative_days")
+            if dt_opt is not None and dt_opt.numel() > 0:
+                vals = dt_opt.abs().to(torch.float32)
+                q = torch.quantile(vals, torch.tensor([0.5, 0.9, 0.95], device=vals.device, dtype=vals.dtype))
+                ta_meta = dict(ta_meta)
+                ta_meta["abs_dt_quantiles_days"] = {
+                    "p50": float(q[0].item()),
+                    "p90": float(q[1].item()),
+                    "p95": float(q[2].item()),
+                }
+            results["meta"]["time_offset"]["timeaware_extra_negative"] = ta_meta
         print("\nRecomputing classification metrics from triplet pairs...")
-        triplet_cls = evaluate_classification_triplet(triplet_logits)
+        triplet_cls = evaluate_classification_triplet(
+            triplet_logits,
+            report_dt_bins=report_dt_bins,
+            dt_bin_edges=dt_bin_edges,
+            report_dt_macro=report_dt_macro,
+        )
         if triplet_cls:
             results["classification"] = triplet_cls
         triplet_cls_by_source = evaluate_classification_triplet_by_source(triplet_logits)
         if triplet_cls_by_source:
             results["classification_by_source"] = triplet_cls_by_source
+        pos_shift_logits = triplet_logits.get("logits_positive_shifted", {}) if triplet_logits else {}
+        if isinstance(pos_shift_logits, dict) and pos_shift_logits:
+            results["classification_time_shift"] = {}
+            for key, val in pos_shift_logits.items():
+                if val is None:
+                    continue
+                tmp = dict(triplet_logits)
+                tmp["logits_positive"] = val
+                shift_cls = evaluate_classification_triplet(
+                    tmp,
+                    report_dt_bins=False,
+                    dt_bin_edges=dt_bin_edges,
+                    report_dt_macro=False,
+                )
+                if shift_cls:
+                    results["classification_time_shift"][str(key)] = shift_cls
+        if triplet_logits_shuffle is not None:
+            shuffle_cls = evaluate_classification_triplet(
+                triplet_logits_shuffle,
+                report_dt_bins=report_dt_bins,
+                dt_bin_edges=dt_bin_edges,
+                report_dt_macro=report_dt_macro,
+            )
+            if shuffle_cls:
+                results["classification_gw_shuffle"] = shuffle_cls
+            shuffle_src = evaluate_classification_triplet_by_source(triplet_logits_shuffle)
+            if shuffle_src:
+                results["classification_by_source_gw_shuffle"] = shuffle_src
 
     # Save and display
     save_results(results, args.output_dir)

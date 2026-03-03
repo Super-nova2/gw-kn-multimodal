@@ -110,6 +110,24 @@ TEMP_FINAL=$(jq -r '.temp_final // empty' "$args_file")
 TEMP_MIN=$(jq -r '.temp_min // empty' "$args_file")
 TEMP_MAX=$(jq -r '.temp_max // empty' "$args_file")
 TEMP_SCHEDULE=$(jq -r '.temp_schedule // empty' "$args_file")
+TIME_COMPAT_WEIGHT=$(jq -r '.time_compat_weight // empty' "$args_file")
+TIME_COMPAT_TAU_DAYS=$(jq -r '.time_compat_tau_days // empty' "$args_file")
+TIME_COMPAT_POWER=$(jq -r '.time_compat_power // empty' "$args_file")
+TIME_COMPAT_MAX_PENALTY=$(jq -r '.time_compat_max_penalty // empty' "$args_file")
+CLS_TIME_DELTA_ENABLE=$(jq -r '.cls_time_delta_enable // false' "$args_file")
+CLS_TIME_DELTA_SCALE_DAYS=$(jq -r '.cls_time_delta_scale_days // empty' "$args_file")
+CLS_TIME_DELTA_CLIP=$(jq -r '.cls_time_delta_clip // empty' "$args_file")
+NONKN_CLS_BASE_FIELD=$(jq -r '.nonkn_cls_base_field // empty' "$args_file")
+CLS_DT_AUG_ENABLE=$(jq -r '.cls_dt_aug_enable // false' "$args_file")
+CLS_DT_AUG_START_EPOCH=$(jq -r '.cls_dt_aug_start_epoch // empty' "$args_file")
+CLS_DT_JITTER_SIGMA_DAYS=$(jq -r '.cls_dt_jitter_sigma_days // empty' "$args_file")
+CLS_DT_JITTER_CLIP_DAYS=$(jq -r '.cls_dt_jitter_clip_days // empty' "$args_file")
+CLS_DT_DROPOUT_P_POS=$(jq -r '.cls_dt_dropout_p_pos // empty' "$args_file")
+CLS_DT_DROPOUT_P_HARD=$(jq -r '.cls_dt_dropout_p_hard // empty' "$args_file")
+CLS_DT_DROPOUT_P_EXTRA=$(jq -r '.cls_dt_dropout_p_extra // empty' "$args_file")
+EXTRA_DT_DROPOUT_ENABLE=$(jq -r '.extra_dt_dropout_enable // false' "$args_file")
+EXTRA_DT_DROPOUT_P=$(jq -r '.extra_dt_dropout_p // empty' "$args_file")
+EXTRA_DT_DROPOUT_APPLY_TO=$(jq -r '.extra_dt_dropout_apply_to // empty' "$args_file")
 GW_DROPOUT=$(jq -r '.gw_dropout // empty' "$args_file")
 OPT_DROPOUT=$(jq -r '.opt_dropout // empty' "$args_file")
 PROJ_DROPOUT=$(jq -r '.proj_dropout // empty' "$args_file")
@@ -120,6 +138,7 @@ CLS_WEIGHT=$(jq -r '.cls_weight // empty' "$args_file")
 CLS_POS_WEIGHT=$(jq -r '.cls_pos_weight // empty' "$args_file")
 CLS_NEG_WEIGHT=$(jq -r '.cls_neg_weight // empty' "$args_file")
 CLS_EXTRA_NEG_WEIGHT=$(jq -r '.cls_extra_neg_weight // empty' "$args_file")
+CLS_POS_NODT_AUX_WEIGHT=$(jq -r '.cls_pos_nodt_aux_weight // empty' "$args_file")
 CLS_RAMP_EPOCHS=$(jq -r '.cls_ramp_epochs // empty' "$args_file")
 ITC_DECAY_START_EPOCH=$(jq -r '.itc_decay_start_epoch // empty' "$args_file")
 ITC_DECAY_EPOCHS=$(jq -r '.itc_decay_epochs // empty' "$args_file")
@@ -133,6 +152,15 @@ HARD_NEG_START_EPOCH=$(jq -r '.hard_neg_start_epoch // empty' "$args_file")
 HARD_NEG_RAMP_EPOCHS=$(jq -r '.hard_neg_ramp_epochs // empty' "$args_file")
 SEMI_HARD=$(jq -r '.semi_hard // false' "$args_file")
 SEMI_HARD_MARGIN=$(jq -r '.semi_hard_margin // empty' "$args_file")
+HARDNEG_TIME_WINDOW_DAYS=$(jq -r '.hardneg_time_window_days // empty' "$args_file")
+HARDNEG_MIN_CANDIDATES=$(jq -r '.hardneg_min_candidates // empty' "$args_file")
+HARDNEG_FALLBACK_MODE=$(jq -r '.hardneg_fallback_mode // empty' "$args_file")
+HARDNEG_MEMORY_BANK_ENABLE=$(jq -r '.hardneg_memory_bank_enable // false' "$args_file")
+HARDNEG_MEMORY_BANK_SIZE=$(jq -r '.hardneg_memory_bank_size // empty' "$args_file")
+HARDNEG_MEMORY_TOPK=$(jq -r '.hardneg_memory_topk // empty' "$args_file")
+HARDNEG_MEMORY_WARMUP_STEPS=$(jq -r '.hardneg_memory_warmup_steps // empty' "$args_file")
+HARDNEG_MEMORY_INTERVAL=$(jq -r '.hardneg_memory_interval // empty' "$args_file")
+HARDNEG_MEMORY_MAX_ROWS=$(jq -r '.hardneg_memory_max_rows // empty' "$args_file")
 CLS_START_EPOCH=$(jq -r '.cls_start_epoch // empty' "$args_file")
 MASK_ITC=$(jq -r '.mask_itc // false' "$args_file")
 USE_LIGHTWEIGHT_GW=$(jq -r '.use_lightweight_gw // false' "$args_file")
@@ -144,6 +172,16 @@ OPT_AUG_NOISE=$(jq -r '.opt_aug_noise // empty' "$args_file")
 OPT_AUG_TIME_JITTER=$(jq -r '.opt_aug_time_jitter // empty' "$args_file")
 OPT_AUG_DROPOUT=$(jq -r '.opt_aug_dropout // empty' "$args_file")
 OPT_AUG_BAND_DROPOUT=$(jq -r '.opt_aug_band_dropout // empty' "$args_file")
+SEED=$(jq -r '.seed // empty' "$args_file")
+NEG_TIME_OFFSET_ENABLE=$(jq -r '.neg_time_offset_enable // false' "$args_file")
+NEG_OFFSET_DIST_NPZ=$(jq -r '.neg_offset_dist_npz // empty' "$args_file")
+NEG_OFFSET_DIST_KEY=$(jq -r '.neg_offset_dist_key // empty' "$args_file")
+NEG_OFFSET_TRAIN_SAMPLING=$(jq -r '.neg_offset_train_sampling // empty' "$args_file")
+NEG_OFFSET_EVAL_MODE=$(jq -r '.neg_offset_eval_mode // empty' "$args_file")
+NEG_OFFSET_EVAL_QUANTILES=$(jq -r '.neg_offset_eval_quantiles // empty' "$args_file")
+NEG_OFFSET_SCALE_DAYS_DIVISOR=$(jq -r '.neg_offset_scale_days_divisor // empty' "$args_file")
+NEG_OFFSET_SEED=$(jq -r '.neg_offset_seed // empty' "$args_file")
+NEG_OFFSET_BANK_SIZE=$(jq -r '.neg_offset_bank_size // empty' "$args_file")
 TEST_DATA_PATH=$(jq -r '.test_data_path // empty' "$args_file")
 TEST_STEPS=$(jq -r '.test_steps // empty' "$args_file")
 mkdir -p "$CKPT_PATH"
@@ -164,6 +202,21 @@ echo "Configuration File: $args_file"
 echo "Checkpoint Path: $CKPT_PATH"
 echo ""
 
+if [[ "$NEG_TIME_OFFSET_ENABLE" == "true" ]]; then
+    if [[ -z "$NEG_DATA_PATH" || "$NEG_DATA_PATH" == "null" ]]; then
+        echo "neg_time_offset_enable=true requires non-empty neg_data_path."
+        exit 1
+    fi
+    if [[ -z "$NEG_OFFSET_DIST_NPZ" || "$NEG_OFFSET_DIST_NPZ" == "null" ]]; then
+        echo "neg_time_offset_enable=true requires neg_offset_dist_npz."
+        exit 1
+    fi
+    if [[ ! -f "$NEG_OFFSET_DIST_NPZ" ]]; then
+        echo "Negative offset distribution file not found: $NEG_OFFSET_DIST_NPZ"
+        exit 1
+    fi
+fi
+
 # Optional: stage large HDF5 to local disk to reduce Lustre I/O
 if [ "$STAGE_TO_JOBFS" = "true" ]; then
     JOBFS_DIR="${SLURM_TMPDIR:-${TMPDIR:-${JOBFS:-}}}"
@@ -174,6 +227,11 @@ if [ "$STAGE_TO_JOBFS" = "true" ]; then
         if [[ -n "$NEG_DATA_PATH" && "$NEG_DATA_PATH" != "null" ]]; then
             cp -f "$NEG_DATA_PATH" "$JOBFS_DIR"/
             NEG_DATA_PATH="$JOBFS_DIR/$(basename "$NEG_DATA_PATH")"
+        fi
+        if [[ "$NEG_TIME_OFFSET_ENABLE" == "true" && -n "$NEG_OFFSET_DIST_NPZ" && "$NEG_OFFSET_DIST_NPZ" != "null" ]]; then
+            NEG_OFFSET_STAGED_NAME="neg_offset_$(basename "$NEG_OFFSET_DIST_NPZ")"
+            cp -f "$NEG_OFFSET_DIST_NPZ" "$JOBFS_DIR/$NEG_OFFSET_STAGED_NAME"
+            NEG_OFFSET_DIST_NPZ="$JOBFS_DIR/$NEG_OFFSET_STAGED_NAME"
         fi
         if [[ -n "$TEST_DATA_PATH" && "$TEST_DATA_PATH" != "null" ]]; then
             TEST_STAGED_NAME="test_$(basename "$TEST_DATA_PATH")"
@@ -200,6 +258,33 @@ if [[ -n "$NEG_DATA_PATH" && "$NEG_DATA_PATH" != "null" ]]; then
 fi
 if [[ -n "$NEG_GROUP" && "$NEG_GROUP" != "null" ]]; then
     cmd+=(--neg_group "$NEG_GROUP")
+fi
+if [[ "$NEG_TIME_OFFSET_ENABLE" == "true" ]]; then
+    cmd+=(--neg_time_offset_enable)
+fi
+if [[ -n "$NEG_OFFSET_DIST_NPZ" && "$NEG_OFFSET_DIST_NPZ" != "null" ]]; then
+    cmd+=(--neg_offset_dist_npz "$NEG_OFFSET_DIST_NPZ")
+fi
+if [[ -n "$NEG_OFFSET_DIST_KEY" && "$NEG_OFFSET_DIST_KEY" != "null" ]]; then
+    cmd+=(--neg_offset_dist_key "$NEG_OFFSET_DIST_KEY")
+fi
+if [[ -n "$NEG_OFFSET_TRAIN_SAMPLING" && "$NEG_OFFSET_TRAIN_SAMPLING" != "null" ]]; then
+    cmd+=(--neg_offset_train_sampling "$NEG_OFFSET_TRAIN_SAMPLING")
+fi
+if [[ -n "$NEG_OFFSET_EVAL_MODE" && "$NEG_OFFSET_EVAL_MODE" != "null" ]]; then
+    cmd+=(--neg_offset_eval_mode "$NEG_OFFSET_EVAL_MODE")
+fi
+if [[ -n "$NEG_OFFSET_EVAL_QUANTILES" && "$NEG_OFFSET_EVAL_QUANTILES" != "null" ]]; then
+    cmd+=(--neg_offset_eval_quantiles "$NEG_OFFSET_EVAL_QUANTILES")
+fi
+if [[ -n "$NEG_OFFSET_SCALE_DAYS_DIVISOR" && "$NEG_OFFSET_SCALE_DAYS_DIVISOR" != "null" ]]; then
+    cmd+=(--neg_offset_scale_days_divisor "$NEG_OFFSET_SCALE_DAYS_DIVISOR")
+fi
+if [[ -n "$NEG_OFFSET_SEED" && "$NEG_OFFSET_SEED" != "null" ]]; then
+    cmd+=(--neg_offset_seed "$NEG_OFFSET_SEED")
+fi
+if [[ -n "$NEG_OFFSET_BANK_SIZE" && "$NEG_OFFSET_BANK_SIZE" != "null" ]]; then
+    cmd+=(--neg_offset_bank_size "$NEG_OFFSET_BANK_SIZE")
 fi
 if [[ -n "$STEPS_PER_EPOCH" && "$STEPS_PER_EPOCH" != "null" ]]; then
     cmd+=(--steps_per_epoch "$STEPS_PER_EPOCH")
@@ -245,6 +330,9 @@ if [[ -n "$VAL_STEPS_PER_EPOCH" && "$VAL_STEPS_PER_EPOCH" != "null" ]]; then
 fi
 if [[ -n "$SPLIT_SEED" && "$SPLIT_SEED" != "null" ]]; then
     cmd+=(--split_seed "$SPLIT_SEED")
+fi
+if [[ -n "$SEED" && "$SEED" != "null" ]]; then
+    cmd+=(--seed "$SEED")
 fi
 if [[ -n "$EARLY_STOP_PATIENCE" && "$EARLY_STOP_PATIENCE" != "null" ]]; then
     cmd+=(--early_stop_patience "$EARLY_STOP_PATIENCE")
@@ -294,6 +382,60 @@ fi
 if [[ -n "$TEMP_SCHEDULE" && "$TEMP_SCHEDULE" != "null" ]]; then
     cmd+=(--temp_schedule "$TEMP_SCHEDULE")
 fi
+if [[ -n "$TIME_COMPAT_WEIGHT" && "$TIME_COMPAT_WEIGHT" != "null" ]]; then
+    cmd+=(--time_compat_weight "$TIME_COMPAT_WEIGHT")
+fi
+if [[ -n "$TIME_COMPAT_TAU_DAYS" && "$TIME_COMPAT_TAU_DAYS" != "null" ]]; then
+    cmd+=(--time_compat_tau_days "$TIME_COMPAT_TAU_DAYS")
+fi
+if [[ -n "$TIME_COMPAT_POWER" && "$TIME_COMPAT_POWER" != "null" ]]; then
+    cmd+=(--time_compat_power "$TIME_COMPAT_POWER")
+fi
+if [[ -n "$TIME_COMPAT_MAX_PENALTY" && "$TIME_COMPAT_MAX_PENALTY" != "null" ]]; then
+    cmd+=(--time_compat_max_penalty "$TIME_COMPAT_MAX_PENALTY")
+fi
+if [[ "$CLS_TIME_DELTA_ENABLE" == "true" ]]; then
+    cmd+=(--cls_time_delta_enable)
+fi
+if [[ -n "$CLS_TIME_DELTA_SCALE_DAYS" && "$CLS_TIME_DELTA_SCALE_DAYS" != "null" ]]; then
+    cmd+=(--cls_time_delta_scale_days "$CLS_TIME_DELTA_SCALE_DAYS")
+fi
+if [[ -n "$CLS_TIME_DELTA_CLIP" && "$CLS_TIME_DELTA_CLIP" != "null" ]]; then
+    cmd+=(--cls_time_delta_clip "$CLS_TIME_DELTA_CLIP")
+fi
+if [[ -n "$NONKN_CLS_BASE_FIELD" && "$NONKN_CLS_BASE_FIELD" != "null" ]]; then
+    cmd+=(--nonkn_cls_base_field "$NONKN_CLS_BASE_FIELD")
+fi
+if [[ "$CLS_DT_AUG_ENABLE" == "true" ]]; then
+    cmd+=(--cls_dt_aug_enable)
+fi
+if [[ -n "$CLS_DT_AUG_START_EPOCH" && "$CLS_DT_AUG_START_EPOCH" != "null" ]]; then
+    cmd+=(--cls_dt_aug_start_epoch "$CLS_DT_AUG_START_EPOCH")
+fi
+if [[ -n "$CLS_DT_JITTER_SIGMA_DAYS" && "$CLS_DT_JITTER_SIGMA_DAYS" != "null" ]]; then
+    cmd+=(--cls_dt_jitter_sigma_days "$CLS_DT_JITTER_SIGMA_DAYS")
+fi
+if [[ -n "$CLS_DT_JITTER_CLIP_DAYS" && "$CLS_DT_JITTER_CLIP_DAYS" != "null" ]]; then
+    cmd+=(--cls_dt_jitter_clip_days "$CLS_DT_JITTER_CLIP_DAYS")
+fi
+if [[ -n "$CLS_DT_DROPOUT_P_POS" && "$CLS_DT_DROPOUT_P_POS" != "null" ]]; then
+    cmd+=(--cls_dt_dropout_p_pos "$CLS_DT_DROPOUT_P_POS")
+fi
+if [[ -n "$CLS_DT_DROPOUT_P_HARD" && "$CLS_DT_DROPOUT_P_HARD" != "null" ]]; then
+    cmd+=(--cls_dt_dropout_p_hard "$CLS_DT_DROPOUT_P_HARD")
+fi
+if [[ -n "$CLS_DT_DROPOUT_P_EXTRA" && "$CLS_DT_DROPOUT_P_EXTRA" != "null" ]]; then
+    cmd+=(--cls_dt_dropout_p_extra "$CLS_DT_DROPOUT_P_EXTRA")
+fi
+if [[ "$EXTRA_DT_DROPOUT_ENABLE" == "true" ]]; then
+    cmd+=(--extra_dt_dropout_enable)
+fi
+if [[ -n "$EXTRA_DT_DROPOUT_P" && "$EXTRA_DT_DROPOUT_P" != "null" ]]; then
+    cmd+=(--extra_dt_dropout_p "$EXTRA_DT_DROPOUT_P")
+fi
+if [[ -n "$EXTRA_DT_DROPOUT_APPLY_TO" && "$EXTRA_DT_DROPOUT_APPLY_TO" != "null" ]]; then
+    cmd+=(--extra_dt_dropout_apply_to "$EXTRA_DT_DROPOUT_APPLY_TO")
+fi
 if [[ -n "$GW_DROPOUT" && "$GW_DROPOUT" != "null" ]]; then
     cmd+=(--gw_dropout "$GW_DROPOUT")
 fi
@@ -323,6 +465,9 @@ if [[ -n "$CLS_NEG_WEIGHT" && "$CLS_NEG_WEIGHT" != "null" ]]; then
 fi
 if [[ -n "$CLS_EXTRA_NEG_WEIGHT" && "$CLS_EXTRA_NEG_WEIGHT" != "null" ]]; then
     cmd+=(--cls_extra_neg_weight "$CLS_EXTRA_NEG_WEIGHT")
+fi
+if [[ -n "$CLS_POS_NODT_AUX_WEIGHT" && "$CLS_POS_NODT_AUX_WEIGHT" != "null" ]]; then
+    cmd+=(--cls_pos_nodt_aux_weight "$CLS_POS_NODT_AUX_WEIGHT")
 fi
 if [[ -n "$CLS_RAMP_EPOCHS" && "$CLS_RAMP_EPOCHS" != "null" ]]; then
     cmd+=(--cls_ramp_epochs "$CLS_RAMP_EPOCHS")
@@ -362,6 +507,33 @@ if [[ "$SEMI_HARD" == "true" ]]; then
 fi
 if [[ -n "$SEMI_HARD_MARGIN" && "$SEMI_HARD_MARGIN" != "null" ]]; then
     cmd+=(--semi_hard_margin "$SEMI_HARD_MARGIN")
+fi
+if [[ -n "$HARDNEG_TIME_WINDOW_DAYS" && "$HARDNEG_TIME_WINDOW_DAYS" != "null" ]]; then
+    cmd+=(--hardneg_time_window_days "$HARDNEG_TIME_WINDOW_DAYS")
+fi
+if [[ -n "$HARDNEG_MIN_CANDIDATES" && "$HARDNEG_MIN_CANDIDATES" != "null" ]]; then
+    cmd+=(--hardneg_min_candidates "$HARDNEG_MIN_CANDIDATES")
+fi
+if [[ -n "$HARDNEG_FALLBACK_MODE" && "$HARDNEG_FALLBACK_MODE" != "null" ]]; then
+    cmd+=(--hardneg_fallback_mode "$HARDNEG_FALLBACK_MODE")
+fi
+if [[ "$HARDNEG_MEMORY_BANK_ENABLE" == "true" ]]; then
+    cmd+=(--hardneg_memory_bank_enable)
+fi
+if [[ -n "$HARDNEG_MEMORY_BANK_SIZE" && "$HARDNEG_MEMORY_BANK_SIZE" != "null" ]]; then
+    cmd+=(--hardneg_memory_bank_size "$HARDNEG_MEMORY_BANK_SIZE")
+fi
+if [[ -n "$HARDNEG_MEMORY_TOPK" && "$HARDNEG_MEMORY_TOPK" != "null" ]]; then
+    cmd+=(--hardneg_memory_topk "$HARDNEG_MEMORY_TOPK")
+fi
+if [[ -n "$HARDNEG_MEMORY_WARMUP_STEPS" && "$HARDNEG_MEMORY_WARMUP_STEPS" != "null" ]]; then
+    cmd+=(--hardneg_memory_warmup_steps "$HARDNEG_MEMORY_WARMUP_STEPS")
+fi
+if [[ -n "$HARDNEG_MEMORY_INTERVAL" && "$HARDNEG_MEMORY_INTERVAL" != "null" ]]; then
+    cmd+=(--hardneg_memory_interval "$HARDNEG_MEMORY_INTERVAL")
+fi
+if [[ -n "$HARDNEG_MEMORY_MAX_ROWS" && "$HARDNEG_MEMORY_MAX_ROWS" != "null" ]]; then
+    cmd+=(--hardneg_memory_max_rows "$HARDNEG_MEMORY_MAX_ROWS")
 fi
 if [[ -n "$CLS_START_EPOCH" && "$CLS_START_EPOCH" != "null" ]]; then
     cmd+=(--cls_start_epoch "$CLS_START_EPOCH")

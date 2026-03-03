@@ -11,7 +11,30 @@
 
 set -euo pipefail
 
-DATASET_MODE="${DATASET_MODE:-test}"   # train | test
+DATASET_MODE="${DATASET_MODE:-train}"   # train | test
+BUILD_POSITIVE="${BUILD_POSITIVE:-false}" # true|false
+BUILD_NEGATIVE="${BUILD_NEGATIVE:-true}" # true|false
+
+normalize_bool() {
+    local v
+    v="$(echo "${1:-}" | tr '[:upper:]' '[:lower:]')"
+    case "${v}" in
+        1|true|yes|y|on) echo "true" ;;
+        0|false|no|n|off) echo "false" ;;
+        *)
+            echo "Invalid boolean value '${1}'. Use true/false (or 1/0)." >&2
+            return 1
+            ;;
+    esac
+}
+
+BUILD_POSITIVE="$(normalize_bool "${BUILD_POSITIVE}")"
+BUILD_NEGATIVE="$(normalize_bool "${BUILD_NEGATIVE}")"
+if [[ "${BUILD_POSITIVE}" != "true" && "${BUILD_NEGATIVE}" != "true" ]]; then
+    echo "Nothing to build: BUILD_POSITIVE=${BUILD_POSITIVE}, BUILD_NEGATIVE=${BUILD_NEGATIVE}"
+    echo "Set at least one of BUILD_POSITIVE/BUILD_NEGATIVE to true."
+    exit 1
+fi
 
 # Self-submit: run this script directly to submit job to Slurm.
 if [[ -z "${SLURM_JOB_ID:-}" ]]; then
@@ -48,6 +71,7 @@ case "${DATASET_MODE}" in
 
         OUTPUT_POS_H5="/fred/oz016/bgao_kn/data/Optical_Only_dataset/combined_dataset_train.h5"
         OUTPUT_NEG_H5="/fred/oz016/bgao_kn/data/Optical_Only_dataset/ELASTICC2_negative_dataset.h5"
+        CLS_TIME_ANCHOR_GW_H5_DEFAULT="/fred/oz016/bgao_kn/data/ALBEF_dataset/combined_dataset_train.h5"
         ;;
     test)
         BNS_SIM_ROOT="/fred/oz016/bgao_kn/SNANA/SNDATA_ROOT/SIM/LSST_KN_BNS"
@@ -61,12 +85,17 @@ case "${DATASET_MODE}" in
 
         OUTPUT_POS_H5="/fred/oz016/bgao_kn/data/Optical_Only_dataset/combined_dataset_test.h5"
         OUTPUT_NEG_H5="/fred/oz016/bgao_kn/data/Optical_Only_dataset/Tutorial_negative_dataset.h5"
+        # C2: use a global GW-time prior from training set for cls base anchoring.
+        CLS_TIME_ANCHOR_GW_H5_DEFAULT="/fred/oz016/bgao_kn/data/ALBEF_dataset/combined_dataset_train.h5"
         ;;
     *)
         echo "Unsupported DATASET_MODE='${DATASET_MODE}'. Use train or test."
         exit 1
         ;;
 esac
+
+CLS_TIME_ANCHOR_GW_H5="${CLS_TIME_ANCHOR_GW_H5:-$CLS_TIME_ANCHOR_GW_H5_DEFAULT}"
+CLS_TIME_ANCHOR_SEED="${CLS_TIME_ANCHOR_SEED:-42}"
 
 MIN_NOBS=5
 SNR_THRESHOLD=5.0
@@ -79,8 +108,12 @@ if [[ -n "${SLURM_CPUS_PER_TASK:-}" && "${NUM_WORKERS}" -gt "${SLURM_CPUS_PER_TA
     NUM_WORKERS="${SLURM_CPUS_PER_TASK}"
 fi
 
-mkdir -p "$(dirname "${OUTPUT_POS_H5}")"
-mkdir -p "$(dirname "${OUTPUT_NEG_H5}")"
+if [[ "${BUILD_POSITIVE}" == "true" ]]; then
+    mkdir -p "$(dirname "${OUTPUT_POS_H5}")"
+fi
+if [[ "${BUILD_NEGATIVE}" == "true" ]]; then
+    mkdir -p "$(dirname "${OUTPUT_NEG_H5}")"
+fi
 
 # Prevent concurrent jobs from writing the same dataset outputs.
 LOCK_FILE="/fred/oz016/bgao_kn/data/Optical_Only_dataset/.build_optical_only_${DATASET_MODE}.lock"
@@ -99,25 +132,23 @@ echo "Start: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
 echo "========================================"
 echo "Build script: ${BUILD_SCRIPT}"
 echo "Dataset mode: ${DATASET_MODE}"
+echo "Build positive: ${BUILD_POSITIVE}"
+echo "Build negative: ${BUILD_NEGATIVE}"
 echo "Output POS: ${OUTPUT_POS_H5}"
 echo "Output NEG: ${OUTPUT_NEG_H5}"
 echo "Lock file: ${LOCK_FILE}"
 echo "Detection rule: PHOTFLAG!=0, fallback SNR>${SNR_THRESHOLD}"
 echo "Workers: ${NUM_WORKERS}"
+echo "CLS anchor GW prior: ${CLS_TIME_ANCHOR_GW_H5}"
 echo "========================================"
+
+if [[ "${BUILD_NEGATIVE}" == "true" && ! -f "${CLS_TIME_ANCHOR_GW_H5}" ]]; then
+    echo "GW anchor H5 not found: ${CLS_TIME_ANCHOR_GW_H5}"
+    exit 1
+fi
 
 cmd=(
     "${PYTHON_BIN}" -u "${BUILD_SCRIPT}"
-    --build_positive
-    --build_negative
-    --output_pos_h5 "${OUTPUT_POS_H5}"
-    --output_neg_h5 "${OUTPUT_NEG_H5}"
-    --neg_group "${NEG_GROUP}"
-    --bns_sim_root "${BNS_SIM_ROOT}"
-    --bns_sim_name "${BNS_SIM_NAME}"
-    --nsbh_sim_root "${NSBH_SIM_ROOT}"
-    --nsbh_sim_name "${NSBH_SIM_NAME}"
-    --neg_sim_root "${NEG_SIM_ROOT}"
     --min_nobs "${MIN_NOBS}"
     --snr_threshold "${SNR_THRESHOLD}"
     --buffer_limit "${BUFFER_LIMIT}"
@@ -126,11 +157,37 @@ cmd=(
     --num_workers "${NUM_WORKERS}"
 )
 
+if [[ "${BUILD_POSITIVE}" == "true" ]]; then
+    cmd+=(
+        --build_positive
+        --output_pos_h5 "${OUTPUT_POS_H5}"
+        --bns_sim_root "${BNS_SIM_ROOT}"
+        --bns_sim_name "${BNS_SIM_NAME}"
+        --nsbh_sim_root "${NSBH_SIM_ROOT}"
+        --nsbh_sim_name "${NSBH_SIM_NAME}"
+    )
+fi
+
+if [[ "${BUILD_NEGATIVE}" == "true" ]]; then
+    cmd+=(
+        --build_negative
+        --output_neg_h5 "${OUTPUT_NEG_H5}"
+        --neg_group "${NEG_GROUP}"
+        --neg_sim_root "${NEG_SIM_ROOT}"
+        --cls_time_anchor_gw_h5 "${CLS_TIME_ANCHOR_GW_H5}"
+        --cls_time_anchor_seed "${CLS_TIME_ANCHOR_SEED}"
+    )
+fi
+
 echo "Command: ${cmd[*]}"
 "${cmd[@]}"
 
 echo "========================================"
 echo "Finished: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
-echo "Saved POS: ${OUTPUT_POS_H5}"
-echo "Saved NEG: ${OUTPUT_NEG_H5}"
+if [[ "${BUILD_POSITIVE}" == "true" ]]; then
+    echo "Saved POS: ${OUTPUT_POS_H5}"
+fi
+if [[ "${BUILD_NEGATIVE}" == "true" ]]; then
+    echo "Saved NEG: ${OUTPUT_NEG_H5}"
+fi
 echo "========================================"
