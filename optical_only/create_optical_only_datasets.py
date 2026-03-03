@@ -505,6 +505,25 @@ def _create_optical_group(
     return ds_values, ds_errors, ds_masks, ds_times, ds_zero_time_mjd_base, ds_coords
 
 
+def load_gw_event_time_prior(gw_h5_path: Optional[Path]) -> Optional[np.ndarray]:
+    """
+    Load finite GW event times (MJD) as an empirical sampling prior.
+    """
+    if gw_h5_path is None:
+        return None
+    if not gw_h5_path.exists():
+        raise FileNotFoundError(f"GW anchor H5 not found: {gw_h5_path}")
+    ds_path = "events/gw_data/event_time_mjd"
+    with h5py.File(gw_h5_path, "r") as f:
+        if ds_path not in f:
+            raise KeyError(f"Missing '{ds_path}' in {gw_h5_path}")
+        arr = np.asarray(f[ds_path][:], dtype=np.float64).reshape(-1)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        raise ValueError(f"No finite GW event_time_mjd found in {gw_h5_path}")
+    return arr
+
+
 def create_positive_h5(
     output_h5: Path,
     bns_sim_root: Path,
@@ -728,6 +747,8 @@ def create_negative_h5(
     max_negative_heads: Optional[int],
     buffer_limit: int,
     num_workers: int,
+    cls_time_anchor_gw_h5: Optional[Path],
+    cls_time_anchor_seed: int,
 ) -> None:
     output_h5.parent.mkdir(parents=True, exist_ok=True)
     chunk_size = 1024
@@ -739,6 +760,17 @@ def create_negative_h5(
             grp, chunk_size
         )
         ds_types = grp.create_dataset("types", (0,), maxshape=(None,), dtype=dt_str, chunks=(chunk_size,))
+        gw_time_prior = load_gw_event_time_prior(cls_time_anchor_gw_h5)
+        rng_anchor = np.random.default_rng(int(cls_time_anchor_seed))
+        ds_zero_time_mjd_cls_base = None
+        if gw_time_prior is not None:
+            ds_zero_time_mjd_cls_base = grp.create_dataset(
+                "zero_time_mjd_cls_base",
+                (0,),
+                maxshape=(None,),
+                dtype="f8",
+                chunks=(chunk_size,),
+            )
 
         total_optical = 0
         b_vals: List[np.ndarray] = []
@@ -746,6 +778,7 @@ def create_negative_h5(
         b_masks: List[np.ndarray] = []
         b_times: List[np.ndarray] = []
         b_zero_time_mjd_base: List[float] = []
+        b_zero_time_mjd_cls_base: List[float] = []
         b_coords: List[np.ndarray] = []
         b_types: List[str] = []
 
@@ -771,6 +804,8 @@ def create_negative_h5(
             ds_zero_time_mjd_base.resize(new_size, axis=0)
             ds_coords.resize(new_size, axis=0)
             ds_types.resize(new_size, axis=0)
+            if ds_zero_time_mjd_cls_base is not None:
+                ds_zero_time_mjd_cls_base.resize(new_size, axis=0)
             ds_values[cur:new_size] = np.asarray(b_vals, dtype=np.float32)
             ds_errors[cur:new_size] = np.asarray(b_errs, dtype=np.float32)
             ds_masks[cur:new_size] = np.asarray(b_masks, dtype=np.float32)
@@ -778,6 +813,10 @@ def create_negative_h5(
             ds_zero_time_mjd_base[cur:new_size] = np.asarray(b_zero_time_mjd_base, dtype=np.float64)
             ds_coords[cur:new_size] = np.asarray(b_coords, dtype=np.float32)
             ds_types[cur:new_size] = np.asarray(b_types, dtype=object)
+            if ds_zero_time_mjd_cls_base is not None:
+                ds_zero_time_mjd_cls_base[cur:new_size] = np.asarray(
+                    b_zero_time_mjd_cls_base, dtype=np.float64
+                )
 
             total_optical = new_size
             b_vals.clear()
@@ -785,6 +824,7 @@ def create_negative_h5(
             b_masks.clear()
             b_times.clear()
             b_zero_time_mjd_base.clear()
+            b_zero_time_mjd_cls_base.clear()
             b_coords.clear()
             b_types.clear()
 
@@ -806,6 +846,11 @@ def create_negative_h5(
                 b_masks.append(masks)
                 b_times.append(times)
                 b_zero_time_mjd_base.append(float(zero_time_mjd_base))
+                if gw_time_prior is not None:
+                    sampled = float(
+                        gw_time_prior[rng_anchor.integers(0, int(gw_time_prior.shape[0]))]
+                    )
+                    b_zero_time_mjd_cls_base.append(sampled)
                 b_coords.append(coords)
                 b_types.append(transient_type)
 
@@ -890,6 +935,13 @@ def create_negative_h5(
         f.attrs["time_zero_base_semantics"] = "first_detection_mjd_plus_fixed_offset_days"
         f.attrs["time_unit"] = "mjd_days"
         f.attrs["runtime_offset_applied"] = 1
+        if gw_time_prior is not None:
+            f.attrs["cls_anchor_policy"] = "global_gw_prior"
+            f.attrs["cls_anchor_source_h5"] = str(cls_time_anchor_gw_h5)
+            f.attrs["cls_anchor_seed"] = int(cls_time_anchor_seed)
+            f.attrs["cls_anchor_samples"] = int(gw_time_prior.shape[0])
+        else:
+            f.attrs["cls_anchor_policy"] = "disabled"
 
     print(f"[NEG] Saved: {output_h5}")
 
@@ -932,6 +984,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--min_nobs", type=int, default=5)
     p.add_argument("--snr_threshold", type=float, default=5.0)
     p.add_argument("--fixed_offset_days", type=float, default=0.0)
+    p.add_argument(
+        "--cls_time_anchor_gw_h5",
+        type=str,
+        default=None,
+        help="H5 path providing events/gw_data/event_time_mjd prior for zero_time_mjd_cls_base.",
+    )
+    p.add_argument(
+        "--cls_time_anchor_seed",
+        type=int,
+        default=42,
+        help="Sampling seed for zero_time_mjd_cls_base generation.",
+    )
     p.add_argument(
         "--num_workers",
         type=int,
@@ -987,6 +1051,8 @@ def main():
             max_negative_heads=args.max_negative_heads,
             buffer_limit=int(args.buffer_limit),
             num_workers=int(args.num_workers),
+            cls_time_anchor_gw_h5=Path(args.cls_time_anchor_gw_h5) if args.cls_time_anchor_gw_h5 else None,
+            cls_time_anchor_seed=int(args.cls_time_anchor_seed),
         )
 
 

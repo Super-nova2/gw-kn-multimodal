@@ -732,11 +732,21 @@ class CrossAttentionFusion(nn.Module):
     When dual=True:  GW queries optical + optical CLS queries GW spatial map
                      + per-pair credible level → classifier(concat).
     """
-    def __init__(self, gw_dim, opt_dim, attn_dim=None, hidden_dim=None, dropout=0.1, dual=False):
+    def __init__(
+        self,
+        gw_dim,
+        opt_dim,
+        attn_dim=None,
+        hidden_dim=None,
+        dropout=0.1,
+        dual=False,
+        cls_time_delta_enable=False,
+    ):
         super().__init__()
         self.attn_dim = d = attn_dim if attn_dim is not None else opt_dim
         self.hidden_dim = hidden_dim if hidden_dim is not None else d * 2
         self.dual = dual
+        self.cls_time_delta_enable = bool(cls_time_delta_enable)
 
         # Direction 1: GW → Optical (always used)
         self.g2o_q = nn.Linear(gw_dim, d)
@@ -754,6 +764,8 @@ class CrossAttentionFusion(nn.Module):
             cls_input_dim = d * 2 + 1
         else:
             cls_input_dim = d
+        if self.cls_time_delta_enable:
+            cls_input_dim += 1
 
         self.classifier = nn.Sequential(
             nn.Linear(cls_input_dim, self.hidden_dim),
@@ -762,7 +774,7 @@ class CrossAttentionFusion(nn.Module):
             nn.Linear(self.hidden_dim, 2)
         )
 
-    def forward(self, g_feat, h_l, z_l=None, H_gw=None, cred_level=None):
+    def forward(self, g_feat, h_l, z_l=None, H_gw=None, cred_level=None, time_delta_feat=None):
         """
         Args:
             g_feat:     [B, gw_dim]     — GW global embedding
@@ -798,6 +810,16 @@ class CrossAttentionFusion(nn.Module):
         else:
             combined = fused_opt  # [B, d]
 
+        if self.cls_time_delta_enable:
+            if time_delta_feat is None:
+                time_delta_feat = torch.zeros(
+                    (combined.size(0), 1), device=combined.device, dtype=combined.dtype
+                )
+            elif time_delta_feat.ndim == 1:
+                time_delta_feat = time_delta_feat.unsqueeze(-1)
+            time_delta_feat = time_delta_feat.to(device=combined.device, dtype=combined.dtype)
+            combined = torch.cat([combined, time_delta_feat], dim=-1)
+
         logits = self.classifier(combined)
         return logits, combined
 
@@ -827,10 +849,20 @@ class GWOpticalALBEFModel(nn.Module):
         label_smoothing=0.0,
         itc_label_smoothing=0.0,
         use_lightweight_gw=False,
-        dual_fusion=False
+        dual_fusion=False,
+        time_compat_weight=0.6,
+        time_compat_tau_days=30.0,
+        time_compat_power=2.0,
+        time_compat_max_penalty=8.0,
+        cls_time_delta_enable=False,
+        cls_time_delta_scale_days=30.0,
+        cls_time_delta_clip=10.0,
     ):
         super().__init__()
         self.dual_fusion = dual_fusion
+        self.cls_time_delta_enable = bool(cls_time_delta_enable)
+        self.cls_time_delta_scale_days = float(cls_time_delta_scale_days)
+        self.cls_time_delta_clip = float(cls_time_delta_clip)
 
         # 根据参数选择GW编码器类型
         if use_lightweight_gw:
@@ -864,6 +896,10 @@ class GWOpticalALBEFModel(nn.Module):
         self.log_temp = nn.Parameter(torch.ones([]) * torch.log(torch.tensor(temp_init)))
         self.temp_min = float(temp_min)
         self.temp_max = float(temp_max)
+        self.time_compat_weight = float(time_compat_weight)
+        self.time_compat_tau_days = float(time_compat_tau_days)
+        self.time_compat_power = float(time_compat_power)
+        self.time_compat_max_penalty = float(time_compat_max_penalty)
         self.itc_criterion = nn.CrossEntropyLoss(label_smoothing=itc_label_smoothing)
 
         self.fusion = CrossAttentionFusion(
@@ -872,7 +908,8 @@ class GWOpticalALBEFModel(nn.Module):
             attn_dim=fusion_attn_dim,
             hidden_dim=fusion_hidden_dim,
             dropout=fusion_dropout,
-            dual=dual_fusion
+            dual=dual_fusion,
+            cls_time_delta_enable=self.cls_time_delta_enable,
         )
         self.cls_criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
 
@@ -897,13 +934,56 @@ class GWOpticalALBEFModel(nn.Module):
             h_l = self.feature_dropout(h_l)
         return z_l, h_l
 
-    def compute_itc_loss(self, g, z_l, gw_indices=None, mask=False):
+    def _build_time_compat_bias(self, gw_event_time_mjd=None, opt_event_time_mjd=None):
+        """
+        Build pairwise time-compatibility bias matrix [B, B] for GW->Optical logits.
+        bias_ij = -w * (|t_opt_j - t_gw_i| / tau)^power, clamped to [-max_penalty, 0].
+
+        Invalid time pairs (NaN/Inf) receive zero bias.
+        """
+        if gw_event_time_mjd is None:
+            return None
+        if self.time_compat_weight <= 0 or self.time_compat_tau_days <= 0:
+            return None
+
+        gw_t = gw_event_time_mjd.reshape(-1).to(torch.float32)
+        opt_t = gw_t if opt_event_time_mjd is None else opt_event_time_mjd.reshape(-1).to(torch.float32)
+
+        valid = torch.isfinite(gw_t).unsqueeze(1) & torch.isfinite(opt_t).unsqueeze(0)
+        delta = opt_t.unsqueeze(0) - gw_t.unsqueeze(1)
+        bias = -self.time_compat_weight * torch.pow(
+            torch.abs(delta) / self.time_compat_tau_days,
+            self.time_compat_power,
+        )
+
+        if self.time_compat_max_penalty > 0:
+            bias = torch.clamp(bias, min=-self.time_compat_max_penalty, max=0.0)
+        else:
+            bias = torch.clamp_max(bias, 0.0)
+
+        bias = torch.where(valid, bias, torch.zeros_like(bias))
+        return bias
+
+    def compute_itc_loss(
+        self,
+        g,
+        z_l,
+        gw_indices=None,
+        mask=False,
+        gw_event_time_mjd=None,
+        opt_event_time_mjd=None,
+    ):
         feat_g = F.normalize(self.gw_proj(g), p=2, dim=1, eps=1e-8)
         feat_o = F.normalize(self.opt_proj(z_l), p=2, dim=1, eps=1e-8)
 
         temperature = torch.clamp(self.log_temp.exp(), min=self.temp_min, max=self.temp_max)
         sim_g2o = torch.matmul(feat_g, feat_o.T) / temperature
         sim_o2g = sim_g2o.T
+        time_bias = self._build_time_compat_bias(gw_event_time_mjd, opt_event_time_mjd)
+        if time_bias is not None:
+            time_bias = time_bias.to(device=sim_g2o.device, dtype=sim_g2o.dtype)
+            sim_g2o = sim_g2o + time_bias
+            sim_o2g = sim_o2g + time_bias.T
 
         if mask and gw_indices is not None:
             labels_mask = (gw_indices.unsqueeze(0) == gw_indices.unsqueeze(1)).float()
@@ -927,7 +1007,15 @@ class GWOpticalALBEFModel(nn.Module):
 
         return total_loss, sim_g2o
 
-    def compute_supcon_loss(self, g, z_l, gw_indices, margin=0.0):
+    def compute_supcon_loss(
+        self,
+        g,
+        z_l,
+        gw_indices,
+        margin=0.0,
+        gw_event_time_mjd=None,
+        opt_event_time_mjd=None,
+    ):
         """
         Supervised Contrastive Loss for many-to-many GW-optical matching.
 
@@ -962,6 +1050,12 @@ class GWOpticalALBEFModel(nn.Module):
         labels = torch.cat([gw_indices, gw_indices], dim=0)
 
         sim_matrix = torch.matmul(features, features.T) / temperature
+        time_bias = self._build_time_compat_bias(gw_event_time_mjd, opt_event_time_mjd)
+        if time_bias is not None:
+            time_bias = time_bias.to(device=sim_matrix.device, dtype=sim_matrix.dtype)
+            # Only apply to cross-modal blocks (GW->Optical and Optical->GW)
+            sim_matrix[:batch_size, batch_size:] = sim_matrix[:batch_size, batch_size:] + time_bias
+            sim_matrix[batch_size:, :batch_size] = sim_matrix[batch_size:, :batch_size] + time_bias.T
 
         labels_eq = labels.unsqueeze(0) == labels.unsqueeze(1)
         mask_pos = labels_eq.clone()
@@ -1001,11 +1095,36 @@ class GWOpticalALBEFModel(nn.Module):
             loss = torch.zeros((), device=device)
 
         sim_g2o = torch.matmul(feat_g, feat_o.T) / temperature
+        if time_bias is not None:
+            sim_g2o = sim_g2o + time_bias
 
         return loss, sim_g2o
 
-    def fusion_logits(self, g_feat, h_l, z_l=None, H_gw=None, cred_level=None):
-        logits, _ = self.fusion(g_feat, h_l, z_l=z_l, H_gw=H_gw, cred_level=cred_level)
+    def _prepare_cls_time_delta(self, time_delta_days, ref_tensor):
+        if time_delta_days is None:
+            dt = torch.zeros((ref_tensor.size(0),), device=ref_tensor.device, dtype=ref_tensor.dtype)
+        else:
+            dt = time_delta_days.reshape(-1).to(device=ref_tensor.device, dtype=ref_tensor.dtype)
+
+        scale = self.cls_time_delta_scale_days
+        if scale <= 0:
+            dt_norm = dt
+        else:
+            dt_norm = dt / scale
+
+        clip = self.cls_time_delta_clip
+        if clip > 0:
+            dt_norm = torch.clamp(dt_norm, min=-clip, max=clip)
+        dt_norm = torch.where(torch.isfinite(dt_norm), dt_norm, torch.zeros_like(dt_norm))
+        return dt_norm.unsqueeze(-1)
+
+    def fusion_logits(self, g_feat, h_l, z_l=None, H_gw=None, cred_level=None, time_delta_days=None):
+        time_delta_feat = None
+        if self.cls_time_delta_enable:
+            time_delta_feat = self._prepare_cls_time_delta(time_delta_days, g_feat)
+        logits, _ = self.fusion(
+            g_feat, h_l, z_l=z_l, H_gw=H_gw, cred_level=cred_level, time_delta_feat=time_delta_feat
+        )
         return logits
 
     @staticmethod

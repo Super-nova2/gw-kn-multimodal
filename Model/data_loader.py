@@ -17,6 +17,31 @@ from pathlib import Path
 import subprocess
 
 
+def _normalize_day_windows(windows) -> List[float]:
+    if windows is None:
+        return []
+    if isinstance(windows, str):
+        parts = [p.strip() for p in windows.split(",")]
+        vals = [float(p) for p in parts if p]
+    else:
+        vals = [float(v) for v in windows]
+    vals = [v for v in vals if np.isfinite(v) and v > 0]
+    if not vals:
+        return []
+    vals = sorted(set(vals))
+    return vals
+
+
+def _geometric_level_probs(n_levels: int) -> np.ndarray:
+    if n_levels <= 0:
+        return np.zeros((0,), dtype=np.float64)
+    weights = np.asarray([0.5 ** i for i in range(n_levels)], dtype=np.float64)
+    s = float(weights.sum())
+    if s <= 0:
+        return np.full((n_levels,), 1.0 / float(n_levels), dtype=np.float64)
+    return weights / s
+
+
 def build_gw_to_lc_mapping(h5_path: str):
     """
     Scans the HDF5 file to build a mapping from GW Event Index to Light Curve Indices.
@@ -57,7 +82,13 @@ class RelationalHDF5Dataset(Dataset):
         negative_h5_path: str = None,
         negative_group: str = "events/optical_data",
         cache_in_memory: bool = False,
-        use_neg_gw: bool = False
+        use_neg_gw: bool = False,
+        return_zero_time_mjd: bool = False,
+        nonkn_cls_base_field: str = "zero_time_mjd_cls_base",
+        extra_negative_timeaware_enable: bool = False,
+        extra_negative_timeaware_windows_days=None,
+        extra_negative_timeaware_min_candidates: int = 1,
+        extra_negative_timeaware_seed: int = 42,
     ):
         super().__init__()
         self.h5_path = h5_path
@@ -69,6 +100,23 @@ class RelationalHDF5Dataset(Dataset):
         self.cache_in_memory = cache_in_memory
         self.data_cache = None
         self.neg_cache = None
+        self.return_zero_time_mjd = bool(return_zero_time_mjd)
+        self.nonkn_cls_base_field = str(nonkn_cls_base_field)
+        self.has_opt_zero_time_mjd_base = False
+        self.has_gw_event_time_mjd = False
+        self.has_neg_zero_time_mjd_base = False
+        self.has_neg_zero_time_mjd_cls_base = False
+        self.extra_negative_timeaware_enable = bool(extra_negative_timeaware_enable)
+        self.extra_negative_timeaware_windows_days = _normalize_day_windows(extra_negative_timeaware_windows_days)
+        self.extra_negative_timeaware_min_candidates = max(1, int(extra_negative_timeaware_min_candidates))
+        self.extra_negative_timeaware_seed = int(extra_negative_timeaware_seed)
+        self.extra_negative_timeaware_level_probs = _geometric_level_probs(
+            len(self.extra_negative_timeaware_windows_days)
+        )
+        self.extra_negative_timeaware_active = False
+        self.gw_event_time_mjd_np = None
+        self.neg_cls_time_sorted = None
+        self.neg_cls_sorted_to_orig_idx = None
 
         # Negative GW support (BNS events without KN)
         self.use_neg_gw = use_neg_gw
@@ -78,6 +126,19 @@ class RelationalHDF5Dataset(Dataset):
         # Open file temporarily to get dataset length
         with h5py.File(h5_path, 'r') as f:
             self.length = f['events/optical_data/values'].shape[0]
+            self.has_opt_zero_time_mjd_base = "events/optical_data/zero_time_mjd_base" in f
+            self.has_gw_event_time_mjd = "events/gw_data/event_time_mjd" in f
+            if self.has_gw_event_time_mjd:
+                self.gw_event_time_mjd_np = np.asarray(
+                    f["events/gw_data/event_time_mjd"][:], dtype=np.float64
+                ).reshape(-1)
+
+            if self.return_zero_time_mjd and (not self.has_opt_zero_time_mjd_base) and (not self.has_gw_event_time_mjd):
+                raise KeyError(
+                    "return_zero_time_mjd=True requires either "
+                    "'events/optical_data/zero_time_mjd_base' or "
+                    "'events/gw_data/event_time_mjd' in positive dataset."
+                )
             if self.cache_in_memory:
                 print(f"Caching positive dataset in memory from {h5_path} (as tensors)...")
                 self.data_cache = {
@@ -90,6 +151,14 @@ class RelationalHDF5Dataset(Dataset):
                     "gw_scalar": torch.from_numpy(f['events/gw_data/scalars'][:]),
                     "gw_skymap": torch.from_numpy(f['events/gw_data/skymaps'][:])
                 }
+                if self.has_opt_zero_time_mjd_base:
+                    self.data_cache["opt_zero_time_mjd_base"] = torch.from_numpy(
+                        f["events/optical_data/zero_time_mjd_base"][:]
+                    )
+                elif self.return_zero_time_mjd and self.has_gw_event_time_mjd:
+                    self.data_cache["gw_event_time_mjd"] = torch.from_numpy(
+                        f["events/gw_data/event_time_mjd"][:]
+                    )
                 # Validate data integrity once at load time
                 assert not torch.isnan(self.data_cache["opt_val"]).any(), "NaN found in cached optical values"
                 assert not torch.isinf(self.data_cache["opt_val"]).any(), "Inf found in cached optical values"
@@ -117,6 +186,20 @@ class RelationalHDF5Dataset(Dataset):
                 if self.negative_group not in f:
                     raise KeyError(f"Negative group '{self.negative_group}' not found in {self.negative_h5_path}")
                 self.neg_length = f[f"{self.negative_group}/values"].shape[0]
+                self.has_neg_zero_time_mjd_base = f"{self.negative_group}/zero_time_mjd_base" in f
+                self.has_neg_zero_time_mjd_cls_base = (
+                    f"{self.negative_group}/{self.nonkn_cls_base_field}" in f
+                )
+                if self.return_zero_time_mjd and not self.has_neg_zero_time_mjd_base:
+                    raise KeyError(
+                        f"return_zero_time_mjd=True requires '{self.negative_group}/zero_time_mjd_base' "
+                        f"in negative dataset: {self.negative_h5_path}"
+                    )
+                if self.return_zero_time_mjd and not self.has_neg_zero_time_mjd_cls_base:
+                    raise KeyError(
+                        f"return_zero_time_mjd=True requires '{self.negative_group}/{self.nonkn_cls_base_field}' "
+                        f"in negative dataset: {self.negative_h5_path}"
+                    )
                 if self.cache_in_memory:
                     print(f"Caching negative dataset in memory from {self.negative_h5_path} (as tensors)...")
                     self.neg_cache = {
@@ -126,6 +209,14 @@ class RelationalHDF5Dataset(Dataset):
                         "neg_time": torch.from_numpy(f[f"{self.negative_group}/times"][:]),
                         "neg_coords": torch.from_numpy(f[f"{self.negative_group}/coordinates"][:])
                     }
+                    if self.has_neg_zero_time_mjd_base:
+                        self.neg_cache["neg_zero_time_mjd_base"] = torch.from_numpy(
+                            f[f"{self.negative_group}/zero_time_mjd_base"][:]
+                        )
+                    if self.has_neg_zero_time_mjd_cls_base:
+                        self.neg_cache["neg_zero_time_mjd_cls_base"] = torch.from_numpy(
+                            f[f"{self.negative_group}/{self.nonkn_cls_base_field}"][:]
+                        )
                     # Validate negative data integrity
                     assert not torch.isnan(self.neg_cache["neg_val"]).any(), "NaN found in cached negative values"
                     assert not torch.isinf(self.neg_cache["neg_val"]).any(), "Inf found in cached negative values"
@@ -133,6 +224,123 @@ class RelationalHDF5Dataset(Dataset):
                     for k, v in self.neg_cache.items():
                         if isinstance(v, torch.Tensor):
                             self.neg_cache[k] = v.share_memory_()
+                if self.extra_negative_timeaware_enable:
+                    if not self.has_neg_zero_time_mjd_cls_base:
+                        print(
+                            "WARNING: extra-negative time-aware sampling disabled because "
+                            f"'{self.negative_group}/{self.nonkn_cls_base_field}' is missing."
+                        )
+                    else:
+                        neg_cls = np.asarray(
+                            f[f"{self.negative_group}/{self.nonkn_cls_base_field}"][:],
+                            dtype=np.float64,
+                        ).reshape(-1)
+                        valid = np.isfinite(neg_cls)
+                        if valid.any():
+                            valid_idx = np.nonzero(valid)[0].astype(np.int64, copy=False)
+                            neg_cls_valid = neg_cls[valid]
+                            order = np.argsort(neg_cls_valid, kind="mergesort")
+                            self.neg_cls_time_sorted = neg_cls_valid[order]
+                            self.neg_cls_sorted_to_orig_idx = valid_idx[order]
+                        else:
+                            print(
+                                "WARNING: extra-negative time-aware sampling disabled because "
+                                "non-KN cls base times are all non-finite."
+                            )
+
+        self.extra_negative_timeaware_active = bool(
+            self.extra_negative_timeaware_enable
+            and self.negative_h5_path is not None
+            and self.neg_length is not None
+            and self.neg_length > 0
+            and self.gw_event_time_mjd_np is not None
+            and self.neg_cls_time_sorted is not None
+            and self.neg_cls_sorted_to_orig_idx is not None
+            and len(self.extra_negative_timeaware_windows_days) > 0
+        )
+        if self.extra_negative_timeaware_enable and not self.extra_negative_timeaware_active:
+            print("WARNING: extra-negative time-aware sampling requested but inactive; fallback to uniform random.")
+        elif self.extra_negative_timeaware_active:
+            print(
+                "Extra-negative time-aware sampling enabled: "
+                f"windows={self.extra_negative_timeaware_windows_days}, "
+                f"min_candidates={self.extra_negative_timeaware_min_candidates}, "
+                f"valid_neg={int(self.neg_cls_time_sorted.shape[0])}/{int(self.neg_length)}"
+            )
+
+    def _sample_uniform_neg_idx(self) -> int:
+        return int(np.random.randint(0, int(self.neg_length)))
+
+    def _sample_timeaware_negative_idx(self, gw_idx: int) -> int:
+        if not self.extra_negative_timeaware_active:
+            return self._sample_uniform_neg_idx()
+
+        gw_idx = int(gw_idx)
+        if gw_idx < 0 or gw_idx >= int(self.gw_event_time_mjd_np.shape[0]):
+            return self._sample_uniform_neg_idx()
+
+        anchor = float(self.gw_event_time_mjd_np[gw_idx])
+        if not np.isfinite(anchor):
+            return self._sample_uniform_neg_idx()
+
+        times = self.neg_cls_time_sorted
+        sorted_to_orig = self.neg_cls_sorted_to_orig_idx
+        windows = self.extra_negative_timeaware_windows_days
+        min_cand = int(self.extra_negative_timeaware_min_candidates)
+        lefts = np.searchsorted(times, anchor - np.asarray(windows, dtype=np.float64), side="left")
+        rights = np.searchsorted(times, anchor + np.asarray(windows, dtype=np.float64), side="right")
+
+        eligible_levels = []
+        level_counts = []
+        for i in range(len(windows)):
+            outer_l = int(lefts[i])
+            outer_r = int(rights[i])
+            if i == 0:
+                count = max(0, outer_r - outer_l)
+            else:
+                inner_l = int(lefts[i - 1])
+                inner_r = int(rights[i - 1])
+                left_count = max(0, inner_l - outer_l)
+                right_count = max(0, outer_r - inner_r)
+                count = left_count + right_count
+            if count >= min_cand:
+                eligible_levels.append(i)
+                level_counts.append(count)
+
+        if not eligible_levels:
+            return self._sample_uniform_neg_idx()
+
+        pri = self.extra_negative_timeaware_level_probs[np.asarray(eligible_levels, dtype=np.int64)]
+        pri_sum = float(pri.sum())
+        if pri_sum <= 0:
+            pri = np.full((len(eligible_levels),), 1.0 / float(len(eligible_levels)), dtype=np.float64)
+        else:
+            pri = pri / pri_sum
+        picked = int(np.random.choice(np.asarray(eligible_levels, dtype=np.int64), p=pri))
+
+        outer_l = int(lefts[picked])
+        outer_r = int(rights[picked])
+        if picked == 0:
+            count = max(0, outer_r - outer_l)
+            if count <= 0:
+                return self._sample_uniform_neg_idx()
+            sorted_idx = outer_l + int(np.random.randint(0, count))
+            return int(sorted_to_orig[sorted_idx])
+
+        inner_l = int(lefts[picked - 1])
+        inner_r = int(rights[picked - 1])
+        left_count = max(0, inner_l - outer_l)
+        right_count = max(0, outer_r - inner_r)
+        count = left_count + right_count
+        if count <= 0:
+            return self._sample_uniform_neg_idx()
+
+        draw = int(np.random.randint(0, count))
+        if draw < left_count:
+            sorted_idx = outer_l + draw
+        else:
+            sorted_idx = inner_r + (draw - left_count)
+        return int(sorted_to_orig[sorted_idx])
             
     def __len__(self):
         return self.length
@@ -157,6 +365,7 @@ class RelationalHDF5Dataset(Dataset):
         else:
             opt_idx = idx
 
+        opt_zero_time_mjd_base = None
         if self.data_cache is None:
             # Lazy loading: Open file only when needed (crucial for num_workers > 0)
             if self.h5_file is None:
@@ -177,6 +386,20 @@ class RelationalHDF5Dataset(Dataset):
             #    HDF5 structure: events/gw/...
             gw_scalar = torch.from_numpy(self.h5_file['events/gw_data/scalars'][gw_idx])
             gw_skymap = torch.from_numpy(self.h5_file['events/gw_data/skymaps'][gw_idx])
+            if self.return_zero_time_mjd:
+                if self.has_opt_zero_time_mjd_base:
+                    opt_zero_time_mjd_base = torch.as_tensor(
+                        self.h5_file["events/optical_data/zero_time_mjd_base"][opt_idx], dtype=torch.float32
+                    )
+                elif self.has_gw_event_time_mjd:
+                    opt_zero_time_mjd_base = torch.as_tensor(
+                        self.h5_file["events/gw_data/event_time_mjd"][gw_idx], dtype=torch.float32
+                    )
+                else:
+                    raise KeyError(
+                        "Missing both 'events/optical_data/zero_time_mjd_base' and "
+                        "'events/gw_data/event_time_mjd' while return_zero_time_mjd=True."
+                    )
         else:
             # Data is already cached as tensors - direct indexing, no conversion needed
             opt_val = self.data_cache["opt_val"][opt_idx]
@@ -187,6 +410,16 @@ class RelationalHDF5Dataset(Dataset):
             gw_idx = self.data_cache["parent_gw_idx"][opt_idx]
             gw_scalar = self.data_cache["gw_scalar"][gw_idx]
             gw_skymap = self.data_cache["gw_skymap"][gw_idx]
+            if self.return_zero_time_mjd:
+                if "opt_zero_time_mjd_base" in self.data_cache:
+                    opt_zero_time_mjd_base = self.data_cache["opt_zero_time_mjd_base"][opt_idx].to(torch.float32)
+                elif "gw_event_time_mjd" in self.data_cache:
+                    opt_zero_time_mjd_base = self.data_cache["gw_event_time_mjd"][gw_idx].to(torch.float32)
+                else:
+                    raise KeyError(
+                        "Missing both cached opt_zero_time_mjd_base and gw_event_time_mjd while "
+                        "return_zero_time_mjd=True."
+                    )
 
         is_neg_gw = False
         if (
@@ -202,7 +435,9 @@ class RelationalHDF5Dataset(Dataset):
         
         # Optional: Retrieve Negative Optical Data (non-KN or unrelated transient)
         if self.negative_h5_path is not None:
-            neg_idx = np.random.randint(0, self.neg_length)
+            neg_idx = self._sample_timeaware_negative_idx(int(gw_idx))
+            neg_zero_time_mjd_base = None
+            neg_zero_time_mjd_cls_base = None
             if self.neg_cache is None:
                 if self.neg_file is None:
                     self.neg_file = h5py.File(self.negative_h5_path, 'r')
@@ -211,6 +446,23 @@ class RelationalHDF5Dataset(Dataset):
                 neg_mask = torch.from_numpy(self.neg_file[f"{self.negative_group}/masks"][neg_idx])
                 neg_time = torch.from_numpy(self.neg_file[f"{self.negative_group}/times"][neg_idx])
                 neg_coords = torch.from_numpy(self.neg_file[f"{self.negative_group}/coordinates"][neg_idx])
+                if self.return_zero_time_mjd:
+                    if not self.has_neg_zero_time_mjd_base:
+                        raise KeyError(
+                            f"Missing '{self.negative_group}/zero_time_mjd_base' in negative dataset "
+                            "while return_zero_time_mjd=True."
+                        )
+                    neg_zero_time_mjd_base = torch.as_tensor(
+                        self.neg_file[f"{self.negative_group}/zero_time_mjd_base"][neg_idx], dtype=torch.float32
+                    )
+                    if not self.has_neg_zero_time_mjd_cls_base:
+                        raise KeyError(
+                            f"Missing '{self.negative_group}/{self.nonkn_cls_base_field}' in negative dataset "
+                            "while return_zero_time_mjd=True."
+                        )
+                    neg_zero_time_mjd_cls_base = torch.as_tensor(
+                        self.neg_file[f"{self.negative_group}/{self.nonkn_cls_base_field}"][neg_idx], dtype=torch.float32
+                    )
             else:
                 # Data is already cached as tensors - direct indexing
                 neg_val = self.neg_cache["neg_val"][neg_idx]
@@ -218,24 +470,30 @@ class RelationalHDF5Dataset(Dataset):
                 neg_mask = self.neg_cache["neg_mask"][neg_idx]
                 neg_time = self.neg_cache["neg_time"][neg_idx]
                 neg_coords = self.neg_cache["neg_coords"][neg_idx]
+                if self.return_zero_time_mjd:
+                    neg_zero_time_mjd_base = self.neg_cache["neg_zero_time_mjd_base"][neg_idx].to(torch.float32)
+                    neg_zero_time_mjd_cls_base = self.neg_cache["neg_zero_time_mjd_cls_base"][neg_idx].to(torch.float32)
 
             # Return tuple: (GW_Inputs, Optical_Inputs, Metadata, Negative_Optical_Inputs)
             # gw_idx is returned for masking the contrastive loss (handling same-source negatives)
-            if neg_gw_local_idx is not None:
-                return (
-                    gw_scalar, gw_skymap, opt_time, opt_val, opt_mask, opt_err, opt_coords, int(gw_idx),
-                    neg_time, neg_val, neg_mask, neg_err, neg_coords, is_neg_gw
-                )
-            return (
+            out = [
                 gw_scalar, gw_skymap, opt_time, opt_val, opt_mask, opt_err, opt_coords, int(gw_idx),
-                neg_time, neg_val, neg_mask, neg_err, neg_coords
-            )
+                neg_time, neg_val, neg_mask, neg_err, neg_coords,
+            ]
+            if self.return_zero_time_mjd:
+                out.extend([opt_zero_time_mjd_base, neg_zero_time_mjd_base, neg_zero_time_mjd_cls_base])
+            if neg_gw_local_idx is not None:
+                out.append(is_neg_gw)
+            return tuple(out)
 
         # Return tuple: (GW_Inputs, Optical_Inputs, Metadata)
         # gw_idx is returned for masking the contrastive loss (handling same-source negatives)
+        out = [gw_scalar, gw_skymap, opt_time, opt_val, opt_mask, opt_err, opt_coords, int(gw_idx)]
+        if self.return_zero_time_mjd:
+            out.append(opt_zero_time_mjd_base)
         if neg_gw_local_idx is not None:
-            return gw_scalar, gw_skymap, opt_time, opt_val, opt_mask, opt_err, opt_coords, int(gw_idx), is_neg_gw
-        return gw_scalar, gw_skymap, opt_time, opt_val, opt_mask, opt_err, opt_coords, int(gw_idx)
+            out.append(is_neg_gw)
+        return tuple(out)
 
     def get_neg_gw_sample(self, local_idx: int = None):
         """
@@ -601,7 +859,13 @@ def create_training_dataloader(
     prefetch_factor: int = 4,
     negative_h5_path: str = None,
     negative_group: str = "events/optical_data",
-    cache_in_memory: bool = False
+    cache_in_memory: bool = False,
+    return_zero_time_mjd: bool = False,
+    nonkn_cls_base_field: str = "zero_time_mjd_cls_base",
+    extra_negative_timeaware_enable: bool = False,
+    extra_negative_timeaware_windows_days=None,
+    extra_negative_timeaware_min_candidates: int = 1,
+    extra_negative_timeaware_seed: int = 42,
 ):
     """
     Factory function to initialize the Dataset, Sampler, and DataLoader.
@@ -616,7 +880,13 @@ def create_training_dataloader(
         h5_path,
         negative_h5_path=negative_h5_path,
         negative_group=negative_group,
-        cache_in_memory=cache_in_memory
+        cache_in_memory=cache_in_memory,
+        return_zero_time_mjd=return_zero_time_mjd,
+        nonkn_cls_base_field=nonkn_cls_base_field,
+        extra_negative_timeaware_enable=extra_negative_timeaware_enable,
+        extra_negative_timeaware_windows_days=extra_negative_timeaware_windows_days,
+        extra_negative_timeaware_min_candidates=extra_negative_timeaware_min_candidates,
+        extra_negative_timeaware_seed=extra_negative_timeaware_seed,
     )
     
     # 3. Initialize Custom Sampler
@@ -653,7 +923,13 @@ def create_train_val_dataloaders(
     prefetch_factor: int = 4,
     negative_h5_path: str = None,
     negative_group: str = "events/optical_data",
-    cache_in_memory: bool = False
+    cache_in_memory: bool = False,
+    return_zero_time_mjd: bool = False,
+    nonkn_cls_base_field: str = "zero_time_mjd_cls_base",
+    extra_negative_timeaware_enable: bool = False,
+    extra_negative_timeaware_windows_days=None,
+    extra_negative_timeaware_min_candidates: int = 1,
+    extra_negative_timeaware_seed: int = 42,
 ):
     if cache_in_memory and num_workers > 0:
         print("cache_in_memory=True with num_workers>0 may increase RAM usage.")
@@ -680,7 +956,13 @@ def create_train_val_dataloaders(
             h5_path,
             negative_h5_path=negative_h5_path,
             negative_group=negative_group,
-            cache_in_memory=cache_in_memory
+            cache_in_memory=cache_in_memory,
+            return_zero_time_mjd=return_zero_time_mjd,
+            nonkn_cls_base_field=nonkn_cls_base_field,
+            extra_negative_timeaware_enable=extra_negative_timeaware_enable,
+            extra_negative_timeaware_windows_days=extra_negative_timeaware_windows_days,
+            extra_negative_timeaware_min_candidates=extra_negative_timeaware_min_candidates,
+            extra_negative_timeaware_seed=extra_negative_timeaware_seed,
         )
         train_dataset = shared_dataset
         val_dataset = shared_dataset
@@ -689,13 +971,25 @@ def create_train_val_dataloaders(
             h5_path,
             negative_h5_path=negative_h5_path,
             negative_group=negative_group,
-            cache_in_memory=cache_in_memory
+            cache_in_memory=cache_in_memory,
+            return_zero_time_mjd=return_zero_time_mjd,
+            nonkn_cls_base_field=nonkn_cls_base_field,
+            extra_negative_timeaware_enable=extra_negative_timeaware_enable,
+            extra_negative_timeaware_windows_days=extra_negative_timeaware_windows_days,
+            extra_negative_timeaware_min_candidates=extra_negative_timeaware_min_candidates,
+            extra_negative_timeaware_seed=extra_negative_timeaware_seed,
         )
         val_dataset = RelationalHDF5Dataset(
             h5_path,
             negative_h5_path=negative_h5_path,
             negative_group=negative_group,
-            cache_in_memory=cache_in_memory
+            cache_in_memory=cache_in_memory,
+            return_zero_time_mjd=return_zero_time_mjd,
+            nonkn_cls_base_field=nonkn_cls_base_field,
+            extra_negative_timeaware_enable=extra_negative_timeaware_enable,
+            extra_negative_timeaware_windows_days=extra_negative_timeaware_windows_days,
+            extra_negative_timeaware_min_candidates=extra_negative_timeaware_min_candidates,
+            extra_negative_timeaware_seed=extra_negative_timeaware_seed,
         )
 
     train_sampler = BalancedGWBatchedSampler(
@@ -744,7 +1038,13 @@ def create_supcon_dataloaders(
     negative_h5_path: str = None,
     negative_group: str = "events/optical_data",
     cache_in_memory: bool = False,
-    min_lc_per_gw: int = 2
+    min_lc_per_gw: int = 2,
+    return_zero_time_mjd: bool = False,
+    nonkn_cls_base_field: str = "zero_time_mjd_cls_base",
+    extra_negative_timeaware_enable: bool = False,
+    extra_negative_timeaware_windows_days=None,
+    extra_negative_timeaware_min_candidates: int = 1,
+    extra_negative_timeaware_seed: int = 42,
 ):
     """
     Create dataloaders for Supervised Contrastive Learning.
@@ -776,7 +1076,13 @@ def create_supcon_dataloaders(
             h5_path,
             negative_h5_path=negative_h5_path,
             negative_group=negative_group,
-            cache_in_memory=cache_in_memory
+            cache_in_memory=cache_in_memory,
+            return_zero_time_mjd=return_zero_time_mjd,
+            nonkn_cls_base_field=nonkn_cls_base_field,
+            extra_negative_timeaware_enable=extra_negative_timeaware_enable,
+            extra_negative_timeaware_windows_days=extra_negative_timeaware_windows_days,
+            extra_negative_timeaware_min_candidates=extra_negative_timeaware_min_candidates,
+            extra_negative_timeaware_seed=extra_negative_timeaware_seed,
         )
         train_dataset = shared_dataset
         val_dataset = shared_dataset
@@ -785,13 +1091,25 @@ def create_supcon_dataloaders(
             h5_path,
             negative_h5_path=negative_h5_path,
             negative_group=negative_group,
-            cache_in_memory=cache_in_memory
+            cache_in_memory=cache_in_memory,
+            return_zero_time_mjd=return_zero_time_mjd,
+            nonkn_cls_base_field=nonkn_cls_base_field,
+            extra_negative_timeaware_enable=extra_negative_timeaware_enable,
+            extra_negative_timeaware_windows_days=extra_negative_timeaware_windows_days,
+            extra_negative_timeaware_min_candidates=extra_negative_timeaware_min_candidates,
+            extra_negative_timeaware_seed=extra_negative_timeaware_seed,
         )
         val_dataset = RelationalHDF5Dataset(
             h5_path,
             negative_h5_path=negative_h5_path,
             negative_group=negative_group,
-            cache_in_memory=cache_in_memory
+            cache_in_memory=cache_in_memory,
+            return_zero_time_mjd=return_zero_time_mjd,
+            nonkn_cls_base_field=nonkn_cls_base_field,
+            extra_negative_timeaware_enable=extra_negative_timeaware_enable,
+            extra_negative_timeaware_windows_days=extra_negative_timeaware_windows_days,
+            extra_negative_timeaware_min_candidates=extra_negative_timeaware_min_candidates,
+            extra_negative_timeaware_seed=extra_negative_timeaware_seed,
         )
 
     train_sampler = MultiPositiveGWBatchedSampler(
@@ -846,7 +1164,13 @@ def create_mixed_gw_dataloaders(
     negative_h5_path: str = None,
     negative_group: str = "events/optical_data",
     cache_in_memory: bool = False,
-    min_lc_per_gw: int = 1
+    min_lc_per_gw: int = 1,
+    return_zero_time_mjd: bool = False,
+    nonkn_cls_base_field: str = "zero_time_mjd_cls_base",
+    extra_negative_timeaware_enable: bool = False,
+    extra_negative_timeaware_windows_days=None,
+    extra_negative_timeaware_min_candidates: int = 1,
+    extra_negative_timeaware_seed: int = 42,
 ):
     """
     Create dataloaders with mixed positive/negative GW sampling.
@@ -890,7 +1214,13 @@ def create_mixed_gw_dataloaders(
             negative_h5_path=negative_h5_path,
             negative_group=negative_group,
             cache_in_memory=cache_in_memory,
-            use_neg_gw=True
+            use_neg_gw=True,
+            return_zero_time_mjd=return_zero_time_mjd,
+            nonkn_cls_base_field=nonkn_cls_base_field,
+            extra_negative_timeaware_enable=extra_negative_timeaware_enable,
+            extra_negative_timeaware_windows_days=extra_negative_timeaware_windows_days,
+            extra_negative_timeaware_min_candidates=extra_negative_timeaware_min_candidates,
+            extra_negative_timeaware_seed=extra_negative_timeaware_seed,
         )
         train_dataset = shared_dataset
         val_dataset = shared_dataset
@@ -900,14 +1230,26 @@ def create_mixed_gw_dataloaders(
             negative_h5_path=negative_h5_path,
             negative_group=negative_group,
             cache_in_memory=cache_in_memory,
-            use_neg_gw=True
+            use_neg_gw=True,
+            return_zero_time_mjd=return_zero_time_mjd,
+            nonkn_cls_base_field=nonkn_cls_base_field,
+            extra_negative_timeaware_enable=extra_negative_timeaware_enable,
+            extra_negative_timeaware_windows_days=extra_negative_timeaware_windows_days,
+            extra_negative_timeaware_min_candidates=extra_negative_timeaware_min_candidates,
+            extra_negative_timeaware_seed=extra_negative_timeaware_seed,
         )
         val_dataset = RelationalHDF5Dataset(
             h5_path,
             negative_h5_path=negative_h5_path,
             negative_group=negative_group,
             cache_in_memory=cache_in_memory,
-            use_neg_gw=True
+            use_neg_gw=True,
+            return_zero_time_mjd=return_zero_time_mjd,
+            nonkn_cls_base_field=nonkn_cls_base_field,
+            extra_negative_timeaware_enable=extra_negative_timeaware_enable,
+            extra_negative_timeaware_windows_days=extra_negative_timeaware_windows_days,
+            extra_negative_timeaware_min_candidates=extra_negative_timeaware_min_candidates,
+            extra_negative_timeaware_seed=extra_negative_timeaware_seed,
         )
 
     # Check that negative GW data is available

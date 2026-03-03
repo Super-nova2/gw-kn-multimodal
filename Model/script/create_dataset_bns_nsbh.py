@@ -7,6 +7,7 @@ import h5py
 import numpy as np
 import pandas as pd
 from astropy.io import fits
+from astropy.time import Time
 from tqdm import tqdm
 
 # Load required functions/constants from data_loader.py (not a standard package due to '+' in path)
@@ -29,6 +30,22 @@ GW_PARAM_COLUMNS = [
     "distmean",
     "diststd",
 ]
+
+MJD_TIME_COLUMN_CANDIDATES = (
+    "mjd_time",
+    "mjd",
+    "mjd_event",
+    "event_mjd",
+    "merger_mjd",
+    "trigger_mjd",
+)
+GPS_TIME_COLUMN_CANDIDATES = (
+    "gps_time",
+    "gps",
+    "gps_event_time",
+    "event_gps_time",
+    "trigger_time_gps",
+)
 
 
 @dataclass
@@ -61,10 +78,63 @@ class SourcePrepared:
     neg_event_ids: np.ndarray
     neg_type_by_event: Dict[int, int]
     mej_by_event: Dict[int, float]
+    event_time_mjd: np.ndarray
+    event_time_col: str
+    event_time_from_gps: bool
+    n_invalid_event_time: int
     n_missing_skymap: int
     n_filtered_non_success_mej_pos: int = 0
     nsbh_mej_col_resolved: Optional[str] = None
     success_ids_mej_pos: Optional[Set[int]] = None
+
+
+def _find_column_case_insensitive(df: pd.DataFrame, candidates: Tuple[str, ...]) -> Optional[str]:
+    col_by_lower = {str(col).lower(): str(col) for col in df.columns}
+    for cand in candidates:
+        found = col_by_lower.get(cand.lower())
+        if found is not None:
+            return found
+    return None
+
+
+def _gps_to_mjd(gps_values: np.ndarray) -> np.ndarray:
+    out = np.full(gps_values.shape, np.nan, dtype=np.float64)
+    finite_mask = np.isfinite(gps_values)
+    if not np.any(finite_mask):
+        return out
+    out[finite_mask] = Time(gps_values[finite_mask], format="gps", scale="utc").mjd.astype(np.float64)
+    return out
+
+
+def _extract_event_time_mjd(
+    gw_df: pd.DataFrame,
+) -> Tuple[np.ndarray, str, bool, int]:
+    """
+    Resolve GW event time in MJD.
+
+    Priority:
+      1. `mjd_*`-style columns
+      2. `gps_*`-style columns converted to MJD
+      3. fallback to all-NaN if no usable column exists
+    """
+    event_time_col = _find_column_case_insensitive(gw_df, MJD_TIME_COLUMN_CANDIDATES)
+    used_gps_fallback = False
+
+    if event_time_col is not None:
+        event_time_mjd = pd.to_numeric(gw_df[event_time_col], errors="coerce").to_numpy(np.float64)
+    else:
+        gps_col = _find_column_case_insensitive(gw_df, GPS_TIME_COLUMN_CANDIDATES)
+        if gps_col is not None:
+            gps_values = pd.to_numeric(gw_df[gps_col], errors="coerce").to_numpy(np.float64)
+            event_time_mjd = _gps_to_mjd(gps_values)
+            event_time_col = gps_col
+            used_gps_fallback = True
+        else:
+            event_time_mjd = np.full((len(gw_df),), np.nan, dtype=np.float64)
+            event_time_col = "MISSING"
+
+    n_invalid = int((~np.isfinite(event_time_mjd)).sum())
+    return event_time_mjd, event_time_col, used_gps_fallback, n_invalid
 
 
 def _load_success_ids(success_ids_path: str) -> Set[int]:
@@ -246,6 +316,9 @@ def _prepare_bns_source(
         )
 
     gw_df = gw_df.copy()
+    event_time_mjd, event_time_col, event_time_from_gps, n_invalid_event_time = _extract_event_time_mjd(
+        gw_df
+    )
     gw_df["inclination"] = np.cos(gw_df["inclination"])
     gw_df["distmean"] = gw_df["distmean"] / 1000.0
     gw_df["diststd"] = gw_df["diststd"] / 1000.0
@@ -276,6 +349,9 @@ def _prepare_bns_source(
 
     print(
         f"\n[{cfg.tag}] catalog={len(sim_ids)} "
+        f"event_time_col={event_time_col} "
+        f"event_time_from_gps={int(event_time_from_gps)} "
+        f"invalid_event_time={n_invalid_event_time} "
         f"missing_skymap={missing_skymap} "
         f"selected_pos={len(pos_ids)} selected_neg={len(neg_ids)}"
     )
@@ -290,6 +366,10 @@ def _prepare_bns_source(
         neg_event_ids=neg_ids,
         neg_type_by_event=neg_type_by_event,
         mej_by_event=mej_by_event,
+        event_time_mjd=event_time_mjd,
+        event_time_col=event_time_col,
+        event_time_from_gps=event_time_from_gps,
+        n_invalid_event_time=n_invalid_event_time,
         n_missing_skymap=missing_skymap,
     )
 
@@ -308,6 +388,9 @@ def _prepare_nsbh_source(
         )
 
     gw_df = gw_df.copy()
+    event_time_mjd, event_time_col, event_time_from_gps, n_invalid_event_time = _extract_event_time_mjd(
+        gw_df
+    )
     gw_df["inclination"] = np.cos(gw_df["inclination"])
     gw_df["distmean"] = gw_df["distmean"] / 1000.0
     gw_df["diststd"] = gw_df["diststd"] / 1000.0
@@ -391,6 +474,9 @@ def _prepare_nsbh_source(
 
     print(
         f"\n[{cfg.tag}] catalog={len(sim_ids)} "
+        f"event_time_col={event_time_col} "
+        f"event_time_from_gps={int(event_time_from_gps)} "
+        f"invalid_event_time={n_invalid_event_time} "
         f"mej_col={mej_col} "
         f"type1_candidates={len(type1_ids_all)} "
         f"mej_pos_candidates={len(mej_pos_ids_all)} "
@@ -411,6 +497,10 @@ def _prepare_nsbh_source(
         neg_event_ids=neg_ids,
         neg_type_by_event=neg_type_by_event,
         mej_by_event=mej_by_event,
+        event_time_mjd=event_time_mjd,
+        event_time_col=event_time_col,
+        event_time_from_gps=event_time_from_gps,
+        n_invalid_event_time=n_invalid_event_time,
         n_missing_skymap=missing_skymap_mej_pos + missing_skymap_type1,
         n_filtered_non_success_mej_pos=n_filtered_non_success,
         nsbh_mej_col_resolved=mej_col,
@@ -508,6 +598,13 @@ def create_dataset_with_neg_gw_bns_nsbh_fast(
             dtype="f4",
             chunks=(gw_chunk,),
         )
+        ds_gw_event_time_mjd = grp_gw.create_dataset(
+            "event_time_mjd",
+            (0,),
+            maxshape=(None,),
+            dtype="f8",
+            chunks=(gw_chunk,),
+        )
         ds_gw_source_type = grp_gw.create_dataset(
             "source_type",
             (0,),
@@ -546,6 +643,13 @@ def create_dataset_with_neg_gw_bns_nsbh_fast(
             dtype="f4",
             chunks=(chunk_size, MAX_LC_LENGTH),
         )
+        ds_opt_zero_time_mjd_base = grp_opt.create_dataset(
+            "zero_time_mjd_base",
+            (0,),
+            maxshape=(None,),
+            dtype="f8",
+            chunks=(chunk_size,),
+        )
         ds_opt_coordinates = grp_opt.create_dataset(
             "coordinates",
             (0, 2),
@@ -573,6 +677,7 @@ def create_dataset_with_neg_gw_bns_nsbh_fast(
                 "neg_type2": 0,
                 "drop_empty_lc": 0,
                 "drop_skymap": 0,
+                "invalid_event_time_written": 0,
             },
             "nsbh": {
                 "pos": 0,
@@ -581,6 +686,7 @@ def create_dataset_with_neg_gw_bns_nsbh_fast(
                 "neg_type2": 0,
                 "drop_empty_lc": 0,
                 "drop_skymap": 0,
+                "invalid_event_time_written": 0,
             },
         }
 
@@ -588,6 +694,7 @@ def create_dataset_with_neg_gw_bns_nsbh_fast(
         opt_buffer_errs: List[np.ndarray] = []
         opt_buffer_masks: List[np.ndarray] = []
         opt_buffer_times: List[np.ndarray] = []
+        opt_buffer_zero_time_mjd_base: List[float] = []
         opt_buffer_parent_idx: List[int] = []
         opt_buffer_coordinates: List[np.ndarray] = []
 
@@ -598,6 +705,7 @@ def create_dataset_with_neg_gw_bns_nsbh_fast(
             ds_gw_has_kn.resize(new_size, axis=0)
             ds_gw_neg_type.resize(new_size, axis=0)
             ds_gw_mej_tot.resize(new_size, axis=0)
+            ds_gw_event_time_mjd.resize(new_size, axis=0)
             ds_gw_source_type.resize(new_size, axis=0)
 
         def append_gw(
@@ -607,6 +715,7 @@ def create_dataset_with_neg_gw_bns_nsbh_fast(
             has_kn: int,
             neg_type: int,
             mej_tot: float,
+            event_time_mjd: float,
             source_type: str,
         ) -> int:
             nonlocal gw_count
@@ -617,6 +726,7 @@ def create_dataset_with_neg_gw_bns_nsbh_fast(
             ds_gw_has_kn[gw_count] = int(has_kn)
             ds_gw_neg_type[gw_count] = int(neg_type)
             ds_gw_mej_tot[gw_count] = np.float32(mej_tot)
+            ds_gw_event_time_mjd[gw_count] = np.float64(event_time_mjd)
             ds_gw_source_type[gw_count] = source_type
             gw_idx = gw_count
             gw_count += 1
@@ -634,6 +744,7 @@ def create_dataset_with_neg_gw_bns_nsbh_fast(
             ds_opt_errs.resize(new_size, axis=0)
             ds_opt_masks.resize(new_size, axis=0)
             ds_opt_times.resize(new_size, axis=0)
+            ds_opt_zero_time_mjd_base.resize(new_size, axis=0)
             ds_opt_coordinates.resize(new_size, axis=0)
             ds_parent_idx.resize(new_size, axis=0)
 
@@ -641,6 +752,9 @@ def create_dataset_with_neg_gw_bns_nsbh_fast(
             ds_opt_errs[cur:new_size] = np.asarray(opt_buffer_errs)
             ds_opt_masks[cur:new_size] = np.asarray(opt_buffer_masks)
             ds_opt_times[cur:new_size] = np.asarray(opt_buffer_times)
+            ds_opt_zero_time_mjd_base[cur:new_size] = np.asarray(
+                opt_buffer_zero_time_mjd_base, dtype=np.float64
+            )
             ds_opt_coordinates[cur:new_size] = np.asarray(opt_buffer_coordinates)
             ds_parent_idx[cur:new_size] = np.asarray(opt_buffer_parent_idx, dtype=np.int32)
 
@@ -649,6 +763,7 @@ def create_dataset_with_neg_gw_bns_nsbh_fast(
             opt_buffer_errs.clear()
             opt_buffer_masks.clear()
             opt_buffer_times.clear()
+            opt_buffer_zero_time_mjd_base.clear()
             opt_buffer_coordinates.clear()
             opt_buffer_parent_idx.clear()
 
@@ -687,6 +802,7 @@ def create_dataset_with_neg_gw_bns_nsbh_fast(
             written_id_set.add(gw_id)
 
             mej_val = float(src.mej_by_event.get(event_id, np.nan))
+            event_time_val = float(src.event_time_mjd[row_idx])
             if (
                 tag == "nsbh"
                 and nsbh_cfg.require_success_for_mej_pos
@@ -706,15 +822,19 @@ def create_dataset_with_neg_gw_bns_nsbh_fast(
                 has_kn=1,
                 neg_type=0,
                 mej_tot=mej_val,
+                event_time_mjd=event_time_val,
                 source_type=tag,
             )
             source_counts[tag]["pos"] += 1
+            if not np.isfinite(event_time_val):
+                source_counts[tag]["invalid_event_time_written"] += 1
 
             for vals, errs, masks, times, coordinates in lcs:
                 opt_buffer_vals.append(vals)
                 opt_buffer_errs.append(errs)
                 opt_buffer_masks.append(masks)
                 opt_buffer_times.append(times)
+                opt_buffer_zero_time_mjd_base.append(event_time_val)
                 opt_buffer_coordinates.append(coordinates)
                 opt_buffer_parent_idx.append(gw_idx)
 
@@ -745,6 +865,7 @@ def create_dataset_with_neg_gw_bns_nsbh_fast(
 
                 neg_type = int(src.neg_type_by_event.get(event_id, 2))
                 mej_val = float(src.mej_by_event.get(event_id, np.nan))
+                event_time_val = float(src.event_time_mjd[row_idx])
                 if (
                     tag == "nsbh"
                     and nsbh_cfg.require_success_for_mej_pos
@@ -764,9 +885,12 @@ def create_dataset_with_neg_gw_bns_nsbh_fast(
                     has_kn=0,
                     neg_type=neg_type,
                     mej_tot=mej_val,
+                    event_time_mjd=event_time_val,
                     source_type=tag,
                 )
                 source_counts[tag]["neg"] += 1
+                if not np.isfinite(event_time_val):
+                    source_counts[tag]["invalid_event_time_written"] += 1
                 if neg_type == 1:
                     source_counts[tag]["neg_type1"] += 1
                 elif neg_type == 2:
@@ -806,6 +930,25 @@ def create_dataset_with_neg_gw_bns_nsbh_fast(
         f.attrs["n_filtered_non_success_mej_pos_nsbh"] = int(
             prepared["nsbh"].n_filtered_non_success_mej_pos
         )
+        f.attrs["event_time_col_bns"] = prepared["bns"].event_time_col
+        f.attrs["event_time_col_nsbh"] = prepared["nsbh"].event_time_col
+        f.attrs["event_time_from_gps_bns"] = int(prepared["bns"].event_time_from_gps)
+        f.attrs["event_time_from_gps_nsbh"] = int(prepared["nsbh"].event_time_from_gps)
+        f.attrs["n_invalid_event_time_bns_catalog"] = int(prepared["bns"].n_invalid_event_time)
+        f.attrs["n_invalid_event_time_nsbh_catalog"] = int(prepared["nsbh"].n_invalid_event_time)
+        f.attrs["n_invalid_event_time_bns_written"] = int(
+            source_counts["bns"]["invalid_event_time_written"]
+        )
+        f.attrs["n_invalid_event_time_nsbh_written"] = int(
+            source_counts["nsbh"]["invalid_event_time_written"]
+        )
+        f.attrs["n_invalid_event_time_written_total"] = int(
+            source_counts["bns"]["invalid_event_time_written"]
+            + source_counts["nsbh"]["invalid_event_time_written"]
+        )
+        f.attrs["time_zero_base_semantics"] = "optical zero_time_mjd_base stores parent GW event_time_mjd"
+        f.attrs["time_unit"] = "mjd_days"
+        f.attrs["runtime_offset_applied"] = 1
 
         print("\nProcessing complete.")
         print(f"  Mode: {dataset_mode}")
@@ -821,6 +964,21 @@ def create_dataset_with_neg_gw_bns_nsbh_fast(
         print(
             "  NSBH filtered mej>threshold non-success events: "
             f"{prepared['nsbh'].n_filtered_non_success_mej_pos}"
+        )
+        print(
+            "  Event time source (bns/nsbh): "
+            f"{prepared['bns'].event_time_col}/{prepared['nsbh'].event_time_col} "
+            f"(gps_fallback={int(prepared['bns'].event_time_from_gps)}/"
+            f"{int(prepared['nsbh'].event_time_from_gps)})"
+        )
+        print(
+            "  Invalid event_time_mjd (catalog bns/nsbh): "
+            f"{prepared['bns'].n_invalid_event_time}/{prepared['nsbh'].n_invalid_event_time}"
+        )
+        print(
+            "  Invalid event_time_mjd written (bns/nsbh): "
+            f"{source_counts['bns']['invalid_event_time_written']}/"
+            f"{source_counts['nsbh']['invalid_event_time_written']}"
         )
         print(f"  Total GW events written: {gw_count}")
         print(f"  Total optical light curves: {total_optical_count}")

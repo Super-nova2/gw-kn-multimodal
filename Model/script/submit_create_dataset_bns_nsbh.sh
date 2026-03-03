@@ -44,7 +44,7 @@ set_profile_defaults() {
             NSBH_SIM_NAME="${NSBH_SIM_NAME:-LSST_KN_NSBH_AUG}"
             NSBH_SUCCESS_IDS_PATH="${NSBH_SUCCESS_IDS_PATH:-/fred/oz016/bgao_kn/data/LSST_KN_NSBH_AUG/success_sim_ids.txt}"
 
-            OUTPUT_H5_PATH="${OUTPUT_H5_PATH:-/fred/oz016/bgao_kn/data/BNS_NSBH_dataset/combined_dataset_${DATASET_MODE}.h5}"
+            OUTPUT_H5_PATH="${OUTPUT_H5_PATH:-/fred/oz016/bgao_kn/data/ALBEF_dataset/combined_dataset_${DATASET_MODE}.h5}"
             ;;
         final_train)
             BNS_FULL_CATALOG_PATH="${BNS_FULL_CATALOG_PATH:-/fred/oz016/bgao_kn/ML+GW+KN/dataset/O5_sim_bns_aug/injections_final.csv}"
@@ -60,7 +60,7 @@ set_profile_defaults() {
             NSBH_SIM_NAME="${NSBH_SIM_NAME:-LSST_KN_NSBH_TRAIN}"
             NSBH_SUCCESS_IDS_PATH="${NSBH_SUCCESS_IDS_PATH:-/fred/oz016/bgao_kn/data/LSST_KN_NSBH_TRAIN/success_sim_ids.txt}"
 
-            OUTPUT_H5_PATH="${OUTPUT_H5_PATH:-/fred/oz016/bgao_kn/data/BNS_NSBH_dataset/combined_dataset_${DATASET_MODE}.h5}"
+            OUTPUT_H5_PATH="${OUTPUT_H5_PATH:-/fred/oz016/bgao_kn/data/ALBEF_dataset/combined_dataset_${DATASET_MODE}.h5}"
             ;;
         *)
             echo "Unsupported PROFILE='$PROFILE'. Use PROFILE=test_aug or PROFILE=final_train."
@@ -91,6 +91,46 @@ append_optional_arg() {
     if [[ -n "$val" ]]; then
         cmd+=("$flag" "$val")
     fi
+}
+
+validate_output_h5_schema() {
+    local h5_path="$1"
+    python - "$h5_path" <<'PY'
+import sys
+import numpy as np
+import h5py
+
+h5_path = sys.argv[1]
+with h5py.File(h5_path, "r") as f:
+    scalars_path = "events/gw_data/scalars"
+    event_time_path = "events/gw_data/event_time_mjd"
+    if scalars_path not in f:
+        raise SystemExit(f"[SchemaError] Missing dataset: {scalars_path}")
+    if event_time_path not in f:
+        raise SystemExit(f"[SchemaError] Missing dataset: {event_time_path}")
+
+    scalars = f[scalars_path]
+    event_time = f[event_time_path]
+    if scalars.ndim != 2 or scalars.shape[1] != 7:
+        raise SystemExit(
+            f"[SchemaError] {scalars_path} shape must be (n_gw, 7), got {tuple(scalars.shape)}"
+        )
+    if event_time.ndim != 1:
+        raise SystemExit(
+            f"[SchemaError] {event_time_path} shape must be (n_gw,), got {tuple(event_time.shape)}"
+        )
+    if event_time.shape[0] != scalars.shape[0]:
+        raise SystemExit(
+            f"[SchemaError] Length mismatch: {event_time_path}={event_time.shape[0]} "
+            f"vs {scalars_path} n_gw={scalars.shape[0]}"
+        )
+
+    invalid = int((~np.isfinite(event_time[:])).sum())
+    print(
+        f"[SchemaOK] n_gw={scalars.shape[0]} scalars_dim={scalars.shape[1]} "
+        f"event_time_len={event_time.shape[0]} invalid_event_time={invalid}"
+    )
+PY
 }
 
 set_profile_defaults
@@ -205,3 +245,4 @@ append_optional_arg --nsbh_max_neg_type2_gw "${NSBH_MAX_NEG_TYPE2_GW:-}"
 echo "PROFILE=$PROFILE DATASET_MODE=$DATASET_MODE"
 echo "Output H5: $OUTPUT_H5_PATH"
 "${cmd[@]}"
+validate_output_h5_schema "$OUTPUT_H5_PATH"
