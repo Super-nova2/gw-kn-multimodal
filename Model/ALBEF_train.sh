@@ -96,6 +96,7 @@ VAL_STEPS_PER_EPOCH=$(jq -r '.val_steps_per_epoch // empty' "$args_file")
 SPLIT_SEED=$(jq -r '.split_seed // empty' "$args_file")
 EARLY_STOP_PATIENCE=$(jq -r '.early_stop_patience // empty' "$args_file")
 EARLY_STOP_MIN_DELTA=$(jq -r '.early_stop_min_delta // empty' "$args_file")
+BEST_CKPT_METRIC=$(jq -r '.best_ckpt_metric // empty' "$args_file")
 N_REF=$(jq -r '.n_ref // empty' "$args_file")
 REF_START=$(jq -r '.ref_start // empty' "$args_file")
 REF_END=$(jq -r '.ref_end // empty' "$args_file")
@@ -114,20 +115,7 @@ TIME_COMPAT_WEIGHT=$(jq -r '.time_compat_weight // empty' "$args_file")
 TIME_COMPAT_TAU_DAYS=$(jq -r '.time_compat_tau_days // empty' "$args_file")
 TIME_COMPAT_POWER=$(jq -r '.time_compat_power // empty' "$args_file")
 TIME_COMPAT_MAX_PENALTY=$(jq -r '.time_compat_max_penalty // empty' "$args_file")
-CLS_TIME_DELTA_ENABLE=$(jq -r '.cls_time_delta_enable // false' "$args_file")
-CLS_TIME_DELTA_SCALE_DAYS=$(jq -r '.cls_time_delta_scale_days // empty' "$args_file")
-CLS_TIME_DELTA_CLIP=$(jq -r '.cls_time_delta_clip // empty' "$args_file")
 NONKN_CLS_BASE_FIELD=$(jq -r '.nonkn_cls_base_field // empty' "$args_file")
-CLS_DT_AUG_ENABLE=$(jq -r '.cls_dt_aug_enable // false' "$args_file")
-CLS_DT_AUG_START_EPOCH=$(jq -r '.cls_dt_aug_start_epoch // empty' "$args_file")
-CLS_DT_JITTER_SIGMA_DAYS=$(jq -r '.cls_dt_jitter_sigma_days // empty' "$args_file")
-CLS_DT_JITTER_CLIP_DAYS=$(jq -r '.cls_dt_jitter_clip_days // empty' "$args_file")
-CLS_DT_DROPOUT_P_POS=$(jq -r '.cls_dt_dropout_p_pos // empty' "$args_file")
-CLS_DT_DROPOUT_P_HARD=$(jq -r '.cls_dt_dropout_p_hard // empty' "$args_file")
-CLS_DT_DROPOUT_P_EXTRA=$(jq -r '.cls_dt_dropout_p_extra // empty' "$args_file")
-EXTRA_DT_DROPOUT_ENABLE=$(jq -r '.extra_dt_dropout_enable // false' "$args_file")
-EXTRA_DT_DROPOUT_P=$(jq -r '.extra_dt_dropout_p // empty' "$args_file")
-EXTRA_DT_DROPOUT_APPLY_TO=$(jq -r '.extra_dt_dropout_apply_to // empty' "$args_file")
 GW_DROPOUT=$(jq -r '.gw_dropout // empty' "$args_file")
 OPT_DROPOUT=$(jq -r '.opt_dropout // empty' "$args_file")
 PROJ_DROPOUT=$(jq -r '.proj_dropout // empty' "$args_file")
@@ -138,7 +126,6 @@ CLS_WEIGHT=$(jq -r '.cls_weight // empty' "$args_file")
 CLS_POS_WEIGHT=$(jq -r '.cls_pos_weight // empty' "$args_file")
 CLS_NEG_WEIGHT=$(jq -r '.cls_neg_weight // empty' "$args_file")
 CLS_EXTRA_NEG_WEIGHT=$(jq -r '.cls_extra_neg_weight // empty' "$args_file")
-CLS_POS_NODT_AUX_WEIGHT=$(jq -r '.cls_pos_nodt_aux_weight // empty' "$args_file")
 CLS_RAMP_EPOCHS=$(jq -r '.cls_ramp_epochs // empty' "$args_file")
 ITC_DECAY_START_EPOCH=$(jq -r '.itc_decay_start_epoch // empty' "$args_file")
 ITC_DECAY_EPOCHS=$(jq -r '.itc_decay_epochs // empty' "$args_file")
@@ -340,6 +327,9 @@ fi
 if [[ -n "$EARLY_STOP_MIN_DELTA" && "$EARLY_STOP_MIN_DELTA" != "null" ]]; then
     cmd+=(--early_stop_min_delta "$EARLY_STOP_MIN_DELTA")
 fi
+if [[ -n "$BEST_CKPT_METRIC" && "$BEST_CKPT_METRIC" != "null" ]]; then
+    cmd+=(--best_ckpt_metric "$BEST_CKPT_METRIC")
+fi
 if [[ -n "$N_REF" && "$N_REF" != "null" ]]; then
     cmd+=(--n_ref "$N_REF")
 fi
@@ -394,47 +384,8 @@ fi
 if [[ -n "$TIME_COMPAT_MAX_PENALTY" && "$TIME_COMPAT_MAX_PENALTY" != "null" ]]; then
     cmd+=(--time_compat_max_penalty "$TIME_COMPAT_MAX_PENALTY")
 fi
-if [[ "$CLS_TIME_DELTA_ENABLE" == "true" ]]; then
-    cmd+=(--cls_time_delta_enable)
-fi
-if [[ -n "$CLS_TIME_DELTA_SCALE_DAYS" && "$CLS_TIME_DELTA_SCALE_DAYS" != "null" ]]; then
-    cmd+=(--cls_time_delta_scale_days "$CLS_TIME_DELTA_SCALE_DAYS")
-fi
-if [[ -n "$CLS_TIME_DELTA_CLIP" && "$CLS_TIME_DELTA_CLIP" != "null" ]]; then
-    cmd+=(--cls_time_delta_clip "$CLS_TIME_DELTA_CLIP")
-fi
 if [[ -n "$NONKN_CLS_BASE_FIELD" && "$NONKN_CLS_BASE_FIELD" != "null" ]]; then
     cmd+=(--nonkn_cls_base_field "$NONKN_CLS_BASE_FIELD")
-fi
-if [[ "$CLS_DT_AUG_ENABLE" == "true" ]]; then
-    cmd+=(--cls_dt_aug_enable)
-fi
-if [[ -n "$CLS_DT_AUG_START_EPOCH" && "$CLS_DT_AUG_START_EPOCH" != "null" ]]; then
-    cmd+=(--cls_dt_aug_start_epoch "$CLS_DT_AUG_START_EPOCH")
-fi
-if [[ -n "$CLS_DT_JITTER_SIGMA_DAYS" && "$CLS_DT_JITTER_SIGMA_DAYS" != "null" ]]; then
-    cmd+=(--cls_dt_jitter_sigma_days "$CLS_DT_JITTER_SIGMA_DAYS")
-fi
-if [[ -n "$CLS_DT_JITTER_CLIP_DAYS" && "$CLS_DT_JITTER_CLIP_DAYS" != "null" ]]; then
-    cmd+=(--cls_dt_jitter_clip_days "$CLS_DT_JITTER_CLIP_DAYS")
-fi
-if [[ -n "$CLS_DT_DROPOUT_P_POS" && "$CLS_DT_DROPOUT_P_POS" != "null" ]]; then
-    cmd+=(--cls_dt_dropout_p_pos "$CLS_DT_DROPOUT_P_POS")
-fi
-if [[ -n "$CLS_DT_DROPOUT_P_HARD" && "$CLS_DT_DROPOUT_P_HARD" != "null" ]]; then
-    cmd+=(--cls_dt_dropout_p_hard "$CLS_DT_DROPOUT_P_HARD")
-fi
-if [[ -n "$CLS_DT_DROPOUT_P_EXTRA" && "$CLS_DT_DROPOUT_P_EXTRA" != "null" ]]; then
-    cmd+=(--cls_dt_dropout_p_extra "$CLS_DT_DROPOUT_P_EXTRA")
-fi
-if [[ "$EXTRA_DT_DROPOUT_ENABLE" == "true" ]]; then
-    cmd+=(--extra_dt_dropout_enable)
-fi
-if [[ -n "$EXTRA_DT_DROPOUT_P" && "$EXTRA_DT_DROPOUT_P" != "null" ]]; then
-    cmd+=(--extra_dt_dropout_p "$EXTRA_DT_DROPOUT_P")
-fi
-if [[ -n "$EXTRA_DT_DROPOUT_APPLY_TO" && "$EXTRA_DT_DROPOUT_APPLY_TO" != "null" ]]; then
-    cmd+=(--extra_dt_dropout_apply_to "$EXTRA_DT_DROPOUT_APPLY_TO")
 fi
 if [[ -n "$GW_DROPOUT" && "$GW_DROPOUT" != "null" ]]; then
     cmd+=(--gw_dropout "$GW_DROPOUT")
@@ -465,9 +416,6 @@ if [[ -n "$CLS_NEG_WEIGHT" && "$CLS_NEG_WEIGHT" != "null" ]]; then
 fi
 if [[ -n "$CLS_EXTRA_NEG_WEIGHT" && "$CLS_EXTRA_NEG_WEIGHT" != "null" ]]; then
     cmd+=(--cls_extra_neg_weight "$CLS_EXTRA_NEG_WEIGHT")
-fi
-if [[ -n "$CLS_POS_NODT_AUX_WEIGHT" && "$CLS_POS_NODT_AUX_WEIGHT" != "null" ]]; then
-    cmd+=(--cls_pos_nodt_aux_weight "$CLS_POS_NODT_AUX_WEIGHT")
 fi
 if [[ -n "$CLS_RAMP_EPOCHS" && "$CLS_RAMP_EPOCHS" != "null" ]]; then
     cmd+=(--cls_ramp_epochs "$CLS_RAMP_EPOCHS")

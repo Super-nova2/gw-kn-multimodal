@@ -130,9 +130,9 @@ EVAL_MAX_NEG_SAMPLES=$(jq -r '.eval_max_neg_samples // empty' "$args_file")
 EVAL_SAMPLE_SEED=$(jq -r '.eval_sample_seed // empty' "$args_file")
 EVAL_TARGET_RECALL=$(jq -r '.eval_target_recall // empty' "$args_file")
 EVAL_NO_PLOTS=$(jq -r '.eval_no_plots // false' "$args_file")
-EVAL_POS_DATA_PATH=$(jq -r '.eval_pos_data_path // "/fred/oz016/bgao_kn/data/LSST_KN_BNS/combined_dataset_with_neg_gw.h5"' "$args_file")
-EVAL_NEG_DATA_PATH=$(jq -r '.eval_neg_data_path // "/fred/oz016/bgao_kn/data/Optical_Negative_dataset/ELASTICC_negative_dataset.h5"' "$args_file")
-EVAL_NEG_GROUP=$(jq -r '.eval_neg_group // "ELASTICC/optical_data"' "$args_file")
+EVAL_POS_DATA_PATH=$(jq -r '.eval_pos_data_path // empty' "$args_file")
+EVAL_NEG_DATA_PATH=$(jq -r '.eval_neg_data_path // empty' "$args_file")
+EVAL_NEG_GROUP=$(jq -r '.eval_neg_group // empty' "$args_file")
 
 TIME_OFFSET_ENABLE=$(jq -r '.time_offset_enable // false' "$args_file")
 OFFSET_DIST_NPZ=$(jq -r '.offset_dist_npz // empty' "$args_file")
@@ -143,6 +143,32 @@ OFFSET_EVAL_QUANTILES=$(jq -r '.offset_eval_quantiles // empty' "$args_file")
 OFFSET_SCALE_DAYS_DIVISOR=$(jq -r '.offset_scale_days_divisor // empty' "$args_file")
 OFFSET_SEED=$(jq -r '.offset_seed // empty' "$args_file")
 OFFSET_BANK_SIZE=$(jq -r '.offset_bank_size // empty' "$args_file")
+
+OPTICAL_V2_EVAL_POS_DEFAULT="/fred/oz016/bgao_kn/data/Optical_Only_dataset/combined_dataset_test.h5"
+OPTICAL_V2_EVAL_NEG_DEFAULT="/fred/oz016/bgao_kn/data/Optical_Only_dataset/Tutorial_negative_dataset.h5"
+OPTICAL_V2_EVAL_GROUP_DEFAULT="Tutorial/optical_data"
+
+if [[ -z "$EVAL_POS_DATA_PATH" || "$EVAL_POS_DATA_PATH" == "null" ]]; then
+    if [[ -n "$POS_DATA_PATH" && "$POS_DATA_PATH" != "null" ]]; then
+        EVAL_POS_DATA_PATH="$POS_DATA_PATH"
+    else
+        EVAL_POS_DATA_PATH="$OPTICAL_V2_EVAL_POS_DEFAULT"
+    fi
+fi
+if [[ -z "$EVAL_NEG_DATA_PATH" || "$EVAL_NEG_DATA_PATH" == "null" ]]; then
+    if [[ -n "$NEG_DATA_PATH" && "$NEG_DATA_PATH" != "null" ]]; then
+        EVAL_NEG_DATA_PATH="$NEG_DATA_PATH"
+    else
+        EVAL_NEG_DATA_PATH="$OPTICAL_V2_EVAL_NEG_DEFAULT"
+    fi
+fi
+if [[ -z "$EVAL_NEG_GROUP" || "$EVAL_NEG_GROUP" == "null" ]]; then
+    if [[ -n "$NEG_GROUP" && "$NEG_GROUP" != "null" ]]; then
+        EVAL_NEG_GROUP="$NEG_GROUP"
+    else
+        EVAL_NEG_GROUP="$OPTICAL_V2_EVAL_GROUP_DEFAULT"
+    fi
+fi
 
 if [[ -z "$RUN_NAME" || "$RUN_NAME" == "null" ]]; then
     if [[ -n "${SLURM_JOB_ID:-}" ]]; then
@@ -175,6 +201,14 @@ echo ""
 echo "Configuration File: $args_file"
 echo "Checkpoint Path: $CKPT_PATH"
 echo "Run Name: $RUN_NAME"
+echo "Train POS data: $POS_DATA_PATH"
+echo "Train NEG data: $NEG_DATA_PATH"
+if [[ -n "$NEG_GROUP" && "$NEG_GROUP" != "null" ]]; then
+    echo "Train NEG group: $NEG_GROUP"
+fi
+echo "Eval POS data (resolved): $EVAL_POS_DATA_PATH"
+echo "Eval NEG data (resolved): $EVAL_NEG_DATA_PATH"
+echo "Eval NEG group (resolved): $EVAL_NEG_GROUP"
 echo ""
 
 # Optional: stage large HDF5 to local disk to reduce shared filesystem I/O

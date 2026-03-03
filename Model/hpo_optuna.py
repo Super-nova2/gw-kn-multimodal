@@ -29,9 +29,6 @@ ALBEF_BOOL_KEYS = {
     "cache_in_memory",
     "enable_ood_monitoring",
     "neg_time_offset_enable",
-    "cls_time_delta_enable",
-    "cls_dt_aug_enable",
-    "extra_dt_dropout_enable",
     "mask_itc",
     "semi_hard",
     "hardneg_memory_bank_enable",
@@ -99,20 +96,7 @@ ALBEF_ARG_KEYS = {
     "time_compat_tau_days",
     "time_compat_power",
     "time_compat_max_penalty",
-    "cls_time_delta_enable",
-    "cls_time_delta_scale_days",
-    "cls_time_delta_clip",
     "nonkn_cls_base_field",
-    "cls_dt_aug_enable",
-    "cls_dt_aug_start_epoch",
-    "cls_dt_jitter_sigma_days",
-    "cls_dt_jitter_clip_days",
-    "cls_dt_dropout_p_pos",
-    "cls_dt_dropout_p_hard",
-    "cls_dt_dropout_p_extra",
-    "extra_dt_dropout_enable",
-    "extra_dt_dropout_p",
-    "extra_dt_dropout_apply_to",
     "gw_dropout",
     "opt_dropout",
     "proj_dropout",
@@ -122,7 +106,6 @@ ALBEF_ARG_KEYS = {
     "cls_pos_weight",
     "cls_neg_weight",
     "cls_extra_neg_weight",
-    "cls_pos_nodt_aux_weight",
     "cls_ramp_epochs",
     "itc_decay_start_epoch",
     "itc_decay_epochs",
@@ -179,21 +162,23 @@ DEFAULT_TUNABLE_PARAMS = [
     "warmup_epochs",
     "enc_dim",
     "proj_dim",
-    "gw_dropout",
-    "opt_dropout",
-    "fusion_dropout",
-    "proj_dropout",
-    "feature_dropout",
-    "label_smoothing",
-    "itc_weight",
-    "cls_weight",
-    "cls_neg_weight",
-    "cls_extra_neg_weight",
     "ref_shared_dim",
-    "samples_per_gw",
     "cls_start_epoch",
+    "time_compat_weight",
     "semi_hard_margin",
+    "hardneg_min_candidates",
+    "augment_enable",
 ]
+
+AUGMENT_PRESET_KEYS = (
+    "gw_aug_noise",
+    "gw_aug_jitter",
+    "gw_aug_dropout",
+    "opt_aug_noise",
+    "opt_aug_time_jitter",
+    "opt_aug_dropout",
+    "opt_aug_band_dropout",
+)
 
 OBJECTIVE_PRESETS = {
     # Historical objective used in earlier experiments.
@@ -382,12 +367,13 @@ def load_hpo_config(config_path: str) -> Dict[str, Any]:
     if not isinstance(cfg["tunable_params"], list) or not cfg["tunable_params"]:
         raise ValueError("tunable_params must be a non-empty list")
 
-    valid_tunable_names = (ALBEF_ARG_KEYS - {"hpo_trial_number"}) | {"ref_shared_dim"}
+    valid_tunable_names = (ALBEF_ARG_KEYS - {"hpo_trial_number"}) | {"ref_shared_dim", "augment_enable"}
     unknown_tunable = sorted(set(cfg["tunable_params"]) - valid_tunable_names)
     if unknown_tunable:
         raise ValueError(f"Unknown tunable parameter(s): {unknown_tunable}")
 
-    unknown_fixed = sorted(set(cfg["fixed_overrides"].keys()) - (ALBEF_ARG_KEYS - {"hpo_trial_number"}))
+    valid_fixed_names = (ALBEF_ARG_KEYS - {"hpo_trial_number"}) | {"augment_enable"}
+    unknown_fixed = sorted(set(cfg["fixed_overrides"].keys()) - valid_fixed_names)
     if unknown_fixed:
         raise ValueError(f"Unknown fixed_overrides parameter(s): {unknown_fixed}")
 
@@ -437,6 +423,7 @@ def _filter_train_config(config: Dict[str, Any]) -> Dict[str, Any]:
 
 def build_trial_config(trial: optuna.Trial, hpo_cfg: Dict[str, Any], base_cfg: Dict[str, Any]) -> Dict[str, Any]:
     config = dict(base_cfg)
+    default_aug_preset = {k: base_cfg.get(k, 0.0) for k in AUGMENT_PRESET_KEYS}
 
     # Runtime overrides from HPO config
     for key in (
@@ -465,16 +452,30 @@ def build_trial_config(trial: optuna.Trial, hpo_cfg: Dict[str, Any], base_cfg: D
         sampled[name] = suggest_from_space(trial, name, hpo_cfg["search_space"][name])
 
     # Apply sampled values (with tied params)
+    augment_enable = None
     for name, value in sampled.items():
         if name == "ref_shared_dim":
             shared = int(value)
             config["n_ref"] = shared
             config["ref_dim"] = shared
+        elif name == "augment_enable":
+            augment_enable = bool(value)
         else:
             config[name] = value
 
     # Fixed overrides from HPO config
-    config.update(hpo_cfg.get("fixed_overrides", {}))
+    fixed_overrides = dict(hpo_cfg.get("fixed_overrides", {}))
+    if "augment_enable" in fixed_overrides:
+        augment_enable = bool(fixed_overrides.pop("augment_enable"))
+    config.update(fixed_overrides)
+
+    if augment_enable is not None:
+        if augment_enable:
+            for key, value in default_aug_preset.items():
+                config[key] = value
+        else:
+            for key in AUGMENT_PRESET_KEYS:
+                config[key] = 0.0
 
     # Hard constraints requested by user
     cls_start = int(config.get("cls_start_epoch", 0))

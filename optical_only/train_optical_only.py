@@ -779,7 +779,7 @@ def parse_args():
     parser.add_argument("--config", type=str, default=None, help="Optional JSON config file.")
     parser.add_argument("--pos_data_path", type=str, default=None)
     parser.add_argument("--neg_data_path", type=str, default=None)
-    parser.add_argument("--neg_group", type=str, default="ELASTICC2_TRAIN/optical_data")
+    parser.add_argument("--neg_group", type=str, default="ELASTICC2/optical_data")
     parser.add_argument("--ckpt_path", type=str, default=None)
     parser.add_argument("--pretrained_albef_ckpt", type=str, default=None)
 

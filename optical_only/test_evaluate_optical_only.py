@@ -100,6 +100,22 @@ def choose_value(cli_value, config_dict, ckpt_args, key, default=None):
     return default
 
 
+def _preview_keys(keys: List[str], limit: int = 8) -> str:
+    if not keys:
+        return "[]"
+    shown = keys[:limit]
+    suffix = "" if len(keys) <= limit else ", ..."
+    return "[" + ", ".join(shown) + suffix + "]"
+
+
+def _default_neg_group_from_path(neg_data_path: str) -> str:
+    # Keep v2 defaults without relying on old *_TRAIN groups.
+    name = Path(neg_data_path).name.lower()
+    if "tutorial_negative_dataset" in name:
+        return "Tutorial/optical_data"
+    return "ELASTICC2/optical_data"
+
+
 def build_ref_time(batch_size, n_ref, ref_start, ref_end, device, dtype):
     ref = torch.linspace(ref_start, ref_end, n_ref, dtype=dtype, device=device)
     return ref.unsqueeze(0).repeat(batch_size, 1)
@@ -254,27 +270,34 @@ def load_model(checkpoint_path, device, config_dict):
     if not isinstance(state_dict, dict):
         raise ValueError("Checkpoint does not contain valid state_dict.")
     state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
-    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    model_state = model.state_dict()
+    missing = sorted(set(model_state.keys()) - set(state_dict.keys()))
+    unexpected = sorted(set(state_dict.keys()) - set(model_state.keys()))
+    shape_mismatch = sorted(
+        k
+        for k in (set(model_state.keys()) & set(state_dict.keys()))
+        if tuple(model_state[k].shape) != tuple(state_dict[k].shape)
+    )
+    try:
+        model.load_state_dict(state_dict, strict=True)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "Strict checkpoint loading failed for optical-only eval. "
+            f"missing={len(missing)} {_preview_keys(missing)} | "
+            f"unexpected={len(unexpected)} {_preview_keys(unexpected)} | "
+            f"shape_mismatch={len(shape_mismatch)} {_preview_keys(shape_mismatch)}"
+        ) from exc
 
     model.to(device)
     model.eval()
-    print(
-        f"Loaded checkpoint: {checkpoint_path} | epoch={ckpt.get('epoch', '?')} "
-        f"| missing={len(missing)} unexpected={len(unexpected)}"
-    )
+    print(f"Loaded checkpoint: {checkpoint_path} | epoch={ckpt.get('epoch', '?')} | strict=True")
     return model, ckpt_args
 
 
 def build_eval_dataset(args, ckpt_args, config_dict):
     pos_data_path = choose_value(args.pos_data_path, config_dict, ckpt_args, "pos_data_path", default=None)
     neg_data_path = choose_value(args.neg_data_path, config_dict, ckpt_args, "neg_data_path", default=None)
-    neg_group = choose_value(
-        args.neg_group,
-        config_dict,
-        ckpt_args,
-        "neg_group",
-        default="ELASTICC2_TRAIN/optical_data",
-    )
+    neg_group = choose_value(args.neg_group, config_dict, ckpt_args, "neg_group", default=None)
     include_coords = bool(choose_value(None, config_dict, ckpt_args, "include_coords", default=False))
 
     if pos_data_path is None or neg_data_path is None:
@@ -282,6 +305,8 @@ def build_eval_dataset(args, ckpt_args, config_dict):
             "pos_data_path/neg_data_path missing. Provide via CLI or --config, "
             "or ensure they are stored in checkpoint args."
         )
+    if neg_group is None:
+        neg_group = _default_neg_group_from_path(neg_data_path)
     if not os.path.exists(pos_data_path):
         raise FileNotFoundError(f"Positive data file not found: {pos_data_path}")
     if not os.path.exists(neg_data_path):

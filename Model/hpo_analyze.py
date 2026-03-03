@@ -24,6 +24,25 @@ METRIC_SHORT_NAMES = {
     "val_itc_acc": "ITC_ACC",
 }
 
+PREFERRED_SLICE_PARAMS = [
+    # Current v2 HPO defaults
+    "lr",
+    "weight_decay",
+    "warmup_epochs",
+    "enc_dim",
+    "proj_dim",
+    "ref_shared_dim",
+    "cls_start_epoch",
+    "time_compat_weight",
+    "semi_hard_margin",
+    "hardneg_min_candidates",
+    "augment_enable",
+    # Backward-compatible legacy params
+    "samples_per_gw",
+    "itc_weight",
+    "cls_weight",
+]
+
 
 def _parse_dict_attr(value):
     if isinstance(value, dict):
@@ -208,18 +227,7 @@ def generate_plots(study, output_dir):
     except Exception as e:
         print(f"  Warning: parallel_coordinate failed: {e}")
 
-    key_params = [
-        "lr",
-        "enc_dim",
-        "proj_dim",
-        "ref_shared_dim",
-        "samples_per_gw",
-        "cls_start_epoch",
-        "semi_hard_margin",
-        "itc_weight",
-        "cls_weight",
-    ]
-    available_params = [p for p in key_params if p in study.best_params]
+    available_params = [p for p in PREFERRED_SLICE_PARAMS if p in study.best_params]
     if available_params:
         try:
             plots["slice_plots"] = plot_slice(study, params=available_params)
@@ -339,10 +347,15 @@ def main():
         storage_path = args.storage.replace("sqlite:///", "")
         args.config_dir = os.path.join(os.path.dirname(storage_path), "configs")
 
-    study = optuna.load_study(
-        study_name=args.study_name,
-        storage=args.storage,
-    )
+    try:
+        study = optuna.load_study(
+            study_name=args.study_name,
+            storage=args.storage,
+        )
+    except KeyError as exc:
+        raise SystemExit(
+            f"Study '{args.study_name}' not found in storage '{args.storage}'."
+        ) from exc
 
     has_results = print_study_summary(study)
     if not has_results:

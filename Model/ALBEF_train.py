@@ -20,7 +20,7 @@ import gc
 import json
 import time
 import warnings
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 warnings.filterwarnings("ignore", "Wswiglal-redir-stdio")
 
 
@@ -84,10 +84,50 @@ def apply_time_offsets(opt_t, opt_mask, delta_days, scale_divisor):
     return opt_t - shift * valid
 
 
+def apply_hard_negative_time_shift(opt_t, opt_mask, delta_days, scale_divisor):
+    """
+    Shift optical timeline for hard negatives with absolute mismatch preserved.
+
+    t_shift = t + (delta_days / scale_divisor), where:
+      delta_days = t_candidate_gw - t_anchor_gw
+    """
+    valid = (opt_mask.sum(dim=-1) > 0).to(dtype=opt_t.dtype)
+    shift = (delta_days.to(device=opt_t.device, dtype=opt_t.dtype) / float(scale_divisor)).unsqueeze(1)
+    return opt_t + shift * valid
+
+
 def compute_time_delta_days(opt_zero_time_mjd, gw_anchor_time_mjd):
     dt = opt_zero_time_mjd.to(torch.float32) - gw_anchor_time_mjd.to(torch.float32)
     dt = torch.where(torch.isfinite(dt), dt, torch.zeros_like(dt))
     return dt
+
+
+def encode_hard_negative_with_time_shift(
+    model,
+    *,
+    opt_coords,
+    opt_t,
+    opt_v,
+    opt_mask,
+    opt_err,
+    opt_ref_t,
+    candidate_zero_time_mjd,
+    anchor_gw_time_mjd,
+    scale_divisor,
+):
+    """
+    Re-encode hard negatives after timeline shift to preserve absolute mismatch.
+    """
+    if candidate_zero_time_mjd is None or anchor_gw_time_mjd is None:
+        delta_days = torch.zeros((opt_t.size(0),), device=opt_t.device, dtype=torch.float32)
+        shifted_opt_t = opt_t
+    else:
+        delta_days = compute_time_delta_days(candidate_zero_time_mjd, anchor_gw_time_mjd)
+        shifted_opt_t = apply_hard_negative_time_shift(opt_t, opt_mask, delta_days, scale_divisor)
+    z_l_hard, h_l_hard = model.encode_optical(
+        opt_coords, shifted_opt_t, opt_v, opt_ref_t, opt_mask, opt_err
+    )
+    return z_l_hard, h_l_hard, delta_days
 
 
 def summarize_time_delta(dt_days):
@@ -136,50 +176,6 @@ def summarize_abs_time_delta_quantiles(dt_days, quantiles=(0.5, 0.9, 0.95)):
     for i, qq in enumerate(quantiles):
         out[f"p{int(qq * 100):02d}"] = float(q_vals[i].item())
     return out
-
-
-def apply_cls_dt_train_augmentation(
-    dt_days: Optional[torch.Tensor],
-    *,
-    enable_aug: bool,
-    jitter_sigma_days: float,
-    jitter_clip_days: float,
-    dropout_p: float,
-) -> Tuple[Optional[torch.Tensor], Dict[str, float]]:
-    stats = {"count": 0.0, "zero_count": 0.0, "std_days": 0.0}
-    if dt_days is None:
-        return None, stats
-
-    dt_aug = dt_days
-    if enable_aug:
-        if jitter_sigma_days > 0:
-            dt_aug = dt_aug + torch.randn_like(dt_aug) * float(jitter_sigma_days)
-        if jitter_clip_days > 0:
-            clip = float(jitter_clip_days)
-            dt_aug = torch.clamp(dt_aug, min=-clip, max=clip)
-        if dropout_p > 0:
-            keep = (torch.rand_like(dt_aug) >= float(dropout_p)).to(dt_aug.dtype)
-            dt_aug = dt_aug * keep
-
-    dt_aug = torch.where(torch.isfinite(dt_aug), dt_aug, torch.zeros_like(dt_aug))
-    count = int(dt_aug.numel())
-    if count <= 0:
-        return dt_aug, stats
-
-    stats["count"] = float(count)
-    stats["zero_count"] = float((dt_aug.abs() <= 1e-6).sum().item())
-    vals = dt_aug.to(torch.float32)
-    stats["std_days"] = float(vals.std(unbiased=False).item()) if count > 1 else 0.0
-    return dt_aug, stats
-
-
-def require_negative_zero_time_field(neg_h5_path, neg_group, field_name):
-    ds_path = f"{neg_group}/{field_name}"
-    with h5py.File(neg_h5_path, "r") as f:
-        if ds_path not in f:
-            raise KeyError(
-                f"cls_time_delta_enable=true requires '{ds_path}' in negative dataset: {neg_h5_path}"
-            )
 
 
 def _sample_semi_hard_from_candidates(
@@ -302,14 +298,20 @@ class HardNegativeMemoryBank:
         self.z_l_bank = None
         self.coords_bank = None
         self.zero_time_bank = None
+        self.opt_t_bank = None
+        self.opt_v_bank = None
+        self.opt_mask_bank = None
+        self.opt_err_bank = None
 
-    def _ensure_initialized(self, feat_o, h_l, z_l, opt_coords):
+    def _ensure_initialized(self, feat_o, h_l, z_l, opt_coords, opt_t, opt_v, opt_mask, opt_err):
         if self.initialized:
             return
         d_proj = int(feat_o.size(1))
         seq_len = int(h_l.size(1))
         d_enc = int(h_l.size(2))
         d_z = int(z_l.size(1))
+        n_time = int(opt_t.size(1))
+        n_band = int(opt_v.size(2))
         self.feat_o_bank = torch.empty(
             (self.capacity, d_proj), device=self.device, dtype=torch.float16
         )
@@ -331,26 +333,63 @@ class HardNegativeMemoryBank:
         self.zero_time_bank = torch.empty(
             (self.capacity,), device=self.device, dtype=torch.float32
         )
+        self.opt_t_bank = torch.empty(
+            (self.capacity, n_time), device=self.device, dtype=torch.float32
+        )
+        self.opt_v_bank = torch.empty(
+            (self.capacity, n_time, n_band), device=self.device, dtype=torch.float16
+        )
+        self.opt_mask_bank = torch.empty(
+            (self.capacity, n_time, n_band), device=self.device, dtype=torch.float16
+        )
+        self.opt_err_bank = torch.empty(
+            (self.capacity, n_time, n_band), device=self.device, dtype=torch.float16
+        )
         self.initialized = True
 
-    def update(self, feat_o, h_l, z_l, opt_coords, opt_zero_time_mjd_base, gw_indices):
+    def update(
+        self,
+        feat_o,
+        h_l,
+        z_l,
+        opt_coords,
+        candidate_gw_time_mjd,
+        gw_indices,
+        opt_t,
+        opt_v,
+        opt_mask,
+        opt_err,
+    ):
         if not self.enabled:
             return
-        if feat_o is None or h_l is None or z_l is None or opt_zero_time_mjd_base is None:
+        if (
+            feat_o is None
+            or h_l is None
+            or z_l is None
+            or candidate_gw_time_mjd is None
+            or opt_t is None
+            or opt_v is None
+            or opt_mask is None
+            or opt_err is None
+        ):
             return
-        self._ensure_initialized(feat_o, h_l, z_l, opt_coords)
+        self._ensure_initialized(feat_o, h_l, z_l, opt_coords, opt_t, opt_v, opt_mask, opt_err)
 
         n = int(feat_o.size(0))
         if n <= 0:
             return
 
         feat_o_w = feat_o.detach().to(dtype=torch.float16)
-        gw_time_w = opt_zero_time_mjd_base.detach().to(dtype=torch.float32)
+        gw_time_w = candidate_gw_time_mjd.detach().to(dtype=torch.float32)
         gw_idx_w = gw_indices.detach().to(dtype=torch.long)
         h_l_w = h_l.detach().to(device=self.device, dtype=torch.float16)
         z_l_w = z_l.detach().to(device=self.device, dtype=torch.float16)
         coords_w = opt_coords.detach().to(device=self.device, dtype=torch.float32)
-        zero_w = opt_zero_time_mjd_base.detach().to(device=self.device, dtype=torch.float32)
+        zero_w = candidate_gw_time_mjd.detach().to(device=self.device, dtype=torch.float32)
+        opt_t_w = opt_t.detach().to(device=self.device, dtype=torch.float32)
+        opt_v_w = opt_v.detach().to(device=self.device, dtype=torch.float16)
+        opt_mask_w = opt_mask.detach().to(device=self.device, dtype=torch.float16)
+        opt_err_w = opt_err.detach().to(device=self.device, dtype=torch.float16)
 
         first = min(n, self.capacity - self.ptr)
         sl1 = slice(self.ptr, self.ptr + first)
@@ -361,6 +400,10 @@ class HardNegativeMemoryBank:
         self.z_l_bank[sl1] = z_l_w[:first]
         self.coords_bank[sl1] = coords_w[:first]
         self.zero_time_bank[sl1] = zero_w[:first]
+        self.opt_t_bank[sl1] = opt_t_w[:first]
+        self.opt_v_bank[sl1] = opt_v_w[:first]
+        self.opt_mask_bank[sl1] = opt_mask_w[:first]
+        self.opt_err_bank[sl1] = opt_err_w[:first]
 
         if n > first:
             rem = n - first
@@ -372,6 +415,10 @@ class HardNegativeMemoryBank:
             self.z_l_bank[sl2] = z_l_w[first:]
             self.coords_bank[sl2] = coords_w[first:]
             self.zero_time_bank[sl2] = zero_w[first:]
+            self.opt_t_bank[sl2] = opt_t_w[first:]
+            self.opt_v_bank[sl2] = opt_v_w[first:]
+            self.opt_mask_bank[sl2] = opt_mask_w[first:]
+            self.opt_err_bank[sl2] = opt_err_w[first:]
 
         self.ptr = (self.ptr + n) % self.capacity
         self.size = min(self.capacity, self.size + n)
@@ -455,7 +502,7 @@ class HardNegativeMemoryBank:
 
         return sel, level_hits, fallback_count, attempted
 
-    def fetch(self, bank_indices, device, h_l_dtype, z_l_dtype):
+    def fetch(self, bank_indices, device, h_l_dtype, z_l_dtype, opt_dtype):
         if bank_indices.numel() == 0:
             return None
         idx = bank_indices.detach().to(device=self.device, dtype=torch.long)
@@ -463,7 +510,22 @@ class HardNegativeMemoryBank:
         z_sel = self.z_l_bank[idx].to(device=device, dtype=z_l_dtype)
         c_sel = self.coords_bank[idx].to(device=device, dtype=torch.float32)
         t_sel = self.zero_time_bank[idx].to(device=device, dtype=torch.float32)
-        return h_sel, z_sel, c_sel, t_sel
+        gw_idx_sel = self.gw_idx_bank[idx].to(device=device, dtype=torch.long)
+        opt_t_sel = self.opt_t_bank[idx].to(device=device, dtype=opt_dtype)
+        opt_v_sel = self.opt_v_bank[idx].to(device=device, dtype=opt_dtype)
+        opt_mask_sel = self.opt_mask_bank[idx].to(device=device, dtype=opt_dtype)
+        opt_err_sel = self.opt_err_bank[idx].to(device=device, dtype=opt_dtype)
+        return (
+            h_sel,
+            z_sel,
+            c_sel,
+            t_sel,
+            gw_idx_sel,
+            opt_t_sel,
+            opt_v_sel,
+            opt_mask_sel,
+            opt_err_sel,
+        )
 
 
 class NegativeTimeOffsetPolicy:
@@ -792,6 +854,13 @@ def compute_hard_neg_ratio(args, epoch):
     progress = (epoch - args.hard_neg_start_epoch + 1) / float(args.hard_neg_ramp_epochs)
     return min(1.0, progress)
 
+
+def is_best_ckpt_selection_eligible(args, epoch, hard_neg_ratio=None):
+    """Gate best-checkpoint selection until hard negatives are fully enabled."""
+    ratio = compute_hard_neg_ratio(args, epoch) if hard_neg_ratio is None else float(hard_neg_ratio)
+    return ratio >= (1.0 - 1e-8)
+
+
 def compute_weighted_cls_loss(pos_loss, hard_loss, neg_loss, has_negatives, args):
     pos_weight = args.cls_pos_weight
     neg_weight = args.cls_neg_weight
@@ -896,28 +965,26 @@ def evaluate(
     with torch.no_grad():
         for batch_data in val_loader:
             if has_negatives:
-                if args.cls_time_delta_enable:
-                    if len(batch_data) >= 16:
-                        (
-                            gw_s, gw_m, opt_t, opt_v, opt_mask, opt_err, opt_coords, gw_indices,
-                            neg_t, neg_v, neg_mask, neg_err, neg_coords,
-                            opt_zero_time_mjd_base, neg_zero_time_mjd_base, neg_zero_time_mjd_cls_base,
-                        ) = batch_data[:16]
-                    else:
-                        (
-                            gw_s, gw_m, opt_t, opt_v, opt_mask, opt_err, opt_coords, gw_indices,
-                            neg_t, neg_v, neg_mask, neg_err, neg_coords,
-                            opt_zero_time_mjd_base, neg_zero_time_mjd_base,
-                        ) = batch_data
-                        neg_zero_time_mjd_cls_base = neg_zero_time_mjd_base
+                if len(batch_data) >= 16:
+                    (
+                        gw_s, gw_m, opt_t, opt_v, opt_mask, opt_err, opt_coords, gw_indices,
+                        neg_t, neg_v, neg_mask, neg_err, neg_coords,
+                        _opt_zero_time_mjd_base, _neg_zero_time_mjd_base, _neg_zero_time_mjd_cls_base,
+                    ) = batch_data[:16]
+                elif len(batch_data) >= 15:
+                    (
+                        gw_s, gw_m, opt_t, opt_v, opt_mask, opt_err, opt_coords, gw_indices,
+                        neg_t, neg_v, neg_mask, neg_err, neg_coords,
+                        _opt_zero_time_mjd_base, _neg_zero_time_mjd_base,
+                    ) = batch_data[:15]
                 else:
                     (
                         gw_s, gw_m, opt_t, opt_v, opt_mask, opt_err, opt_coords, gw_indices,
                         neg_t, neg_v, neg_mask, neg_err, neg_coords,
-                    ) = batch_data
+                    ) = batch_data[:13]
             else:
-                if args.cls_time_delta_enable:
-                    gw_s, gw_m, opt_t, opt_v, opt_mask, opt_err, opt_coords, gw_indices, opt_zero_time_mjd_base = batch_data
+                if len(batch_data) >= 9:
+                    gw_s, gw_m, opt_t, opt_v, opt_mask, opt_err, opt_coords, gw_indices, _opt_zero_time_mjd_base = batch_data[:9]
                 else:
                     gw_s, gw_m, opt_t, opt_v, opt_mask, opt_err, opt_coords, gw_indices = batch_data
 
@@ -939,11 +1006,6 @@ def evaluate(
                 neg_mask = neg_mask.to(device, non_blocking=True)
                 neg_err = neg_err.to(device, non_blocking=True)
                 neg_coords = neg_coords.to(device, non_blocking=True)
-                if args.cls_time_delta_enable:
-                    neg_zero_time_mjd_base = neg_zero_time_mjd_base.to(device, non_blocking=True).to(torch.float32)
-                    neg_zero_time_mjd_cls_base = neg_zero_time_mjd_cls_base.to(device, non_blocking=True).to(torch.float32)
-            if args.cls_time_delta_enable:
-                opt_zero_time_mjd_base = opt_zero_time_mjd_base.to(device, non_blocking=True).to(torch.float32)
 
             batch_size = gw_s.size(0)
             if (
@@ -979,23 +1041,20 @@ def evaluate(
 
                 # Compute per-pair credible level for dual fusion
                 cred_level = compute_credible_level(gw_m, opt_coords) if args.dual_fusion else None
-                dt_pos = None
-                if args.cls_time_delta_enable:
-                    dt_pos = compute_time_delta_days(opt_zero_time_mjd_base, batch_event_time_mjd)
-                    _accumulate_time_delta_stats(dt_stats, "pos", dt_pos)
-
                 logits_pos = model.fusion_logits(
-                    g, h_l, z_l=z_l, H_gw=H_gw, cred_level=cred_level, time_delta_days=dt_pos
+                    g, h_l, z_l=z_l, H_gw=H_gw, cred_level=cred_level
                 )
                 labels_pos = torch.ones(batch_size, device=device, dtype=torch.long)
                 labels_neg = torch.zeros(batch_size, device=device, dtype=torch.long)
                 pos_loss = model.cls_criterion(logits_pos, labels_pos)
 
                 easy_idx = sample_easy_negatives(batch_size, device)
+                choose_hard_mask = None
                 if easy_idx is None:
                     neg_idx = None
                 elif hard_neg_ratio <= 0:
                     neg_idx = easy_idx
+                    choose_hard_mask = torch.zeros(batch_size, device=device, dtype=torch.bool)
                 else:
                     if batch_event_time_mjd is not None:
                         hard_idx, lvl_hits, fallback_cnt = sample_inbatch_hard_negatives_with_time(
@@ -1018,33 +1077,62 @@ def evaluate(
                         hard_idx = model.sample_hard_negatives(sim_g2o, gw_indices)
                     if hard_neg_ratio >= 1:
                         neg_idx = hard_idx
+                        choose_hard_mask = torch.ones(batch_size, device=device, dtype=torch.bool)
                     else:
                         choose_hard = torch.rand(batch_size, device=device) < hard_neg_ratio
                         neg_idx = torch.where(choose_hard, hard_idx, easy_idx)
+                        choose_hard_mask = choose_hard
 
                 if neg_idx is None:
                     hard_loss = torch.zeros((), device=device)
                     logits_hard = logits_pos.detach()
                 else:
-                    h_l_hard = h_l[neg_idx]
-                    z_l_hard = z_l[neg_idx]
+                    h_l_hard = h_l[neg_idx].clone()
+                    z_l_hard = z_l[neg_idx].clone()
+                    coords_hard = opt_coords[neg_idx].clone()
+                    dt_hard = torch.zeros((batch_size,), device=device, dtype=torch.float32)
+                    if choose_hard_mask is None:
+                        choose_hard_mask = torch.ones(batch_size, device=device, dtype=torch.bool)
+                    if choose_hard_mask.any():
+                        hard_rows = torch.nonzero(choose_hard_mask, as_tuple=False).squeeze(-1)
+                        hard_opt_idx = neg_idx[hard_rows]
+                        coords_hard_rows = opt_coords[hard_opt_idx]
+                        candidate_gw_time_hard = (
+                            batch_event_time_mjd[hard_opt_idx] if batch_event_time_mjd is not None else None
+                        )
+                        anchor_gw_time_hard = (
+                            batch_event_time_mjd[hard_rows] if batch_event_time_mjd is not None else None
+                        )
+                        z_hard_rows, h_hard_rows, dt_hard_rows = encode_hard_negative_with_time_shift(
+                            model,
+                            opt_coords=coords_hard_rows,
+                            opt_t=opt_t[hard_opt_idx],
+                            opt_v=opt_v[hard_opt_idx],
+                            opt_mask=opt_mask[hard_opt_idx],
+                            opt_err=opt_err[hard_opt_idx],
+                            opt_ref_t=opt_ref_t[hard_rows],
+                            candidate_zero_time_mjd=candidate_gw_time_hard,
+                            anchor_gw_time_mjd=anchor_gw_time_hard,
+                            scale_divisor=args.neg_offset_scale_days_divisor,
+                        )
+                        h_l_hard[hard_rows] = h_hard_rows
+                        z_l_hard[hard_rows] = z_hard_rows
+                        coords_hard[hard_rows] = coords_hard_rows
+                        dt_hard[hard_rows] = dt_hard_rows
                     cred_level_hard = (
-                        compute_credible_level(gw_m, opt_coords[neg_idx])
+                        compute_credible_level(gw_m, coords_hard)
                         if args.dual_fusion else None
                     )
-                    dt_hard = None
-                    if args.cls_time_delta_enable:
-                        dt_hard = compute_time_delta_days(opt_zero_time_mjd_base[neg_idx], batch_event_time_mjd)
-                        _accumulate_time_delta_stats(dt_stats, "hard", dt_hard)
+                    if batch_event_time_mjd is not None and choose_hard_mask.any():
+                        _accumulate_time_delta_stats(dt_stats, "hard", dt_hard[choose_hard_mask])
                     logits_hard = model.fusion_logits(
-                        g, h_l_hard, z_l=z_l_hard, H_gw=H_gw, cred_level=cred_level_hard, time_delta_days=dt_hard
+                        g, h_l_hard, z_l=z_l_hard, H_gw=H_gw, cred_level=cred_level_hard
                     )
                     hard_loss = model.cls_criterion(logits_hard, labels_neg)
 
                 if has_negatives:
                     if neg_offset_policy is not None and neg_offset_policy.enabled:
                         logits_neg_sum = None
-                        dt_extra_sum = None
                         cred_level_neg = compute_credible_level(gw_m, neg_coords) if args.dual_fusion else None
                         for off_days in neg_offset_policy.eval_offsets_days:
                             delta_days = torch.full(
@@ -1056,36 +1144,18 @@ def evaluate(
                             z_l_neg_i, h_l_neg_i = model.encode_optical(
                                 neg_coords, shifted_neg_t, neg_v, opt_ref_t, neg_mask, neg_err
                             )
-                            dt_extra_i = None
-                            if args.cls_time_delta_enable:
-                                off_vec = torch.full(
-                                    (batch_size,), float(off_days), device=device, dtype=torch.float32
-                                )
-                                dt_extra_i = compute_time_delta_days(
-                                    neg_zero_time_mjd_cls_base - off_vec, batch_event_time_mjd
-                                )
-                                dt_extra_sum = dt_extra_i if dt_extra_sum is None else (dt_extra_sum + dt_extra_i)
                             logits_neg_i = model.fusion_logits(
                                 g, h_l_neg_i, z_l=z_l_neg_i, H_gw=H_gw, cred_level=cred_level_neg,
-                                time_delta_days=dt_extra_i,
                             )
                             logits_neg_sum = logits_neg_i if logits_neg_sum is None else logits_neg_sum + logits_neg_i
                         logits_neg = logits_neg_sum / float(max(1, len(neg_offset_policy.eval_offsets_days)))
-                        if dt_extra_sum is not None:
-                            dt_extra_avg = dt_extra_sum / float(max(1, len(neg_offset_policy.eval_offsets_days)))
-                            _accumulate_time_delta_stats(dt_stats, "extra", dt_extra_avg)
                     else:
                         z_l_neg, h_l_neg = model.encode_optical(
                             neg_coords, neg_t, neg_v, opt_ref_t, neg_mask, neg_err
                         )
                         cred_level_neg = compute_credible_level(gw_m, neg_coords) if args.dual_fusion else None
-                        dt_extra = None
-                        if args.cls_time_delta_enable:
-                            dt_extra = compute_time_delta_days(neg_zero_time_mjd_cls_base, batch_event_time_mjd)
-                            _accumulate_time_delta_stats(dt_stats, "extra", dt_extra)
                         logits_neg = model.fusion_logits(
                             g, h_l_neg, z_l=z_l_neg, H_gw=H_gw, cred_level=cred_level_neg,
-                            time_delta_days=dt_extra,
                         )
                     neg_loss = model.cls_criterion(logits_neg, labels_neg)
                 else:
@@ -1195,7 +1265,7 @@ def evaluate(
         "classification": cls_metrics,
         "embedding": emb_metrics,
     }
-    if args.cls_time_delta_enable:
+    if any(int(v.get("count", 0)) > 0 for v in dt_stats.values()):
         metrics["time_delta"] = _finalize_time_delta_stats(dt_stats)
     if hard_total > 0:
         mining = {
@@ -1231,31 +1301,6 @@ def train(args):
             raise ValueError("neg_time_offset_enable=true requires --neg_offset_dist_npz.")
         if not os.path.exists(args.neg_offset_dist_npz):
             raise FileNotFoundError(f"neg_offset_dist_npz not found: {args.neg_offset_dist_npz}")
-    if args.cls_time_delta_scale_days <= 0:
-        raise ValueError("cls_time_delta_scale_days must be > 0.")
-    if args.cls_time_delta_clip <= 0:
-        raise ValueError("cls_time_delta_clip must be > 0.")
-    if args.cls_dt_aug_start_epoch < 0:
-        raise ValueError("cls_dt_aug_start_epoch must be >= 0.")
-    if args.cls_dt_jitter_sigma_days < 0:
-        raise ValueError("cls_dt_jitter_sigma_days must be >= 0.")
-    if args.cls_dt_jitter_clip_days < 0:
-        raise ValueError("cls_dt_jitter_clip_days must be >= 0.")
-    if args.cls_dt_dropout_p_pos < 0 or args.cls_dt_dropout_p_pos > 1:
-        raise ValueError("cls_dt_dropout_p_pos must be in [0, 1].")
-    if args.cls_dt_dropout_p_hard < 0 or args.cls_dt_dropout_p_hard > 1:
-        raise ValueError("cls_dt_dropout_p_hard must be in [0, 1].")
-    if args.cls_dt_dropout_p_extra > 1:
-        raise ValueError("cls_dt_dropout_p_extra must be <= 1.")
-    if args.cls_dt_dropout_p_extra < -1:
-        raise ValueError("cls_dt_dropout_p_extra must be >= -1.")
-    if args.cls_pos_nodt_aux_weight < 0:
-        raise ValueError("cls_pos_nodt_aux_weight must be >= 0.")
-    if args.extra_dt_dropout_p < 0 or args.extra_dt_dropout_p > 1:
-        raise ValueError("extra_dt_dropout_p must be in [0, 1].")
-    args.extra_dt_dropout_apply_to = str(args.extra_dt_dropout_apply_to).strip().lower()
-    if args.extra_dt_dropout_apply_to not in {"train_only"}:
-        raise ValueError("extra_dt_dropout_apply_to must be 'train_only'.")
     if args.hardneg_min_candidates < 1:
         raise ValueError("hardneg_min_candidates must be >= 1.")
     if args.hardneg_memory_bank_size < 1:
@@ -1267,8 +1312,6 @@ def train(args):
     if args.hardneg_memory_max_rows < 1:
         raise ValueError("hardneg_memory_max_rows must be >= 1.")
     args._hardneg_window_days = parse_day_windows(args.hardneg_time_window_days)
-    if args.cls_time_delta_enable and args.neg_data_path is not None:
-        require_negative_zero_time_field(args.neg_data_path, args.neg_group, args.nonkn_cls_base_field)
     if args.neg_offset_seed is None:
         args.neg_offset_seed = int(getattr(args, "seed", 42))
 
@@ -1292,9 +1335,7 @@ def train(args):
     log_dir = os.path.join(os.path.dirname(args.ckpt_path), "tb_logs", f"run_albef_{timestamp}")
     writer = SummaryWriter(log_dir=log_dir)
     print(f"TensorBoard logging started at: {log_dir}")
-    extra_neg_timeaware_enable = bool(
-        args.neg_data_path is not None and args.cls_time_delta_enable
-    )
+    extra_neg_timeaware_enable = bool(args.neg_data_path is not None)
     extra_neg_timeaware_seed = int(getattr(args, "split_seed", args.seed))
     if extra_neg_timeaware_enable:
         print(
@@ -1326,7 +1367,7 @@ def train(args):
                 negative_h5_path=args.neg_data_path,
                 negative_group=args.neg_group,
                 min_lc_per_gw=args.min_lc_per_gw,
-                return_zero_time_mjd=bool(args.cls_time_delta_enable),
+                return_zero_time_mjd=False,
                 nonkn_cls_base_field=args.nonkn_cls_base_field,
                 extra_negative_timeaware_enable=extra_neg_timeaware_enable,
                 extra_negative_timeaware_windows_days=args._hardneg_window_days,
@@ -1353,7 +1394,7 @@ def train(args):
                 cache_in_memory=bool(args.cache_in_memory),
                 negative_h5_path=args.neg_data_path,
                 negative_group=args.neg_group,
-                return_zero_time_mjd=bool(args.cls_time_delta_enable),
+                return_zero_time_mjd=False,
                 nonkn_cls_base_field=args.nonkn_cls_base_field,
                 extra_negative_timeaware_enable=extra_neg_timeaware_enable,
                 extra_negative_timeaware_windows_days=args._hardneg_window_days,
@@ -1381,7 +1422,7 @@ def train(args):
             cache_in_memory=bool(args.cache_in_memory),
             negative_h5_path=args.neg_data_path,
             negative_group=args.neg_group,
-            return_zero_time_mjd=bool(args.cls_time_delta_enable),
+            return_zero_time_mjd=False,
             nonkn_cls_base_field=args.nonkn_cls_base_field,
             extra_negative_timeaware_enable=extra_neg_timeaware_enable,
             extra_negative_timeaware_windows_days=args._hardneg_window_days,
@@ -1414,9 +1455,6 @@ def train(args):
         time_compat_tau_days=args.time_compat_tau_days,
         time_compat_power=args.time_compat_power,
         time_compat_max_penalty=args.time_compat_max_penalty,
-        cls_time_delta_enable=args.cls_time_delta_enable,
-        cls_time_delta_scale_days=args.cls_time_delta_scale_days,
-        cls_time_delta_clip=args.cls_time_delta_clip,
     ).to(device)
 
     if args.use_lightweight_gw:
@@ -1435,7 +1473,16 @@ def train(args):
         if not os.path.exists(args.resume):
             raise FileNotFoundError(f"Resume checkpoint not found: {args.resume}")
         ckpt = torch.load(args.resume, map_location=device)
-        model.load_state_dict(ckpt["model_state_dict"], strict=True)
+        try:
+            model.load_state_dict(ckpt["model_state_dict"], strict=True)
+        except RuntimeError as exc:
+            msg = str(exc)
+            if "size mismatch" in msg:
+                raise RuntimeError(
+                    "Resume checkpoint is incompatible with the no-delta-time classifier head. "
+                    "Use a checkpoint trained with dt removed, or start from scratch."
+                ) from exc
+            raise
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         if 'scaler_state_dict' in ckpt:
             scaler.load_state_dict(ckpt['scaler_state_dict'])
@@ -1451,9 +1498,10 @@ def train(args):
     else:
         print("Negative time-offset policy disabled.")
     gw_event_time_mjd_table = load_gw_event_time_mjd_table(args.data_path, device)
-    if args.cls_time_delta_enable and gw_event_time_mjd_table is None:
+    if gw_event_time_mjd_table is None:
         raise ValueError(
-            "cls_time_delta_enable=true requires 'events/gw_data/event_time_mjd' in training dataset."
+            "Hard-negative time-shift re-encoding requires 'events/gw_data/event_time_mjd' "
+            "in training dataset."
         )
     hardneg_memory = HardNegativeMemoryBank(args, device)
     print(
@@ -1503,7 +1551,7 @@ def train(args):
                 cache_in_memory=False,
                 negative_h5_path=args.neg_data_path,
                 negative_group=args.neg_group,
-                return_zero_time_mjd=bool(args.cls_time_delta_enable),
+                return_zero_time_mjd=False,
                 nonkn_cls_base_field=args.nonkn_cls_base_field,
                 extra_negative_timeaware_enable=extra_neg_timeaware_enable,
                 extra_negative_timeaware_windows_days=args._hardneg_window_days,
@@ -1511,9 +1559,10 @@ def train(args):
                 extra_negative_timeaware_seed=extra_neg_timeaware_seed,
             )
             ood_event_time_mjd_table = load_gw_event_time_mjd_table(args.test_data_path, device)
-            if args.cls_time_delta_enable and ood_event_time_mjd_table is None:
+            if ood_event_time_mjd_table is None:
                 raise ValueError(
-                    "cls_time_delta_enable=true requires 'events/gw_data/event_time_mjd' in OOD dataset."
+                    "Hard-negative time-shift re-encoding requires 'events/gw_data/event_time_mjd' "
+                    "in OOD dataset."
                 )
             print(
                 f"OOD test loader: {args.test_data_path} "
@@ -1523,8 +1572,12 @@ def train(args):
     pbar_update_every = 500
     tb_log_interval = 50
     best_val_score = None
+    best_epoch_idx = None
     best_val_metrics = {}
     epochs_no_improve = 0
+    best_tracking_started = False
+    best_tracking_start_epoch = None
+    last_selection_score = None
     lr_scheduler = build_lr_scheduler(optimizer, args, steps_per_epoch, global_step)
 
     for epoch in range(start_epoch, args.epochs):
@@ -1537,23 +1590,25 @@ def train(args):
         hardneg_mem_attempted_epoch = 0
         hardneg_mem_selected_epoch = 0
         hardneg_mem_fallback_epoch = 0
-        dt_aug_active = bool(
-            args.cls_time_delta_enable
-            and args.cls_dt_aug_enable
-            and epoch >= args.cls_dt_aug_start_epoch
-        )
-        dt_aug_extra_dropout_p = float(args.cls_dt_dropout_p_extra)
-        if dt_aug_extra_dropout_p < 0:
-            if args.extra_dt_dropout_enable and args.extra_dt_dropout_apply_to == "train_only":
-                dt_aug_extra_dropout_p = float(args.extra_dt_dropout_p)
-            else:
-                dt_aug_extra_dropout_p = 0.0
 
         ref_time_cache = None
         apply_temperature_schedule(model, args, epoch)
         cls_weight = compute_cls_weight(args, epoch)
         itc_weight = compute_itc_weight(args, epoch)
         hard_neg_ratio = compute_hard_neg_ratio(args, epoch)
+        best_selection_eligible = is_best_ckpt_selection_eligible(
+            args, epoch, hard_neg_ratio=hard_neg_ratio
+        )
+        if best_selection_eligible and not best_tracking_started:
+            best_tracking_started = True
+            best_tracking_start_epoch = int(epoch)
+            best_val_score = None
+            best_epoch_idx = None
+            epochs_no_improve = 0
+            print(
+                "Best-checkpoint selection activated "
+                f"at epoch {epoch+1} (hard_neg_ratio={hard_neg_ratio:.3f})."
+            )
 
         pbar = tqdm(
             train_loader,
@@ -1564,28 +1619,26 @@ def train(args):
         
         for batch_idx, batch_data in enumerate(pbar):
             if has_negatives:
-                if args.cls_time_delta_enable:
-                    if len(batch_data) >= 16:
-                        (
-                            gw_s, gw_m, opt_t, opt_v, opt_mask, opt_err, opt_coords, gw_indices,
-                            neg_t, neg_v, neg_mask, neg_err, neg_coords,
-                            opt_zero_time_mjd_base, neg_zero_time_mjd_base, neg_zero_time_mjd_cls_base,
-                        ) = batch_data[:16]
-                    else:
-                        (
-                            gw_s, gw_m, opt_t, opt_v, opt_mask, opt_err, opt_coords, gw_indices,
-                            neg_t, neg_v, neg_mask, neg_err, neg_coords,
-                            opt_zero_time_mjd_base, neg_zero_time_mjd_base,
-                        ) = batch_data
-                        neg_zero_time_mjd_cls_base = neg_zero_time_mjd_base
+                if len(batch_data) >= 16:
+                    (
+                        gw_s, gw_m, opt_t, opt_v, opt_mask, opt_err, opt_coords, gw_indices,
+                        neg_t, neg_v, neg_mask, neg_err, neg_coords,
+                        _opt_zero_time_mjd_base, _neg_zero_time_mjd_base, _neg_zero_time_mjd_cls_base,
+                    ) = batch_data[:16]
+                elif len(batch_data) >= 15:
+                    (
+                        gw_s, gw_m, opt_t, opt_v, opt_mask, opt_err, opt_coords, gw_indices,
+                        neg_t, neg_v, neg_mask, neg_err, neg_coords,
+                        _opt_zero_time_mjd_base, _neg_zero_time_mjd_base,
+                    ) = batch_data[:15]
                 else:
                     (
                         gw_s, gw_m, opt_t, opt_v, opt_mask, opt_err, opt_coords, gw_indices,
                         neg_t, neg_v, neg_mask, neg_err, neg_coords,
-                    ) = batch_data
+                    ) = batch_data[:13]
             else:
-                if args.cls_time_delta_enable:
-                    gw_s, gw_m, opt_t, opt_v, opt_mask, opt_err, opt_coords, gw_indices, opt_zero_time_mjd_base = batch_data
+                if len(batch_data) >= 9:
+                    gw_s, gw_m, opt_t, opt_v, opt_mask, opt_err, opt_coords, gw_indices, _opt_zero_time_mjd_base = batch_data[:9]
                 else:
                     gw_s, gw_m, opt_t, opt_v, opt_mask, opt_err, opt_coords, gw_indices = batch_data
 
@@ -1613,11 +1666,10 @@ def train(args):
                 neg_mask = neg_mask.to(device, non_blocking=True)
                 neg_err = neg_err.to(device, non_blocking=True)
                 neg_coords = neg_coords.to(device, non_blocking=True)
-                if args.cls_time_delta_enable:
-                    neg_zero_time_mjd_base = neg_zero_time_mjd_base.to(device, non_blocking=True).to(torch.float32)
-                    neg_zero_time_mjd_cls_base = neg_zero_time_mjd_cls_base.to(device, non_blocking=True).to(torch.float32)
-            if args.cls_time_delta_enable:
-                opt_zero_time_mjd_base = opt_zero_time_mjd_base.to(device, non_blocking=True).to(torch.float32)
+            opt_t_raw = opt_t.clone()
+            opt_v_raw = opt_v.clone()
+            opt_mask_raw = opt_mask.clone()
+            opt_err_raw = opt_err.clone()
 
             opt_t, opt_v, opt_mask, opt_err = augment_optical_data(
                 opt_t, opt_v, opt_mask, opt_err, training=True,
@@ -1654,9 +1706,6 @@ def train(args):
             memory_hard_mine_ms = 0.0
             memory_fetch_ms = 0.0
             hard_branch_total_ms = 0.0
-            dt_pos_aug_stats = None
-            dt_hard_aug_stats = None
-            dt_extra_aug_stats = None
 
             optimizer.zero_grad(set_to_none=True)
 
@@ -1679,35 +1728,14 @@ def train(args):
 
                 # Compute per-pair credible level for dual fusion
                 cred_level = compute_credible_level(gw_m, opt_coords) if args.dual_fusion else None
-                dt_pos = None
-                dt_pos_for_cls = None
-                if args.cls_time_delta_enable:
-                    dt_pos = compute_time_delta_days(opt_zero_time_mjd_base, batch_event_time_mjd)
-                    dt_pos_for_cls = dt_pos
-                    if dt_aug_active:
-                        dt_pos_for_cls, dt_pos_aug_stats = apply_cls_dt_train_augmentation(
-                            dt_pos_for_cls,
-                            enable_aug=True,
-                            jitter_sigma_days=float(args.cls_dt_jitter_sigma_days),
-                            jitter_clip_days=float(args.cls_dt_jitter_clip_days),
-                            dropout_p=float(args.cls_dt_dropout_p_pos),
-                        )
                 logits_pos = model.fusion_logits(
-                    g, h_l, z_l=z_l, H_gw=H_gw, cred_level=cred_level, time_delta_days=dt_pos_for_cls
+                    g, h_l, z_l=z_l, H_gw=H_gw, cred_level=cred_level
                 )
                 feat_g_hard = F.normalize(model.gw_proj(g), p=2, dim=1, eps=1e-8)
                 feat_o_hard = F.normalize(model.opt_proj(z_l), p=2, dim=1, eps=1e-8)
                 labels_pos = torch.ones(batch_size, device=device, dtype=torch.long)
                 labels_neg = torch.zeros(batch_size, device=device, dtype=torch.long)
                 pos_loss = model.cls_criterion(logits_pos, labels_pos)
-                pos_nodt_aux_loss = torch.zeros((), device=device)
-                logits_pos_nodt = None
-                if args.cls_time_delta_enable and args.cls_pos_nodt_aux_weight > 0:
-                    dt_pos_zero = torch.zeros_like(dt_pos_for_cls) if dt_pos_for_cls is not None else None
-                    logits_pos_nodt = model.fusion_logits(
-                        g, h_l, z_l=z_l, H_gw=H_gw, cred_level=cred_level, time_delta_days=dt_pos_zero
-                    )
-                    pos_nodt_aux_loss = model.cls_criterion(logits_pos_nodt, labels_pos)
 
                 hard_branch_cpu_start = time.perf_counter() if should_perf_log else None
                 easy_idx = sample_easy_negatives(batch_size, device)
@@ -1762,7 +1790,35 @@ def train(args):
                     h_l_hard = h_l[neg_idx].clone()
                     z_l_hard = z_l[neg_idx].clone()
                     coords_hard = opt_coords[neg_idx].clone()
-                    hard_opt_zero_time = opt_zero_time_mjd_base[neg_idx].clone() if args.cls_time_delta_enable else None
+                    dt_hard = torch.zeros((batch_size,), device=device, dtype=torch.float32)
+                    if choose_hard_mask is None:
+                        choose_hard_mask = torch.ones(batch_size, device=device, dtype=torch.bool)
+                    if choose_hard_mask.any():
+                        hard_rows = torch.nonzero(choose_hard_mask, as_tuple=False).squeeze(-1)
+                        hard_opt_idx = neg_idx[hard_rows]
+                        coords_hard_rows = opt_coords[hard_opt_idx]
+                        candidate_gw_time_hard = (
+                            batch_event_time_mjd[hard_opt_idx] if batch_event_time_mjd is not None else None
+                        )
+                        anchor_gw_time_hard = (
+                            batch_event_time_mjd[hard_rows] if batch_event_time_mjd is not None else None
+                        )
+                        z_hard_rows, h_hard_rows, dt_hard_rows = encode_hard_negative_with_time_shift(
+                            model,
+                            opt_coords=coords_hard_rows,
+                            opt_t=opt_t[hard_opt_idx],
+                            opt_v=opt_v[hard_opt_idx],
+                            opt_mask=opt_mask[hard_opt_idx],
+                            opt_err=opt_err[hard_opt_idx],
+                            opt_ref_t=opt_ref_t[hard_rows],
+                            candidate_zero_time_mjd=candidate_gw_time_hard,
+                            anchor_gw_time_mjd=anchor_gw_time_hard,
+                            scale_divisor=args.neg_offset_scale_days_divisor,
+                        )
+                        h_l_hard[hard_rows] = h_hard_rows
+                        z_l_hard[hard_rows] = z_hard_rows
+                        coords_hard[hard_rows] = coords_hard_rows
+                        dt_hard[hard_rows] = dt_hard_rows
 
                     # B5 memory-bank mining: replace selected hard rows with cross-batch candidates.
                     if (
@@ -1770,7 +1826,6 @@ def train(args):
                         and hard_neg_ratio > 0
                         and choose_hard_mask is not None
                         and choose_hard_mask.any()
-                        and args.cls_time_delta_enable
                         and batch_event_time_mjd is not None
                         and (global_step % args.hardneg_memory_interval == 0)
                     ):
@@ -1816,6 +1871,7 @@ def train(args):
                                 device=device,
                                 h_l_dtype=h_l.dtype,
                                 z_l_dtype=z_l.dtype,
+                                opt_dtype=opt_t.dtype,
                             )
                             if should_perf_log:
                                 if fetch_timer is not None:
@@ -1824,40 +1880,47 @@ def train(args):
                                     memory_fetch_ms = (time.perf_counter() - fetch_cpu_start) * 1000.0
                             if fetched is not None:
                                 use_rows = mem_rows[use_mem_mask]
-                                h_sel, z_sel, c_sel, t_sel = fetched
-                                h_l_hard[use_rows] = h_sel
-                                z_l_hard[use_rows] = z_sel
+                                (
+                                    _h_sel,
+                                    _z_sel,
+                                    c_sel,
+                                    t_sel,
+                                    _gw_idx_sel,
+                                    opt_t_sel,
+                                    opt_v_sel,
+                                    opt_mask_sel,
+                                    opt_err_sel,
+                                ) = fetched
+                                z_sel_re, h_sel_re, dt_sel = encode_hard_negative_with_time_shift(
+                                    model,
+                                    opt_coords=c_sel,
+                                    opt_t=opt_t_sel,
+                                    opt_v=opt_v_sel,
+                                    opt_mask=opt_mask_sel,
+                                    opt_err=opt_err_sel,
+                                    opt_ref_t=opt_ref_t[use_rows],
+                                    candidate_zero_time_mjd=t_sel,
+                                    anchor_gw_time_mjd=batch_event_time_mjd[use_rows],
+                                    scale_divisor=args.neg_offset_scale_days_divisor,
+                                )
+                                h_l_hard[use_rows] = h_sel_re
+                                z_l_hard[use_rows] = z_sel_re
                                 coords_hard[use_rows] = c_sel
-                                if hard_opt_zero_time is not None:
-                                    hard_opt_zero_time[use_rows] = t_sel
+                                dt_hard[use_rows] = dt_sel
                                 hardneg_mem_selected_epoch += int(use_rows.numel())
 
                     cred_level_hard = (
                         compute_credible_level(gw_m, coords_hard)
                         if args.dual_fusion else None
                     )
-                    dt_hard = None
-                    dt_hard_for_cls = None
-                    if args.cls_time_delta_enable:
-                        dt_hard = compute_time_delta_days(hard_opt_zero_time, batch_event_time_mjd)
-                        dt_hard_for_cls = dt_hard
-                        if dt_aug_active:
-                            dt_hard_for_cls, dt_hard_aug_stats = apply_cls_dt_train_augmentation(
-                                dt_hard_for_cls,
-                                enable_aug=True,
-                                jitter_sigma_days=float(args.cls_dt_jitter_sigma_days),
-                                jitter_clip_days=float(args.cls_dt_jitter_clip_days),
-                                dropout_p=float(args.cls_dt_dropout_p_hard),
-                            )
                     logits_hard = model.fusion_logits(
                         g, h_l_hard, z_l=z_l_hard, H_gw=H_gw, cred_level=cred_level_hard,
-                        time_delta_days=dt_hard_for_cls,
                     )
                     hard_loss = model.cls_criterion(logits_hard, labels_neg)
                     if choose_hard_mask is not None:
                         hard_count = int(choose_hard_mask.sum().item())
                         hardneg_total_epoch += hard_count
-                        if dt_hard is not None and hard_count > 0:
+                        if dt_hard is not None and batch_event_time_mjd is not None and hard_count > 0:
                             abs_dt = dt_hard[choose_hard_mask].abs()
                             assigned = torch.zeros_like(abs_dt, dtype=torch.bool)
                             for li, wnd in enumerate(args._hardneg_window_days):
@@ -1882,44 +1945,16 @@ def train(args):
                         neg_coords, neg_t_for_cls, neg_v, opt_ref_t, neg_mask, neg_err
                     )
                     cred_level_neg = compute_credible_level(gw_m, neg_coords) if args.dual_fusion else None
-                    dt_extra = None
-                    dt_extra_for_cls = None
-                    if args.cls_time_delta_enable:
-                        dt_extra = compute_time_delta_days(
-                            neg_zero_time_mjd_cls_base - delta_days, batch_event_time_mjd
-                        )
-                        dt_extra_for_cls = dt_extra
-                        if dt_aug_active:
-                            dt_extra_for_cls, dt_extra_aug_stats = apply_cls_dt_train_augmentation(
-                                dt_extra_for_cls,
-                                enable_aug=True,
-                                jitter_sigma_days=float(args.cls_dt_jitter_sigma_days),
-                                jitter_clip_days=float(args.cls_dt_jitter_clip_days),
-                                dropout_p=float(dt_aug_extra_dropout_p),
-                            )
-                        elif (
-                            args.extra_dt_dropout_enable
-                            and args.extra_dt_dropout_apply_to == "train_only"
-                            and args.extra_dt_dropout_p > 0
-                        ):
-                            keep = (
-                                torch.rand((batch_size,), device=device) >= float(args.extra_dt_dropout_p)
-                            ).to(dt_extra_for_cls.dtype)
-                            dt_extra_for_cls = dt_extra_for_cls * keep
                     logits_neg = model.fusion_logits(
                         g, h_l_neg, z_l=z_l_neg, H_gw=H_gw, cred_level=cred_level_neg,
-                        time_delta_days=dt_extra_for_cls,
                     )
                     neg_loss = model.cls_criterion(logits_neg, labels_neg)
                 else:
                     neg_loss = None
-                    dt_extra = None
 
                 cls_loss = compute_weighted_cls_loss(
                     pos_loss, hard_loss, neg_loss, has_negatives, args
                 )
-                if args.cls_pos_nodt_aux_weight > 0:
-                    cls_loss = cls_loss + float(args.cls_pos_nodt_aux_weight) * pos_nodt_aux_loss
 
                 # 分阶段训练：cls_start_epoch之前只训练ITC
                 total_loss = itc_weight * itc_loss + cls_weight * cls_loss
@@ -1960,14 +1995,18 @@ def train(args):
                     neg_acc = (logits_neg.argmax(dim=1) == labels_neg).float().mean().item()
                 current_temp = model.log_temp.exp().item()
 
-            if args.cls_time_delta_enable and batch_event_time_mjd is not None:
+            if batch_event_time_mjd is not None:
                 hardneg_memory.update(
                     feat_o=feat_o_hard,
                     h_l=h_l,
                     z_l=z_l,
                     opt_coords=opt_coords,
-                    opt_zero_time_mjd_base=opt_zero_time_mjd_base,
+                    candidate_gw_time_mjd=batch_event_time_mjd,
                     gw_indices=gw_indices,
+                    opt_t=opt_t_raw,
+                    opt_v=opt_v_raw,
+                    opt_mask=opt_mask_raw,
+                    opt_err=opt_err_raw,
                 )
 
             step_time_ms = 0.0
@@ -1979,8 +2018,6 @@ def train(args):
                 writer.add_scalar('Train/Batch_ITC_Loss', itc_val, global_step)
                 writer.add_scalar('Train/Batch_CLS_Loss', cls_val, global_step)
                 writer.add_scalar('Train/Batch_Pos_Loss', pos_loss_val, global_step)
-                if args.cls_pos_nodt_aux_weight > 0:
-                    writer.add_scalar('Train/Batch_PosNoDtAux_Loss', float(pos_nodt_aux_loss.item()), global_step)
                 writer.add_scalar('Train/Batch_HardNeg_Loss', hard_loss_val, global_step)
                 if has_negatives:
                     writer.add_scalar('Train/Batch_ExtraNeg_Loss', neg_loss_val, global_step)
@@ -1994,46 +2031,14 @@ def train(args):
                 writer.add_scalar('Train/HardNeg_Ratio', hard_neg_ratio, global_step)
                 writer.add_scalar('Train/Temperature', current_temp, global_step)
                 writer.add_scalar('Train/Learning_Rate', optimizer.param_groups[0]['lr'], global_step)
-                if args.cls_time_delta_enable:
-                    dt_pos_mean, dt_pos_std = summarize_time_delta(dt_pos)
-                    writer.add_scalar('Train/TimeDelta/dt_pos_mean', dt_pos_mean, global_step)
-                    writer.add_scalar('Train/TimeDelta/dt_pos_std', dt_pos_std, global_step)
-                    if dt_hard is not None:
-                        dt_hard_mean, dt_hard_std = summarize_time_delta(dt_hard)
-                        writer.add_scalar('Train/TimeDelta/dt_hard_mean', dt_hard_mean, global_step)
-                        writer.add_scalar('Train/TimeDelta/dt_hard_std', dt_hard_std, global_step)
-                        hard_q = summarize_abs_time_delta_quantiles(dt_hard, quantiles=(0.5, 0.9, 0.95))
-                        writer.add_scalar('Train/TimeDelta/dt_hard_abs_p50', hard_q["p50"], global_step)
-                        writer.add_scalar('Train/TimeDelta/dt_hard_abs_p90', hard_q["p90"], global_step)
-                        writer.add_scalar('Train/TimeDelta/dt_hard_abs_p95', hard_q["p95"], global_step)
-                    if dt_extra is not None:
-                        dt_extra_mean, dt_extra_std = summarize_time_delta(dt_extra)
-                        writer.add_scalar('Train/TimeDelta/dt_extra_mean', dt_extra_mean, global_step)
-                        writer.add_scalar('Train/TimeDelta/dt_extra_std', dt_extra_std, global_step)
-                    if dt_aug_active:
-                        if dt_pos_aug_stats is not None and dt_pos_aug_stats["count"] > 0:
-                            writer.add_scalar(
-                                'Train/TimeDelta/aug_pos_zero_rate',
-                                dt_pos_aug_stats["zero_count"] / dt_pos_aug_stats["count"],
-                                global_step,
-                            )
-                            writer.add_scalar(
-                                'Train/TimeDelta/aug_pos_std_days',
-                                dt_pos_aug_stats["std_days"],
-                                global_step,
-                            )
-                        if dt_hard_aug_stats is not None and dt_hard_aug_stats["count"] > 0:
-                            writer.add_scalar(
-                                'Train/TimeDelta/aug_hard_zero_rate',
-                                dt_hard_aug_stats["zero_count"] / dt_hard_aug_stats["count"],
-                                global_step,
-                            )
-                        if dt_extra_aug_stats is not None and dt_extra_aug_stats["count"] > 0:
-                            writer.add_scalar(
-                                'Train/TimeDelta/aug_extra_zero_rate',
-                                dt_extra_aug_stats["zero_count"] / dt_extra_aug_stats["count"],
-                                global_step,
-                            )
+                if dt_hard is not None and batch_event_time_mjd is not None:
+                    dt_hard_mean, dt_hard_std = summarize_time_delta(dt_hard)
+                    writer.add_scalar('Train/TimeShift/hard_delta_days_mean', dt_hard_mean, global_step)
+                    writer.add_scalar('Train/TimeShift/hard_delta_days_std', dt_hard_std, global_step)
+                    hard_q = summarize_abs_time_delta_quantiles(dt_hard, quantiles=(0.5, 0.9, 0.95))
+                    writer.add_scalar('Train/TimeShift/hard_delta_abs_p50', hard_q["p50"], global_step)
+                    writer.add_scalar('Train/TimeShift/hard_delta_abs_p90', hard_q["p90"], global_step)
+                    writer.add_scalar('Train/TimeShift/hard_delta_abs_p95', hard_q["p95"], global_step)
                 if hardneg_total_epoch > 0:
                     writer.add_scalar(
                         'Train/HardNeg/hardneg_window_uncovered_rate',
@@ -2075,22 +2080,16 @@ def train(args):
                     'CLS': f"{cls_val:.4f}",
                     'ITC_Acc': f"{itc_acc:.2f}"
                 }
-                if args.cls_time_delta_enable:
-                    dt_pos_mean, _ = summarize_time_delta(dt_pos)
-                    postfix['dt_pos'] = f"{dt_pos_mean:.2f}"
-                    if dt_hard is not None:
-                        dt_hard_mean, _ = summarize_time_delta(dt_hard)
-                        postfix['dt_hard'] = f"{dt_hard_mean:.2f}"
-                    if dt_extra is not None:
-                        dt_extra_mean, _ = summarize_time_delta(dt_extra)
-                        postfix['dt_extra'] = f"{dt_extra_mean:.2f}"
+                if dt_hard is not None and batch_event_time_mjd is not None:
+                    dt_hard_mean, _ = summarize_time_delta(dt_hard)
+                    postfix['hard_dt'] = f"{dt_hard_mean:.2f}"
+                if last_selection_score is not None:
+                    postfix[f"{args.best_ckpt_metric}"] = f"{last_selection_score:.4f}"
                 pbar.set_postfix(postfix)
 
             # Memory cleanup: delete large tensors to free memory
             del g, z_l, h_l, sim_g2o, sim_g2o_detached, itc_loss, total_loss
             del logits_pos, logits_hard, pos_loss, hard_loss, cls_loss
-            if logits_pos_nodt is not None:
-                del logits_pos_nodt
             if has_negatives:
                 del logits_neg, neg_loss
             
@@ -2159,12 +2158,9 @@ def train(args):
                 emb = val_metrics.get('embedding', {})
                 for k, v in emb.items():
                     writer.add_scalar(f'Val/Embedding/{k}', v, epoch)
-                if args.cls_time_delta_enable:
-                    dt_m = val_metrics.get("time_delta", {})
-                    for k in ("pos_mean", "pos_std", "hard_mean", "hard_std", "extra_mean", "extra_std"):
-                        key = f"{k}"
-                        if key in dt_m:
-                            writer.add_scalar(f'Val/TimeDelta/{key}', dt_m[key], epoch)
+                dt_m = val_metrics.get("time_delta", {})
+                for key, value in dt_m.items():
+                    writer.add_scalar(f'Val/TimeShift/{key}', value, epoch)
                 hard_m = val_metrics.get("hardneg_mining", {})
                 for k, v in hard_m.items():
                     writer.add_scalar(f'Val/HardNeg/{k}', v, epoch)
@@ -2185,45 +2181,81 @@ def train(args):
                 current_selection_score = compute_ckpt_selection_score(
                     val_metrics, args.best_ckpt_metric
                 )
-                if best_val_score is None or current_selection_score > best_val_score + args.early_stop_min_delta:
-                    best_val_score = current_selection_score
-                    best_val_metrics = {
-                        "best_ckpt_metric": args.best_ckpt_metric,
-                        "best_ckpt_score": current_selection_score,
-                        "best_val_acc_total": val_metrics.get('classification', {}).get('acc_total', 0),
-                        "best_val_loss": val_metrics['total'],
-                        "best_epoch": epoch,
-                        "val_itc_loss": val_metrics.get('itc', 0),
-                        "val_cls_loss": val_metrics.get('cls', 0),
-                        "val_recall_at_1": val_metrics.get('retrieval', {}).get('g2o_recall_at_1', 0),
-                        "val_recall_at_5": val_metrics.get('retrieval', {}).get('g2o_recall_at_5', 0),
-                        "val_mrr": val_metrics.get('retrieval', {}).get('g2o_mrr', 0),
-                        "val_auroc": val_metrics.get('classification', {}).get('auroc', 0),
-                        "val_auprc": val_metrics.get('classification', {}).get('auprc', 0),
-                    }
-                    epochs_no_improve = 0
-                    best_ckpt = os.path.join(args.ckpt_path, "ALBEF", "albef_best.pth")
-                    os.makedirs(os.path.dirname(best_ckpt), exist_ok=True)
-                    torch.save({
-                        'epoch': epoch,
-                        'model_state_dict': model.state_dict(),
-                        'optimizer_state_dict': optimizer.state_dict(),
-                        'scaler_state_dict': scaler.state_dict(),
-                        'acc_total': val_metrics.get('classification', {}).get('acc_total', 0),
-                        'selection_metric': args.best_ckpt_metric,
-                        'selection_score': current_selection_score,
-                        'loss': val_metrics['total'],
-                        'args': vars(args),
-                    }, best_ckpt)
+                last_selection_score = float(current_selection_score)
+                is_best_epoch = False
+                writer.add_scalar(
+                    f'Val/BestCkpt/{args.best_ckpt_metric}',
+                    float(current_selection_score),
+                    epoch,
+                )
+
+                if not best_selection_eligible:
                     print(
-                        f"Saved best checkpoint ({args.best_ckpt_metric}="
-                        f"{current_selection_score:.4f}): {best_ckpt}"
+                        "  Best-CKPT selection pending: waiting for full hard-negative ratio "
+                        f"(current={hard_neg_ratio:.3f}, required=1.000)."
                     )
                 else:
-                    epochs_no_improve += 1
-                    if args.early_stop_patience > 0 and epochs_no_improve >= args.early_stop_patience:
-                        print("Early stopping triggered.")
-                        stop_early = True
+                    prev_best = best_val_score
+                    improved = (
+                        prev_best is None
+                        or current_selection_score > prev_best + args.early_stop_min_delta
+                    )
+                    if improved:
+                        best_val_score = current_selection_score
+                        best_epoch_idx = int(epoch)
+                        is_best_epoch = True
+                        best_val_metrics = {
+                            "best_ckpt_metric": args.best_ckpt_metric,
+                            "best_ckpt_score": current_selection_score,
+                            "best_val_acc_total": val_metrics.get('classification', {}).get('acc_total', 0),
+                            "best_val_loss": val_metrics['total'],
+                            "best_epoch": epoch,
+                            "best_epoch_1based": epoch + 1,
+                            "best_tracking_start_epoch": best_tracking_start_epoch,
+                            "best_tracking_start_epoch_1based": (
+                                best_tracking_start_epoch + 1 if best_tracking_start_epoch is not None else None
+                            ),
+                            "val_itc_loss": val_metrics.get('itc', 0),
+                            "val_cls_loss": val_metrics.get('cls', 0),
+                            "val_recall_at_1": val_metrics.get('retrieval', {}).get('g2o_recall_at_1', 0),
+                            "val_recall_at_5": val_metrics.get('retrieval', {}).get('g2o_recall_at_5', 0),
+                            "val_mrr": val_metrics.get('retrieval', {}).get('g2o_mrr', 0),
+                            "val_auroc": val_metrics.get('classification', {}).get('auroc', 0),
+                            "val_auprc": val_metrics.get('classification', {}).get('auprc', 0),
+                        }
+                        epochs_no_improve = 0
+                        best_ckpt = os.path.join(args.ckpt_path, "ALBEF", "albef_best.pth")
+                        os.makedirs(os.path.dirname(best_ckpt), exist_ok=True)
+                        torch.save({
+                            'epoch': epoch,
+                            'model_state_dict': model.state_dict(),
+                            'optimizer_state_dict': optimizer.state_dict(),
+                            'scaler_state_dict': scaler.state_dict(),
+                            'acc_total': val_metrics.get('classification', {}).get('acc_total', 0),
+                            'selection_metric': args.best_ckpt_metric,
+                            'selection_score': current_selection_score,
+                            'selection_eligible': bool(best_selection_eligible),
+                            'best_tracking_start_epoch': best_tracking_start_epoch,
+                            'loss': val_metrics['total'],
+                            'args': vars(args),
+                        }, best_ckpt)
+                        print(
+                            f"Saved best checkpoint ({args.best_ckpt_metric}="
+                            f"{current_selection_score:.4f}, epoch={epoch+1}): {best_ckpt}"
+                        )
+                    else:
+                        epochs_no_improve += 1
+                        if args.early_stop_patience > 0 and epochs_no_improve >= args.early_stop_patience:
+                            print("Early stopping triggered.")
+                            stop_early = True
+
+                best_score_str = "N/A" if best_val_score is None else f"{best_val_score:.4f}"
+                best_epoch_str = "N/A" if best_epoch_idx is None else str(best_epoch_idx + 1)
+                print(
+                    f"  Best-CKPT metric[{args.best_ckpt_metric}]: current={current_selection_score:.4f}, "
+                    f"best={best_score_str}@epoch{best_epoch_str}, "
+                    f"eligible={int(best_selection_eligible)}, is_best={int(is_best_epoch)}"
+                )
 
         # --- OOD (out-of-distribution) validation on independent test set ---
         if ood_val_loader is not None:
@@ -2251,11 +2283,9 @@ def train(args):
                 ood_emb = ood_metrics.get('embedding', {})
                 for k, v in ood_emb.items():
                     writer.add_scalar(f'OOD/Embedding/{k}', v, epoch)
-                if args.cls_time_delta_enable:
-                    ood_dt = ood_metrics.get("time_delta", {})
-                    for k in ("pos_mean", "pos_std", "hard_mean", "hard_std", "extra_mean", "extra_std"):
-                        if k in ood_dt:
-                            writer.add_scalar(f'OOD/TimeDelta/{k}', ood_dt[k], epoch)
+                ood_dt = ood_metrics.get("time_delta", {})
+                for key, value in ood_dt.items():
+                    writer.add_scalar(f'OOD/TimeShift/{key}', value, epoch)
                 ood_hard_m = ood_metrics.get("hardneg_mining", {})
                 for k, v in ood_hard_m.items():
                     writer.add_scalar(f'OOD/HardNeg/{k}', v, epoch)
@@ -2384,35 +2414,8 @@ if __name__ == "__main__":
                         help="Power for |Δt/tau|^power in time-compatibility penalty.")
     parser.add_argument("--time_compat_max_penalty", type=float, default=8.0,
                         help="Maximum absolute logit penalty for time compatibility.")
-    parser.add_argument("--cls_time_delta_enable", action='store_true',
-                        help="Enable pair time-delta feature in classification head.")
-    parser.add_argument("--cls_time_delta_scale_days", type=float, default=30.0,
-                        help="Scale days for normalizing classification time delta.")
-    parser.add_argument("--cls_time_delta_clip", type=float, default=10.0,
-                        help="Clamp bound for normalized classification time delta.")
     parser.add_argument("--nonkn_cls_base_field", type=str, default="zero_time_mjd_cls_base",
                         help="Negative H5 field used as base absolute time for extra-negative dt.")
-    parser.add_argument("--cls_dt_aug_enable", action='store_true',
-                        help="Apply train-time augmentation to classification time-delta inputs.")
-    parser.add_argument("--cls_dt_aug_start_epoch", type=int, default=0,
-                        help="Epoch index to start classification dt augmentation.")
-    parser.add_argument("--cls_dt_jitter_sigma_days", type=float, default=0.0,
-                        help="Gaussian jitter std (days) added to classification dt in training.")
-    parser.add_argument("--cls_dt_jitter_clip_days", type=float, default=30.0,
-                        help="Absolute clamp (days) after dt jitter. <=0 disables clamp.")
-    parser.add_argument("--cls_dt_dropout_p_pos", type=float, default=0.0,
-                        help="Drop probability (set to zero) for positive-pair dt in training.")
-    parser.add_argument("--cls_dt_dropout_p_hard", type=float, default=0.0,
-                        help="Drop probability (set to zero) for hard-negative dt in training.")
-    parser.add_argument("--cls_dt_dropout_p_extra", type=float, default=-1.0,
-                        help="Drop probability for extra-negative dt in training. <0 reuses extra_dt_dropout_p.")
-    parser.add_argument("--extra_dt_dropout_enable", action='store_true',
-                        help="Apply stochastic drop (to zero) on extra-negative dt during training.")
-    parser.add_argument("--extra_dt_dropout_p", type=float, default=0.5,
-                        help="Drop probability for extra-negative dt in training.")
-    parser.add_argument("--extra_dt_dropout_apply_to", type=str, default="train_only",
-                        choices=["train_only"],
-                        help="Scope for extra-negative dt drop.")
     parser.add_argument("--gw_dropout", type=float, default=0.1)
     parser.add_argument("--opt_dropout", type=float, default=0.1)
     parser.add_argument("--proj_dropout", type=float, default=0.0,
@@ -2427,8 +2430,6 @@ if __name__ == "__main__":
                         help="Negative class weight for CLS loss")
     parser.add_argument("--cls_extra_neg_weight", type=float, default=1.0,
                         help="Extra negative class weight for CLS loss")
-    parser.add_argument("--cls_pos_nodt_aux_weight", type=float, default=0.0,
-                        help="Extra positive CE loss using forced-zero dt input (0 to disable).")
     parser.add_argument("--cls_ramp_epochs", type=int, default=0,
                         help="Epochs to ramp CLS weight from 0 to cls_weight (0 to disable)")
     parser.add_argument("--itc_decay_start_epoch", type=int, default=0,
