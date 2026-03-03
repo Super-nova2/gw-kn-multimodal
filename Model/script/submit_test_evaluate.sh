@@ -25,10 +25,7 @@ extract_version_tag() {
 enforce_eval_mapping_checks() {
     local checkpoint_path="$1"
     local output_dir_path="$2"
-    local cls_dt_state="$3"
-    local cls_dt_force_zero="$4"
     local allow_version_mismatch="${EVAL_ALLOW_VERSION_MISMATCH:-false}"
-    local allow_mode_mismatch="${EVAL_ALLOW_MODE_TAG_MISMATCH:-false}"
 
     local ckpt_ver
     local out_ver
@@ -46,41 +43,6 @@ enforce_eval_mapping_checks() {
         echo "EVAL_ALLOW_VERSION_MISMATCH=true, continuing despite mismatch."
     fi
 
-    local eval_mode="unknown"
-    if [[ "$cls_dt_force_zero" == "true" ]]; then
-        eval_mode="force_zero"
-    elif [[ "$cls_dt_state" == "true" ]]; then
-        eval_mode="delta_on"
-    elif [[ "$cls_dt_state" == "false" ]]; then
-        eval_mode="force_zero"
-    fi
-
-    local out_base_lc
-    out_base_lc="$(basename "$output_dir_path" | tr '[:upper:]' '[:lower:]')"
-    local out_has_no_delta="false"
-    if [[ "$out_base_lc" == *"no_delta"* || "$out_base_lc" == *"nodelta"* ]]; then
-        out_has_no_delta="true"
-    fi
-
-    if [[ "$eval_mode" == "force_zero" && "$out_has_no_delta" != "true" ]]; then
-        echo "Output dir naming mismatch: eval mode is force-zero but output_dir lacks no_delta tag."
-        echo "output_dir: $output_dir_path"
-        if [[ "$allow_mode_mismatch" != "true" ]]; then
-            echo "Set EVAL_ALLOW_MODE_TAG_MISMATCH=true to bypass."
-            exit 1
-        fi
-        echo "EVAL_ALLOW_MODE_TAG_MISMATCH=true, continuing despite mismatch."
-    fi
-
-    if [[ "$eval_mode" == "delta_on" && "$out_has_no_delta" == "true" ]]; then
-        echo "Output dir naming mismatch: eval mode is delta-on but output_dir contains no_delta tag."
-        echo "output_dir: $output_dir_path"
-        if [[ "$allow_mode_mismatch" != "true" ]]; then
-            echo "Set EVAL_ALLOW_MODE_TAG_MISMATCH=true to bypass."
-            exit 1
-        fi
-        echo "EVAL_ALLOW_MODE_TAG_MISMATCH=true, continuing despite mismatch."
-    fi
 }
 
 args_file=${1:-}
@@ -149,6 +111,7 @@ NEG_GROUP=$(jq -r '.neg_group // empty' "$args_file")
 CONFIG_PATH=$(jq -r '.config // empty' "$args_file")
 OUTPUT_DIR=$(jq -r '.output_dir // empty' "$args_file")
 DEVICE=$(jq -r '.device // "cuda"' "$args_file")
+AMP_DTYPE=$(jq -r '.amp_dtype // empty' "$args_file")
 NO_PLOTS=$(jq -r '.no_plots // false' "$args_file")
 STAGE_TO_JOBFS=$(jq -r '.stage_to_jobfs // false' "$args_file")
 
@@ -164,21 +127,10 @@ NEG_OFFSET_DIST_KEY=$(jq -r '.neg_offset_dist_key // empty' "$args_file")
 NEG_OFFSET_EVAL_MODE=$(jq -r '.neg_offset_eval_mode // empty' "$args_file")
 NEG_OFFSET_EVAL_QUANTILES=$(jq -r '.neg_offset_eval_quantiles // empty' "$args_file")
 NEG_OFFSET_SCALE_DAYS_DIVISOR=$(jq -r '.neg_offset_scale_days_divisor // empty' "$args_file")
-CLS_TIME_DELTA_ENABLE=$(jq -r '.cls_time_delta_enable // false' "$args_file")
-CLS_TIME_DELTA_ENABLE_STATE=$(jq -r 'if has("cls_time_delta_enable") then (.cls_time_delta_enable | tostring) else "unset" end' "$args_file")
-CLS_TIME_DELTA_SCALE_DAYS=$(jq -r '.cls_time_delta_scale_days // empty' "$args_file")
-CLS_TIME_DELTA_CLIP=$(jq -r '.cls_time_delta_clip // empty' "$args_file")
-CLS_TIME_DELTA_FORCE_ZERO=$(jq -r '.cls_time_delta_force_zero // false' "$args_file")
 NONKN_CLS_BASE_FIELD=$(jq -r '.nonkn_cls_base_field // empty' "$args_file")
 REPORT_DT_BINS_STATE=$(jq -r 'if has("report_dt_bins") then (.report_dt_bins | tostring) else "unset" end' "$args_file")
 DT_BIN_EDGES=$(jq -r '.dt_bin_edges // empty' "$args_file")
 REPORT_DT_MACRO_STATE=$(jq -r 'if has("report_dt_macro") then (.report_dt_macro | tostring) else "unset" end' "$args_file")
-DT_MATCH_STRATEGY=$(jq -r '.dt_match_strategy // empty' "$args_file")
-DT_MATCH_WINDOW_DAYS=$(jq -r '.dt_match_window_days // empty' "$args_file")
-DT_MATCH_QUANTILES=$(jq -r '.dt_match_quantiles // empty' "$args_file")
-DT_MATCH_TARGET=$(jq -r '.dt_match_target // empty' "$args_file")
-DT_MATCH_APPLY_TO=$(jq -r '.dt_match_apply_to // empty' "$args_file")
-POS_TIME_OFFSETS_DAYS=$(jq -r '.pos_time_offsets_days // empty' "$args_file")
 
 if [[ -z "$CHECKPOINT" ]]; then
     echo "Required field missing in args: checkpoint"
@@ -218,7 +170,7 @@ fi
 if [[ -z "$OUTPUT_DIR" || "$OUTPUT_DIR" == "null" ]]; then
     OUTPUT_DIR="$(dirname "$CHECKPOINT")/eval_results"
 fi
-enforce_eval_mapping_checks "$CHECKPOINT" "$OUTPUT_DIR" "$CLS_TIME_DELTA_ENABLE_STATE" "$CLS_TIME_DELTA_FORCE_ZERO"
+enforce_eval_mapping_checks "$CHECKPOINT" "$OUTPUT_DIR"
 mkdir -p "$OUTPUT_DIR"
 
 echo "========================================"
@@ -290,6 +242,9 @@ fi
 if [[ -n "$NUM_WORKERS" && "$NUM_WORKERS" != "null" ]]; then
     cmd+=(--num_workers "$NUM_WORKERS")
 fi
+if [[ -n "$AMP_DTYPE" && "$AMP_DTYPE" != "null" ]]; then
+    cmd+=(--amp_dtype "$AMP_DTYPE")
+fi
 if [[ -n "$N_NEG_SAMPLES" && "$N_NEG_SAMPLES" != "null" ]]; then
     cmd+=(--n_neg_samples "$N_NEG_SAMPLES")
 fi
@@ -323,21 +278,6 @@ fi
 if [[ -n "$NEG_OFFSET_SCALE_DAYS_DIVISOR" && "$NEG_OFFSET_SCALE_DAYS_DIVISOR" != "null" ]]; then
     cmd+=(--neg_offset_scale_days_divisor "$NEG_OFFSET_SCALE_DAYS_DIVISOR")
 fi
-if [[ "$CLS_TIME_DELTA_ENABLE" == "true" ]]; then
-    cmd+=(--cls_time_delta_enable)
-fi
-if [[ "$CLS_TIME_DELTA_ENABLE_STATE" == "false" ]]; then
-    cmd+=(--cls_time_delta_force_zero)
-fi
-if [[ -n "$CLS_TIME_DELTA_SCALE_DAYS" && "$CLS_TIME_DELTA_SCALE_DAYS" != "null" ]]; then
-    cmd+=(--cls_time_delta_scale_days "$CLS_TIME_DELTA_SCALE_DAYS")
-fi
-if [[ -n "$CLS_TIME_DELTA_CLIP" && "$CLS_TIME_DELTA_CLIP" != "null" ]]; then
-    cmd+=(--cls_time_delta_clip "$CLS_TIME_DELTA_CLIP")
-fi
-if [[ "$CLS_TIME_DELTA_FORCE_ZERO" == "true" ]]; then
-    cmd+=(--cls_time_delta_force_zero)
-fi
 if [[ -n "$NONKN_CLS_BASE_FIELD" && "$NONKN_CLS_BASE_FIELD" != "null" ]]; then
     cmd+=(--nonkn_cls_base_field "$NONKN_CLS_BASE_FIELD")
 fi
@@ -356,25 +296,6 @@ fi
 if [[ "$REPORT_DT_MACRO_STATE" == "false" ]]; then
     cmd+=(--no_report_dt_macro)
 fi
-if [[ -n "$DT_MATCH_STRATEGY" && "$DT_MATCH_STRATEGY" != "null" ]]; then
-    cmd+=(--dt_match_strategy "$DT_MATCH_STRATEGY")
-fi
-if [[ -n "$DT_MATCH_WINDOW_DAYS" && "$DT_MATCH_WINDOW_DAYS" != "null" ]]; then
-    cmd+=(--dt_match_window_days "$DT_MATCH_WINDOW_DAYS")
-fi
-if [[ -n "$DT_MATCH_QUANTILES" && "$DT_MATCH_QUANTILES" != "null" ]]; then
-    cmd+=(--dt_match_quantiles "$DT_MATCH_QUANTILES")
-fi
-if [[ -n "$DT_MATCH_TARGET" && "$DT_MATCH_TARGET" != "null" ]]; then
-    cmd+=(--dt_match_target "$DT_MATCH_TARGET")
-fi
-if [[ -n "$DT_MATCH_APPLY_TO" && "$DT_MATCH_APPLY_TO" != "null" ]]; then
-    cmd+=(--dt_match_apply_to "$DT_MATCH_APPLY_TO")
-fi
-if [[ -n "$POS_TIME_OFFSETS_DAYS" && "$POS_TIME_OFFSETS_DAYS" != "null" ]]; then
-    cmd+=(--pos_time_offsets_days "$POS_TIME_OFFSETS_DAYS")
-fi
-
 echo "Command: ${cmd[*]}"
 "${cmd[@]}"
 exit_code=$?

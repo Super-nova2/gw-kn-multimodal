@@ -740,13 +740,11 @@ class CrossAttentionFusion(nn.Module):
         hidden_dim=None,
         dropout=0.1,
         dual=False,
-        cls_time_delta_enable=False,
     ):
         super().__init__()
         self.attn_dim = d = attn_dim if attn_dim is not None else opt_dim
         self.hidden_dim = hidden_dim if hidden_dim is not None else d * 2
         self.dual = dual
-        self.cls_time_delta_enable = bool(cls_time_delta_enable)
 
         # Direction 1: GW → Optical (always used)
         self.g2o_q = nn.Linear(gw_dim, d)
@@ -764,8 +762,6 @@ class CrossAttentionFusion(nn.Module):
             cls_input_dim = d * 2 + 1
         else:
             cls_input_dim = d
-        if self.cls_time_delta_enable:
-            cls_input_dim += 1
 
         self.classifier = nn.Sequential(
             nn.Linear(cls_input_dim, self.hidden_dim),
@@ -774,7 +770,7 @@ class CrossAttentionFusion(nn.Module):
             nn.Linear(self.hidden_dim, 2)
         )
 
-    def forward(self, g_feat, h_l, z_l=None, H_gw=None, cred_level=None, time_delta_feat=None):
+    def forward(self, g_feat, h_l, z_l=None, H_gw=None, cred_level=None):
         """
         Args:
             g_feat:     [B, gw_dim]     — GW global embedding
@@ -810,16 +806,6 @@ class CrossAttentionFusion(nn.Module):
         else:
             combined = fused_opt  # [B, d]
 
-        if self.cls_time_delta_enable:
-            if time_delta_feat is None:
-                time_delta_feat = torch.zeros(
-                    (combined.size(0), 1), device=combined.device, dtype=combined.dtype
-                )
-            elif time_delta_feat.ndim == 1:
-                time_delta_feat = time_delta_feat.unsqueeze(-1)
-            time_delta_feat = time_delta_feat.to(device=combined.device, dtype=combined.dtype)
-            combined = torch.cat([combined, time_delta_feat], dim=-1)
-
         logits = self.classifier(combined)
         return logits, combined
 
@@ -854,15 +840,9 @@ class GWOpticalALBEFModel(nn.Module):
         time_compat_tau_days=30.0,
         time_compat_power=2.0,
         time_compat_max_penalty=8.0,
-        cls_time_delta_enable=False,
-        cls_time_delta_scale_days=30.0,
-        cls_time_delta_clip=10.0,
     ):
         super().__init__()
         self.dual_fusion = dual_fusion
-        self.cls_time_delta_enable = bool(cls_time_delta_enable)
-        self.cls_time_delta_scale_days = float(cls_time_delta_scale_days)
-        self.cls_time_delta_clip = float(cls_time_delta_clip)
 
         # 根据参数选择GW编码器类型
         if use_lightweight_gw:
@@ -909,7 +889,6 @@ class GWOpticalALBEFModel(nn.Module):
             hidden_dim=fusion_hidden_dim,
             dropout=fusion_dropout,
             dual=dual_fusion,
-            cls_time_delta_enable=self.cls_time_delta_enable,
         )
         self.cls_criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
 
@@ -1100,30 +1079,9 @@ class GWOpticalALBEFModel(nn.Module):
 
         return loss, sim_g2o
 
-    def _prepare_cls_time_delta(self, time_delta_days, ref_tensor):
-        if time_delta_days is None:
-            dt = torch.zeros((ref_tensor.size(0),), device=ref_tensor.device, dtype=ref_tensor.dtype)
-        else:
-            dt = time_delta_days.reshape(-1).to(device=ref_tensor.device, dtype=ref_tensor.dtype)
-
-        scale = self.cls_time_delta_scale_days
-        if scale <= 0:
-            dt_norm = dt
-        else:
-            dt_norm = dt / scale
-
-        clip = self.cls_time_delta_clip
-        if clip > 0:
-            dt_norm = torch.clamp(dt_norm, min=-clip, max=clip)
-        dt_norm = torch.where(torch.isfinite(dt_norm), dt_norm, torch.zeros_like(dt_norm))
-        return dt_norm.unsqueeze(-1)
-
-    def fusion_logits(self, g_feat, h_l, z_l=None, H_gw=None, cred_level=None, time_delta_days=None):
-        time_delta_feat = None
-        if self.cls_time_delta_enable:
-            time_delta_feat = self._prepare_cls_time_delta(time_delta_days, g_feat)
+    def fusion_logits(self, g_feat, h_l, z_l=None, H_gw=None, cred_level=None):
         logits, _ = self.fusion(
-            g_feat, h_l, z_l=z_l, H_gw=H_gw, cred_level=cred_level, time_delta_feat=time_delta_feat
+            g_feat, h_l, z_l=z_l, H_gw=H_gw, cred_level=cred_level
         )
         return logits
 

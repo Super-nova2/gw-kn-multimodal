@@ -59,9 +59,59 @@ OBJECTIVE_METRIC=$(jq -r '.objective_metric // "combined_auroc_g2o_r5"' "$args_f
 BEST_CKPT_METRIC=$(jq -r '.best_ckpt_metric // "auprc"' "$args_file")
 OOD_MONITORING=$(jq -r '.enable_ood_monitoring // false' "$args_file")
 
-DATA_PATH=$(jq -r '.data_path' "$args_file")
+BASE_TRAIN_CONFIG=$(jq -r '.base_train_config // empty' "$args_file")
+if [[ -n "$BASE_TRAIN_CONFIG" && "$BASE_TRAIN_CONFIG" != "null" ]]; then
+    if [[ "$BASE_TRAIN_CONFIG" != /* ]]; then
+        BASE_TRAIN_CONFIG="$args_dir/$BASE_TRAIN_CONFIG"
+    fi
+    if [[ ! -f "$BASE_TRAIN_CONFIG" ]]; then
+        echo "base_train_config not found: $BASE_TRAIN_CONFIG"
+        exit 1
+    fi
+fi
+
+DATA_PATH=$(jq -r '.data_path // empty' "$args_file")
 NEG_DATA_PATH=$(jq -r '.neg_data_path // empty' "$args_file")
 NEG_GROUP=$(jq -r '.neg_group // empty' "$args_file")
+TEST_DATA_PATH=$(jq -r '.test_data_path // empty' "$args_file")
+NEG_OFFSET_DIST_NPZ=$(jq -r '.neg_offset_dist_npz // empty' "$args_file")
+
+if [[ ( -z "$DATA_PATH" || "$DATA_PATH" == "null" ) && -n "$BASE_TRAIN_CONFIG" && "$BASE_TRAIN_CONFIG" != "null" ]]; then
+    DATA_PATH=$(jq -r '.data_path // empty' "$BASE_TRAIN_CONFIG")
+fi
+if [[ ( -z "$NEG_DATA_PATH" || "$NEG_DATA_PATH" == "null" ) && -n "$BASE_TRAIN_CONFIG" && "$BASE_TRAIN_CONFIG" != "null" ]]; then
+    NEG_DATA_PATH=$(jq -r '.neg_data_path // empty' "$BASE_TRAIN_CONFIG")
+fi
+if [[ ( -z "$NEG_GROUP" || "$NEG_GROUP" == "null" ) && -n "$BASE_TRAIN_CONFIG" && "$BASE_TRAIN_CONFIG" != "null" ]]; then
+    NEG_GROUP=$(jq -r '.neg_group // empty' "$BASE_TRAIN_CONFIG")
+fi
+if [[ ( -z "$TEST_DATA_PATH" || "$TEST_DATA_PATH" == "null" ) && -n "$BASE_TRAIN_CONFIG" && "$BASE_TRAIN_CONFIG" != "null" ]]; then
+    TEST_DATA_PATH=$(jq -r '.test_data_path // empty' "$BASE_TRAIN_CONFIG")
+fi
+if [[ ( -z "$NEG_OFFSET_DIST_NPZ" || "$NEG_OFFSET_DIST_NPZ" == "null" ) && -n "$BASE_TRAIN_CONFIG" && "$BASE_TRAIN_CONFIG" != "null" ]]; then
+    NEG_OFFSET_DIST_NPZ=$(jq -r '.neg_offset_dist_npz // empty' "$BASE_TRAIN_CONFIG")
+fi
+
+if [[ -z "$DATA_PATH" || "$DATA_PATH" == "null" ]]; then
+    echo "data_path missing in HPO config and base_train_config."
+    exit 1
+fi
+if [[ ! -f "$DATA_PATH" ]]; then
+    echo "Training data file not found: $DATA_PATH"
+    exit 1
+fi
+if [[ -n "$NEG_DATA_PATH" && "$NEG_DATA_PATH" != "null" && ! -f "$NEG_DATA_PATH" ]]; then
+    echo "Negative data file not found: $NEG_DATA_PATH"
+    exit 1
+fi
+if [[ -n "$TEST_DATA_PATH" && "$TEST_DATA_PATH" != "null" && ! -f "$TEST_DATA_PATH" ]]; then
+    echo "Test/OOD data file not found: $TEST_DATA_PATH"
+    exit 1
+fi
+if [[ -n "$NEG_OFFSET_DIST_NPZ" && "$NEG_OFFSET_DIST_NPZ" != "null" && ! -f "$NEG_OFFSET_DIST_NPZ" ]]; then
+    echo "Negative offset distribution file not found: $NEG_OFFSET_DIST_NPZ"
+    exit 1
+fi
 
 # ─── SLURM Info ────────────────────────────────────────────────────────
 echo "========================================"
@@ -86,6 +136,19 @@ echo "  Objective metric: $OBJECTIVE_METRIC"
 echo "  Best ckpt metric: $BEST_CKPT_METRIC"
 echo "  enable_ood_monitoring (config): $OOD_MONITORING"
 echo "  enable_ood_monitoring (runtime override): false"
+echo "  data_path (resolved): $DATA_PATH"
+if [[ -n "$NEG_DATA_PATH" && "$NEG_DATA_PATH" != "null" ]]; then
+    echo "  neg_data_path (resolved): $NEG_DATA_PATH"
+fi
+if [[ -n "$NEG_GROUP" && "$NEG_GROUP" != "null" ]]; then
+    echo "  neg_group (resolved): $NEG_GROUP"
+fi
+if [[ -n "$TEST_DATA_PATH" && "$TEST_DATA_PATH" != "null" ]]; then
+    echo "  test_data_path (resolved): $TEST_DATA_PATH"
+fi
+if [[ -n "$NEG_OFFSET_DIST_NPZ" && "$NEG_OFFSET_DIST_NPZ" != "null" ]]; then
+    echo "  neg_offset_dist_npz (resolved): $NEG_OFFSET_DIST_NPZ"
+fi
 echo ""
 
 # ─── Stage data to local disk ─────────────────────────────────────────
@@ -97,6 +160,14 @@ if [ -n "$JOBFS_DIR" ]; then
     if [[ -n "$NEG_DATA_PATH" && "$NEG_DATA_PATH" != "null" ]]; then
         cp -f "$NEG_DATA_PATH" "$JOBFS_DIR"/
         NEG_DATA_PATH="$JOBFS_DIR/$(basename "$NEG_DATA_PATH")"
+    fi
+    if [[ -n "$TEST_DATA_PATH" && "$TEST_DATA_PATH" != "null" ]]; then
+        cp -f "$TEST_DATA_PATH" "$JOBFS_DIR"/
+        TEST_DATA_PATH="$JOBFS_DIR/$(basename "$TEST_DATA_PATH")"
+    fi
+    if [[ -n "$NEG_OFFSET_DIST_NPZ" && "$NEG_OFFSET_DIST_NPZ" != "null" ]]; then
+        cp -f "$NEG_OFFSET_DIST_NPZ" "$JOBFS_DIR"/
+        NEG_OFFSET_DIST_NPZ="$JOBFS_DIR/$(basename "$NEG_OFFSET_DIST_NPZ")"
     fi
     echo "Staging complete."
 else
@@ -113,6 +184,9 @@ jq \
   --arg data_path "$DATA_PATH" \
   --arg neg_data_path "$NEG_DATA_PATH" \
   --arg neg_group "$NEG_GROUP" \
+  --arg test_data_path "$TEST_DATA_PATH" \
+  --arg neg_offset_dist_npz "$NEG_OFFSET_DIST_NPZ" \
+  --arg base_train_config "$BASE_TRAIN_CONFIG" \
   --arg best_ckpt_metric "$BEST_CKPT_METRIC" \
   --argjson num_workers "${SLURM_CPUS_PER_TASK}" \
   '
@@ -120,12 +194,24 @@ jq \
   | .num_workers = $num_workers
   | .best_ckpt_metric = $best_ckpt_metric
   | .enable_ood_monitoring = false
+  | (if ($base_train_config | length) > 0 and $base_train_config != "null"
+     then .base_train_config = $base_train_config
+     else .
+     end)
   | (if ($neg_data_path | length) > 0 and $neg_data_path != "null"
      then .neg_data_path = $neg_data_path
      else .
      end)
   | (if ($neg_group | length) > 0 and $neg_group != "null"
      then .neg_group = $neg_group
+     else .
+     end)
+  | (if ($test_data_path | length) > 0 and $test_data_path != "null"
+     then .test_data_path = $test_data_path
+     else .
+     end)
+  | (if ($neg_offset_dist_npz | length) > 0 and $neg_offset_dist_npz != "null"
+     then .neg_offset_dist_npz = $neg_offset_dist_npz
      else .
      end)
   ' \
