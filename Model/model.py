@@ -332,6 +332,35 @@ class OpticalEncoderWithCLS(nn.Module):
         
         return z_l, H_l
 
+
+class OpticalEncoderWithCLSNoCoord(nn.Module):
+    """
+    Optical encoder variant without coordinate conditioning.
+    Used by optical-only pipeline to avoid spatial branch dependence.
+    """
+    def __init__(self, input_dim, num_heads=4, ref_dim=64, k_dim=64, output_dim=128, dropout=0.0):
+        super().__init__()
+        self.time_embedding = LearnablePeriodicEmbedding(num_heads, ref_dim)
+        self.cls_token = nn.Parameter(torch.empty(1, 1, num_heads, ref_dim))
+        nn.init.normal_(self.cls_token, mean=0.0, std=0.02)
+        self.mtan = MultiTimeAttention(input_dim, num_heads, ref_dim, k_dim, output_dim)
+        self.output_dropout = nn.Dropout(dropout)
+
+    def forward(self, t_obs, values_obs, t_ref, mask=None, errors_obs=None):
+        batch_size = t_obs.size(0)
+
+        key_emb = self.time_embedding(t_obs)
+        ref_time_emb = self.time_embedding(t_ref)
+        cls_emb = self.cls_token.expand(batch_size, -1, -1, -1)
+        query_emb = torch.cat([cls_emb, ref_time_emb], dim=1)
+
+        full_output = self.mtan(query_emb, key_emb, values_obs, mask, errors_obs)
+        full_output = self.output_dropout(full_output)
+
+        z_l = full_output[:, 0, :]
+        h_l = full_output[:, 1:, :]
+        return z_l, h_l
+
 # ==============================================================================
 # 4. 1D ResNet Basic Module
 # ==============================================================================
@@ -1323,13 +1352,11 @@ class OpticalKNClassifier(nn.Module):
         feature_dropout=0.0,
         head_hidden_dim=None,
         head_dropout=0.2,
-        include_coords=False,
     ):
         super().__init__()
-        self.include_coords = bool(include_coords)
         self.feature_dropout = nn.Dropout(feature_dropout)
 
-        self.optical_encoder = OpticalEncoderWithCLS(
+        self.optical_encoder = OpticalEncoderWithCLSNoCoord(
             input_dim=optical_input_dim,
             output_dim=enc_dim,
             num_heads=num_heads,
@@ -1354,23 +1381,17 @@ class OpticalKNClassifier(nn.Module):
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
 
-    def _build_coords(self, opt_coords, opt_t):
-        if self.include_coords and opt_coords is not None:
-            return opt_coords
-        return torch.zeros(opt_t.size(0), 2, dtype=opt_t.dtype, device=opt_t.device)
-
-    def encode_optical(self, opt_coords, opt_t, opt_v, opt_ref_t, opt_mask, opt_err):
-        coords = self._build_coords(opt_coords, opt_t)
+    def encode_optical(self, opt_t, opt_v, opt_ref_t, opt_mask, opt_err):
         z_l, h_l = self.optical_encoder(
-            coords, opt_t, opt_v, opt_ref_t, opt_mask, errors_obs=opt_err
+            opt_t, opt_v, opt_ref_t, opt_mask, errors_obs=opt_err
         )
         if self.feature_dropout.p > 0:
             z_l = self.feature_dropout(z_l)
             h_l = self.feature_dropout(h_l)
         return z_l, h_l
 
-    def forward(self, opt_coords, opt_t, opt_v, opt_ref_t, opt_mask, opt_err):
-        z_l, h_l = self.encode_optical(opt_coords, opt_t, opt_v, opt_ref_t, opt_mask, opt_err)
+    def forward(self, opt_t, opt_v, opt_ref_t, opt_mask, opt_err):
+        z_l, h_l = self.encode_optical(opt_t, opt_v, opt_ref_t, opt_mask, opt_err)
         # Concatenate CLS and pooled temporal features for robust single-modal classification.
         h_pool = h_l.mean(dim=1)
         feat = torch.cat([z_l, h_pool], dim=1)

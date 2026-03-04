@@ -255,7 +255,6 @@ def select_threshold_for_target_recall(probs, labels, target_recall=0.98):
 
 def forward_logits_with_offsets(
     model,
-    opt_coords,
     opt_t,
     opt_v,
     ref_time,
@@ -269,7 +268,7 @@ def forward_logits_with_offsets(
 ):
     if not offset_policy.enabled:
         with autocast(device_type="cuda", dtype=amp_dtype, enabled=(device.type == "cuda")):
-            logits = model(opt_coords, opt_t, opt_v, ref_time, opt_mask, opt_err).squeeze(-1)
+            logits = model(opt_t, opt_v, ref_time, opt_mask, opt_err).squeeze(-1)
         return logits.float()
 
     if training:
@@ -277,7 +276,7 @@ def forward_logits_with_offsets(
         delta_days = torch.from_numpy(delta_np).to(device=device, dtype=torch.float32)
         shifted_opt_t = apply_time_offsets(opt_t, opt_mask, delta_days, args.offset_scale_days_divisor)
         with autocast(device_type="cuda", dtype=amp_dtype, enabled=(device.type == "cuda")):
-            logits = model(opt_coords, shifted_opt_t, opt_v, ref_time, opt_mask, opt_err).squeeze(-1)
+            logits = model(shifted_opt_t, opt_v, ref_time, opt_mask, opt_err).squeeze(-1)
         return logits.float()
 
     logits_sum = None
@@ -285,7 +284,7 @@ def forward_logits_with_offsets(
         delta_days = torch.full((opt_t.size(0),), float(off_days), device=device, dtype=torch.float32)
         shifted_opt_t = apply_time_offsets(opt_t, opt_mask, delta_days, args.offset_scale_days_divisor)
         with autocast(device_type="cuda", dtype=amp_dtype, enabled=(device.type == "cuda")):
-            logits = model(opt_coords, shifted_opt_t, opt_v, ref_time, opt_mask, opt_err).squeeze(-1)
+            logits = model(shifted_opt_t, opt_v, ref_time, opt_mask, opt_err).squeeze(-1)
         logits = logits.float()
         logits_sum = logits if logits_sum is None else logits_sum + logits
 
@@ -302,12 +301,11 @@ def run_eval(model, loader, device, args, criterion, amp_dtype, offset_policy):
 
     with torch.no_grad():
         for batch in loader:
-            opt_t, opt_v, opt_mask, opt_err, opt_coords, labels = batch
+            opt_t, opt_v, opt_mask, opt_err, labels = batch
             opt_t = opt_t.to(device, non_blocking=True)
             opt_v = opt_v.to(device, non_blocking=True)
             opt_mask = opt_mask.to(device, non_blocking=True)
             opt_err = opt_err.to(device, non_blocking=True)
-            opt_coords = opt_coords.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True).float()
 
             batch_size = opt_t.size(0)
@@ -322,7 +320,6 @@ def run_eval(model, loader, device, args, criterion, amp_dtype, offset_policy):
 
             logits = forward_logits_with_offsets(
                 model=model,
-                opt_coords=opt_coords,
                 opt_t=opt_t,
                 opt_v=opt_v,
                 ref_time=ref_time_cache,
@@ -374,12 +371,11 @@ def train_one_epoch(model, loader, optimizer, device, args, criterion, scaler, a
 
     pbar = tqdm(loader, desc="Train", mininterval=0.0, miniters=100)
     for batch in pbar:
-        opt_t, opt_v, opt_mask, opt_err, opt_coords, labels = batch
+        opt_t, opt_v, opt_mask, opt_err, labels = batch
         opt_t = opt_t.to(device, non_blocking=True)
         opt_v = opt_v.to(device, non_blocking=True)
         opt_mask = opt_mask.to(device, non_blocking=True)
         opt_err = opt_err.to(device, non_blocking=True)
-        opt_coords = opt_coords.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True).float()
 
         opt_t, opt_v, opt_mask, opt_err = augment_optical_data(
@@ -407,7 +403,6 @@ def train_one_epoch(model, loader, optimizer, device, args, criterion, scaler, a
         optimizer.zero_grad(set_to_none=True)
         logits = forward_logits_with_offsets(
             model=model,
-            opt_coords=opt_coords,
             opt_t=opt_t,
             opt_v=opt_v,
             ref_time=ref_time_cache,
@@ -537,7 +532,6 @@ def train(args):
         pin_memory=bool(args.pin_memory),
         persistent_workers=bool(args.persistent_workers),
         prefetch_factor=args.prefetch_factor,
-        include_coords=bool(args.include_coords),
         cache_in_memory=bool(args.cache_in_memory),
     )
     print(f"Train Steps/Epoch: {steps_per_epoch} | Val Steps/Epoch: {val_steps}")
@@ -550,7 +544,6 @@ def train(args):
         feature_dropout=args.feature_dropout,
         head_hidden_dim=args.head_hidden_dim,
         head_dropout=args.head_dropout,
-        include_coords=bool(args.include_coords),
     ).to(device)
 
     if args.pretrained_albef_ckpt:
@@ -579,6 +572,7 @@ def train(args):
 
     run_name = resolve_run_name(args)
     args.run_name = run_name
+    print(f"Architecture version: {args.arch_version} (requires nocoord-compatible checkpoint)")
 
     save_root = Path(args.ckpt_path) / "optical_only" / run_name
     save_root.mkdir(parents=True, exist_ok=True)
@@ -745,6 +739,7 @@ def train(args):
     final_metrics = {
         "run_name": run_name,
         "save_root": str(save_root),
+        "arch_version": str(args.arch_version),
         "best_epoch": best_epoch,
         "best_auroc_plus_auprc": best_score,
         "best_precision_at_target_recall": float(best_metrics.get("op_precision", 0.0)) if best_metrics else 0.0,
@@ -808,7 +803,7 @@ def parse_args():
     parser.add_argument("--feature_dropout", type=float, default=0.0)
     parser.add_argument("--head_hidden_dim", type=int, default=None)
     parser.add_argument("--head_dropout", type=float, default=0.2)
-    parser.add_argument("--include_coords", action="store_true")
+    parser.add_argument("--arch_version", type=str, default="optical_only_nocoord_v1")
 
     parser.add_argument("--opt_aug_noise", type=float, default=0.0)
     parser.add_argument("--opt_aug_time_jitter", type=float, default=0.0)

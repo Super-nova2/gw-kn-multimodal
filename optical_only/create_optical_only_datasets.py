@@ -460,6 +460,8 @@ def _create_optical_group(
     grp,
     chunk_size: int,
 ):
+    # Keep legacy fields for backward compatibility with existing H5 files.
+    # Optical-only training/evaluation consumes values/errors/masks/times only.
     ds_values = grp.create_dataset(
         "values",
         (0, MAX_LC_LENGTH, NUM_BANDS),
@@ -764,6 +766,7 @@ def create_negative_h5(
         rng_anchor = np.random.default_rng(int(cls_time_anchor_seed))
         ds_zero_time_mjd_cls_base = None
         if gw_time_prior is not None:
+            # Legacy ALBEF-oriented anchor field; not consumed by optical-only training/eval.
             ds_zero_time_mjd_cls_base = grp.create_dataset(
                 "zero_time_mjd_cls_base",
                 (0,),

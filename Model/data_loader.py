@@ -1334,14 +1334,12 @@ class OpticalBinaryDataset(Dataset):
         neg_group: str = "ELASTICC2_TRAIN/optical_data",
         pos_indices: Optional[np.ndarray] = None,
         neg_indices: Optional[np.ndarray] = None,
-        include_coords: bool = False,
         cache_in_memory: bool = False,
     ):
         super().__init__()
         self.pos_h5_path = pos_h5_path
         self.neg_h5_path = neg_h5_path
         self.neg_group = neg_group
-        self.include_coords = bool(include_coords)
         self.cache_in_memory = bool(cache_in_memory)
 
         self.pos_file = None
@@ -1415,13 +1413,8 @@ class OpticalBinaryDataset(Dataset):
         opt_mask = self._as_tensor(f[f"{grp}/masks"][real_idx])
         opt_time = self._as_tensor(f[f"{grp}/times"][real_idx])
 
-        if self.include_coords:
-            opt_coords = self._as_tensor(f[f"{grp}/coordinates"][real_idx])
-        else:
-            opt_coords = torch.zeros(2, dtype=torch.float32)
-
         target = torch.tensor(label, dtype=torch.float32)
-        return opt_time, opt_val, opt_mask, opt_err, opt_coords, target
+        return opt_time, opt_val, opt_mask, opt_err, target
 
     def __del__(self):
         if self.pos_file is not None:
@@ -1548,7 +1541,6 @@ def create_optical_binary_dataloaders(
     persistent_workers: bool = True,
     prefetch_factor: int = 4,
     neg_group: str = "ELASTICC2_TRAIN/optical_data",
-    include_coords: bool = False,
     cache_in_memory: bool = False,
 ):
     if cache_in_memory and num_workers > 0:
@@ -1576,7 +1568,6 @@ def create_optical_binary_dataloaders(
         neg_group=neg_group,
         pos_indices=train_pos_idx,
         neg_indices=train_neg_idx,
-        include_coords=include_coords,
         cache_in_memory=cache_in_memory,
     )
     val_dataset = OpticalBinaryDataset(
@@ -1585,7 +1576,6 @@ def create_optical_binary_dataloaders(
         neg_group=neg_group,
         pos_indices=val_pos_idx,
         neg_indices=val_neg_idx,
-        include_coords=include_coords,
         cache_in_memory=cache_in_memory,
     )
 
