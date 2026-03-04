@@ -102,7 +102,7 @@ OPT_DROPOUT=$(jq -r '.opt_dropout // empty' "$args_file")
 FEATURE_DROPOUT=$(jq -r '.feature_dropout // empty' "$args_file")
 HEAD_HIDDEN_DIM=$(jq -r '.head_hidden_dim // empty' "$args_file")
 HEAD_DROPOUT=$(jq -r '.head_dropout // empty' "$args_file")
-INCLUDE_COORDS=$(jq -r '.include_coords // false' "$args_file")
+ARCH_VERSION=$(jq -r '.arch_version // empty' "$args_file")
 
 OPT_AUG_NOISE=$(jq -r '.opt_aug_noise // empty' "$args_file")
 OPT_AUG_TIME_JITTER=$(jq -r '.opt_aug_time_jitter // empty' "$args_file")
@@ -324,8 +324,8 @@ fi
 if [[ -n "$HEAD_DROPOUT" && "$HEAD_DROPOUT" != "null" ]]; then
     cmd+=(--head_dropout "$HEAD_DROPOUT")
 fi
-if [[ "$INCLUDE_COORDS" == "true" ]]; then
-    cmd+=(--include_coords)
+if [[ -n "$ARCH_VERSION" && "$ARCH_VERSION" != "null" ]]; then
+    cmd+=(--arch_version "$ARCH_VERSION")
 fi
 
 if [[ -n "$OPT_AUG_NOISE" && "$OPT_AUG_NOISE" != "null" ]]; then

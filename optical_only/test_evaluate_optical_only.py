@@ -263,7 +263,6 @@ def load_model(checkpoint_path, device, config_dict):
         feature_dropout=_get("feature_dropout", 0.0),
         head_hidden_dim=_get("head_hidden_dim", None),
         head_dropout=_get("head_dropout", 0.2),
-        include_coords=bool(_get("include_coords", False)),
     )
 
     state_dict = ckpt.get("model_state_dict", ckpt)
@@ -298,7 +297,6 @@ def build_eval_dataset(args, ckpt_args, config_dict):
     pos_data_path = choose_value(args.pos_data_path, config_dict, ckpt_args, "pos_data_path", default=None)
     neg_data_path = choose_value(args.neg_data_path, config_dict, ckpt_args, "neg_data_path", default=None)
     neg_group = choose_value(args.neg_group, config_dict, ckpt_args, "neg_group", default=None)
-    include_coords = bool(choose_value(None, config_dict, ckpt_args, "include_coords", default=False))
 
     if pos_data_path is None or neg_data_path is None:
         raise ValueError(
@@ -316,7 +314,6 @@ def build_eval_dataset(args, ckpt_args, config_dict):
         pos_h5_path=pos_data_path,
         neg_h5_path=neg_data_path,
         neg_group=neg_group,
-        include_coords=include_coords,
         cache_in_memory=False,
     )
 
@@ -337,7 +334,6 @@ def build_eval_dataset(args, ckpt_args, config_dict):
         neg_group=neg_group,
         pos_indices=pos_indices,
         neg_indices=neg_indices,
-        include_coords=include_coords,
         cache_in_memory=False,
     )
 
@@ -350,7 +346,7 @@ def build_eval_dataset(args, ckpt_args, config_dict):
         "pos_data_path": pos_data_path,
         "neg_data_path": neg_data_path,
         "neg_group": neg_group,
-        "include_coords": include_coords,
+        "arch_version": str(choose_value(None, config_dict, ckpt_args, "arch_version", default="unknown")),
     }
 
 
@@ -391,12 +387,11 @@ def run_evaluation(model, loader, device, n_ref, ref_start, ref_end, target_reca
     ref_time_cache = None
 
     for batch in tqdm(loader, desc="Evaluating"):
-        opt_t, opt_v, opt_mask, opt_err, opt_coords, labels = batch
+        opt_t, opt_v, opt_mask, opt_err, labels = batch
         opt_t = opt_t.to(device, non_blocking=True)
         opt_v = opt_v.to(device, non_blocking=True)
         opt_mask = opt_mask.to(device, non_blocking=True)
         opt_err = opt_err.to(device, non_blocking=True)
-        opt_coords = opt_coords.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True).float()
 
         batch_size = opt_t.size(0)
@@ -409,7 +404,7 @@ def run_evaluation(model, loader, device, n_ref, ref_start, ref_end, target_reca
 
         if not offset_policy.enabled:
             with autocast(device_type="cuda", dtype=amp_dtype, enabled=(device.type == "cuda")):
-                logits = model(opt_coords, opt_t, opt_v, ref_time_cache, opt_mask, opt_err).squeeze(-1)
+                logits = model(opt_t, opt_v, ref_time_cache, opt_mask, opt_err).squeeze(-1)
             logits = logits.float()
         else:
             logits_accum = None
@@ -417,7 +412,7 @@ def run_evaluation(model, loader, device, n_ref, ref_start, ref_end, target_reca
                 delta_days = torch.full((batch_size,), float(off_days), device=device, dtype=torch.float32)
                 shifted_opt_t = apply_time_offsets(opt_t, opt_mask, delta_days, offset_policy.scale_divisor)
                 with autocast(device_type="cuda", dtype=amp_dtype, enabled=(device.type == "cuda")):
-                    logits_i = model(opt_coords, shifted_opt_t, opt_v, ref_time_cache, opt_mask, opt_err).squeeze(-1)
+                    logits_i = model(shifted_opt_t, opt_v, ref_time_cache, opt_mask, opt_err).squeeze(-1)
                 logits_i = logits_i.float()
                 logits_accum = logits_i if logits_accum is None else logits_accum + logits_i
             logits = logits_accum / float(max(1, len(offset_policy.eval_offsets_days)))

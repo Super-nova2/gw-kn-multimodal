@@ -13,6 +13,8 @@ hpo_results/
 logs/
 eval_results/
 *.png
+*.svg
+*.dot
 PRD/
 *.h5
 
