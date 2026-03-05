@@ -381,6 +381,7 @@ def run_evaluation(model, loader, device, n_ref, ref_start, ref_end, target_reca
         amp_dtype = torch.float32
 
     all_probs = []
+    all_logits = []
     all_labels = []
     total_loss = 0.0
     n_batches = 0
@@ -423,12 +424,14 @@ def run_evaluation(model, loader, device, n_ref, ref_start, ref_end, target_reca
         total_loss += loss.item()
         n_batches += 1
         all_probs.append(probs.detach().cpu())
+        all_logits.append(logits.detach().cpu())
         all_labels.append(labels.detach().cpu().long())
 
     if n_batches == 0:
         raise RuntimeError("No batches were evaluated.")
 
     probs = torch.cat(all_probs, dim=0)
+    logits = torch.cat(all_logits, dim=0)
     labels = torch.cat(all_labels, dim=0)
     cls = compute_classification_metrics(probs, labels)
     op = select_threshold_for_target_recall(probs, labels, target_recall=target_recall)
@@ -444,10 +447,10 @@ def run_evaluation(model, loader, device, n_ref, ref_start, ref_end, target_reca
         "target_recall": float(target_recall),
         "offset_eval_count": int(len(offset_policy.eval_offsets_days)),
     }
-    return results, probs.numpy(), labels.numpy()
+    return results, probs.numpy(), labels.numpy(), logits.numpy()
 
 
-def generate_plots(probs, labels, results, output_dir):
+def generate_plots(probs, labels, logits, results, output_dir):
     try:
         import matplotlib
 
@@ -460,6 +463,7 @@ def generate_plots(probs, labels, results, output_dir):
     os.makedirs(output_dir, exist_ok=True)
     probs = np.asarray(probs, dtype=np.float64)
     labels = np.asarray(labels, dtype=np.int64)
+    logits = np.asarray(logits, dtype=np.float64)
 
     sorted_idx = np.argsort(-probs)
     sorted_labels = labels[sorted_idx]
@@ -550,6 +554,56 @@ def generate_plots(probs, labels, results, output_dir):
     fig.savefig(os.path.join(output_dir, "prob_distribution.png"), dpi=180, bbox_inches="tight")
     plt.close(fig)
 
+    pos_logits = logits[labels == 1]
+    neg_logits = logits[labels == 0]
+    finite_logits = logits[np.isfinite(logits)]
+    if finite_logits.size > 0:
+        lo, hi = np.percentile(finite_logits, [0.5, 99.5])
+        span = max(2.0, float(hi - lo))
+        pad = 0.1 * span
+        bins = np.linspace(float(lo - pad), float(hi + pad), 81)
+
+        fig, ax = plt.subplots(figsize=(10, 6))
+        if len(pos_logits) > 0:
+            ax.hist(
+                pos_logits,
+                bins=bins,
+                histtype="step",
+                linewidth=2.0,
+                color="#27ae60",
+                label=f"Positive (KN) n={len(pos_logits)}",
+            )
+        if len(neg_logits) > 0:
+            ax.hist(
+                neg_logits,
+                bins=bins,
+                histtype="step",
+                linewidth=2.0,
+                color="#c0392b",
+                label=f"Negative (non-KN) n={len(neg_logits)}",
+            )
+
+        ax.axvline(0.0, color="black", linestyle="--", linewidth=1.0, alpha=0.6, label="logit(0.5)=0")
+        op_thr = float(results.get("op_threshold", 0.5))
+        if 0.0 < op_thr < 1.0:
+            op_logit = np.log(op_thr / (1.0 - op_thr))
+            if np.isfinite(op_logit):
+                ax.axvline(
+                    float(op_logit),
+                    color="#34495e",
+                    linestyle="-.",
+                    linewidth=1.2,
+                    alpha=0.8,
+                    label=f"logit(op_thr)={op_logit:.3f}",
+                )
+        ax.set_title("Optical-only Logits Distribution")
+        ax.set_xlabel("Logit")
+        ax.set_ylabel("Count")
+        ax.grid(True, alpha=0.3, linestyle="--")
+        ax.legend()
+        fig.savefig(os.path.join(output_dir, "logits_distribution.png"), dpi=180, bbox_inches="tight")
+        plt.close(fig)
+
     print(f"Plots saved to {output_dir}/")
 
 
@@ -615,7 +669,7 @@ def main():
     )
     print(f"Time offset policy: {json.dumps(offset_policy.info, indent=2)}")
 
-    metrics, probs, labels = run_evaluation(
+    metrics, probs, labels, logits = run_evaluation(
         model=model,
         loader=loader,
         device=device,
@@ -663,7 +717,7 @@ def main():
     print(f"Saved: {out_json}")
 
     if not args.no_plots:
-        generate_plots(probs, labels, metrics, args.output_dir)
+        generate_plots(probs, labels, logits, metrics, args.output_dir)
 
 
 if __name__ == "__main__":

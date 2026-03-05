@@ -28,6 +28,10 @@ NSBH_MAX_NEG_TYPE2_GW="${NSBH_MAX_NEG_TYPE2_GW:-}"
 NSBH_MEJ_COL="${NSBH_MEJ_COL:-mej_tot}"
 NSBH_TYPE1_THRESHOLD="${NSBH_TYPE1_THRESHOLD:-0.0}"
 NSBH_REQUIRE_SUCCESS_FOR_MEJ_POS="${NSBH_REQUIRE_SUCCESS_FOR_MEJ_POS:-1}"
+FLUXCAL_ZP="${FLUXCAL_ZP:-27.5}"
+PSFFLUX_ZP="${PSFFLUX_ZP:-31.4}"
+LUPT_K="${LUPT_K:-1.0}"
+LUPT_M5_MAG="${LUPT_M5_MAG:-23.9,25.0,24.7,24.0,23.3,22.1}"
 
 set_profile_defaults() {
     case "$PROFILE" in
@@ -218,6 +222,10 @@ cmd=(
     --dataset_mode "$DATASET_MODE"
     --buffer_limit "$BUFFER_LIMIT"
     --seed "$SEED"
+    --fluxcal_zp "$FLUXCAL_ZP"
+    --psfflux_zp "$PSFFLUX_ZP"
+    --lupt_k "$LUPT_K"
+    --lupt_m5_mag "$LUPT_M5_MAG"
     --bns_full_catalog_path "$BNS_FULL_CATALOG_PATH"
     --bns_skymap_dir "$BNS_SKYMAP_DIR"
     --bns_sim_root "$BNS_SIM_ROOT"
@@ -244,5 +252,6 @@ append_optional_arg --nsbh_max_neg_type2_gw "${NSBH_MAX_NEG_TYPE2_GW:-}"
 
 echo "PROFILE=$PROFILE DATASET_MODE=$DATASET_MODE"
 echo "Output H5: $OUTPUT_H5_PATH"
+echo "Luptitude params: FLUXCAL_ZP=$FLUXCAL_ZP PSFFLUX_ZP=$PSFFLUX_ZP LUPT_K=$LUPT_K LUPT_M5_MAG=$LUPT_M5_MAG"
 "${cmd[@]}"
 validate_output_h5_schema "$OUTPUT_H5_PATH"

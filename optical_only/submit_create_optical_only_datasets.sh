@@ -12,7 +12,7 @@
 set -euo pipefail
 
 DATASET_MODE="${DATASET_MODE:-train}"   # train | test
-BUILD_POSITIVE="${BUILD_POSITIVE:-false}" # true|false
+BUILD_POSITIVE="${BUILD_POSITIVE:-true}" # true|false
 BUILD_NEGATIVE="${BUILD_NEGATIVE:-true}" # true|false
 
 normalize_bool() {
@@ -102,10 +102,20 @@ SNR_THRESHOLD=5.0
 BUFFER_LIMIT=3000
 FIXED_OFFSET_DAYS=0.0
 MAX_LCS_PER_EVENT=1000
+FLUXCAL_ZP="${FLUXCAL_ZP:-27.5}"
+PSFFLUX_ZP="${PSFFLUX_ZP:-31.4}"
+LUPT_K="${LUPT_K:-1.0}"
+LUPT_M5_MAG="${LUPT_M5_MAG:-23.9,25.0,24.7,24.0,23.3,22.1}"
 # Conservative default to reduce worker crashes on large FITS parsing.
 NUM_WORKERS="${NUM_WORKERS:-4}"
 if [[ -n "${SLURM_CPUS_PER_TASK:-}" && "${NUM_WORKERS}" -gt "${SLURM_CPUS_PER_TASK}" ]]; then
     NUM_WORKERS="${SLURM_CPUS_PER_TASK}"
+fi
+
+if [[ -z "${LUPT_M5_MAG}" ]]; then
+    echo "LUPT_M5_MAG is required (6 comma-separated m5 values in order u,g,r,i,z,Y)."
+    echo "Example: LUPT_M5_MAG='23.9,25.0,24.7,24.0,23.3,22.1'"
+    exit 1
 fi
 
 if [[ "${BUILD_POSITIVE}" == "true" ]]; then
@@ -140,6 +150,8 @@ echo "Lock file: ${LOCK_FILE}"
 echo "Detection rule: PHOTFLAG!=0, fallback SNR>${SNR_THRESHOLD}"
 echo "Workers: ${NUM_WORKERS}"
 echo "CLS anchor GW prior: ${CLS_TIME_ANCHOR_GW_H5}"
+echo "Flux zeropoints: FLUXCAL_ZP=${FLUXCAL_ZP}, PSFFLUX_ZP=${PSFFLUX_ZP}"
+echo "Luptitude params: LUPT_K=${LUPT_K}, LUPT_M5_MAG=${LUPT_M5_MAG}"
 echo "========================================"
 
 if [[ "${BUILD_NEGATIVE}" == "true" && ! -f "${CLS_TIME_ANCHOR_GW_H5}" ]]; then
@@ -155,6 +167,10 @@ cmd=(
     --fixed_offset_days "${FIXED_OFFSET_DAYS}"
     --max_lcs_per_event "${MAX_LCS_PER_EVENT}"
     --num_workers "${NUM_WORKERS}"
+    --fluxcal_zp "${FLUXCAL_ZP}"
+    --psfflux_zp "${PSFFLUX_ZP}"
+    --lupt_k "${LUPT_K}"
+    --lupt_m5_mag "${LUPT_M5_MAG}"
 )
 
 if [[ "${BUILD_POSITIVE}" == "true" ]]; then
