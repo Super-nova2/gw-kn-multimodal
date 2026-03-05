@@ -46,6 +46,84 @@ GPS_TIME_COLUMN_CANDIDATES = (
     "event_gps_time",
     "trigger_time_gps",
 )
+LUPT_BAND_ORDER = ("u", "g", "r", "i", "z", "Y")
+
+
+def parse_lupt_m5_mag(text: str) -> np.ndarray:
+    raw = str(text).strip()
+    if raw == "":
+        raise ValueError(
+            "--lupt_m5_mag is required and must contain 6 comma-separated finite values in order u,g,r,i,z,Y."
+        )
+    parts = [p.strip() for p in raw.split(",")]
+    if len(parts) != NUM_BANDS:
+        raise ValueError(
+            f"--lupt_m5_mag must provide exactly {NUM_BANDS} values in order u,g,r,i,z,Y; got {len(parts)}."
+        )
+    try:
+        vals = np.asarray([float(p) for p in parts], dtype=np.float64)
+    except ValueError as exc:
+        raise ValueError("--lupt_m5_mag contains non-numeric values.") from exc
+    if not np.all(np.isfinite(vals)):
+        raise ValueError("--lupt_m5_mag values must be finite.")
+    return vals
+
+
+def build_luptitude_params(
+    fluxcal_zp: float,
+    psfflux_zp: float,
+    lupt_k: float,
+    lupt_m5_mag: np.ndarray,
+) -> Tuple[float, np.ndarray, np.ndarray]:
+    if not np.isfinite(fluxcal_zp) or not np.isfinite(psfflux_zp):
+        raise ValueError("fluxcal_zp and psfflux_zp must be finite.")
+    if not np.isfinite(lupt_k) or lupt_k <= 0:
+        raise ValueError("lupt_k must be finite and > 0.")
+    if lupt_m5_mag.shape != (NUM_BANDS,):
+        raise ValueError(
+            f"lupt_m5_mag must contain exactly {NUM_BANDS} values in order u,g,r,i,z,Y."
+        )
+    if not np.all(np.isfinite(lupt_m5_mag)):
+        raise ValueError("lupt_m5_mag values must be finite.")
+
+    fluxcal_to_psfflux_factor = 10.0 ** (0.4 * (float(psfflux_zp) - float(fluxcal_zp)))
+    if not np.isfinite(fluxcal_to_psfflux_factor) or fluxcal_to_psfflux_factor <= 0:
+        raise ValueError(
+            f"Invalid FLUXCAL->psfFlux conversion factor computed from fluxcal_zp={fluxcal_zp}, psfflux_zp={psfflux_zp}."
+        )
+
+    lupt_f5sigma_njy = 10.0 ** ((float(psfflux_zp) - lupt_m5_mag.astype(np.float64, copy=False)) / 2.5)
+    if np.any(lupt_f5sigma_njy <= 0) or not np.all(np.isfinite(lupt_f5sigma_njy)):
+        raise ValueError("Derived lupt_f5sigma_njy values must be finite and > 0.")
+    lupt_b_njy = float(lupt_k) * (lupt_f5sigma_njy / 5.0)
+    if np.any(lupt_b_njy <= 0) or not np.all(np.isfinite(lupt_b_njy)):
+        raise ValueError("Derived lupt_b_njy values must be finite and > 0.")
+    return float(fluxcal_to_psfflux_factor), lupt_f5sigma_njy, lupt_b_njy
+
+
+def write_luptitude_metadata_attrs(
+    h5_obj,
+    fluxcal_zp: float,
+    psfflux_zp: float,
+    fluxcal_to_psfflux_factor: float,
+    lupt_k: float,
+    lupt_m5_mag: np.ndarray,
+    lupt_f5sigma_njy: np.ndarray,
+    lupt_b_njy: np.ndarray,
+) -> None:
+    h5_obj.attrs["photometry_representation"] = "luptitude"
+    h5_obj.attrs["flux_input_column"] = "FLUXCAL"
+    h5_obj.attrs["fluxerr_input_column"] = "FLUXCALERR"
+    h5_obj.attrs["fluxcal_zp"] = float(fluxcal_zp)
+    h5_obj.attrs["psfflux_zp"] = float(psfflux_zp)
+    h5_obj.attrs["fluxcal_to_psfflux_factor"] = float(fluxcal_to_psfflux_factor)
+    h5_obj.attrs["lupt_k"] = float(lupt_k)
+    h5_obj.attrs["lupt_band_order"] = ",".join(LUPT_BAND_ORDER)
+    h5_obj.attrs["lupt_m5_mag"] = np.asarray(lupt_m5_mag, dtype=np.float64)
+    h5_obj.attrs["lupt_f5sigma_njy"] = np.asarray(lupt_f5sigma_njy, dtype=np.float64)
+    h5_obj.attrs["lupt_b_njy"] = np.asarray(lupt_b_njy, dtype=np.float64)
+    h5_obj.attrs["values_semantics"] = "luptitude"
+    h5_obj.attrs["errors_semantics"] = "luptitude_sigma"
 
 
 @dataclass
@@ -515,12 +593,27 @@ def create_dataset_with_neg_gw_bns_nsbh_fast(
     nsbh_cfg: SourceConfig,
     buffer_limit: int = 10000,
     seed: int = 42,
+    fluxcal_zp: float = 27.5,
+    psfflux_zp: float = 31.4,
+    lupt_k: float = 1.0,
+    lupt_m5_mag: Optional[np.ndarray] = None,
+    lupt_f5sigma_njy: Optional[np.ndarray] = None,
+    fluxcal_to_psfflux_factor: float = 1.0,
+    lupt_b_njy: Optional[np.ndarray] = None,
 ):
     dataset_mode = dataset_mode.strip().lower()
     if dataset_mode not in {"train", "test"}:
         raise ValueError(f"dataset_mode must be 'train' or 'test', got: {dataset_mode}")
     if buffer_limit <= 0:
         raise ValueError("buffer_limit must be positive")
+    if not np.isfinite(fluxcal_to_psfflux_factor) or fluxcal_to_psfflux_factor <= 0:
+        raise ValueError("fluxcal_to_psfflux_factor must be finite and > 0.")
+    if lupt_m5_mag is None or np.asarray(lupt_m5_mag).shape != (NUM_BANDS,):
+        raise ValueError(f"lupt_m5_mag must contain {NUM_BANDS} values in order u,g,r,i,z,Y.")
+    if lupt_f5sigma_njy is None or np.asarray(lupt_f5sigma_njy).shape != (NUM_BANDS,):
+        raise ValueError(f"lupt_f5sigma_njy must contain {NUM_BANDS} values in order u,g,r,i,z,Y.")
+    if lupt_b_njy is None or np.asarray(lupt_b_njy).shape != (NUM_BANDS,):
+        raise ValueError(f"lupt_b_njy must contain {NUM_BANDS} values in order u,g,r,i,z,Y.")
 
     rng = np.random.default_rng(seed)
     bns_rng = np.random.default_rng(int(rng.integers(0, 2**31 - 1)))
@@ -778,6 +871,9 @@ def create_dataset_with_neg_gw_bns_nsbh_fast(
                 event_id=event_id,
                 sim_dir=src.cfg.sim_root,
                 sim_name=src.cfg.sim_name,
+                fluxcal_to_psfflux_factor=float(fluxcal_to_psfflux_factor),
+                psfflux_zp=float(psfflux_zp),
+                lupt_b_njy=lupt_b_njy,
             )
             max_lc = _normalize_max_count(src.cfg.max_lc_per_gw)
             if max_lc is not None and len(lcs) > max_lc:
@@ -949,6 +1045,16 @@ def create_dataset_with_neg_gw_bns_nsbh_fast(
         f.attrs["time_zero_base_semantics"] = "optical zero_time_mjd_base stores parent GW event_time_mjd"
         f.attrs["time_unit"] = "mjd_days"
         f.attrs["runtime_offset_applied"] = 1
+        write_luptitude_metadata_attrs(
+            h5_obj=f,
+            fluxcal_zp=float(fluxcal_zp),
+            psfflux_zp=float(psfflux_zp),
+            fluxcal_to_psfflux_factor=float(fluxcal_to_psfflux_factor),
+            lupt_k=float(lupt_k),
+            lupt_m5_mag=np.asarray(lupt_m5_mag, dtype=np.float64),
+            lupt_f5sigma_njy=np.asarray(lupt_f5sigma_njy, dtype=np.float64),
+            lupt_b_njy=np.asarray(lupt_b_njy, dtype=np.float64),
+        )
 
         print("\nProcessing complete.")
         print(f"  Mode: {dataset_mode}")
@@ -1002,6 +1108,15 @@ def _build_arg_parser():
     p.add_argument("--dataset_mode", choices=["train", "test"], default="train")
     p.add_argument("--buffer_limit", type=int, default=10000)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--fluxcal_zp", type=float, default=27.5)
+    p.add_argument("--psfflux_zp", type=float, default=31.4)
+    p.add_argument("--lupt_k", type=float, default=1.0)
+    p.add_argument(
+        "--lupt_m5_mag",
+        type=str,
+        default="23.9,25.0,24.7,24.0,23.3,22.1",
+        help="Comma-separated 6 Rubin single-exposure m5 values (AB mag) in order u,g,r,i,z,Y.",
+    )
 
     # BNS source
     p.add_argument("--bns_full_catalog_path", required=True)
@@ -1039,6 +1154,13 @@ def _build_arg_parser():
 
 if __name__ == "__main__":
     args = _build_arg_parser().parse_args()
+    lupt_m5_mag = parse_lupt_m5_mag(args.lupt_m5_mag)
+    fluxcal_to_psfflux_factor, lupt_f5sigma_njy, lupt_b_njy = build_luptitude_params(
+        fluxcal_zp=float(args.fluxcal_zp),
+        psfflux_zp=float(args.psfflux_zp),
+        lupt_k=float(args.lupt_k),
+        lupt_m5_mag=lupt_m5_mag,
+    )
 
     bns_cfg = SourceConfig(
         tag="bns",
@@ -1075,4 +1197,11 @@ if __name__ == "__main__":
         nsbh_cfg=nsbh_cfg,
         buffer_limit=args.buffer_limit,
         seed=args.seed,
+        fluxcal_zp=float(args.fluxcal_zp),
+        psfflux_zp=float(args.psfflux_zp),
+        lupt_k=float(args.lupt_k),
+        lupt_m5_mag=lupt_m5_mag,
+        lupt_f5sigma_njy=lupt_f5sigma_njy,
+        fluxcal_to_psfflux_factor=float(fluxcal_to_psfflux_factor),
+        lupt_b_njy=lupt_b_njy,
     )

@@ -32,6 +32,8 @@ from tqdm import tqdm
 
 NUM_BANDS = 6
 MAX_LC_LENGTH = 200
+LUPT_BAND_ORDER = ("u", "g", "r", "i", "z", "Y")
+ASINH_MAG_FACTOR = 2.5 / np.log(10.0)
 
 BAND_TO_INDEX = {
     "LSST-u": 0,
@@ -94,14 +96,120 @@ def first_detection_index(
     return None, None
 
 
-def normalize_flux(
-    flux: np.ndarray,
-    fluxerr: np.ndarray,
-) -> Tuple[np.ndarray, np.ndarray]:
-    std = float(np.std(flux))
-    mean = float(np.mean(flux))
-    scale = std + 1e-8
-    return (flux - mean) / scale, fluxerr / scale
+def parse_lupt_m5_mag(text: str) -> np.ndarray:
+    raw = str(text).strip()
+    if raw == "":
+        raise ValueError(
+            "--lupt_m5_mag is required and must contain 6 comma-separated finite values in order u,g,r,i,z,Y."
+        )
+    parts = [p.strip() for p in raw.split(",")]
+    if len(parts) != NUM_BANDS:
+        raise ValueError(
+            f"--lupt_m5_mag must provide exactly {NUM_BANDS} values in order u,g,r,i,z,Y; got {len(parts)}."
+        )
+    try:
+        vals = np.asarray([float(p) for p in parts], dtype=np.float64)
+    except ValueError as exc:
+        raise ValueError("--lupt_m5_mag contains non-numeric values.") from exc
+    if not np.all(np.isfinite(vals)):
+        raise ValueError("--lupt_m5_mag values must be finite.")
+    return vals
+
+
+def build_luptitude_params(
+    fluxcal_zp: float,
+    psfflux_zp: float,
+    lupt_k: float,
+    lupt_m5_mag: np.ndarray,
+) -> Tuple[float, np.ndarray, np.ndarray]:
+    if not np.isfinite(fluxcal_zp) or not np.isfinite(psfflux_zp):
+        raise ValueError("fluxcal_zp and psfflux_zp must be finite.")
+    if not np.isfinite(lupt_k) or lupt_k <= 0:
+        raise ValueError("lupt_k must be finite and > 0.")
+    if lupt_m5_mag.shape != (NUM_BANDS,):
+        raise ValueError(
+            f"lupt_m5_mag must contain exactly {NUM_BANDS} values in order u,g,r,i,z,Y."
+        )
+    if not np.all(np.isfinite(lupt_m5_mag)):
+        raise ValueError("lupt_m5_mag values must be finite.")
+
+    fluxcal_to_psfflux_factor = 10.0 ** (0.4 * (float(psfflux_zp) - float(fluxcal_zp)))
+    if not np.isfinite(fluxcal_to_psfflux_factor) or fluxcal_to_psfflux_factor <= 0:
+        raise ValueError(
+            f"Invalid FLUXCAL->psfFlux conversion factor computed from fluxcal_zp={fluxcal_zp}, psfflux_zp={psfflux_zp}."
+        )
+
+    lupt_f5sigma_njy = 10.0 ** ((float(psfflux_zp) - lupt_m5_mag.astype(np.float64, copy=False)) / 2.5)
+    if np.any(lupt_f5sigma_njy <= 0) or not np.all(np.isfinite(lupt_f5sigma_njy)):
+        raise ValueError("Derived lupt_f5sigma_njy values must be finite and > 0.")
+    lupt_b_njy = float(lupt_k) * (lupt_f5sigma_njy / 5.0)
+    if np.any(lupt_b_njy <= 0) or not np.all(np.isfinite(lupt_b_njy)):
+        raise ValueError("Derived lupt_b_njy values must be finite and > 0.")
+    return float(fluxcal_to_psfflux_factor), lupt_f5sigma_njy, lupt_b_njy
+
+
+def transform_fluxcal_to_luptitude(
+    mjd: np.ndarray,
+    fluxcal: np.ndarray,
+    fluxcalerr: np.ndarray,
+    flt: np.ndarray,
+    fluxcal_to_psfflux_factor: float,
+    psfflux_zp: float,
+    lupt_b_njy: Sequence[float],
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    lupt_b_arr = np.asarray(lupt_b_njy, dtype=np.float64)
+    if lupt_b_arr.shape != (NUM_BANDS,):
+        raise ValueError(
+            f"lupt_b_njy must contain {NUM_BANDS} values in order u,g,r,i,z,Y."
+        )
+
+    band_idx_list: List[int] = []
+    for band_raw in flt:
+        idx = band_index(band_raw)
+        band_idx_list.append(-1 if idx is None else int(idx))
+    band_idx = np.asarray(band_idx_list, dtype=np.int64)
+    base_valid = (
+        np.isfinite(mjd)
+        & np.isfinite(fluxcal)
+        & np.isfinite(fluxcalerr)
+        & (fluxcalerr > 0)
+        & (band_idx >= 0)
+    )
+    if not np.any(base_valid):
+        return (
+            np.asarray([], dtype=np.float64),
+            np.asarray([], dtype=np.float64),
+            np.asarray([], dtype=np.float64),
+            np.asarray([], dtype=flt.dtype),
+        )
+
+    idx_valid = np.nonzero(base_valid)[0]
+    band_valid = band_idx[idx_valid]
+    b_valid = lupt_b_arr[band_valid]
+
+    f_psf = fluxcal[idx_valid] * float(fluxcal_to_psfflux_factor)
+    sigma_psf = np.abs(fluxcalerr[idx_valid]) * float(fluxcal_to_psfflux_factor)
+    m_lupt = float(psfflux_zp) - ASINH_MAG_FACTOR * (
+        np.arcsinh(f_psf / (2.0 * b_valid)) + np.log(b_valid)
+    )
+    sigma_lupt = ASINH_MAG_FACTOR * sigma_psf / np.sqrt((f_psf * f_psf) + (2.0 * b_valid) ** 2)
+
+    finite_valid = np.isfinite(m_lupt) & np.isfinite(sigma_lupt) & (sigma_lupt > 0)
+    if not np.any(finite_valid):
+        return (
+            np.asarray([], dtype=np.float64),
+            np.asarray([], dtype=np.float64),
+            np.asarray([], dtype=np.float64),
+            np.asarray([], dtype=flt.dtype),
+        )
+
+    keep = idx_valid[finite_valid]
+    return (
+        np.asarray(mjd[keep], dtype=np.float64),
+        np.asarray(m_lupt[finite_valid], dtype=np.float64),
+        np.asarray(sigma_lupt[finite_valid], dtype=np.float64),
+        np.asarray(flt[keep]),
+    )
 
 
 def format_realization(
@@ -155,6 +263,9 @@ def parse_kn_event(
     snr_threshold: float,
     min_nobs: int,
     fixed_offset_days: float,
+    fluxcal_to_psfflux_factor: float,
+    psfflux_zp: float,
+    lupt_b_njy: Sequence[float],
 ) -> Tuple[List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]], Dict[str, int]]:
     prefix = event_dir.name
     head_path = event_dir / f"{prefix}_HEAD.FITS"
@@ -227,17 +338,28 @@ def parse_kn_event(
                     continue
 
                 t0_mjd = float(lc_mjd[det_idx]) + float(fixed_offset_days)
-                lc_flux, lc_fluxerr = normalize_flux(lc_flux, lc_fluxerr)
+                lc_mjd_lupt, lc_lupt, lc_lupt_err, lc_flt_lupt = transform_fluxcal_to_luptitude(
+                    mjd=lc_mjd,
+                    fluxcal=lc_flux,
+                    fluxcalerr=lc_fluxerr,
+                    flt=lc_flt,
+                    fluxcal_to_psfflux_factor=fluxcal_to_psfflux_factor,
+                    psfflux_zp=psfflux_zp,
+                    lupt_b_njy=lupt_b_njy,
+                )
+                if lc_mjd_lupt.size == 0:
+                    stats["drop_empty_or_invalid"] += 1
+                    continue
 
                 try:
                     ra = float(data_head["RA"][i])
                     dec = float(data_head["DEC"][i])
                     out.append(
                         format_realization(
-                            mjd=lc_mjd,
-                            flux=lc_flux,
-                            fluxerr=lc_fluxerr,
-                            flt=lc_flt,
+                            mjd=lc_mjd_lupt,
+                            flux=lc_lupt,
+                            fluxerr=lc_lupt_err,
+                            flt=lc_flt_lupt,
                             ra=ra,
                             dec=dec,
                             t0_mjd=t0_mjd,
@@ -259,6 +381,9 @@ def _parse_kn_event_worker(
     snr_threshold: float,
     min_nobs: int,
     fixed_offset_days: float,
+    fluxcal_to_psfflux_factor: float,
+    psfflux_zp: float,
+    lupt_b_njy: Sequence[float],
 ) -> Tuple[str, List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]], Dict[str, int]]:
     event_dir = Path(event_dir_str)
     lcs, stats = parse_kn_event(
@@ -267,6 +392,9 @@ def _parse_kn_event_worker(
         snr_threshold=snr_threshold,
         min_nobs=min_nobs,
         fixed_offset_days=fixed_offset_days,
+        fluxcal_to_psfflux_factor=fluxcal_to_psfflux_factor,
+        psfflux_zp=psfflux_zp,
+        lupt_b_njy=lupt_b_njy,
     )
     return event_dir.name, lcs, stats
 
@@ -311,6 +439,9 @@ def parse_negative_file(
     snr_threshold: float,
     min_nobs: int,
     fixed_offset_days: float,
+    fluxcal_to_psfflux_factor: float,
+    psfflux_zp: float,
+    lupt_b_njy: Sequence[float],
 ) -> Tuple[List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]], Dict[str, int]]:
     stats = {
         "n_realizations_total": 0,
@@ -374,17 +505,28 @@ def parse_negative_file(
                     continue
 
                 t0_mjd = float(lc_mjd[det_idx]) + float(fixed_offset_days)
-                lc_flux, lc_fluxerr = normalize_flux(lc_flux, lc_fluxerr)
+                lc_mjd_lupt, lc_lupt, lc_lupt_err, lc_flt_lupt = transform_fluxcal_to_luptitude(
+                    mjd=lc_mjd,
+                    fluxcal=lc_flux,
+                    fluxcalerr=lc_fluxerr,
+                    flt=lc_flt,
+                    fluxcal_to_psfflux_factor=fluxcal_to_psfflux_factor,
+                    psfflux_zp=psfflux_zp,
+                    lupt_b_njy=lupt_b_njy,
+                )
+                if lc_mjd_lupt.size == 0:
+                    stats["drop_empty_or_invalid"] += 1
+                    continue
 
                 try:
                     ra = float(data_head["RA"][i])
                     dec = float(data_head["DEC"][i])
                     out.append(
                         format_realization(
-                            mjd=lc_mjd,
-                            flux=lc_flux,
-                            fluxerr=lc_fluxerr,
-                            flt=lc_flt,
+                            mjd=lc_mjd_lupt,
+                            flux=lc_lupt,
+                            fluxerr=lc_lupt_err,
+                            flt=lc_flt_lupt,
                             ra=ra,
                             dec=dec,
                             t0_mjd=t0_mjd,
@@ -407,6 +549,9 @@ def _parse_negative_file_worker(
     snr_threshold: float,
     min_nobs: int,
     fixed_offset_days: float,
+    fluxcal_to_psfflux_factor: float,
+    psfflux_zp: float,
+    lupt_b_njy: Sequence[float],
 ) -> Tuple[str, List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]], Dict[str, int]]:
     lcs, stats = parse_negative_file(
         head_path=Path(head_path_str),
@@ -415,6 +560,9 @@ def _parse_negative_file_worker(
         snr_threshold=snr_threshold,
         min_nobs=min_nobs,
         fixed_offset_days=fixed_offset_days,
+        fluxcal_to_psfflux_factor=fluxcal_to_psfflux_factor,
+        psfflux_zp=psfflux_zp,
+        lupt_b_njy=lupt_b_njy,
     )
     return transient_type, lcs, stats
 
@@ -526,6 +674,31 @@ def load_gw_event_time_prior(gw_h5_path: Optional[Path]) -> Optional[np.ndarray]
     return arr
 
 
+def write_luptitude_metadata_attrs(
+    h5_obj,
+    fluxcal_zp: float,
+    psfflux_zp: float,
+    fluxcal_to_psfflux_factor: float,
+    lupt_k: float,
+    lupt_m5_mag: np.ndarray,
+    lupt_f5sigma_njy: np.ndarray,
+    lupt_b_njy: np.ndarray,
+) -> None:
+    h5_obj.attrs["photometry_representation"] = "luptitude"
+    h5_obj.attrs["flux_input_column"] = "FLUXCAL"
+    h5_obj.attrs["fluxerr_input_column"] = "FLUXCALERR"
+    h5_obj.attrs["fluxcal_zp"] = float(fluxcal_zp)
+    h5_obj.attrs["psfflux_zp"] = float(psfflux_zp)
+    h5_obj.attrs["fluxcal_to_psfflux_factor"] = float(fluxcal_to_psfflux_factor)
+    h5_obj.attrs["lupt_k"] = float(lupt_k)
+    h5_obj.attrs["lupt_band_order"] = ",".join(LUPT_BAND_ORDER)
+    h5_obj.attrs["lupt_m5_mag"] = np.asarray(lupt_m5_mag, dtype=np.float64)
+    h5_obj.attrs["lupt_f5sigma_njy"] = np.asarray(lupt_f5sigma_njy, dtype=np.float64)
+    h5_obj.attrs["lupt_b_njy"] = np.asarray(lupt_b_njy, dtype=np.float64)
+    h5_obj.attrs["values_semantics"] = "luptitude"
+    h5_obj.attrs["errors_semantics"] = "luptitude_sigma"
+
+
 def create_positive_h5(
     output_h5: Path,
     bns_sim_root: Path,
@@ -535,6 +708,13 @@ def create_positive_h5(
     snr_threshold: float,
     min_nobs: int,
     fixed_offset_days: float,
+    fluxcal_zp: float,
+    psfflux_zp: float,
+    lupt_k: float,
+    lupt_m5_mag: np.ndarray,
+    lupt_f5sigma_njy: np.ndarray,
+    fluxcal_to_psfflux_factor: float,
+    lupt_b_njy: np.ndarray,
     max_events_per_source: Optional[int],
     max_lcs_per_event: Optional[int],
     buffer_limit: int,
@@ -676,6 +856,9 @@ def create_positive_h5(
                         snr_threshold=snr_threshold,
                         min_nobs=min_nobs,
                         fixed_offset_days=fixed_offset_days,
+                        fluxcal_to_psfflux_factor=fluxcal_to_psfflux_factor,
+                        psfflux_zp=psfflux_zp,
+                        lupt_b_njy=lupt_b_njy,
                     )
                     consume_positive_result(
                         event_name=event_dir.name,
@@ -695,6 +878,9 @@ def create_positive_h5(
                         float(snr_threshold),
                         int(min_nobs),
                         float(fixed_offset_days),
+                        float(fluxcal_to_psfflux_factor),
+                        float(psfflux_zp),
+                        tuple(float(x) for x in np.asarray(lupt_b_njy, dtype=np.float64).tolist()),
                     )
                     for i in range(n_rows)
                 ]
@@ -735,6 +921,16 @@ def create_positive_h5(
         f.attrs["runtime_offset_applied"] = 1
         if max_lcs_per_event is not None:
             f.attrs["max_lcs_per_event"] = int(max_lcs_per_event)
+        write_luptitude_metadata_attrs(
+            h5_obj=f,
+            fluxcal_zp=fluxcal_zp,
+            psfflux_zp=psfflux_zp,
+            fluxcal_to_psfflux_factor=fluxcal_to_psfflux_factor,
+            lupt_k=lupt_k,
+            lupt_m5_mag=lupt_m5_mag,
+            lupt_f5sigma_njy=lupt_f5sigma_njy,
+            lupt_b_njy=lupt_b_njy,
+        )
 
     print(f"[POS] Saved: {output_h5}")
 
@@ -746,6 +942,13 @@ def create_negative_h5(
     snr_threshold: float,
     min_nobs: int,
     fixed_offset_days: float,
+    fluxcal_zp: float,
+    psfflux_zp: float,
+    lupt_k: float,
+    lupt_m5_mag: np.ndarray,
+    lupt_f5sigma_njy: np.ndarray,
+    fluxcal_to_psfflux_factor: float,
+    lupt_b_njy: np.ndarray,
     max_negative_heads: Optional[int],
     buffer_limit: int,
     num_workers: int,
@@ -884,6 +1087,9 @@ def create_negative_h5(
                     snr_threshold=snr_threshold,
                     min_nobs=min_nobs,
                     fixed_offset_days=fixed_offset_days,
+                    fluxcal_to_psfflux_factor=fluxcal_to_psfflux_factor,
+                    psfflux_zp=psfflux_zp,
+                    lupt_b_njy=lupt_b_njy,
                 )
                 consume_negative_result(
                     transient_type=transient_type,
@@ -904,6 +1110,9 @@ def create_negative_h5(
                     float(snr_threshold),
                     int(min_nobs),
                     float(fixed_offset_days),
+                    float(fluxcal_to_psfflux_factor),
+                    float(psfflux_zp),
+                    tuple(float(x) for x in np.asarray(lupt_b_njy, dtype=np.float64).tolist()),
                 )
                 for i in range(n_rows)
             ]
@@ -945,6 +1154,16 @@ def create_negative_h5(
             f.attrs["cls_anchor_samples"] = int(gw_time_prior.shape[0])
         else:
             f.attrs["cls_anchor_policy"] = "disabled"
+        write_luptitude_metadata_attrs(
+            h5_obj=f,
+            fluxcal_zp=fluxcal_zp,
+            psfflux_zp=psfflux_zp,
+            fluxcal_to_psfflux_factor=fluxcal_to_psfflux_factor,
+            lupt_k=lupt_k,
+            lupt_m5_mag=lupt_m5_mag,
+            lupt_f5sigma_njy=lupt_f5sigma_njy,
+            lupt_b_njy=lupt_b_njy,
+        )
 
     print(f"[NEG] Saved: {output_h5}")
 
@@ -987,6 +1206,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--min_nobs", type=int, default=5)
     p.add_argument("--snr_threshold", type=float, default=5.0)
     p.add_argument("--fixed_offset_days", type=float, default=0.0)
+    p.add_argument("--fluxcal_zp", type=float, default=27.5)
+    p.add_argument("--psfflux_zp", type=float, default=31.4)
+    p.add_argument("--lupt_k", type=float, default=1.0)
+    p.add_argument(
+        "--lupt_m5_mag",
+        type=str,
+        default="23.9,25.0,24.7,24.0,23.3,22.1",
+        help="Comma-separated 6 Rubin single-exposure m5 values (AB mag) in order u,g,r,i,z,Y.",
+    )
     p.add_argument(
         "--cls_time_anchor_gw_h5",
         type=str,
@@ -1011,6 +1239,14 @@ def build_parser() -> argparse.ArgumentParser:
 def main():
     args = build_parser().parse_args()
 
+    lupt_m5_mag = parse_lupt_m5_mag(args.lupt_m5_mag)
+    fluxcal_to_psfflux_factor, lupt_f5sigma_njy, lupt_b_njy = build_luptitude_params(
+        fluxcal_zp=float(args.fluxcal_zp),
+        psfflux_zp=float(args.psfflux_zp),
+        lupt_k=float(args.lupt_k),
+        lupt_m5_mag=lupt_m5_mag,
+    )
+
     build_pos = bool(args.build_positive)
     build_neg = bool(args.build_negative)
     if not build_pos and not build_neg:
@@ -1033,6 +1269,13 @@ def main():
             snr_threshold=float(args.snr_threshold),
             min_nobs=int(args.min_nobs),
             fixed_offset_days=float(args.fixed_offset_days),
+            fluxcal_zp=float(args.fluxcal_zp),
+            psfflux_zp=float(args.psfflux_zp),
+            lupt_k=float(args.lupt_k),
+            lupt_m5_mag=lupt_m5_mag,
+            lupt_f5sigma_njy=lupt_f5sigma_njy,
+            fluxcal_to_psfflux_factor=float(fluxcal_to_psfflux_factor),
+            lupt_b_njy=lupt_b_njy,
             max_events_per_source=args.max_events_per_source,
             max_lcs_per_event=args.max_lcs_per_event,
             buffer_limit=int(args.buffer_limit),
@@ -1051,6 +1294,13 @@ def main():
             snr_threshold=float(args.snr_threshold),
             min_nobs=int(args.min_nobs),
             fixed_offset_days=float(args.fixed_offset_days),
+            fluxcal_zp=float(args.fluxcal_zp),
+            psfflux_zp=float(args.psfflux_zp),
+            lupt_k=float(args.lupt_k),
+            lupt_m5_mag=lupt_m5_mag,
+            lupt_f5sigma_njy=lupt_f5sigma_njy,
+            fluxcal_to_psfflux_factor=float(fluxcal_to_psfflux_factor),
+            lupt_b_njy=lupt_b_njy,
             max_negative_heads=args.max_negative_heads,
             buffer_limit=int(args.buffer_limit),
             num_workers=int(args.num_workers),

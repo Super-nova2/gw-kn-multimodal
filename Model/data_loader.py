@@ -11,7 +11,7 @@ import warnings
 warnings.filterwarnings("ignore", "Wswiglal-redir-stdio")
 import torch
 from collections import defaultdict
-from typing import List, Iterator, Optional, Tuple
+from typing import List, Iterator, Optional, Tuple, Sequence
 from torch.utils.data import Dataset, DataLoader, Sampler
 from pathlib import Path
 import subprocess
@@ -1620,9 +1620,192 @@ BAND_MAP = {'LSST-u': 0, 'LSST-g': 1, 'LSST-r': 2, 'LSST-i': 3, 'LSST-z': 4, 'LS
 NEG_BAND_MAP = {'u': 0, 'g': 1, 'r': 2, 'i': 3, 'z': 4, 'Y': 5}
 NUM_BANDS = 6
 MAX_LC_LENGTH = 200  # Maximum length of light curves all band
+LUPT_BAND_ORDER = ("u", "g", "r", "i", "z", "Y")
+ASINH_MAG_FACTOR = 2.5 / np.log(10.0)
+
+_ALL_BAND_MAP = {
+    "LSST-u": 0,
+    "LSST-g": 1,
+    "LSST-r": 2,
+    "LSST-i": 3,
+    "LSST-z": 4,
+    "LSST-Y": 5,
+    "u": 0,
+    "g": 1,
+    "r": 2,
+    "i": 3,
+    "z": 4,
+    "Y": 5,
+    "y": 5,
+}
+
+
+def _normalize_band_token(band_raw) -> str:
+    if isinstance(band_raw, bytes):
+        band = band_raw.decode("utf-8", errors="ignore")
+    else:
+        band = str(band_raw)
+    return band.strip()
+
+
+def _band_index_from_raw(band_raw) -> Optional[int]:
+    band = _normalize_band_token(band_raw)
+    if band in _ALL_BAND_MAP:
+        return int(_ALL_BAND_MAP[band])
+    if band.startswith("LSST-"):
+        tail = band.split("-", 1)[1]
+        return int(_ALL_BAND_MAP[tail]) if tail in _ALL_BAND_MAP else None
+    return None
+
+
+def parse_lupt_m5_mag(text: str) -> np.ndarray:
+    raw = str(text).strip()
+    if raw == "":
+        raise ValueError(
+            "lupt_m5_mag is required and must contain 6 comma-separated finite values in order u,g,r,i,z,Y."
+        )
+    parts = [p.strip() for p in raw.split(",")]
+    if len(parts) != NUM_BANDS:
+        raise ValueError(
+            f"lupt_m5_mag must provide exactly {NUM_BANDS} values in order u,g,r,i,z,Y; got {len(parts)}."
+        )
+    try:
+        vals = np.asarray([float(p) for p in parts], dtype=np.float64)
+    except ValueError as exc:
+        raise ValueError("lupt_m5_mag contains non-numeric values.") from exc
+    if not np.all(np.isfinite(vals)):
+        raise ValueError("lupt_m5_mag values must be finite.")
+    return vals
+
+
+def build_luptitude_params(
+    fluxcal_zp: float,
+    psfflux_zp: float,
+    lupt_k: float,
+    lupt_m5_mag: np.ndarray,
+) -> Tuple[float, np.ndarray, np.ndarray]:
+    if not np.isfinite(fluxcal_zp) or not np.isfinite(psfflux_zp):
+        raise ValueError("fluxcal_zp and psfflux_zp must be finite.")
+    if not np.isfinite(lupt_k) or lupt_k <= 0:
+        raise ValueError("lupt_k must be finite and > 0.")
+    if lupt_m5_mag.shape != (NUM_BANDS,):
+        raise ValueError(
+            f"lupt_m5_mag must contain exactly {NUM_BANDS} values in order u,g,r,i,z,Y."
+        )
+    if not np.all(np.isfinite(lupt_m5_mag)):
+        raise ValueError("lupt_m5_mag values must be finite.")
+
+    fluxcal_to_psfflux_factor = 10.0 ** (0.4 * (float(psfflux_zp) - float(fluxcal_zp)))
+    if not np.isfinite(fluxcal_to_psfflux_factor) or fluxcal_to_psfflux_factor <= 0:
+        raise ValueError(
+            f"Invalid FLUXCAL->psfFlux conversion factor computed from fluxcal_zp={fluxcal_zp}, psfflux_zp={psfflux_zp}."
+        )
+
+    lupt_f5sigma_njy = 10.0 ** ((float(psfflux_zp) - lupt_m5_mag.astype(np.float64, copy=False)) / 2.5)
+    if np.any(lupt_f5sigma_njy <= 0) or not np.all(np.isfinite(lupt_f5sigma_njy)):
+        raise ValueError("Derived lupt_f5sigma_njy values must be finite and > 0.")
+    lupt_b_njy = float(lupt_k) * (lupt_f5sigma_njy / 5.0)
+    if np.any(lupt_b_njy <= 0) or not np.all(np.isfinite(lupt_b_njy)):
+        raise ValueError("Derived lupt_b_njy values must be finite and > 0.")
+    return float(fluxcal_to_psfflux_factor), lupt_f5sigma_njy, lupt_b_njy
+
+
+def _transform_fluxcal_to_luptitude(
+    mjd: np.ndarray,
+    fluxcal: np.ndarray,
+    fluxcalerr: np.ndarray,
+    flt: np.ndarray,
+    fluxcal_to_psfflux_factor: float,
+    psfflux_zp: float,
+    lupt_b_njy: Sequence[float],
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    lupt_b_arr = np.asarray(lupt_b_njy, dtype=np.float64)
+    if lupt_b_arr.shape != (NUM_BANDS,):
+        raise ValueError(f"lupt_b_njy must contain {NUM_BANDS} values in order u,g,r,i,z,Y.")
+
+    band_idx_list: List[int] = []
+    for band_raw in flt:
+        idx = _band_index_from_raw(band_raw)
+        band_idx_list.append(-1 if idx is None else int(idx))
+    band_idx = np.asarray(band_idx_list, dtype=np.int64)
+
+    base_valid = (
+        np.isfinite(mjd)
+        & np.isfinite(fluxcal)
+        & np.isfinite(fluxcalerr)
+        & (fluxcalerr > 0)
+        & (band_idx >= 0)
+    )
+    if not np.any(base_valid):
+        return (
+            np.asarray([], dtype=np.float64),
+            np.asarray([], dtype=np.float64),
+            np.asarray([], dtype=np.float64),
+            np.asarray([], dtype=flt.dtype),
+        )
+
+    idx_valid = np.nonzero(base_valid)[0]
+    band_valid = band_idx[idx_valid]
+    b_valid = lupt_b_arr[band_valid]
+
+    f_psf = fluxcal[idx_valid] * float(fluxcal_to_psfflux_factor)
+    sigma_psf = np.abs(fluxcalerr[idx_valid]) * float(fluxcal_to_psfflux_factor)
+    m_lupt = float(psfflux_zp) - ASINH_MAG_FACTOR * (
+        np.arcsinh(f_psf / (2.0 * b_valid)) + np.log(b_valid)
+    )
+    sigma_lupt = ASINH_MAG_FACTOR * sigma_psf / np.sqrt((f_psf * f_psf) + (2.0 * b_valid) ** 2)
+
+    finite_valid = np.isfinite(m_lupt) & np.isfinite(sigma_lupt) & (sigma_lupt > 0)
+    if not np.any(finite_valid):
+        return (
+            np.asarray([], dtype=np.float64),
+            np.asarray([], dtype=np.float64),
+            np.asarray([], dtype=np.float64),
+            np.asarray([], dtype=flt.dtype),
+        )
+
+    keep = idx_valid[finite_valid]
+    return (
+        np.asarray(mjd[keep], dtype=np.float64),
+        np.asarray(m_lupt[finite_valid], dtype=np.float64),
+        np.asarray(sigma_lupt[finite_valid], dtype=np.float64),
+        np.asarray(flt[keep]),
+    )
+
+
+def _first_detection_index(
+    flux: np.ndarray,
+    fluxerr: np.ndarray,
+    photflag: Optional[np.ndarray],
+    snr_threshold: float = 5.0,
+) -> Optional[int]:
+    if flux.size == 0:
+        return None
+
+    if photflag is not None:
+        det_mask = photflag.astype(np.int64) != 0
+        if np.any(det_mask):
+            return int(np.argmax(det_mask))
+
+    valid = np.isfinite(fluxerr) & (fluxerr > 0)
+    if np.any(valid):
+        snr = np.full(flux.shape, -np.inf, dtype=np.float64)
+        snr[valid] = flux[valid] / fluxerr[valid]
+        det_mask = snr > float(snr_threshold)
+        if np.any(det_mask):
+            return int(np.argmax(det_mask))
+
+    return None
 
 # Functions for parsing SNANA FITS files, and sampling MOC skymaps
-def parse_snana_fits(event_id, sim_dir, sim_name="LSST_KN_BNS_AUG"):
+def parse_snana_fits(
+    event_id,
+    sim_dir,
+    sim_name="LSST_KN_BNS_AUG",
+    fluxcal_to_psfflux_factor=None,
+    psfflux_zp=31.4,
+    lupt_b_njy=None,
+):
     """
     Parses {event_id}_HEAD.fits and {event_id}_PHOT.fits.
     Extracts multiple light curve realizations for a single GW event.
@@ -1668,6 +1851,10 @@ def parse_snana_fits(event_id, sim_dir, sim_name="LSST_KN_BNS_AUG"):
             flt_all = data_phot['BAND'] # Filters
 
             extracted_lcs = []
+            use_luptitude = (
+                fluxcal_to_psfflux_factor is not None
+                and lupt_b_njy is not None
+            )
             
             # Iterate over each realization in HEAD
             for i in range(len(data_head)):
@@ -1692,11 +1879,24 @@ def parse_snana_fits(event_id, sim_dir, sim_name="LSST_KN_BNS_AUG"):
                 lc_fluxerr = fluxerr_all[start_idx : end_idx]
                 lc_flt = flt_all[start_idx : end_idx]
 
-                # Normalization
-                std = np.std(lc_flux)
-                mean = np.mean(lc_flux)
-                lc_flux = (lc_flux - mean) / (std + 1e-8)
-                lc_fluxerr = lc_fluxerr / (std + 1e-8)
+                if use_luptitude:
+                    lc_mjd, lc_flux, lc_fluxerr, lc_flt = _transform_fluxcal_to_luptitude(
+                        mjd=np.asarray(lc_mjd, dtype=np.float64),
+                        fluxcal=np.asarray(lc_flux, dtype=np.float64),
+                        fluxcalerr=np.asarray(lc_fluxerr, dtype=np.float64),
+                        flt=np.asarray(lc_flt),
+                        fluxcal_to_psfflux_factor=float(fluxcal_to_psfflux_factor),
+                        psfflux_zp=float(psfflux_zp),
+                        lupt_b_njy=lupt_b_njy,
+                    )
+                    if len(lc_mjd) == 0:
+                        continue
+                else:
+                    # Legacy behavior for callers not passing luptitude parameters.
+                    std = np.std(lc_flux)
+                    mean = np.mean(lc_flux)
+                    lc_flux = (lc_flux - mean) / (std + 1e-8)
+                    lc_fluxerr = lc_fluxerr / (std + 1e-8)
                 
                 # --- Format Conversion (to Tensor-ready numpy) ---
                 val_mat = np.zeros((MAX_LC_LENGTH, NUM_BANDS), dtype=np.float32)    # Values matrix (flux)
@@ -1713,6 +1913,8 @@ def parse_snana_fits(event_id, sim_dir, sim_name="LSST_KN_BNS_AUG"):
                 # 2. Fill Matrices
                 # Truncate if longer than MAX_LC_LENGTH
                 seq_len = min(len(lc_mjd), MAX_LC_LENGTH)
+                if seq_len <= 0:
+                    continue
                 if len(lc_mjd) > MAX_LC_LENGTH:
                     print(f"Warning: Light curve for event {event_id} exceeds MAX_LC_LENGTH. Truncating.")
                     # Keep the MAX_LC_LENGTH points with smallest absolute rel_times
@@ -1725,14 +1927,17 @@ def parse_snana_fits(event_id, sim_dir, sim_name="LSST_KN_BNS_AUG"):
                     rel_times = rel_times[sorted_indices]
                 
                 for t in range(seq_len):
-                    band_char = lc_flt[t].strip() # Remove whitespace
-                    if band_char in BAND_MAP:
-                        b_idx = BAND_MAP[band_char]
-                        
-                        val_mat[t, b_idx] = lc_flux[t]
-                        err_mat[t, b_idx] = lc_fluxerr[t]
-                        mask_mat[t, b_idx] = 1.0
-                        time_vec[t] = rel_times[t]
+                    b_idx = _band_index_from_raw(lc_flt[t])
+                    if b_idx is None:
+                        continue
+
+                    val_mat[t, b_idx] = lc_flux[t]
+                    err_mat[t, b_idx] = lc_fluxerr[t]
+                    mask_mat[t, b_idx] = 1.0
+                    time_vec[t] = rel_times[t]
+
+                if not np.any(mask_mat):
+                    continue
                 
                 extracted_lcs.append((val_mat, err_mat, mask_mat, time_vec, coordinates))
                 
@@ -1798,7 +2003,14 @@ def sample_moc_skymap(map_file):
 
 
 # Functions for parsing SNANA FITS files for negative samples
-def parse_snana_fits_neg(head_path, phot_path, type="SN"):
+def parse_snana_fits_neg(
+    head_path,
+    phot_path,
+    type="SN",
+    fluxcal_to_psfflux_factor=None,
+    psfflux_zp=31.4,
+    lupt_b_njy=None,
+):
     '''
     Parses HEAD.fits and PHOT.fits.
     Extracts multiple light curve realizations for a kind of transients.
@@ -1838,8 +2050,13 @@ def parse_snana_fits_neg(head_path, phot_path, type="SN"):
             flux_all = data_phot['FLUXCAL']
             fluxerr_all = data_phot['FLUXCALERR'] # Optional usage
             flt_all = data_phot['BAND'] # Filters
+            photflag_all = data_phot['PHOTFLAG'] if 'PHOTFLAG' in data_phot.columns.names else None
 
             extracted_lcs = []
+            use_luptitude = (
+                fluxcal_to_psfflux_factor is not None
+                and lupt_b_njy is not None
+            )
             
             # Iterate over each realization in HEAD
             for i in range(len(data_head)):
@@ -1863,12 +2080,39 @@ def parse_snana_fits_neg(head_path, phot_path, type="SN"):
                 lc_flux = flux_all[start_idx : end_idx]
                 lc_fluxerr = fluxerr_all[start_idx : end_idx]
                 lc_flt = flt_all[start_idx : end_idx]
+                lc_photflag = (
+                    np.asarray(photflag_all[start_idx:end_idx], dtype=np.int64)
+                    if photflag_all is not None
+                    else None
+                )
+                det_idx = _first_detection_index(
+                    flux=np.asarray(lc_flux, dtype=np.float64),
+                    fluxerr=np.asarray(lc_fluxerr, dtype=np.float64),
+                    photflag=lc_photflag,
+                    snr_threshold=5.0,
+                )
+                if det_idx is None:
+                    continue
+                t0_mjd = float(np.asarray(lc_mjd, dtype=np.float64)[det_idx])
 
-                # Normalization
-                std = np.std(lc_flux)
-                mean = np.mean(lc_flux)
-                lc_flux = (lc_flux - mean) / (std + 1e-8)
-                lc_fluxerr = lc_fluxerr / (std + 1e-8)
+                if use_luptitude:
+                    lc_mjd, lc_flux, lc_fluxerr, lc_flt = _transform_fluxcal_to_luptitude(
+                        mjd=np.asarray(lc_mjd, dtype=np.float64),
+                        fluxcal=np.asarray(lc_flux, dtype=np.float64),
+                        fluxcalerr=np.asarray(lc_fluxerr, dtype=np.float64),
+                        flt=np.asarray(lc_flt),
+                        fluxcal_to_psfflux_factor=float(fluxcal_to_psfflux_factor),
+                        psfflux_zp=float(psfflux_zp),
+                        lupt_b_njy=lupt_b_njy,
+                    )
+                    if len(lc_mjd) == 0:
+                        continue
+                else:
+                    # Legacy behavior for callers not passing luptitude parameters.
+                    std = np.std(lc_flux)
+                    mean = np.mean(lc_flux)
+                    lc_flux = (lc_flux - mean) / (std + 1e-8)
+                    lc_fluxerr = lc_fluxerr / (std + 1e-8)
                 
                 # --- Format Conversion (to Tensor-ready numpy) ---
                 val_mat = np.zeros((MAX_LC_LENGTH, NUM_BANDS), dtype=np.float32)    # Values matrix (flux)
@@ -1876,14 +2120,9 @@ def parse_snana_fits_neg(head_path, phot_path, type="SN"):
                 mask_mat = np.zeros((MAX_LC_LENGTH, NUM_BANDS), dtype=np.float32)
                 time_vec = np.zeros((MAX_LC_LENGTH,), dtype=np.float32)
                 
-                # 1. Time Normalization (Relative to pseudo-explosion time)
+                # 1. Time normalization: optical-only rule (first detection as t0)
                 if len(lc_mjd) > 0:
-                    use_peak = type in ['SN', 'uLens', 'dwarf-nova', 'TDE']
-                    if use_peak and 'PEAKMJD' in data_head.columns.names:
-                        pesudo_mjd_explode = data_head['PEAKMJD'][i] - np.random.uniform(0.5, 5.0)
-                    else:
-                        pesudo_mjd_explode = np.random.uniform(lc_mjd.min(), lc_mjd.max())
-                    rel_times = (lc_mjd - pesudo_mjd_explode) / 100  # Scale down to manageable range[-0.3, 0.6]
+                    rel_times = (lc_mjd - t0_mjd) / 100  # first-detection anchored, scaled as before
                     time_mask = np.where((rel_times >= -0.3) & (rel_times <= 0.6))[0]
                     lc_mjd = lc_mjd[time_mask]
                     lc_flux = lc_flux[time_mask]
@@ -1896,6 +2135,8 @@ def parse_snana_fits_neg(head_path, phot_path, type="SN"):
                 # 2. Fill Matrices
                 # Truncate if longer than MAX_LC_LENGTH
                 seq_len = min(len(lc_mjd), MAX_LC_LENGTH)
+                if seq_len <= 0:
+                    continue
                 if len(lc_mjd) > MAX_LC_LENGTH:
                     print(f"Warning: Light curve for realization {i} exceeds MAX_LC_LENGTH. Truncating.")
                     # Keep the MAX_LC_LENGTH points with smallest absolute rel_times
@@ -1908,14 +2149,17 @@ def parse_snana_fits_neg(head_path, phot_path, type="SN"):
                     rel_times = rel_times[sorted_indices]
                 
                 for t in range(seq_len):
-                    band_char = lc_flt[t].strip() # Remove whitespace
-                    if band_char in NEG_BAND_MAP:
-                        b_idx = NEG_BAND_MAP[band_char]
-                        
-                        val_mat[t, b_idx] = lc_flux[t]
-                        err_mat[t, b_idx] = lc_fluxerr[t]
-                        mask_mat[t, b_idx] = 1.0
-                        time_vec[t] = rel_times[t]
+                    b_idx = _band_index_from_raw(lc_flt[t])
+                    if b_idx is None:
+                        continue
+
+                    val_mat[t, b_idx] = lc_flux[t]
+                    err_mat[t, b_idx] = lc_fluxerr[t]
+                    mask_mat[t, b_idx] = 1.0
+                    time_vec[t] = rel_times[t]
+
+                if not np.any(mask_mat):
+                    continue
                 
                 extracted_lcs.append((val_mat, err_mat, mask_mat, time_vec, coordinates))
                 
@@ -1926,8 +2170,23 @@ def parse_snana_fits_neg(head_path, phot_path, type="SN"):
         return []
 
 # Function to create negative dataset HDF5
-def create_negative_dataset(sim_root, output_h5_path, buffer_limit=5000):
+def create_negative_dataset(
+    sim_root,
+    output_h5_path,
+    buffer_limit=5000,
+    fluxcal_zp=27.5,
+    psfflux_zp=31.4,
+    lupt_k=1.0,
+    lupt_m5_mag="23.9,25.0,24.7,24.0,23.3,22.1",
+):
     sim_root = Path(sim_root)
+    lupt_m5_mag_arr = parse_lupt_m5_mag(lupt_m5_mag)
+    fluxcal_to_psfflux_factor, lupt_f5sigma_njy, lupt_b_njy = build_luptitude_params(
+        fluxcal_zp=float(fluxcal_zp),
+        psfflux_zp=float(psfflux_zp),
+        lupt_k=float(lupt_k),
+        lupt_m5_mag=lupt_m5_mag_arr,
+    )
 
     # Decompress FITS.gz files (exclude KN) and remove .gz
     gz_files = [p for p in sim_root.rglob("*.FITS.gz") if "ELASTICC2_TRAIN_02_KN_" not in p.as_posix()]
@@ -2034,7 +2293,14 @@ def create_negative_dataset(sim_root, output_h5_path, buffer_limit=5000):
                 print(f"Missing PHOT file for {head_path.name}")
                 continue
 
-            lcs = parse_snana_fits_neg(str(head_path), str(phot_path), type=transient_type)
+            lcs = parse_snana_fits_neg(
+                str(head_path),
+                str(phot_path),
+                type=transient_type,
+                fluxcal_to_psfflux_factor=float(fluxcal_to_psfflux_factor),
+                psfflux_zp=float(psfflux_zp),
+                lupt_b_njy=lupt_b_njy,
+            )
             for (vals, errs, masks, times, coordinates) in lcs:
                 opt_buffer_vals.append(vals)
                 opt_buffer_errs.append(errs)
@@ -2048,5 +2314,18 @@ def create_negative_dataset(sim_root, output_h5_path, buffer_limit=5000):
 
         flush_buffer()
         f.attrs['n_total_optical'] = total_optical
+        f.attrs["photometry_representation"] = "luptitude"
+        f.attrs["flux_input_column"] = "FLUXCAL"
+        f.attrs["fluxerr_input_column"] = "FLUXCALERR"
+        f.attrs["fluxcal_zp"] = float(fluxcal_zp)
+        f.attrs["psfflux_zp"] = float(psfflux_zp)
+        f.attrs["fluxcal_to_psfflux_factor"] = float(fluxcal_to_psfflux_factor)
+        f.attrs["lupt_k"] = float(lupt_k)
+        f.attrs["lupt_band_order"] = ",".join(LUPT_BAND_ORDER)
+        f.attrs["lupt_m5_mag"] = np.asarray(lupt_m5_mag_arr, dtype=np.float64)
+        f.attrs["lupt_f5sigma_njy"] = np.asarray(lupt_f5sigma_njy, dtype=np.float64)
+        f.attrs["lupt_b_njy"] = np.asarray(lupt_b_njy, dtype=np.float64)
+        f.attrs["values_semantics"] = "luptitude"
+        f.attrs["errors_semantics"] = "luptitude_sigma"
         print(f"Total negative light curves: {total_optical}")
         print(f"Saved to: {output_h5_path}")
