@@ -6,6 +6,7 @@ Supports optional K-quantile time-offset ensemble with logits averaging.
 """
 
 import argparse
+import csv
 import json
 import os
 import sys
@@ -25,9 +26,15 @@ MODEL_DIR = SCRIPT_DIR.parent / "Model"
 if str(MODEL_DIR) not in sys.path:
     sys.path.insert(0, str(MODEL_DIR))
 
-from data_loader import OpticalBinaryDataset
+from data_loader import (
+    OpticalBinaryDataset,
+    OpticalPrefixEvalDataset,
+    _build_prefix_manifest_for_binary_dataset,
+    _filter_indices_by_min_detection_count,
+)
 from metrics import compute_classification_metrics
 from model import OpticalKNClassifier
+from optical_prefix import parse_prefix_det_support
 
 
 def parse_quantiles(text: str) -> List[float]:
@@ -68,6 +75,10 @@ def parse_args():
     p.add_argument("--output_dir", type=str, default="eval_results/optical_only_fd_t0")
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--no_plots", action="store_true")
+    p.add_argument("--prefix_eval_enable", action="store_true", default=None)
+    p.add_argument("--prefix_min_det", type=int, default=None)
+    p.add_argument("--prefix_eval_det_support", type=str, default=None)
+    p.add_argument("--prefix_manifest_out", type=str, default=None)
 
     p.add_argument("--time_offset_enable", action="store_true", default=None)
     p.add_argument("--offset_dist_npz", type=str, default=None)
@@ -76,8 +87,12 @@ def parse_args():
     p.add_argument("--offset_eval_quantiles", type=str, default=None)
     p.add_argument("--offset_scale_days_divisor", type=float, default=None)
     p.add_argument("--offset_seed", type=int, default=None)
-
-    return p.parse_args()
+    args = p.parse_args()
+    if args.prefix_min_det is not None and int(args.prefix_min_det) < 1:
+        raise ValueError("--prefix_min_det must be >= 1.")
+    if args.prefix_eval_det_support is not None:
+        parse_prefix_det_support(args.prefix_eval_det_support)
+    return args
 
 
 def load_json(path):
@@ -171,6 +186,95 @@ def select_threshold_for_target_recall(probs, labels, target_recall=0.98):
         best["meets_target_recall"] = True
     best["target_recall"] = float(target_recall)
     return best
+
+
+def unpack_optical_batch(batch):
+    if not isinstance(batch, (list, tuple)):
+        raise TypeError(f"Expected batch to be tuple/list, got {type(batch)!r}")
+    if len(batch) == 5:
+        opt_t, opt_v, opt_mask, opt_err, labels = batch
+        return {
+            "opt_t": opt_t,
+            "opt_v": opt_v,
+            "opt_mask": opt_mask,
+            "opt_err": opt_err,
+            "labels": labels,
+            "slot_is_detection": None,
+            "actual_target_k": None,
+            "is_terminal_prefix": None,
+        }
+    if len(batch) == 8:
+        opt_t, opt_v, opt_mask, opt_err, labels, slot_is_detection, actual_target_k, is_terminal_prefix = batch
+        return {
+            "opt_t": opt_t,
+            "opt_v": opt_v,
+            "opt_mask": opt_mask,
+            "opt_err": opt_err,
+            "labels": labels,
+            "slot_is_detection": slot_is_detection,
+            "actual_target_k": actual_target_k,
+            "is_terminal_prefix": is_terminal_prefix,
+        }
+    raise ValueError(f"Unsupported optical eval batch length: {len(batch)}")
+
+
+def build_prefix_bucket_metrics(probs, labels, actual_target_k, is_terminal_prefix):
+    if actual_target_k is None or is_terminal_prefix is None:
+        return {}
+    probs = probs.detach().cpu()
+    labels = labels.detach().cpu().long()
+    actual_target_k = actual_target_k.detach().cpu().long()
+    is_terminal_prefix = is_terminal_prefix.detach().cpu().long()
+
+    bucket_defs = [
+        ("k2", actual_target_k == 2),
+        ("k3", actual_target_k == 3),
+        ("k4", actual_target_k == 4),
+        ("k5", actual_target_k == 5),
+        ("k6plus", actual_target_k >= 6),
+        ("terminal", is_terminal_prefix > 0),
+    ]
+    out: Dict[str, Dict[str, float]] = {}
+    for name, mask in bucket_defs:
+        mask = mask.bool()
+        if int(mask.sum().item()) <= 0:
+            continue
+        p = probs[mask]
+        y = labels[mask]
+        cls = compute_classification_metrics(p, y)
+        out[name] = {
+            "n_samples": int(mask.sum().item()),
+            "n_pos": int((y == 1).sum().item()),
+            "n_neg": int((y == 0).sum().item()),
+            "auroc": float(cls.get("auroc", 0.0)),
+            "auprc": float(cls.get("auprc", 0.0)),
+            "f1_optimal": float(cls.get("f1_optimal", 0.0)),
+            "ece": float(cls.get("ece", 0.0)),
+            "mean_prob": float(p.mean().item()),
+        }
+    return out
+
+
+def save_prefix_manifest_csv(path: str, manifest_rows: List[Dict[str, object]]) -> None:
+    if not manifest_rows:
+        return
+    out_path = Path(path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = [
+        "base_idx",
+        "label",
+        "prefix_det_target_k",
+        "prefix_cut_time",
+        "actual_n_det_snr5",
+        "actual_n_obs",
+        "actual_n_bands",
+        "is_terminal_prefix",
+    ]
+    with out_path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in manifest_rows:
+            writer.writerow({key: row.get(key) for key in fieldnames})
 
 
 class EvalTimeOffsetPolicy:
@@ -293,10 +397,36 @@ def load_model(checkpoint_path, device, config_dict):
     return model, ckpt_args
 
 
-def build_eval_dataset(args, ckpt_args, config_dict):
+def build_eval_datasets(args, ckpt_args, config_dict):
     pos_data_path = choose_value(args.pos_data_path, config_dict, ckpt_args, "pos_data_path", default=None)
     neg_data_path = choose_value(args.neg_data_path, config_dict, ckpt_args, "neg_data_path", default=None)
     neg_group = choose_value(args.neg_group, config_dict, ckpt_args, "neg_group", default=None)
+    prefix_eval_enable = choose_value(
+        args.prefix_eval_enable,
+        config_dict,
+        ckpt_args,
+        "prefix_eval_enable",
+        default=None,
+    )
+    if prefix_eval_enable is None:
+        prefix_eval_enable = choose_value(
+            None,
+            config_dict,
+            ckpt_args,
+            "prefix_train_enable",
+            default=False,
+        )
+    prefix_eval_enable = bool(prefix_eval_enable)
+    prefix_min_det = int(choose_value(args.prefix_min_det, config_dict, ckpt_args, "prefix_min_det", default=2))
+    prefix_eval_det_support = parse_prefix_det_support(
+        choose_value(
+            args.prefix_eval_det_support,
+            config_dict,
+            ckpt_args,
+            "prefix_eval_det_support",
+            default="2,3,4,5,6,8,10,12",
+        )
+    )
 
     if pos_data_path is None or neg_data_path is None:
         raise ValueError(
@@ -310,15 +440,35 @@ def build_eval_dataset(args, ckpt_args, config_dict):
     if not os.path.exists(neg_data_path):
         raise FileNotFoundError(f"Negative data file not found: {neg_data_path}")
 
-    base_dataset = OpticalBinaryDataset(
-        pos_h5_path=pos_data_path,
-        neg_h5_path=neg_data_path,
-        neg_group=neg_group,
-        cache_in_memory=False,
+    pos_indices = np.arange(
+        OpticalBinaryDataset(
+            pos_h5_path=pos_data_path,
+            neg_h5_path=neg_data_path,
+            neg_group=neg_group,
+            cache_in_memory=False,
+        ).n_pos,
+        dtype=np.int64,
+    )
+    neg_indices = np.arange(
+        OpticalBinaryDataset(
+            pos_h5_path=pos_data_path,
+            neg_h5_path=neg_data_path,
+            neg_group=neg_group,
+            cache_in_memory=False,
+        ).n_neg,
+        dtype=np.int64,
     )
 
-    pos_indices = np.arange(base_dataset.n_pos, dtype=np.int64)
-    neg_indices = np.arange(base_dataset.n_neg, dtype=np.int64)
+    if prefix_eval_enable:
+        pos_indices = _filter_indices_by_min_detection_count(
+            pos_data_path, "events/optical_data", pos_indices, prefix_min_det
+        )
+        neg_indices = _filter_indices_by_min_detection_count(
+            neg_data_path, neg_group, neg_indices, prefix_min_det
+        )
+        if pos_indices.size == 0 or neg_indices.size == 0:
+            raise ValueError("prefix_eval_enable=true left an empty class after prefix_min_det filtering.")
+
     rng = np.random.default_rng(args.sample_seed)
 
     if args.max_pos_samples is not None and args.max_pos_samples < len(pos_indices):
@@ -328,25 +478,63 @@ def build_eval_dataset(args, ckpt_args, config_dict):
         neg_indices = rng.choice(neg_indices, size=int(args.max_neg_samples), replace=False)
         neg_indices = np.sort(neg_indices)
 
-    dataset = OpticalBinaryDataset(
+    base_dataset = OpticalBinaryDataset(
         pos_h5_path=pos_data_path,
         neg_h5_path=neg_data_path,
         neg_group=neg_group,
         pos_indices=pos_indices,
         neg_indices=neg_indices,
         cache_in_memory=False,
+        return_prefix_aux=prefix_eval_enable,
     )
 
     print(
-        "Evaluation dataset: "
-        f"n_pos={dataset.n_pos}, n_neg={dataset.n_neg}, total={len(dataset)} | "
-        f"same source as training may cause leakage (ignored by request)."
+        "Evaluation base dataset: "
+        f"n_pos={base_dataset.n_pos}, n_neg={base_dataset.n_neg}, total={len(base_dataset)} | "
+        f"task_mode={'prefix_right_censored' if prefix_eval_enable else 'full_window'}"
     )
-    return dataset, {
+
+    primary_dataset = base_dataset
+    legacy_dataset = None
+    manifest_rows: List[Dict[str, object]] = []
+    if prefix_eval_enable:
+        manifest_rows = _build_prefix_manifest_for_binary_dataset(
+            base_dataset=base_dataset,
+            det_support=prefix_eval_det_support,
+            prefix_min_det=prefix_min_det,
+            include_terminal=True,
+        )
+        if not manifest_rows:
+            raise ValueError("Prefix evaluation manifest is empty.")
+        primary_dataset = OpticalPrefixEvalDataset(
+            base_dataset=base_dataset,
+            manifest_rows=manifest_rows,
+            prefix_min_det=prefix_min_det,
+        )
+        legacy_dataset = OpticalBinaryDataset(
+            pos_h5_path=pos_data_path,
+            neg_h5_path=neg_data_path,
+            neg_group=neg_group,
+            pos_indices=pos_indices,
+            neg_indices=neg_indices,
+            cache_in_memory=False,
+            return_prefix_aux=False,
+        )
+        print(
+            "Prefix evaluation manifest: "
+            f"n_rows={len(primary_dataset)}, det_support={prefix_eval_det_support}, include_terminal=True"
+        )
+
+    return primary_dataset, legacy_dataset, {
         "pos_data_path": pos_data_path,
         "neg_data_path": neg_data_path,
         "neg_group": neg_group,
         "arch_version": str(choose_value(None, config_dict, ckpt_args, "arch_version", default="unknown")),
+        "task_mode": "prefix_right_censored" if prefix_eval_enable else "full_window",
+        "prefix_eval_enable": bool(prefix_eval_enable),
+        "prefix_min_det": int(prefix_min_det),
+        "prefix_eval_det_support": [int(v) for v in prefix_eval_det_support],
+        "prefix_manifest_rows": int(len(manifest_rows)),
     }
 
 
@@ -383,17 +571,30 @@ def run_evaluation(model, loader, device, n_ref, ref_start, ref_end, target_reca
     all_probs = []
     all_logits = []
     all_labels = []
+    all_actual_target_k = []
+    all_is_terminal_prefix = []
     total_loss = 0.0
     n_batches = 0
     ref_time_cache = None
 
     for batch in tqdm(loader, desc="Evaluating"):
-        opt_t, opt_v, opt_mask, opt_err, labels = batch
+        batch_dict = unpack_optical_batch(batch)
+        opt_t = batch_dict["opt_t"]
+        opt_v = batch_dict["opt_v"]
+        opt_mask = batch_dict["opt_mask"]
+        opt_err = batch_dict["opt_err"]
+        labels = batch_dict["labels"]
+        actual_target_k = batch_dict["actual_target_k"]
+        is_terminal_prefix = batch_dict["is_terminal_prefix"]
         opt_t = opt_t.to(device, non_blocking=True)
         opt_v = opt_v.to(device, non_blocking=True)
         opt_mask = opt_mask.to(device, non_blocking=True)
         opt_err = opt_err.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True).float()
+        if actual_target_k is not None:
+            actual_target_k = actual_target_k.to(device, non_blocking=True)
+        if is_terminal_prefix is not None:
+            is_terminal_prefix = is_terminal_prefix.to(device, non_blocking=True)
 
         batch_size = opt_t.size(0)
         if (
@@ -426,6 +627,10 @@ def run_evaluation(model, loader, device, n_ref, ref_start, ref_end, target_reca
         all_probs.append(probs.detach().cpu())
         all_logits.append(logits.detach().cpu())
         all_labels.append(labels.detach().cpu().long())
+        if actual_target_k is not None:
+            all_actual_target_k.append(actual_target_k.detach().cpu())
+        if is_terminal_prefix is not None:
+            all_is_terminal_prefix.append(is_terminal_prefix.detach().cpu())
 
     if n_batches == 0:
         raise RuntimeError("No batches were evaluated.")
@@ -447,6 +652,14 @@ def run_evaluation(model, loader, device, n_ref, ref_start, ref_end, target_reca
         "target_recall": float(target_recall),
         "offset_eval_count": int(len(offset_policy.eval_offsets_days)),
     }
+    prefix_bucket_metrics = build_prefix_bucket_metrics(
+        probs=probs,
+        labels=labels,
+        actual_target_k=(torch.cat(all_actual_target_k, dim=0) if all_actual_target_k else None),
+        is_terminal_prefix=(torch.cat(all_is_terminal_prefix, dim=0) if all_is_terminal_prefix else None),
+    )
+    if prefix_bucket_metrics:
+        results["prefix_bucket_metrics"] = prefix_bucket_metrics
     return results, probs.numpy(), labels.numpy(), logits.numpy()
 
 
@@ -620,7 +833,7 @@ def main():
     print(f"Using device: {device}")
 
     model, ckpt_args = load_model(args.checkpoint, device, config_dict)
-    dataset, data_meta = build_eval_dataset(args, ckpt_args, config_dict)
+    dataset, legacy_dataset, data_meta = build_eval_datasets(args, ckpt_args, config_dict)
     loader = build_eval_loader(dataset, args)
 
     n_ref = int(choose_value(None, config_dict, ckpt_args, "n_ref", default=64))
@@ -681,8 +894,31 @@ def main():
     )
 
     os.makedirs(args.output_dir, exist_ok=True)
+    if bool(data_meta.get("prefix_eval_enable", False)):
+        manifest_out = args.prefix_manifest_out
+        if manifest_out is None:
+            manifest_out = os.path.join(args.output_dir, "prefix_eval_manifest.csv")
+        if isinstance(dataset, OpticalPrefixEvalDataset):
+            save_prefix_manifest_csv(manifest_out, dataset.manifest.to_dict(orient="records"))
+
+    legacy_results = None
+    if legacy_dataset is not None:
+        legacy_loader = build_eval_loader(legacy_dataset, args)
+        legacy_metrics, _, _, _ = run_evaluation(
+            model=model,
+            loader=legacy_loader,
+            device=device,
+            n_ref=n_ref,
+            ref_start=ref_start,
+            ref_end=ref_end,
+            target_recall=target_recall,
+            offset_policy=offset_policy,
+        )
+        legacy_results = legacy_metrics
+
     results = {
         "classification": metrics,
+        "legacy_full_window": legacy_results,
         "meta": {
             "checkpoint": args.checkpoint,
             "device": str(device),
@@ -714,6 +950,13 @@ def main():
         f"precision={metrics['op_precision']:.4f}, "
         f"fpr={metrics['op_fpr']:.4f}"
     )
+    if legacy_results is not None:
+        print(
+            "Legacy full-window secondary eval: "
+            f"AUROC={legacy_results.get('auroc', 0.0):.4f}, "
+            f"AUPRC={legacy_results.get('auprc', 0.0):.4f}, "
+            f"thr={legacy_results.get('op_threshold', 0.0):.3f}"
+        )
     print(f"Saved: {out_json}")
 
     if not args.no_plots:

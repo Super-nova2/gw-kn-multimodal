@@ -34,6 +34,11 @@ NUM_BANDS = 6
 MAX_LC_LENGTH = 200
 LUPT_BAND_ORDER = ("u", "g", "r", "i", "z", "Y")
 ASINH_MAG_FACTOR = 2.5 / np.log(10.0)
+DEFAULT_TIME_WINDOW_START = -0.3
+DEFAULT_TIME_WINDOW_END = 0.6
+DEFAULT_DENSITY_BINS_N_DET = (3.0, 5.0, 8.0, 12.0, 20.0, 40.0, 80.0, 200.0)
+DEFAULT_DENSITY_BINS_N_BANDS = (1.0, 2.0, 3.0, 4.0, 5.0, 6.0)
+DEFAULT_DENSITY_BINS_T_SPAN = (0.0, 0.01, 0.05, 0.1, 0.2, 0.5, 1.0)
 
 BAND_TO_INDEX = {
     "LSST-u": 0,
@@ -51,6 +56,210 @@ BAND_TO_INDEX = {
 }
 
 MJD_EXPLODE_PATTERN = re.compile(r"MJD_EXPLODE:\s*([+-]?\d+(?:\.\d+)?(?:[Ee][+-]?\d+)?)")
+
+
+def parse_bool_arg(text, *, name: str) -> bool:
+    if isinstance(text, bool):
+        return bool(text)
+    raw = str(text).strip().lower()
+    if raw in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if raw in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean-like value, got: {text!r}")
+
+
+def parse_bin_edges(text: Optional[str], default_vals: Sequence[float], *, name: str) -> np.ndarray:
+    if text is None:
+        vals = np.asarray(default_vals, dtype=np.float64)
+    else:
+        parts = [p.strip() for p in str(text).split(",")]
+        vals = np.asarray([float(p) for p in parts if p != ""], dtype=np.float64)
+    if vals.size == 0:
+        raise ValueError(f"{name} must contain at least one numeric value.")
+    if not np.all(np.isfinite(vals)):
+        raise ValueError(f"{name} must contain finite numeric values.")
+    vals = np.unique(np.sort(vals))
+    return vals.astype(np.float64, copy=False)
+
+
+def compute_meta_features_from_formatted(
+    mask_mat: np.ndarray,
+    time_vec: np.ndarray,
+) -> Tuple[int, int, float, int]:
+    mask = np.asarray(mask_mat, dtype=np.float32)
+    if mask.ndim != 2:
+        raise ValueError(f"mask_mat must be 2D [T,B], got shape={mask.shape}")
+    if mask.shape[1] != NUM_BANDS:
+        raise ValueError(f"mask_mat second dim must be {NUM_BANDS}, got {mask.shape[1]}")
+
+    mask_bin = mask > 0
+    n_det = int(mask_bin.sum())
+    band_hits = mask_bin.sum(axis=0) > 0
+    n_bands = int(band_hits.sum())
+    single_band_id = int(np.argmax(band_hits)) if n_bands == 1 else -1
+
+    slot_valid = mask_bin.sum(axis=1) > 0
+    if np.any(slot_valid):
+        tv = np.asarray(time_vec, dtype=np.float32)[slot_valid]
+        t_span = float(np.max(tv) - np.min(tv))
+    else:
+        t_span = 0.0
+
+    return n_det, n_bands, t_span, single_band_id
+
+
+def compute_detection_meta_from_formatted(
+    mask_mat: np.ndarray,
+    time_vec: np.ndarray,
+    slot_is_detection: np.ndarray,
+) -> Tuple[int, int, int, float, int]:
+    n_obs, n_bands, t_span, single_band_id = compute_meta_features_from_formatted(mask_mat, time_vec)
+    det_vec = np.asarray(slot_is_detection, dtype=np.float32).reshape(-1)
+    if det_vec.shape[0] != np.asarray(mask_mat).shape[0]:
+        raise ValueError("slot_is_detection length must match formatted time dimension.")
+    n_det_snr5 = int(np.sum(det_vec > 0))
+    return int(n_obs), int(n_det_snr5), int(n_bands), float(t_span), int(single_band_id)
+
+
+def _bin_indices_1d(values: np.ndarray, edges: np.ndarray) -> np.ndarray:
+    return np.searchsorted(edges, values, side="right").astype(np.int64)
+
+
+def _flat_bin_index(
+    idx_det: np.ndarray,
+    idx_band: np.ndarray,
+    idx_span: np.ndarray,
+    n_det_bins: int,
+    n_band_bins: int,
+    n_span_bins: int,
+) -> np.ndarray:
+    _ = n_det_bins  # kept for readability at call site
+    return ((idx_det * n_band_bins) + idx_band) * n_span_bins + idx_span
+
+
+def joint_hist_from_meta_arrays(
+    n_det: np.ndarray,
+    n_bands: np.ndarray,
+    t_span: np.ndarray,
+    edges_n_det: np.ndarray,
+    edges_n_bands: np.ndarray,
+    edges_t_span: np.ndarray,
+) -> np.ndarray:
+    n_det_bins = int(edges_n_det.size + 1)
+    n_band_bins = int(edges_n_bands.size + 1)
+    n_span_bins = int(edges_t_span.size + 1)
+    n_joint = n_det_bins * n_band_bins * n_span_bins
+
+    det_idx = _bin_indices_1d(np.asarray(n_det, dtype=np.float64), edges_n_det)
+    band_idx = _bin_indices_1d(np.asarray(n_bands, dtype=np.float64), edges_n_bands)
+    span_idx = _bin_indices_1d(np.asarray(t_span, dtype=np.float64), edges_t_span)
+    flat = _flat_bin_index(det_idx, band_idx, span_idx, n_det_bins, n_band_bins, n_span_bins)
+    hist = np.bincount(flat, minlength=n_joint)
+    return hist.astype(np.int64, copy=False)
+
+
+def load_positive_density_histogram(
+    pos_h5_path: Path,
+    edges_n_det: np.ndarray,
+    edges_n_bands: np.ndarray,
+    edges_t_span: np.ndarray,
+    chunk_size: int = 8192,
+) -> np.ndarray:
+    grp = "events/optical_data"
+    with h5py.File(pos_h5_path, "r") as f:
+        if grp not in f:
+            raise KeyError(f"Missing group '{grp}' in {pos_h5_path}")
+        g = f[grp]
+        n_total = int(g["values"].shape[0])
+        n_det_hist: List[np.ndarray] = []
+        n_band_hist: List[np.ndarray] = []
+        t_span_hist: List[np.ndarray] = []
+
+        has_meta = (
+            "meta_n_det_snr5" in g
+            and "meta_n_bands" in g
+            and "meta_t_span" in g
+        )
+        if has_meta:
+            for s in range(0, n_total, int(chunk_size)):
+                e = min(s + int(chunk_size), n_total)
+                n_det_hist.append(np.asarray(g["meta_n_det_snr5"][s:e], dtype=np.float64).reshape(-1))
+                n_band_hist.append(np.asarray(g["meta_n_bands"][s:e], dtype=np.float64).reshape(-1))
+                t_span_hist.append(np.asarray(g["meta_t_span"][s:e], dtype=np.float64).reshape(-1))
+        else:
+            ds_masks = g["masks"]
+            ds_times = g["times"]
+            ds_slot_is_detection = g["slot_is_detection"] if "slot_is_detection" in g else None
+            for s in range(0, n_total, int(chunk_size)):
+                e = min(s + int(chunk_size), n_total)
+                masks = np.asarray(ds_masks[s:e], dtype=np.float32)
+                times = np.asarray(ds_times[s:e], dtype=np.float32)
+                slot_det = (
+                    np.asarray(ds_slot_is_detection[s:e], dtype=np.float32)
+                    if ds_slot_is_detection is not None
+                    else None
+                )
+                n_det_buf = []
+                n_band_buf = []
+                t_span_buf = []
+                for i in range(masks.shape[0]):
+                    if slot_det is not None:
+                        _, n_det_i, n_bands_i, t_span_i, _ = compute_detection_meta_from_formatted(
+                            masks[i], times[i], slot_det[i]
+                        )
+                    else:
+                        n_det_i, n_bands_i, t_span_i, _ = compute_meta_features_from_formatted(
+                            masks[i], times[i]
+                        )
+                    n_det_buf.append(float(n_det_i))
+                    n_band_buf.append(float(n_bands_i))
+                    t_span_buf.append(float(t_span_i))
+                n_det_hist.append(np.asarray(n_det_buf, dtype=np.float64))
+                n_band_hist.append(np.asarray(n_band_buf, dtype=np.float64))
+                t_span_hist.append(np.asarray(t_span_buf, dtype=np.float64))
+
+    if not n_det_hist:
+        raise ValueError(f"No positive optical samples found in {pos_h5_path}")
+    n_det_arr = np.concatenate(n_det_hist, axis=0)
+    n_band_arr = np.concatenate(n_band_hist, axis=0)
+    t_span_arr = np.concatenate(t_span_hist, axis=0)
+    return joint_hist_from_meta_arrays(
+        n_det=n_det_arr,
+        n_bands=n_band_arr,
+        t_span=t_span_arr,
+        edges_n_det=edges_n_det,
+        edges_n_bands=edges_n_bands,
+        edges_t_span=edges_t_span,
+    )
+
+
+def build_target_quota_from_pos_distribution(
+    pos_hist: np.ndarray,
+    neg_candidate_hist: np.ndarray,
+) -> np.ndarray:
+    pos = np.asarray(pos_hist, dtype=np.float64).reshape(-1)
+    neg = np.asarray(neg_candidate_hist, dtype=np.int64).reshape(-1)
+    if pos.shape != neg.shape:
+        raise ValueError("pos_hist and neg_candidate_hist must have identical flattened shape.")
+
+    pos_total = float(pos.sum())
+    neg_total = int(neg.sum())
+    if pos_total <= 0 or neg_total <= 0:
+        return np.zeros_like(neg, dtype=np.int64)
+
+    probs = pos / pos_total
+    raw = probs * float(neg_total)
+    quota = np.floor(raw).astype(np.int64)
+    frac = raw - quota.astype(np.float64)
+    residual = int(neg_total - int(quota.sum()))
+    if residual > 0:
+        order = np.argsort(frac)[::-1]
+        for idx in order[:residual]:
+            quota[idx] += 1
+
+    quota = np.minimum(quota, neg)
+    return quota.astype(np.int64, copy=False)
 
 
 def read_mjd_explode(readme_path: Path) -> float:
@@ -77,23 +286,41 @@ def first_detection_index(
     photflag: Optional[np.ndarray],
     snr_threshold: float,
 ) -> Tuple[Optional[int], Optional[str]]:
+    det_mask = build_detection_mask(
+        flux=flux,
+        fluxerr=fluxerr,
+        photflag=photflag,
+        snr_threshold=snr_threshold,
+    )
+    if np.any(det_mask):
+        if photflag is not None and np.any(photflag.astype(np.int64) != 0):
+            return int(np.argmax(det_mask)), "photflag"
+        return int(np.argmax(det_mask)), "snr"
+    return None, None
+
+
+def build_detection_mask(
+    flux: np.ndarray,
+    fluxerr: np.ndarray,
+    photflag: Optional[np.ndarray],
+    snr_threshold: float,
+) -> np.ndarray:
     if flux.size == 0:
-        return None, None
+        return np.zeros((0,), dtype=bool)
 
     if photflag is not None:
         det_mask = photflag.astype(np.int64) != 0
         if np.any(det_mask):
-            return int(np.argmax(det_mask)), "photflag"
+            return np.asarray(det_mask, dtype=bool)
 
     valid = np.isfinite(fluxerr) & (fluxerr > 0)
     if np.any(valid):
         snr = np.full(flux.shape, -np.inf, dtype=np.float64)
         snr[valid] = flux[valid] / fluxerr[valid]
         det_mask = snr > float(snr_threshold)
-        if np.any(det_mask):
-            return int(np.argmax(det_mask)), "snr"
+        return np.asarray(det_mask, dtype=bool)
 
-    return None, None
+    return np.zeros(flux.shape, dtype=bool)
 
 
 def parse_lupt_m5_mag(text: str) -> np.ndarray:
@@ -156,7 +383,7 @@ def transform_fluxcal_to_luptitude(
     fluxcal_to_psfflux_factor: float,
     psfflux_zp: float,
     lupt_b_njy: Sequence[float],
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     lupt_b_arr = np.asarray(lupt_b_njy, dtype=np.float64)
     if lupt_b_arr.shape != (NUM_BANDS,):
         raise ValueError(
@@ -181,6 +408,7 @@ def transform_fluxcal_to_luptitude(
             np.asarray([], dtype=np.float64),
             np.asarray([], dtype=np.float64),
             np.asarray([], dtype=flt.dtype),
+            np.asarray([], dtype=np.int64),
         )
 
     idx_valid = np.nonzero(base_valid)[0]
@@ -201,6 +429,7 @@ def transform_fluxcal_to_luptitude(
             np.asarray([], dtype=np.float64),
             np.asarray([], dtype=np.float64),
             np.asarray([], dtype=flt.dtype),
+            np.asarray([], dtype=np.int64),
         )
 
     keep = idx_valid[finite_valid]
@@ -209,6 +438,7 @@ def transform_fluxcal_to_luptitude(
         np.asarray(m_lupt[finite_valid], dtype=np.float64),
         np.asarray(sigma_lupt[finite_valid], dtype=np.float64),
         np.asarray(flt[keep]),
+        np.asarray(keep, dtype=np.int64),
     )
 
 
@@ -217,25 +447,44 @@ def format_realization(
     flux: np.ndarray,
     fluxerr: np.ndarray,
     flt: np.ndarray,
+    is_detection_obs: np.ndarray,
     ra: float,
     dec: float,
     t0_mjd: float,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
+    enforce_time_window: bool,
+    time_window_start: float,
+    time_window_end: float,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
     rel_times = (mjd - float(t0_mjd)) / 100.0
+    det_obs = np.asarray(is_detection_obs, dtype=np.float32).reshape(-1)
+    if det_obs.shape[0] != rel_times.shape[0]:
+        raise ValueError("is_detection_obs length must match mjd/flux length after luptitude transform.")
 
-    if len(mjd) > MAX_LC_LENGTH:
+    if bool(enforce_time_window):
+        in_window = (rel_times >= float(time_window_start)) & (rel_times <= float(time_window_end))
+        if not np.any(in_window):
+            raise ValueError("realization has no points inside configured time window")
+        rel_times = rel_times[in_window]
+        flux = flux[in_window]
+        fluxerr = fluxerr[in_window]
+        flt = flt[in_window]
+        det_obs = det_obs[in_window]
+
+    if len(rel_times) > MAX_LC_LENGTH:
         keep = np.argsort(np.abs(rel_times))[:MAX_LC_LENGTH]
         keep = np.sort(keep)
         rel_times = rel_times[keep]
         flux = flux[keep]
         fluxerr = fluxerr[keep]
         flt = flt[keep]
+        det_obs = det_obs[keep]
 
     seq_len = min(len(rel_times), MAX_LC_LENGTH)
     val_mat = np.zeros((MAX_LC_LENGTH, NUM_BANDS), dtype=np.float32)
     err_mat = np.zeros((MAX_LC_LENGTH, NUM_BANDS), dtype=np.float32)
     mask_mat = np.zeros((MAX_LC_LENGTH, NUM_BANDS), dtype=np.float32)
     time_vec = np.zeros((MAX_LC_LENGTH,), dtype=np.float32)
+    slot_is_detection = np.zeros((MAX_LC_LENGTH,), dtype=np.float32)
 
     for t in range(seq_len):
         b_idx = band_index(flt[t])
@@ -245,12 +494,13 @@ def format_realization(
         err_mat[t, b_idx] = fluxerr[t]
         mask_mat[t, b_idx] = 1.0
         time_vec[t] = rel_times[t]
+        slot_is_detection[t] = float(det_obs[t] > 0)
 
     if not np.any(mask_mat > 0):
         raise ValueError("realization has no valid band after formatting")
 
     coords = np.array([ra, dec], dtype=np.float32)
-    return val_mat, err_mat, mask_mat, time_vec, coords, float(t0_mjd)
+    return val_mat, err_mat, mask_mat, time_vec, coords, slot_is_detection, float(t0_mjd)
 
 
 def iter_event_dirs(base_dir: Path, sim_name: str) -> List[Path]:
@@ -263,10 +513,13 @@ def parse_kn_event(
     snr_threshold: float,
     min_nobs: int,
     fixed_offset_days: float,
+    enforce_time_window: bool,
+    time_window_start: float,
+    time_window_end: float,
     fluxcal_to_psfflux_factor: float,
     psfflux_zp: float,
     lupt_b_njy: Sequence[float],
-) -> Tuple[List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]], Dict[str, int]]:
+) -> Tuple[List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]], Dict[str, int]]:
     prefix = event_dir.name
     head_path = event_dir / f"{prefix}_HEAD.FITS"
     phot_path = event_dir / f"{prefix}_PHOT.FITS"
@@ -279,7 +532,7 @@ def parse_kn_event(
         "drop_no_detection": 0,
         "drop_empty_or_invalid": 0,
     }
-    out: List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]] = []
+    out: List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]] = []
 
     if not (head_path.exists() and phot_path.exists() and readme_path.exists()):
         return out, stats
@@ -336,9 +589,15 @@ def parse_kn_event(
                 if det_idx is None:
                     stats["drop_no_detection"] += 1
                     continue
+                det_mask_obs = build_detection_mask(
+                    flux=lc_flux,
+                    fluxerr=lc_fluxerr,
+                    photflag=lc_photflag,
+                    snr_threshold=snr_threshold,
+                )
 
                 t0_mjd = float(lc_mjd[det_idx]) + float(fixed_offset_days)
-                lc_mjd_lupt, lc_lupt, lc_lupt_err, lc_flt_lupt = transform_fluxcal_to_luptitude(
+                lc_mjd_lupt, lc_lupt, lc_lupt_err, lc_flt_lupt, lc_keep_idx = transform_fluxcal_to_luptitude(
                     mjd=lc_mjd,
                     fluxcal=lc_flux,
                     fluxcalerr=lc_fluxerr,
@@ -350,6 +609,7 @@ def parse_kn_event(
                 if lc_mjd_lupt.size == 0:
                     stats["drop_empty_or_invalid"] += 1
                     continue
+                det_mask_lupt = np.asarray(det_mask_obs[lc_keep_idx], dtype=np.float32)
 
                 try:
                     ra = float(data_head["RA"][i])
@@ -360,9 +620,13 @@ def parse_kn_event(
                             flux=lc_lupt,
                             fluxerr=lc_lupt_err,
                             flt=lc_flt_lupt,
+                            is_detection_obs=det_mask_lupt,
                             ra=ra,
                             dec=dec,
                             t0_mjd=t0_mjd,
+                            enforce_time_window=bool(enforce_time_window),
+                            time_window_start=float(time_window_start),
+                            time_window_end=float(time_window_end),
                         )
                     )
                     stats["n_realizations_kept"] += 1
@@ -381,10 +645,13 @@ def _parse_kn_event_worker(
     snr_threshold: float,
     min_nobs: int,
     fixed_offset_days: float,
+    enforce_time_window: bool,
+    time_window_start: float,
+    time_window_end: float,
     fluxcal_to_psfflux_factor: float,
     psfflux_zp: float,
     lupt_b_njy: Sequence[float],
-) -> Tuple[str, List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]], Dict[str, int]]:
+) -> Tuple[str, List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]], Dict[str, int]]:
     event_dir = Path(event_dir_str)
     lcs, stats = parse_kn_event(
         event_dir=event_dir,
@@ -392,6 +659,9 @@ def _parse_kn_event_worker(
         snr_threshold=snr_threshold,
         min_nobs=min_nobs,
         fixed_offset_days=fixed_offset_days,
+        enforce_time_window=bool(enforce_time_window),
+        time_window_start=float(time_window_start),
+        time_window_end=float(time_window_end),
         fluxcal_to_psfflux_factor=fluxcal_to_psfflux_factor,
         psfflux_zp=psfflux_zp,
         lupt_b_njy=lupt_b_njy,
@@ -439,10 +709,13 @@ def parse_negative_file(
     snr_threshold: float,
     min_nobs: int,
     fixed_offset_days: float,
+    enforce_time_window: bool,
+    time_window_start: float,
+    time_window_end: float,
     fluxcal_to_psfflux_factor: float,
     psfflux_zp: float,
     lupt_b_njy: Sequence[float],
-) -> Tuple[List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]], Dict[str, int]]:
+) -> Tuple[List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]], Dict[str, int]]:
     stats = {
         "n_realizations_total": 0,
         "n_realizations_kept": 0,
@@ -450,7 +723,7 @@ def parse_negative_file(
         "drop_no_detection": 0,
         "drop_empty_or_invalid": 0,
     }
-    out: List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]] = []
+    out: List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]] = []
 
     try:
         with fits.open(head_path, memmap=False) as hdul_head, fits.open(
@@ -503,9 +776,15 @@ def parse_negative_file(
                 if det_idx is None:
                     stats["drop_no_detection"] += 1
                     continue
+                det_mask_obs = build_detection_mask(
+                    flux=lc_flux,
+                    fluxerr=lc_fluxerr,
+                    photflag=lc_photflag,
+                    snr_threshold=snr_threshold,
+                )
 
                 t0_mjd = float(lc_mjd[det_idx]) + float(fixed_offset_days)
-                lc_mjd_lupt, lc_lupt, lc_lupt_err, lc_flt_lupt = transform_fluxcal_to_luptitude(
+                lc_mjd_lupt, lc_lupt, lc_lupt_err, lc_flt_lupt, lc_keep_idx = transform_fluxcal_to_luptitude(
                     mjd=lc_mjd,
                     fluxcal=lc_flux,
                     fluxcalerr=lc_fluxerr,
@@ -517,6 +796,7 @@ def parse_negative_file(
                 if lc_mjd_lupt.size == 0:
                     stats["drop_empty_or_invalid"] += 1
                     continue
+                det_mask_lupt = np.asarray(det_mask_obs[lc_keep_idx], dtype=np.float32)
 
                 try:
                     ra = float(data_head["RA"][i])
@@ -527,9 +807,13 @@ def parse_negative_file(
                             flux=lc_lupt,
                             fluxerr=lc_lupt_err,
                             flt=lc_flt_lupt,
+                            is_detection_obs=det_mask_lupt,
                             ra=ra,
                             dec=dec,
                             t0_mjd=t0_mjd,
+                            enforce_time_window=bool(enforce_time_window),
+                            time_window_start=float(time_window_start),
+                            time_window_end=float(time_window_end),
                         )
                     )
                     stats["n_realizations_kept"] += 1
@@ -549,10 +833,13 @@ def _parse_negative_file_worker(
     snr_threshold: float,
     min_nobs: int,
     fixed_offset_days: float,
+    enforce_time_window: bool,
+    time_window_start: float,
+    time_window_end: float,
     fluxcal_to_psfflux_factor: float,
     psfflux_zp: float,
     lupt_b_njy: Sequence[float],
-) -> Tuple[str, List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]], Dict[str, int]]:
+) -> Tuple[str, List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]], Dict[str, int]]:
     lcs, stats = parse_negative_file(
         head_path=Path(head_path_str),
         phot_path=Path(phot_path_str),
@@ -560,6 +847,9 @@ def _parse_negative_file_worker(
         snr_threshold=snr_threshold,
         min_nobs=min_nobs,
         fixed_offset_days=fixed_offset_days,
+        enforce_time_window=bool(enforce_time_window),
+        time_window_start=float(time_window_start),
+        time_window_end=float(time_window_end),
         fluxcal_to_psfflux_factor=fluxcal_to_psfflux_factor,
         psfflux_zp=psfflux_zp,
         lupt_b_njy=lupt_b_njy,
@@ -607,6 +897,7 @@ def _parallel_map_with_fallback(
 def _create_optical_group(
     grp,
     chunk_size: int,
+    write_meta_features: bool,
 ):
     # Keep legacy fields for backward compatibility with existing H5 files.
     # Optical-only training/evaluation consumes values/errors/masks/times only.
@@ -638,6 +929,13 @@ def _create_optical_group(
         dtype="f4",
         chunks=(chunk_size, MAX_LC_LENGTH),
     )
+    ds_slot_is_detection = grp.create_dataset(
+        "slot_is_detection",
+        (0, MAX_LC_LENGTH),
+        maxshape=(None, MAX_LC_LENGTH),
+        dtype="f4",
+        chunks=(chunk_size, MAX_LC_LENGTH),
+    )
     ds_zero_time_mjd_base = grp.create_dataset(
         "zero_time_mjd_base",
         (0,),
@@ -652,7 +950,70 @@ def _create_optical_group(
         dtype="f4",
         chunks=(chunk_size, 2),
     )
-    return ds_values, ds_errors, ds_masks, ds_times, ds_zero_time_mjd_base, ds_coords
+    ds_meta_n_det = None
+    ds_meta_n_obs = None
+    ds_meta_n_det_snr5 = None
+    ds_meta_n_bands = None
+    ds_meta_t_span = None
+    ds_meta_single_band_id = None
+    if bool(write_meta_features):
+        ds_meta_n_obs = grp.create_dataset(
+            "meta_n_obs",
+            (0,),
+            maxshape=(None,),
+            dtype="i2",
+            chunks=(chunk_size,),
+        )
+        ds_meta_n_det = grp.create_dataset(
+            "meta_n_det",
+            (0,),
+            maxshape=(None,),
+            dtype="i2",
+            chunks=(chunk_size,),
+        )
+        ds_meta_n_det_snr5 = grp.create_dataset(
+            "meta_n_det_snr5",
+            (0,),
+            maxshape=(None,),
+            dtype="i2",
+            chunks=(chunk_size,),
+        )
+        ds_meta_n_bands = grp.create_dataset(
+            "meta_n_bands",
+            (0,),
+            maxshape=(None,),
+            dtype="i1",
+            chunks=(chunk_size,),
+        )
+        ds_meta_t_span = grp.create_dataset(
+            "meta_t_span",
+            (0,),
+            maxshape=(None,),
+            dtype="f4",
+            chunks=(chunk_size,),
+        )
+        ds_meta_single_band_id = grp.create_dataset(
+            "meta_single_band_id",
+            (0,),
+            maxshape=(None,),
+            dtype="i1",
+            chunks=(chunk_size,),
+        )
+    return (
+        ds_values,
+        ds_errors,
+        ds_masks,
+        ds_times,
+        ds_slot_is_detection,
+        ds_zero_time_mjd_base,
+        ds_coords,
+        ds_meta_n_obs,
+        ds_meta_n_det,
+        ds_meta_n_det_snr5,
+        ds_meta_n_bands,
+        ds_meta_t_span,
+        ds_meta_single_band_id,
+    )
 
 
 def load_gw_event_time_prior(gw_h5_path: Optional[Path]) -> Optional[np.ndarray]:
@@ -719,6 +1080,10 @@ def create_positive_h5(
     max_lcs_per_event: Optional[int],
     buffer_limit: int,
     num_workers: int,
+    enforce_time_window: bool,
+    time_window_start: float,
+    time_window_end: float,
+    write_meta_features: bool,
 ) -> None:
     output_h5.parent.mkdir(parents=True, exist_ok=True)
     dt_str = h5py.string_dtype(encoding="utf-8")
@@ -732,9 +1097,21 @@ def create_positive_h5(
         )
 
         opt_grp = f.create_group("events/optical_data")
-        ds_values, ds_errors, ds_masks, ds_times, ds_zero_time_mjd_base, ds_coords = _create_optical_group(
-            opt_grp, chunk_size
-        )
+        (
+            ds_values,
+            ds_errors,
+            ds_masks,
+            ds_times,
+            ds_slot_is_detection,
+            ds_zero_time_mjd_base,
+            ds_coords,
+            ds_meta_n_obs,
+            ds_meta_n_det,
+            ds_meta_n_det_snr5,
+            ds_meta_n_bands,
+            ds_meta_t_span,
+            ds_meta_single_band_id,
+        ) = _create_optical_group(opt_grp, chunk_size, write_meta_features=bool(write_meta_features))
         ds_parent = opt_grp.create_dataset(
             "parent_gw_idx",
             (0,),
@@ -749,9 +1126,16 @@ def create_positive_h5(
         b_errs: List[np.ndarray] = []
         b_masks: List[np.ndarray] = []
         b_times: List[np.ndarray] = []
+        b_slot_is_detection: List[np.ndarray] = []
         b_zero_time_mjd_base: List[float] = []
         b_coords: List[np.ndarray] = []
         b_parent: List[int] = []
+        b_meta_n_obs: List[int] = []
+        b_meta_n_det: List[int] = []
+        b_meta_n_det_snr5: List[int] = []
+        b_meta_n_bands: List[int] = []
+        b_meta_t_span: List[float] = []
+        b_meta_single_band_id: List[int] = []
 
         stats = {
             "bns_events_total": 0,
@@ -775,32 +1159,57 @@ def create_positive_h5(
             ds_errors.resize(new_size, axis=0)
             ds_masks.resize(new_size, axis=0)
             ds_times.resize(new_size, axis=0)
+            ds_slot_is_detection.resize(new_size, axis=0)
             ds_zero_time_mjd_base.resize(new_size, axis=0)
             ds_coords.resize(new_size, axis=0)
             ds_parent.resize(new_size, axis=0)
+            if ds_meta_n_det is not None:
+                ds_meta_n_obs.resize(new_size, axis=0)
+                ds_meta_n_det.resize(new_size, axis=0)
+                ds_meta_n_det_snr5.resize(new_size, axis=0)
+                ds_meta_n_bands.resize(new_size, axis=0)
+                ds_meta_t_span.resize(new_size, axis=0)
+                ds_meta_single_band_id.resize(new_size, axis=0)
             ds_values[cur:new_size] = np.asarray(b_vals, dtype=np.float32)
             ds_errors[cur:new_size] = np.asarray(b_errs, dtype=np.float32)
             ds_masks[cur:new_size] = np.asarray(b_masks, dtype=np.float32)
             ds_times[cur:new_size] = np.asarray(b_times, dtype=np.float32)
+            ds_slot_is_detection[cur:new_size] = np.asarray(b_slot_is_detection, dtype=np.float32)
             ds_zero_time_mjd_base[cur:new_size] = np.asarray(b_zero_time_mjd_base, dtype=np.float64)
             ds_coords[cur:new_size] = np.asarray(b_coords, dtype=np.float32)
             ds_parent[cur:new_size] = np.asarray(b_parent, dtype=np.int32)
+            if ds_meta_n_det is not None:
+                ds_meta_n_obs[cur:new_size] = np.asarray(b_meta_n_obs, dtype=np.int16)
+                ds_meta_n_det[cur:new_size] = np.asarray(b_meta_n_det, dtype=np.int16)
+                ds_meta_n_det_snr5[cur:new_size] = np.asarray(b_meta_n_det_snr5, dtype=np.int16)
+                ds_meta_n_bands[cur:new_size] = np.asarray(b_meta_n_bands, dtype=np.int8)
+                ds_meta_t_span[cur:new_size] = np.asarray(b_meta_t_span, dtype=np.float32)
+                ds_meta_single_band_id[cur:new_size] = np.asarray(
+                    b_meta_single_band_id, dtype=np.int8
+                )
 
             optical_count = new_size
             b_vals.clear()
             b_errs.clear()
             b_masks.clear()
             b_times.clear()
+            b_slot_is_detection.clear()
             b_zero_time_mjd_base.clear()
             b_coords.clear()
             b_parent.clear()
+            b_meta_n_obs.clear()
+            b_meta_n_det.clear()
+            b_meta_n_det_snr5.clear()
+            b_meta_n_bands.clear()
+            b_meta_t_span.clear()
+            b_meta_single_band_id.clear()
 
         worker_count = max(1, int(num_workers))
 
         def consume_positive_result(
             event_name: str,
             source_tag: str,
-            lcs: List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]],
+            lcs: List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]],
             event_stats: Dict[str, int],
             key_written: str,
         ) -> None:
@@ -825,14 +1234,33 @@ def create_positive_h5(
             gw_count += 1
             stats[key_written] += 1
 
-            for vals, errs, masks, times, coords, zero_time_mjd_base in lcs:
+            for vals, errs, masks, times, coords, slot_is_detection, zero_time_mjd_base in lcs:
                 b_vals.append(vals)
                 b_errs.append(errs)
                 b_masks.append(masks)
                 b_times.append(times)
+                b_slot_is_detection.append(slot_is_detection)
                 b_zero_time_mjd_base.append(float(zero_time_mjd_base))
                 b_coords.append(coords)
                 b_parent.append(gw_idx)
+                if ds_meta_n_det is not None:
+                    (
+                        n_obs_i,
+                        n_det_snr5_i,
+                        n_bands_i,
+                        t_span_i,
+                        single_band_i,
+                    ) = compute_detection_meta_from_formatted(
+                        masks,
+                        times,
+                        slot_is_detection,
+                    )
+                    b_meta_n_obs.append(int(n_obs_i))
+                    b_meta_n_det.append(int(n_obs_i))
+                    b_meta_n_det_snr5.append(int(n_det_snr5_i))
+                    b_meta_n_bands.append(int(n_bands_i))
+                    b_meta_t_span.append(float(t_span_i))
+                    b_meta_single_band_id.append(int(single_band_i))
 
             if len(b_vals) >= int(buffer_limit):
                 flush()
@@ -856,6 +1284,9 @@ def create_positive_h5(
                         snr_threshold=snr_threshold,
                         min_nobs=min_nobs,
                         fixed_offset_days=fixed_offset_days,
+                        enforce_time_window=bool(enforce_time_window),
+                        time_window_start=float(time_window_start),
+                        time_window_end=float(time_window_end),
                         fluxcal_to_psfflux_factor=fluxcal_to_psfflux_factor,
                         psfflux_zp=psfflux_zp,
                         lupt_b_njy=lupt_b_njy,
@@ -878,6 +1309,9 @@ def create_positive_h5(
                         float(snr_threshold),
                         int(min_nobs),
                         float(fixed_offset_days),
+                        bool(enforce_time_window),
+                        float(time_window_start),
+                        float(time_window_end),
                         float(fluxcal_to_psfflux_factor),
                         float(psfflux_zp),
                         tuple(float(x) for x in np.asarray(lupt_b_njy, dtype=np.float64).tolist()),
@@ -919,6 +1353,13 @@ def create_positive_h5(
         f.attrs["time_zero_base_semantics"] = "first_detection_mjd_plus_fixed_offset_days"
         f.attrs["time_unit"] = "mjd_days"
         f.attrs["runtime_offset_applied"] = 1
+        f.attrs["enforce_time_window"] = int(bool(enforce_time_window))
+        f.attrs["time_window_start"] = float(time_window_start)
+        f.attrs["time_window_end"] = float(time_window_end)
+        f.attrs["write_meta_features"] = int(bool(write_meta_features))
+        f.attrs["slot_is_detection_semantics"] = "formatted_slot_is_detection_snr_gt_threshold"
+        f.attrs["meta_n_obs_semantics"] = "formatted_observation_count"
+        f.attrs["meta_n_det_snr5_semantics"] = "formatted_detection_count_snr_gt_threshold"
         if max_lcs_per_event is not None:
             f.attrs["max_lcs_per_event"] = int(max_lcs_per_event)
         write_luptitude_metadata_attrs(
@@ -954,6 +1395,15 @@ def create_negative_h5(
     num_workers: int,
     cls_time_anchor_gw_h5: Optional[Path],
     cls_time_anchor_seed: int,
+    enforce_time_window: bool,
+    time_window_start: float,
+    time_window_end: float,
+    write_meta_features: bool,
+    neg_match_pos_density: bool,
+    density_match_pos_h5: Optional[Path],
+    density_bins_n_det: np.ndarray,
+    density_bins_n_bands: np.ndarray,
+    density_bins_t_span: np.ndarray,
 ) -> None:
     output_h5.parent.mkdir(parents=True, exist_ok=True)
     chunk_size = 1024
@@ -961,9 +1411,21 @@ def create_negative_h5(
 
     with h5py.File(output_h5, "w") as f:
         grp = f.create_group(neg_group)
-        ds_values, ds_errors, ds_masks, ds_times, ds_zero_time_mjd_base, ds_coords = _create_optical_group(
-            grp, chunk_size
-        )
+        (
+            ds_values,
+            ds_errors,
+            ds_masks,
+            ds_times,
+            ds_slot_is_detection,
+            ds_zero_time_mjd_base,
+            ds_coords,
+            ds_meta_n_obs,
+            ds_meta_n_det,
+            ds_meta_n_det_snr5,
+            ds_meta_n_bands,
+            ds_meta_t_span,
+            ds_meta_single_band_id,
+        ) = _create_optical_group(grp, chunk_size, write_meta_features=bool(write_meta_features))
         ds_types = grp.create_dataset("types", (0,), maxshape=(None,), dtype=dt_str, chunks=(chunk_size,))
         gw_time_prior = load_gw_event_time_prior(cls_time_anchor_gw_h5)
         rng_anchor = np.random.default_rng(int(cls_time_anchor_seed))
@@ -983,10 +1445,17 @@ def create_negative_h5(
         b_errs: List[np.ndarray] = []
         b_masks: List[np.ndarray] = []
         b_times: List[np.ndarray] = []
+        b_slot_is_detection: List[np.ndarray] = []
         b_zero_time_mjd_base: List[float] = []
         b_zero_time_mjd_cls_base: List[float] = []
         b_coords: List[np.ndarray] = []
         b_types: List[str] = []
+        b_meta_n_obs: List[int] = []
+        b_meta_n_det: List[int] = []
+        b_meta_n_det_snr5: List[int] = []
+        b_meta_n_bands: List[int] = []
+        b_meta_t_span: List[float] = []
+        b_meta_single_band_id: List[int] = []
 
         stats = {
             "head_files_total": 0,
@@ -994,6 +1463,9 @@ def create_negative_h5(
             "drop_nobs": 0,
             "drop_no_detection": 0,
             "drop_empty_or_invalid": 0,
+            "drop_density_mismatch": 0,
+            "density_candidates_total": 0,
+            "density_kept_total": 0,
         }
 
         def flush() -> None:
@@ -1007,15 +1479,24 @@ def create_negative_h5(
             ds_errors.resize(new_size, axis=0)
             ds_masks.resize(new_size, axis=0)
             ds_times.resize(new_size, axis=0)
+            ds_slot_is_detection.resize(new_size, axis=0)
             ds_zero_time_mjd_base.resize(new_size, axis=0)
             ds_coords.resize(new_size, axis=0)
             ds_types.resize(new_size, axis=0)
             if ds_zero_time_mjd_cls_base is not None:
                 ds_zero_time_mjd_cls_base.resize(new_size, axis=0)
+            if ds_meta_n_det is not None:
+                ds_meta_n_obs.resize(new_size, axis=0)
+                ds_meta_n_det.resize(new_size, axis=0)
+                ds_meta_n_det_snr5.resize(new_size, axis=0)
+                ds_meta_n_bands.resize(new_size, axis=0)
+                ds_meta_t_span.resize(new_size, axis=0)
+                ds_meta_single_band_id.resize(new_size, axis=0)
             ds_values[cur:new_size] = np.asarray(b_vals, dtype=np.float32)
             ds_errors[cur:new_size] = np.asarray(b_errs, dtype=np.float32)
             ds_masks[cur:new_size] = np.asarray(b_masks, dtype=np.float32)
             ds_times[cur:new_size] = np.asarray(b_times, dtype=np.float32)
+            ds_slot_is_detection[cur:new_size] = np.asarray(b_slot_is_detection, dtype=np.float32)
             ds_zero_time_mjd_base[cur:new_size] = np.asarray(b_zero_time_mjd_base, dtype=np.float64)
             ds_coords[cur:new_size] = np.asarray(b_coords, dtype=np.float32)
             ds_types[cur:new_size] = np.asarray(b_types, dtype=object)
@@ -1023,22 +1504,62 @@ def create_negative_h5(
                 ds_zero_time_mjd_cls_base[cur:new_size] = np.asarray(
                     b_zero_time_mjd_cls_base, dtype=np.float64
                 )
+            if ds_meta_n_det is not None:
+                ds_meta_n_obs[cur:new_size] = np.asarray(b_meta_n_obs, dtype=np.int16)
+                ds_meta_n_det[cur:new_size] = np.asarray(b_meta_n_det, dtype=np.int16)
+                ds_meta_n_det_snr5[cur:new_size] = np.asarray(b_meta_n_det_snr5, dtype=np.int16)
+                ds_meta_n_bands[cur:new_size] = np.asarray(b_meta_n_bands, dtype=np.int8)
+                ds_meta_t_span[cur:new_size] = np.asarray(b_meta_t_span, dtype=np.float32)
+                ds_meta_single_band_id[cur:new_size] = np.asarray(
+                    b_meta_single_band_id, dtype=np.int8
+                )
 
             total_optical = new_size
             b_vals.clear()
             b_errs.clear()
             b_masks.clear()
             b_times.clear()
+            b_slot_is_detection.clear()
             b_zero_time_mjd_base.clear()
             b_zero_time_mjd_cls_base.clear()
             b_coords.clear()
             b_types.clear()
+            b_meta_n_obs.clear()
+            b_meta_n_det.clear()
+            b_meta_n_det_snr5.clear()
+            b_meta_n_bands.clear()
+            b_meta_t_span.clear()
+            b_meta_single_band_id.clear()
 
         worker_count = max(1, int(num_workers))
+        density_enabled = bool(neg_match_pos_density)
+        density_quota: Optional[np.ndarray] = None
+        density_kept: Optional[np.ndarray] = None
+        density_edges_n_det = np.asarray(density_bins_n_det, dtype=np.float64)
+        density_edges_n_bands = np.asarray(density_bins_n_bands, dtype=np.float64)
+        density_edges_t_span = np.asarray(density_bins_t_span, dtype=np.float64)
+        n_det_bins = int(density_edges_n_det.size + 1)
+        n_band_bins = int(density_edges_n_bands.size + 1)
+        n_span_bins = int(density_edges_t_span.size + 1)
+        n_joint_bins = int(n_det_bins * n_band_bins * n_span_bins)
+
+        def sample_flat_bin(
+            masks: np.ndarray,
+            times: np.ndarray,
+            slot_is_detection: np.ndarray,
+        ) -> Tuple[int, int, int, int, float, int]:
+            n_obs_i, n_det_i, n_bands_i, t_span_i, single_band_i = compute_detection_meta_from_formatted(
+                masks, times, slot_is_detection
+            )
+            det_idx = int(np.searchsorted(density_edges_n_det, float(n_det_i), side="right"))
+            band_idx = int(np.searchsorted(density_edges_n_bands, float(n_bands_i), side="right"))
+            span_idx = int(np.searchsorted(density_edges_t_span, float(t_span_i), side="right"))
+            flat_idx = int(((det_idx * n_band_bins) + band_idx) * n_span_bins + span_idx)
+            return flat_idx, n_obs_i, n_det_i, n_bands_i, t_span_i, single_band_i
 
         def consume_negative_result(
             transient_type: str,
-            lcs: List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]],
+            lcs: List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]],
             file_stats: Dict[str, int],
         ) -> None:
             stats["head_files_used"] += 1
@@ -1046,11 +1567,24 @@ def create_negative_h5(
             stats["drop_no_detection"] += int(file_stats["drop_no_detection"])
             stats["drop_empty_or_invalid"] += int(file_stats["drop_empty_or_invalid"])
 
-            for vals, errs, masks, times, coords, zero_time_mjd_base in lcs:
+            for vals, errs, masks, times, coords, slot_is_detection, zero_time_mjd_base in lcs:
+                flat_idx, n_obs_i, n_det_i, n_bands_i, t_span_i, single_band_i = sample_flat_bin(
+                    masks, times, slot_is_detection
+                )
+                if density_enabled:
+                    if density_quota is None or density_kept is None:
+                        raise RuntimeError("Density matching enabled but quota buffers are not initialized.")
+                    if density_kept[flat_idx] >= density_quota[flat_idx]:
+                        stats["drop_density_mismatch"] += 1
+                        continue
+                    density_kept[flat_idx] += 1
+                    stats["density_kept_total"] += 1
+
                 b_vals.append(vals)
                 b_errs.append(errs)
                 b_masks.append(masks)
                 b_times.append(times)
+                b_slot_is_detection.append(slot_is_detection)
                 b_zero_time_mjd_base.append(float(zero_time_mjd_base))
                 if gw_time_prior is not None:
                     sampled = float(
@@ -1059,6 +1593,13 @@ def create_negative_h5(
                     b_zero_time_mjd_cls_base.append(sampled)
                 b_coords.append(coords)
                 b_types.append(transient_type)
+                if ds_meta_n_det is not None:
+                    b_meta_n_obs.append(int(n_obs_i))
+                    b_meta_n_det.append(int(n_det_i))
+                    b_meta_n_det_snr5.append(int(n_det_i))
+                    b_meta_n_bands.append(int(n_bands_i))
+                    b_meta_t_span.append(float(t_span_i))
+                    b_meta_single_band_id.append(int(single_band_i))
 
             if len(b_vals) >= int(buffer_limit):
                 flush()
@@ -1078,6 +1619,90 @@ def create_negative_h5(
                 continue
             tasks.append((str(head_path), str(phot_path), transient_type))
 
+        if density_enabled:
+            if density_match_pos_h5 is None:
+                raise ValueError(
+                    "neg_match_pos_density=true requires density_match_pos_h5 to be provided."
+                )
+            pos_hist = load_positive_density_histogram(
+                pos_h5_path=Path(density_match_pos_h5),
+                edges_n_det=density_edges_n_det,
+                edges_n_bands=density_edges_n_bands,
+                edges_t_span=density_edges_t_span,
+            )
+            if int(pos_hist.sum()) <= 0:
+                raise ValueError(f"Positive density histogram is empty: {density_match_pos_h5}")
+
+            candidate_hist = np.zeros((n_joint_bins,), dtype=np.int64)
+            if worker_count == 1 or len(tasks) <= 1:
+                for head_path_str, phot_path_str, transient_type in tqdm(
+                    tasks, desc="Negative density pass-1"
+                ):
+                    lcs, _ = parse_negative_file(
+                        head_path=Path(head_path_str),
+                        phot_path=Path(phot_path_str),
+                        transient_type=transient_type,
+                        snr_threshold=snr_threshold,
+                        min_nobs=min_nobs,
+                        fixed_offset_days=fixed_offset_days,
+                        enforce_time_window=bool(enforce_time_window),
+                        time_window_start=float(time_window_start),
+                        time_window_end=float(time_window_end),
+                        fluxcal_to_psfflux_factor=fluxcal_to_psfflux_factor,
+                        psfflux_zp=psfflux_zp,
+                        lupt_b_njy=lupt_b_njy,
+                    )
+                    for _, _, masks, times, _, slot_is_detection, _ in lcs:
+                        flat_idx, _, _, _, _, _ = sample_flat_bin(masks, times, slot_is_detection)
+                        candidate_hist[flat_idx] += 1
+            else:
+                head_path_strs = [t[0] for t in tasks]
+                phot_path_strs = [t[1] for t in tasks]
+                transient_types = [t[2] for t in tasks]
+                n_rows = len(tasks)
+                chunksize = max(1, n_rows // (worker_count * 8))
+                arg_rows_pass1 = [
+                    (
+                        head_path_strs[i],
+                        phot_path_strs[i],
+                        transient_types[i],
+                        float(snr_threshold),
+                        int(min_nobs),
+                        float(fixed_offset_days),
+                        bool(enforce_time_window),
+                        float(time_window_start),
+                        float(time_window_end),
+                        float(fluxcal_to_psfflux_factor),
+                        float(psfflux_zp),
+                        tuple(float(x) for x in np.asarray(lupt_b_njy, dtype=np.float64).tolist()),
+                    )
+                    for i in range(n_rows)
+                ]
+                for _, lcs, _ in _parallel_map_with_fallback(
+                    _parse_negative_file_worker,
+                    arg_rows=arg_rows_pass1,
+                    worker_count=worker_count,
+                    chunksize=chunksize,
+                    total=n_rows,
+                    desc="Negative density pass-1",
+                ):
+                    for _, _, masks, times, _, slot_is_detection, _ in lcs:
+                        flat_idx, _, _, _, _, _ = sample_flat_bin(masks, times, slot_is_detection)
+                        candidate_hist[flat_idx] += 1
+
+            density_quota = build_target_quota_from_pos_distribution(pos_hist=pos_hist, neg_candidate_hist=candidate_hist)
+            density_kept = np.zeros_like(density_quota, dtype=np.int64)
+            stats["density_candidates_total"] = int(candidate_hist.sum())
+            print(
+                "[NEG] Density matching enabled: "
+                f"candidates={int(candidate_hist.sum())}, "
+                f"quota_sum={int(density_quota.sum())}, "
+                f"pos_ref={density_match_pos_h5}"
+            )
+        else:
+            density_kept = np.zeros((n_joint_bins,), dtype=np.int64)
+            density_quota = np.zeros((n_joint_bins,), dtype=np.int64)
+
         if worker_count == 1 or len(tasks) <= 1:
             for head_path_str, phot_path_str, transient_type in tqdm(tasks, desc="Negative HEAD files"):
                 lcs, file_stats = parse_negative_file(
@@ -1087,6 +1712,9 @@ def create_negative_h5(
                     snr_threshold=snr_threshold,
                     min_nobs=min_nobs,
                     fixed_offset_days=fixed_offset_days,
+                    enforce_time_window=bool(enforce_time_window),
+                    time_window_start=float(time_window_start),
+                    time_window_end=float(time_window_end),
                     fluxcal_to_psfflux_factor=fluxcal_to_psfflux_factor,
                     psfflux_zp=psfflux_zp,
                     lupt_b_njy=lupt_b_njy,
@@ -1110,6 +1738,9 @@ def create_negative_h5(
                     float(snr_threshold),
                     int(min_nobs),
                     float(fixed_offset_days),
+                    bool(enforce_time_window),
+                    float(time_window_start),
+                    float(time_window_end),
                     float(fluxcal_to_psfflux_factor),
                     float(psfflux_zp),
                     tuple(float(x) for x in np.asarray(lupt_b_njy, dtype=np.float64).tolist()),
@@ -1131,6 +1762,9 @@ def create_negative_h5(
                 )
 
         flush()
+        if not density_enabled:
+            stats["density_candidates_total"] = int(total_optical)
+            stats["density_kept_total"] = int(total_optical)
 
         f.attrs["n_total_optical"] = int(total_optical)
         for k, v in stats.items():
@@ -1147,6 +1781,19 @@ def create_negative_h5(
         f.attrs["time_zero_base_semantics"] = "first_detection_mjd_plus_fixed_offset_days"
         f.attrs["time_unit"] = "mjd_days"
         f.attrs["runtime_offset_applied"] = 1
+        f.attrs["enforce_time_window"] = int(bool(enforce_time_window))
+        f.attrs["time_window_start"] = float(time_window_start)
+        f.attrs["time_window_end"] = float(time_window_end)
+        f.attrs["write_meta_features"] = int(bool(write_meta_features))
+        f.attrs["slot_is_detection_semantics"] = "formatted_slot_is_detection_snr_gt_threshold"
+        f.attrs["meta_n_obs_semantics"] = "formatted_observation_count"
+        f.attrs["meta_n_det_snr5_semantics"] = "formatted_detection_count_snr_gt_threshold"
+        f.attrs["neg_match_pos_density"] = int(bool(density_enabled))
+        f.attrs["density_bins_n_det"] = np.asarray(density_bins_n_det, dtype=np.float64)
+        f.attrs["density_bins_n_bands"] = np.asarray(density_bins_n_bands, dtype=np.float64)
+        f.attrs["density_bins_t_span"] = np.asarray(density_bins_t_span, dtype=np.float64)
+        if density_match_pos_h5 is not None:
+            f.attrs["density_match_pos_h5"] = str(density_match_pos_h5)
         if gw_time_prior is not None:
             f.attrs["cls_anchor_policy"] = "global_gw_prior"
             f.attrs["cls_anchor_source_h5"] = str(cls_time_anchor_gw_h5)
@@ -1206,6 +1853,47 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--min_nobs", type=int, default=5)
     p.add_argument("--snr_threshold", type=float, default=5.0)
     p.add_argument("--fixed_offset_days", type=float, default=0.0)
+    p.add_argument(
+        "--enforce_time_window",
+        type=str,
+        default="true",
+        help="Whether to force rel_time window filtering before truncation.",
+    )
+    p.add_argument("--time_window_start", type=float, default=DEFAULT_TIME_WINDOW_START)
+    p.add_argument("--time_window_end", type=float, default=DEFAULT_TIME_WINDOW_END)
+    p.add_argument(
+        "--write_meta_features",
+        type=str,
+        default="true",
+        help="Whether to write meta_n_obs/meta_n_det/meta_n_det_snr5/meta_n_bands/meta_t_span/meta_single_band_id.",
+    )
+    p.add_argument(
+        "--neg_match_pos_density",
+        type=str,
+        default="true",
+        help="Whether to downsample negatives to match positive joint density in (n_det,n_bands,t_span).",
+    )
+    p.add_argument(
+        "--density_match_pos_h5",
+        type=str,
+        default=None,
+        help="Positive H5 reference for density matching (defaults to --output_pos_h5 when available).",
+    )
+    p.add_argument(
+        "--density_bins_n_det",
+        type=str,
+        default=",".join(str(x) for x in DEFAULT_DENSITY_BINS_N_DET),
+    )
+    p.add_argument(
+        "--density_bins_n_bands",
+        type=str,
+        default=",".join(str(x) for x in DEFAULT_DENSITY_BINS_N_BANDS),
+    )
+    p.add_argument(
+        "--density_bins_t_span",
+        type=str,
+        default=",".join(str(x) for x in DEFAULT_DENSITY_BINS_T_SPAN),
+    )
     p.add_argument("--fluxcal_zp", type=float, default=27.5)
     p.add_argument("--psfflux_zp", type=float, default=31.4)
     p.add_argument("--lupt_k", type=float, default=1.0)
@@ -1246,6 +1934,24 @@ def main():
         lupt_k=float(args.lupt_k),
         lupt_m5_mag=lupt_m5_mag,
     )
+    enforce_time_window = parse_bool_arg(args.enforce_time_window, name="--enforce_time_window")
+    write_meta_features = parse_bool_arg(args.write_meta_features, name="--write_meta_features")
+    neg_match_pos_density = parse_bool_arg(args.neg_match_pos_density, name="--neg_match_pos_density")
+    time_window_start = float(args.time_window_start)
+    time_window_end = float(args.time_window_end)
+    if not (time_window_end > time_window_start):
+        raise ValueError(
+            f"time_window_end must be > time_window_start, got {time_window_start}..{time_window_end}"
+        )
+    density_bins_n_det = parse_bin_edges(
+        args.density_bins_n_det, DEFAULT_DENSITY_BINS_N_DET, name="--density_bins_n_det"
+    )
+    density_bins_n_bands = parse_bin_edges(
+        args.density_bins_n_bands, DEFAULT_DENSITY_BINS_N_BANDS, name="--density_bins_n_bands"
+    )
+    density_bins_t_span = parse_bin_edges(
+        args.density_bins_t_span, DEFAULT_DENSITY_BINS_T_SPAN, name="--density_bins_t_span"
+    )
 
     build_pos = bool(args.build_positive)
     build_neg = bool(args.build_negative)
@@ -1280,6 +1986,10 @@ def main():
             max_lcs_per_event=args.max_lcs_per_event,
             buffer_limit=int(args.buffer_limit),
             num_workers=int(args.num_workers),
+            enforce_time_window=bool(enforce_time_window),
+            time_window_start=float(time_window_start),
+            time_window_end=float(time_window_end),
+            write_meta_features=bool(write_meta_features),
         )
 
     if build_neg:
@@ -1287,6 +1997,15 @@ def main():
             raise ValueError("--output_neg_h5 is required when building negative dataset.")
         if args.neg_sim_root is None:
             raise ValueError("--neg_sim_root is required when building negative dataset.")
+        density_match_pos_h5 = (
+            Path(args.density_match_pos_h5)
+            if args.density_match_pos_h5
+            else (Path(args.output_pos_h5) if args.output_pos_h5 else None)
+        )
+        if neg_match_pos_density and density_match_pos_h5 is None:
+            raise ValueError(
+                "neg_match_pos_density=true requires --density_match_pos_h5 or --output_pos_h5."
+            )
         create_negative_h5(
             output_h5=Path(args.output_neg_h5),
             neg_sim_root=Path(args.neg_sim_root),
@@ -1306,6 +2025,15 @@ def main():
             num_workers=int(args.num_workers),
             cls_time_anchor_gw_h5=Path(args.cls_time_anchor_gw_h5) if args.cls_time_anchor_gw_h5 else None,
             cls_time_anchor_seed=int(args.cls_time_anchor_seed),
+            enforce_time_window=bool(enforce_time_window),
+            time_window_start=float(time_window_start),
+            time_window_end=float(time_window_end),
+            write_meta_features=bool(write_meta_features),
+            neg_match_pos_density=bool(neg_match_pos_density),
+            density_match_pos_h5=density_match_pos_h5,
+            density_bins_n_det=density_bins_n_det,
+            density_bins_n_bands=density_bins_n_bands,
+            density_bins_t_span=density_bins_t_span,
         )
 
 
