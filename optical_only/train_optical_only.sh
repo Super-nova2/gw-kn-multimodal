@@ -13,14 +13,26 @@
 
 set -euo pipefail
 
-args_file=${1:-}
-if [[ -z "${args_file}" || ! -f "${args_file}" ]]; then
-    echo "Usage: $0 <optical_only_args.json>"
+DEFAULT_ARGS_FILE="/fred/oz016/bgao_kn/ML+GW+KN/optical_only/args/optical_only_kn_v6.json"
+args_file=${1:-${OPTICAL_ONLY_ARGS_FILE:-${DEFAULT_ARGS_FILE}}}
+if [[ ! -f "${args_file}" ]]; then
+    echo "Args file not found: ${args_file}"
+    echo "Usage: $0 [optical_only_args.json]"
+    echo "Default args file: ${DEFAULT_ARGS_FILE}"
     exit 1
 fi
 
 args_dir="$(cd "$(dirname "${args_file}")" && pwd)"
 args_file="${args_dir}/$(basename "${args_file}")"
+
+is_truthy() {
+    local v
+    v="$(echo "${1:-}" | tr '[:upper:]' '[:lower:]')"
+    case "${v}" in
+        1|true|yes|y|on) return 0 ;;
+    esac
+    return 1
+}
 
 if [[ -z "${SLURM_JOB_ID:-}" ]]; then
     if ! command -v sbatch >/dev/null 2>&1; then
@@ -143,6 +155,23 @@ OFFSET_EVAL_QUANTILES=$(jq -r '.offset_eval_quantiles // empty' "$args_file")
 OFFSET_SCALE_DAYS_DIVISOR=$(jq -r '.offset_scale_days_divisor // empty' "$args_file")
 OFFSET_SEED=$(jq -r '.offset_seed // empty' "$args_file")
 OFFSET_BANK_SIZE=$(jq -r '.offset_bank_size // empty' "$args_file")
+META_MATCHED_SAMPLING=$(jq -r '.meta_matched_sampling // empty' "$args_file")
+META_MATCH_FALLBACK=$(jq -r '.meta_match_fallback // empty' "$args_file")
+SINGLE_BAND_KEEP_PROB=$(jq -r '.single_band_keep_prob // empty' "$args_file")
+TARGET_NDET_JITTER=$(jq -r '.target_ndet_jitter // empty' "$args_file")
+SHORTCUT_AUDIT_ENABLE=$(jq -r '.shortcut_audit_enable // empty' "$args_file")
+SHORTCUT_AUDIT_VAL_SAMPLES=$(jq -r '.shortcut_audit_val_samples // empty' "$args_file")
+PREFIX_TRAIN_ENABLE=$(jq -r '.prefix_train_enable // false' "$args_file")
+PREFIX_MIN_DET=$(jq -r '.prefix_min_det // empty' "$args_file")
+PREFIX_TRAIN_SAMPLING=$(jq -r '.prefix_train_sampling // empty' "$args_file")
+PREFIX_TERMINAL_MIX_PROB=$(jq -r '.prefix_terminal_mix_prob // empty' "$args_file")
+PREFIX_REAL_MIX_WEIGHT=$(jq -r '.prefix_real_mix_weight // empty' "$args_file")
+PREFIX_BUCKET_UNIFORM_MIX_WEIGHT=$(jq -r '.prefix_bucket_uniform_mix_weight // empty' "$args_file")
+PREFIX_TERMINAL_MIX_WEIGHT=$(jq -r '.prefix_terminal_mix_weight // empty' "$args_file")
+PREFIX_EVAL_DET_SUPPORT=$(jq -r '.prefix_eval_det_support // empty' "$args_file")
+PREFIX_REAL_HIST_PATH=$(jq -r '.prefix_real_hist_path // empty' "$args_file")
+PREFIX_EVAL_ENABLE=$(jq -r '.prefix_eval_enable // empty' "$args_file")
+PREFIX_MANIFEST_OUT=$(jq -r '(.prefix_manifest_out // .eval_prefix_manifest_out) // empty' "$args_file")
 
 OPTICAL_V2_EVAL_POS_DEFAULT="/fred/oz016/bgao_kn/data/Optical_Only_dataset/combined_dataset_test.h5"
 OPTICAL_V2_EVAL_NEG_DEFAULT="/fred/oz016/bgao_kn/data/Optical_Only_dataset/Tutorial_negative_dataset.h5"
@@ -206,13 +235,32 @@ echo "Train NEG data: $NEG_DATA_PATH"
 if [[ -n "$NEG_GROUP" && "$NEG_GROUP" != "null" ]]; then
     echo "Train NEG group: $NEG_GROUP"
 fi
+echo "Prefix train enable: ${PREFIX_TRAIN_ENABLE}"
+if is_truthy "$PREFIX_TRAIN_ENABLE"; then
+    echo "Prefix min detections: ${PREFIX_MIN_DET:-<default>}"
+    echo "Prefix train sampling: ${PREFIX_TRAIN_SAMPLING:-<default>}"
+    echo "Prefix terminal mix prob: ${PREFIX_TERMINAL_MIX_PROB:-<default>}"
+    echo "Prefix eval det support: ${PREFIX_EVAL_DET_SUPPORT:-<default>}"
+    echo "Prefix real-stream hist: ${PREFIX_REAL_HIST_PATH:-<missing>}"
+fi
 echo "Eval POS data (resolved): $EVAL_POS_DATA_PATH"
 echo "Eval NEG data (resolved): $EVAL_NEG_DATA_PATH"
 echo "Eval NEG group (resolved): $EVAL_NEG_GROUP"
 echo ""
 
+if is_truthy "$PREFIX_TRAIN_ENABLE"; then
+    if [[ -z "$PREFIX_REAL_HIST_PATH" || "$PREFIX_REAL_HIST_PATH" == "null" ]]; then
+        echo "prefix_train_enable=true but prefix_real_hist_path is missing in $args_file"
+        exit 1
+    fi
+    if [[ ! -f "$PREFIX_REAL_HIST_PATH" ]]; then
+        echo "Prefix real-stream histogram file not found: $PREFIX_REAL_HIST_PATH"
+        exit 1
+    fi
+fi
+
 # Optional: stage large HDF5 to local disk to reduce shared filesystem I/O
-if [[ "$STAGE_TO_JOBFS" == "true" ]]; then
+if is_truthy "$STAGE_TO_JOBFS"; then
     JOBFS_DIR="${SLURM_TMPDIR:-${TMPDIR:-${JOBFS:-}}}"
     if [[ -n "$JOBFS_DIR" ]]; then
         echo "Staging datasets to local disk: $JOBFS_DIR"
@@ -221,6 +269,7 @@ if [[ "$STAGE_TO_JOBFS" == "true" ]]; then
         EVAL_POS_LOCAL="$JOBFS_DIR/eval_pos_$(basename "$EVAL_POS_DATA_PATH")"
         EVAL_NEG_LOCAL="$JOBFS_DIR/eval_neg_$(basename "$EVAL_NEG_DATA_PATH")"
         OFFSET_DIST_LOCAL=""
+        PREFIX_REAL_HIST_LOCAL=""
 
         cp -f "$POS_DATA_PATH" "$TRAIN_POS_LOCAL"
         POS_DATA_PATH="$TRAIN_POS_LOCAL"
@@ -230,10 +279,15 @@ if [[ "$STAGE_TO_JOBFS" == "true" ]]; then
         EVAL_POS_DATA_PATH="$EVAL_POS_LOCAL"
         cp -f "$EVAL_NEG_DATA_PATH" "$EVAL_NEG_LOCAL"
         EVAL_NEG_DATA_PATH="$EVAL_NEG_LOCAL"
-        if [[ "$TIME_OFFSET_ENABLE" == "true" && -n "$OFFSET_DIST_NPZ" && "$OFFSET_DIST_NPZ" != "null" ]]; then
+        if is_truthy "$TIME_OFFSET_ENABLE" && [[ -n "$OFFSET_DIST_NPZ" && "$OFFSET_DIST_NPZ" != "null" ]]; then
             OFFSET_DIST_LOCAL="$JOBFS_DIR/offset_dist_$(basename "$OFFSET_DIST_NPZ")"
             cp -f "$OFFSET_DIST_NPZ" "$OFFSET_DIST_LOCAL"
             OFFSET_DIST_NPZ="$OFFSET_DIST_LOCAL"
+        fi
+        if is_truthy "$PREFIX_TRAIN_ENABLE" && [[ -n "$PREFIX_REAL_HIST_PATH" && "$PREFIX_REAL_HIST_PATH" != "null" ]]; then
+            PREFIX_REAL_HIST_LOCAL="$JOBFS_DIR/prefix_hist_$(basename "$PREFIX_REAL_HIST_PATH")"
+            cp -f "$PREFIX_REAL_HIST_PATH" "$PREFIX_REAL_HIST_LOCAL"
+            PREFIX_REAL_HIST_PATH="$PREFIX_REAL_HIST_LOCAL"
         fi
         echo "Staging complete."
     else
@@ -243,6 +297,7 @@ fi
 
 cmd=(
     python -u /fred/oz016/bgao_kn/ML+GW+KN/optical_only/train_optical_only.py
+    --config "$args_file"
     --pos_data_path "$POS_DATA_PATH"
     --neg_data_path "$NEG_DATA_PATH"
     --ckpt_path "$CKPT_PATH"
@@ -363,7 +418,7 @@ fi
 if [[ -n "$PREFETCH_FACTOR" && "$PREFETCH_FACTOR" != "null" ]]; then
     cmd+=(--prefetch_factor "$PREFETCH_FACTOR")
 fi
-if [[ "$CACHE_IN_MEMORY" == "true" ]]; then
+if is_truthy "$CACHE_IN_MEMORY"; then
     cmd+=(--cache_in_memory)
 fi
 if [[ -n "$SEED" && "$SEED" != "null" ]]; then
@@ -375,13 +430,13 @@ fi
 if [[ -n "$TB_FLUSH_SECS" && "$TB_FLUSH_SECS" != "null" ]]; then
     cmd+=(--tb_flush_secs "$TB_FLUSH_SECS")
 fi
-if [[ "$DISABLE_TENSORBOARD" == "true" ]]; then
+if is_truthy "$DISABLE_TENSORBOARD"; then
     cmd+=(--disable_tensorboard)
 fi
 if [[ -n "$RUN_NAME" && "$RUN_NAME" != "null" ]]; then
     cmd+=(--run_name "$RUN_NAME")
 fi
-if [[ "$TIME_OFFSET_ENABLE" == "true" ]]; then
+if is_truthy "$TIME_OFFSET_ENABLE"; then
     cmd+=(--time_offset_enable)
 fi
 if [[ -n "$OFFSET_DIST_NPZ" && "$OFFSET_DIST_NPZ" != "null" ]]; then
@@ -408,8 +463,36 @@ fi
 if [[ -n "$OFFSET_BANK_SIZE" && "$OFFSET_BANK_SIZE" != "null" ]]; then
     cmd+=(--offset_bank_size "$OFFSET_BANK_SIZE")
 fi
+if is_truthy "$PREFIX_TRAIN_ENABLE"; then
+    cmd+=(--prefix_train_enable)
+fi
+if [[ -n "$PREFIX_MIN_DET" && "$PREFIX_MIN_DET" != "null" ]]; then
+    cmd+=(--prefix_min_det "$PREFIX_MIN_DET")
+fi
+if [[ -n "$PREFIX_TRAIN_SAMPLING" && "$PREFIX_TRAIN_SAMPLING" != "null" ]]; then
+    cmd+=(--prefix_train_sampling "$PREFIX_TRAIN_SAMPLING")
+fi
+if [[ -n "$PREFIX_TERMINAL_MIX_PROB" && "$PREFIX_TERMINAL_MIX_PROB" != "null" ]]; then
+    cmd+=(--prefix_terminal_mix_prob "$PREFIX_TERMINAL_MIX_PROB")
+fi
+if [[ -n "$PREFIX_REAL_MIX_WEIGHT" && "$PREFIX_REAL_MIX_WEIGHT" != "null" ]]; then
+    cmd+=(--prefix_real_mix_weight "$PREFIX_REAL_MIX_WEIGHT")
+fi
+if [[ -n "$PREFIX_BUCKET_UNIFORM_MIX_WEIGHT" && "$PREFIX_BUCKET_UNIFORM_MIX_WEIGHT" != "null" ]]; then
+    cmd+=(--prefix_bucket_uniform_mix_weight "$PREFIX_BUCKET_UNIFORM_MIX_WEIGHT")
+fi
+if [[ -n "$PREFIX_TERMINAL_MIX_WEIGHT" && "$PREFIX_TERMINAL_MIX_WEIGHT" != "null" ]]; then
+    cmd+=(--prefix_terminal_mix_weight "$PREFIX_TERMINAL_MIX_WEIGHT")
+fi
+if [[ -n "$PREFIX_EVAL_DET_SUPPORT" && "$PREFIX_EVAL_DET_SUPPORT" != "null" ]]; then
+    cmd+=(--prefix_eval_det_support "$PREFIX_EVAL_DET_SUPPORT")
+fi
+if [[ -n "$PREFIX_REAL_HIST_PATH" && "$PREFIX_REAL_HIST_PATH" != "null" ]]; then
+    cmd+=(--prefix_real_hist_path "$PREFIX_REAL_HIST_PATH")
+fi
 
 echo "Training Command: ${cmd[*]}"
+echo "Optical controls (from config): meta_matched_sampling=${META_MATCHED_SAMPLING:-<default>}, meta_match_fallback=${META_MATCH_FALLBACK:-<default>}, single_band_keep_prob=${SINGLE_BAND_KEEP_PROB:-<default>}, target_ndet_jitter=${TARGET_NDET_JITTER:-<default>}, shortcut_audit_enable=${SHORTCUT_AUDIT_ENABLE:-<default>}, shortcut_audit_val_samples=${SHORTCUT_AUDIT_VAL_SAMPLES:-<default>}, prefix_train_enable=${PREFIX_TRAIN_ENABLE:-<default>}, prefix_min_det=${PREFIX_MIN_DET:-<default>}, prefix_train_sampling=${PREFIX_TRAIN_SAMPLING:-<default>}, prefix_mix_weights=${PREFIX_REAL_MIX_WEIGHT:-<default>}:${PREFIX_BUCKET_UNIFORM_MIX_WEIGHT:-<default>}:${PREFIX_TERMINAL_MIX_WEIGHT:-<default>}"
 set +e
 "${cmd[@]}"
 train_exit_code=$?
@@ -498,10 +581,10 @@ fi
 if [[ -n "$EVAL_TARGET_RECALL" && "$EVAL_TARGET_RECALL" != "null" ]]; then
     eval_cmd+=(--target_recall "$EVAL_TARGET_RECALL")
 fi
-if [[ "$EVAL_NO_PLOTS" == "true" ]]; then
+if is_truthy "$EVAL_NO_PLOTS"; then
     eval_cmd+=(--no_plots)
 fi
-if [[ "$TIME_OFFSET_ENABLE" == "true" ]]; then
+if is_truthy "$TIME_OFFSET_ENABLE"; then
     eval_cmd+=(--time_offset_enable)
 fi
 if [[ -n "$OFFSET_DIST_NPZ" && "$OFFSET_DIST_NPZ" != "null" ]]; then
@@ -518,6 +601,21 @@ if [[ -n "$OFFSET_EVAL_QUANTILES" && "$OFFSET_EVAL_QUANTILES" != "null" ]]; then
 fi
 if [[ -n "$OFFSET_SCALE_DAYS_DIVISOR" && "$OFFSET_SCALE_DAYS_DIVISOR" != "null" ]]; then
     eval_cmd+=(--offset_scale_days_divisor "$OFFSET_SCALE_DAYS_DIVISOR")
+fi
+if [[ -z "$PREFIX_EVAL_ENABLE" || "$PREFIX_EVAL_ENABLE" == "null" ]]; then
+    PREFIX_EVAL_ENABLE="$PREFIX_TRAIN_ENABLE"
+fi
+if is_truthy "$PREFIX_EVAL_ENABLE"; then
+    eval_cmd+=(--prefix_eval_enable)
+fi
+if [[ -n "$PREFIX_MIN_DET" && "$PREFIX_MIN_DET" != "null" ]]; then
+    eval_cmd+=(--prefix_min_det "$PREFIX_MIN_DET")
+fi
+if [[ -n "$PREFIX_EVAL_DET_SUPPORT" && "$PREFIX_EVAL_DET_SUPPORT" != "null" ]]; then
+    eval_cmd+=(--prefix_eval_det_support "$PREFIX_EVAL_DET_SUPPORT")
+fi
+if [[ -n "$PREFIX_MANIFEST_OUT" && "$PREFIX_MANIFEST_OUT" != "null" ]]; then
+    eval_cmd+=(--prefix_manifest_out "$PREFIX_MANIFEST_OUT")
 fi
 
 echo "Evaluation Command: ${eval_cmd[*]}"

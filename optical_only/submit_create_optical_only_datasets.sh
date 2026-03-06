@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH --job-name=BUILD_OPTICAL_ONLT_DATASET
+#SBATCH --job-name=BUILD_OPTICAL_ONLY_DATASET
 #SBATCH --output=logs/data/%x_%j.out
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -14,6 +14,11 @@ set -euo pipefail
 DATASET_MODE="${DATASET_MODE:-train}"   # train | test
 BUILD_POSITIVE="${BUILD_POSITIVE:-true}" # true|false
 BUILD_NEGATIVE="${BUILD_NEGATIVE:-true}" # true|false
+ENFORCE_TIME_WINDOW="${ENFORCE_TIME_WINDOW:-true}"  # true|false
+WRITE_META_FEATURES="${WRITE_META_FEATURES:-true}"  # true|false
+NEG_MATCH_POS_DENSITY="${NEG_MATCH_POS_DENSITY:-true}" # true|false
+PREFIX_TASK_ENABLE="${PREFIX_TASK_ENABLE:-true}"   # true|false
+DATASET_TAG="${DATASET_TAG:-}"
 
 normalize_bool() {
     local v
@@ -30,10 +35,27 @@ normalize_bool() {
 
 BUILD_POSITIVE="$(normalize_bool "${BUILD_POSITIVE}")"
 BUILD_NEGATIVE="$(normalize_bool "${BUILD_NEGATIVE}")"
+ENFORCE_TIME_WINDOW="$(normalize_bool "${ENFORCE_TIME_WINDOW}")"
+WRITE_META_FEATURES="$(normalize_bool "${WRITE_META_FEATURES}")"
+NEG_MATCH_POS_DENSITY="$(normalize_bool "${NEG_MATCH_POS_DENSITY}")"
+PREFIX_TASK_ENABLE="$(normalize_bool "${PREFIX_TASK_ENABLE}")"
 if [[ "${BUILD_POSITIVE}" != "true" && "${BUILD_NEGATIVE}" != "true" ]]; then
     echo "Nothing to build: BUILD_POSITIVE=${BUILD_POSITIVE}, BUILD_NEGATIVE=${BUILD_NEGATIVE}"
     echo "Set at least one of BUILD_POSITIVE/BUILD_NEGATIVE to true."
     exit 1
+fi
+if [[ "${PREFIX_TASK_ENABLE}" == "true" && "${WRITE_META_FEATURES}" != "true" ]]; then
+    echo "PREFIX_TASK_ENABLE=true requires WRITE_META_FEATURES=true so meta_n_obs/meta_n_det_snr5 are written."
+    exit 1
+fi
+if [[ -z "${DATASET_TAG}" && "${PREFIX_TASK_ENABLE}" == "true" ]]; then
+    DATASET_TAG="v7_prefix_full"
+fi
+DATASET_TAG_SLUG="${DATASET_TAG//[^A-Za-z0-9._-]/_}"
+if [[ -n "${DATASET_TAG_SLUG}" ]]; then
+    LOCK_TAG="_${DATASET_TAG_SLUG}"
+else
+    LOCK_TAG=""
 fi
 
 # Self-submit: run this script directly to submit job to Slurm.
@@ -46,7 +68,7 @@ if [[ -z "${SLURM_JOB_ID:-}" ]]; then
     script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     script_path="${script_dir}/$(basename "${BASH_SOURCE[0]}")"
 
-    mkdir -p /fred/oz016/bgao_kn/logs/optical_only
+    mkdir -p /fred/oz016/bgao_kn/logs/data
     echo "Submitting: sbatch ${script_path}"
     sbatch "${script_path}"
     exit 0
@@ -69,8 +91,13 @@ case "${DATASET_MODE}" in
         NEG_SIM_ROOT="/fred/oz016/bgao_kn/data/ELASTICC2_TRAIN_02"
         NEG_GROUP="ELASTICC2/optical_data"
 
-        OUTPUT_POS_H5="/fred/oz016/bgao_kn/data/Optical_Only_dataset/combined_dataset_train.h5"
-        OUTPUT_NEG_H5="/fred/oz016/bgao_kn/data/Optical_Only_dataset/ELASTICC2_negative_dataset.h5"
+        if [[ "${PREFIX_TASK_ENABLE}" == "true" ]]; then
+            OUTPUT_POS_H5_DEFAULT="/fred/oz016/bgao_kn/data/Optical_Only_dataset/combined_dataset_train_${DATASET_TAG_SLUG}.h5"
+            OUTPUT_NEG_H5_DEFAULT="/fred/oz016/bgao_kn/data/Optical_Only_dataset/ELASTICC2_negative_dataset_${DATASET_TAG_SLUG}.h5"
+        else
+            OUTPUT_POS_H5_DEFAULT="/fred/oz016/bgao_kn/data/Optical_Only_dataset/combined_dataset_train.h5"
+            OUTPUT_NEG_H5_DEFAULT="/fred/oz016/bgao_kn/data/Optical_Only_dataset/ELASTICC2_negative_dataset.h5"
+        fi
         CLS_TIME_ANCHOR_GW_H5_DEFAULT="/fred/oz016/bgao_kn/data/ALBEF_dataset/combined_dataset_train.h5"
         ;;
     test)
@@ -83,8 +110,13 @@ case "${DATASET_MODE}" in
         NEG_SIM_ROOT="/fred/oz016/bgao_kn/data/Tutorial_LSST_sims_2025"
         NEG_GROUP="Tutorial/optical_data"
 
-        OUTPUT_POS_H5="/fred/oz016/bgao_kn/data/Optical_Only_dataset/combined_dataset_test.h5"
-        OUTPUT_NEG_H5="/fred/oz016/bgao_kn/data/Optical_Only_dataset/Tutorial_negative_dataset.h5"
+        if [[ "${PREFIX_TASK_ENABLE}" == "true" ]]; then
+            OUTPUT_POS_H5_DEFAULT="/fred/oz016/bgao_kn/data/Optical_Only_dataset/combined_dataset_test_${DATASET_TAG_SLUG}.h5"
+            OUTPUT_NEG_H5_DEFAULT="/fred/oz016/bgao_kn/data/Optical_Only_dataset/Tutorial_negative_dataset_${DATASET_TAG_SLUG}.h5"
+        else
+            OUTPUT_POS_H5_DEFAULT="/fred/oz016/bgao_kn/data/Optical_Only_dataset/combined_dataset_test.h5"
+            OUTPUT_NEG_H5_DEFAULT="/fred/oz016/bgao_kn/data/Optical_Only_dataset/Tutorial_negative_dataset.h5"
+        fi
         # C2: use a global GW-time prior from training set for cls base anchoring.
         CLS_TIME_ANCHOR_GW_H5_DEFAULT="/fred/oz016/bgao_kn/data/ALBEF_dataset/combined_dataset_train.h5"
         ;;
@@ -94,18 +126,35 @@ case "${DATASET_MODE}" in
         ;;
 esac
 
+OUTPUT_POS_H5="${OUTPUT_POS_H5:-$OUTPUT_POS_H5_DEFAULT}"
+OUTPUT_NEG_H5="${OUTPUT_NEG_H5:-$OUTPUT_NEG_H5_DEFAULT}"
 CLS_TIME_ANCHOR_GW_H5="${CLS_TIME_ANCHOR_GW_H5:-$CLS_TIME_ANCHOR_GW_H5_DEFAULT}"
 CLS_TIME_ANCHOR_SEED="${CLS_TIME_ANCHOR_SEED:-42}"
 
-MIN_NOBS=5
-SNR_THRESHOLD=5.0
-BUFFER_LIMIT=3000
-FIXED_OFFSET_DAYS=0.0
-MAX_LCS_PER_EVENT=1000
+if [[ "${PREFIX_TASK_ENABLE}" == "true" ]]; then
+    MIN_NOBS_DEFAULT=2
+    DENSITY_BINS_N_DET_DEFAULT="2,3,4,5,6,8,10,12,20,40,80,200"
+else
+    MIN_NOBS_DEFAULT=5
+    DENSITY_BINS_N_DET_DEFAULT="3,5,8,12,20,40,80,200"
+fi
+
+MIN_NOBS="${MIN_NOBS:-$MIN_NOBS_DEFAULT}"
+SNR_THRESHOLD="${SNR_THRESHOLD:-5.0}"
+BUFFER_LIMIT="${BUFFER_LIMIT:-3000}"
+FIXED_OFFSET_DAYS="${FIXED_OFFSET_DAYS:-0.0}"
+MAX_LCS_PER_EVENT="${MAX_LCS_PER_EVENT:-1000}"
+MAX_NEGATIVE_HEADS="${MAX_NEGATIVE_HEADS:-}"
+TIME_WINDOW_START="${TIME_WINDOW_START:--0.3}"
+TIME_WINDOW_END="${TIME_WINDOW_END:-0.6}"
+DENSITY_BINS_N_DET="${DENSITY_BINS_N_DET:-$DENSITY_BINS_N_DET_DEFAULT}"
+DENSITY_BINS_N_BANDS="${DENSITY_BINS_N_BANDS:-1,2,3,4,5,6}"
+DENSITY_BINS_T_SPAN="${DENSITY_BINS_T_SPAN:-0,0.01,0.05,0.1,0.2,0.5,1.0}"
 FLUXCAL_ZP="${FLUXCAL_ZP:-27.5}"
 PSFFLUX_ZP="${PSFFLUX_ZP:-31.4}"
 LUPT_K="${LUPT_K:-1.0}"
 LUPT_M5_MAG="${LUPT_M5_MAG:-23.9,25.0,24.7,24.0,23.3,22.1}"
+DENSITY_MATCH_POS_H5="${DENSITY_MATCH_POS_H5:-$OUTPUT_POS_H5}"
 # Conservative default to reduce worker crashes on large FITS parsing.
 NUM_WORKERS="${NUM_WORKERS:-4}"
 if [[ -n "${SLURM_CPUS_PER_TASK:-}" && "${NUM_WORKERS}" -gt "${SLURM_CPUS_PER_TASK}" ]]; then
@@ -126,7 +175,7 @@ if [[ "${BUILD_NEGATIVE}" == "true" ]]; then
 fi
 
 # Prevent concurrent jobs from writing the same dataset outputs.
-LOCK_FILE="/fred/oz016/bgao_kn/data/Optical_Only_dataset/.build_optical_only_${DATASET_MODE}.lock"
+LOCK_FILE="/fred/oz016/bgao_kn/data/Optical_Only_dataset/.build_optical_only_${DATASET_MODE}${LOCK_TAG}.lock"
 exec 200>"${LOCK_FILE}"
 if ! flock -n 200; then
     echo "Another build job is already running for DATASET_MODE=${DATASET_MODE}."
@@ -142,6 +191,8 @@ echo "Start: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
 echo "========================================"
 echo "Build script: ${BUILD_SCRIPT}"
 echo "Dataset mode: ${DATASET_MODE}"
+echo "Prefix task enable: ${PREFIX_TASK_ENABLE}"
+echo "Dataset tag: ${DATASET_TAG_SLUG:-<legacy-default>}"
 echo "Build positive: ${BUILD_POSITIVE}"
 echo "Build negative: ${BUILD_NEGATIVE}"
 echo "Output POS: ${OUTPUT_POS_H5}"
@@ -152,11 +203,27 @@ echo "Workers: ${NUM_WORKERS}"
 echo "CLS anchor GW prior: ${CLS_TIME_ANCHOR_GW_H5}"
 echo "Flux zeropoints: FLUXCAL_ZP=${FLUXCAL_ZP}, PSFFLUX_ZP=${PSFFLUX_ZP}"
 echo "Luptitude params: LUPT_K=${LUPT_K}, LUPT_M5_MAG=${LUPT_M5_MAG}"
+echo "Time window: enforce=${ENFORCE_TIME_WINDOW}, range=[${TIME_WINDOW_START}, ${TIME_WINDOW_END}]"
+echo "Meta features: write_meta_features=${WRITE_META_FEATURES}"
+echo "Density matching: neg_match_pos_density=${NEG_MATCH_POS_DENSITY}"
+echo "Density ref POS H5: ${DENSITY_MATCH_POS_H5}"
+echo "Density bins: n_det=${DENSITY_BINS_N_DET}"
+echo "Density bins: n_bands=${DENSITY_BINS_N_BANDS}"
+echo "Density bins: t_span=${DENSITY_BINS_T_SPAN}"
 echo "========================================"
 
 if [[ "${BUILD_NEGATIVE}" == "true" && ! -f "${CLS_TIME_ANCHOR_GW_H5}" ]]; then
     echo "GW anchor H5 not found: ${CLS_TIME_ANCHOR_GW_H5}"
     exit 1
+fi
+if [[ "${BUILD_NEGATIVE}" == "true" && "${NEG_MATCH_POS_DENSITY}" == "true" ]]; then
+    if [[ "${BUILD_POSITIVE}" == "true" && "${DENSITY_MATCH_POS_H5}" == "${OUTPUT_POS_H5}" ]]; then
+        :
+    elif [[ ! -f "${DENSITY_MATCH_POS_H5}" ]]; then
+        echo "Density-match positive H5 not found: ${DENSITY_MATCH_POS_H5}"
+        echo "Set DENSITY_MATCH_POS_H5 to an existing positive H5, or build positives in the same run."
+        exit 1
+    fi
 fi
 
 cmd=(
@@ -171,7 +238,19 @@ cmd=(
     --psfflux_zp "${PSFFLUX_ZP}"
     --lupt_k "${LUPT_K}"
     --lupt_m5_mag "${LUPT_M5_MAG}"
+    --enforce_time_window "${ENFORCE_TIME_WINDOW}"
+    --time_window_start "${TIME_WINDOW_START}"
+    --time_window_end "${TIME_WINDOW_END}"
+    --write_meta_features "${WRITE_META_FEATURES}"
+    --neg_match_pos_density "${NEG_MATCH_POS_DENSITY}"
+    --density_bins_n_det "${DENSITY_BINS_N_DET}"
+    --density_bins_n_bands "${DENSITY_BINS_N_BANDS}"
+    --density_bins_t_span "${DENSITY_BINS_T_SPAN}"
 )
+
+if [[ -n "${MAX_NEGATIVE_HEADS}" ]]; then
+    cmd+=(--max_negative_heads "${MAX_NEGATIVE_HEADS}")
+fi
 
 if [[ "${BUILD_POSITIVE}" == "true" ]]; then
     cmd+=(
@@ -192,6 +271,7 @@ if [[ "${BUILD_NEGATIVE}" == "true" ]]; then
         --neg_sim_root "${NEG_SIM_ROOT}"
         --cls_time_anchor_gw_h5 "${CLS_TIME_ANCHOR_GW_H5}"
         --cls_time_anchor_seed "${CLS_TIME_ANCHOR_SEED}"
+        --density_match_pos_h5 "${DENSITY_MATCH_POS_H5}"
     )
 fi
 

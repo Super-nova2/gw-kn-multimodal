@@ -11,10 +11,17 @@ import warnings
 warnings.filterwarnings("ignore", "Wswiglal-redir-stdio")
 import torch
 from collections import defaultdict
-from typing import List, Iterator, Optional, Tuple, Sequence
+from typing import Dict, List, Iterator, Optional, Tuple, Sequence
 from torch.utils.data import Dataset, DataLoader, Sampler
 from pathlib import Path
 import subprocess
+
+from optical_prefix import (
+    DEFAULT_PREFIX_DET_SUPPORT,
+    apply_prefix_right_censoring_numpy,
+    build_prefix_manifest_entries,
+    parse_prefix_det_support,
+)
 
 
 def _normalize_day_windows(windows) -> List[float]:
@@ -1327,6 +1334,10 @@ class OpticalBinaryDataset(Dataset):
     Negative samples come from:
         neg_h5_path/{neg_group}/*
     """
+    DEFAULT_META_BINS_N_DET = np.asarray([3, 5, 8, 12, 20, 40, 80, 200], dtype=np.float64)
+    DEFAULT_META_BINS_N_BANDS = np.asarray([1, 2, 3, 4, 5, 6], dtype=np.float64)
+    DEFAULT_META_BINS_T_SPAN = np.asarray([0.0, 0.01, 0.05, 0.1, 0.2, 0.5, 1.0], dtype=np.float64)
+
     def __init__(
         self,
         pos_h5_path: str,
@@ -1335,6 +1346,8 @@ class OpticalBinaryDataset(Dataset):
         pos_indices: Optional[np.ndarray] = None,
         neg_indices: Optional[np.ndarray] = None,
         cache_in_memory: bool = False,
+        load_meta_features: bool = True,
+        return_prefix_aux: bool = False,
     ):
         super().__init__()
         self.pos_h5_path = pos_h5_path
@@ -1344,14 +1357,29 @@ class OpticalBinaryDataset(Dataset):
 
         self.pos_file = None
         self.neg_file = None
+        self.pos_meta = {}
+        self.neg_meta = {}
+        self._meta_loaded = False
+        self._load_meta_features = bool(load_meta_features)
+        self.return_prefix_aux = bool(return_prefix_aux)
 
         with h5py.File(self.pos_h5_path, "r") as f:
             n_pos_total = int(f["events/optical_data/values"].shape[0])
+            if self.return_prefix_aux and "slot_is_detection" not in f["events/optical_data"]:
+                raise KeyError(
+                    "Prefix auxiliary fields requested but 'events/optical_data/slot_is_detection' is missing "
+                    f"in {self.pos_h5_path}"
+                )
 
         with h5py.File(self.neg_h5_path, "r") as f:
             if self.neg_group not in f:
                 raise KeyError(f"Negative group '{self.neg_group}' not found in {self.neg_h5_path}")
             n_neg_total = int(f[f"{self.neg_group}/values"].shape[0])
+            if self.return_prefix_aux and "slot_is_detection" not in f[self.neg_group]:
+                raise KeyError(
+                    f"Prefix auxiliary fields requested but '{self.neg_group}/slot_is_detection' is missing "
+                    f"in {self.neg_h5_path}"
+                )
 
         self.pos_indices = (
             np.arange(n_pos_total, dtype=np.int64)
@@ -1371,12 +1399,128 @@ class OpticalBinaryDataset(Dataset):
                 f"OpticalBinaryDataset requires both classes. got n_pos={self.n_pos}, n_neg={self.n_neg}"
             )
 
+        if self._load_meta_features:
+            self._ensure_meta_loaded()
+
         self.length = self.n_pos + self.n_neg
 
         if self.cache_in_memory:
             # Avoid caching multi-million samples by default; keep memory predictable.
             print("OpticalBinaryDataset: cache_in_memory is not supported, using lazy HDF5 loading.")
             self.cache_in_memory = False
+
+    @staticmethod
+    def _compute_meta_from_sample(mask_mat: np.ndarray, time_vec: np.ndarray) -> Tuple[int, int, float, int]:
+        mask_bin = np.asarray(mask_mat, dtype=np.float32) > 0
+        n_det = int(mask_bin.sum())
+        band_hits = mask_bin.sum(axis=0) > 0
+        n_bands = int(band_hits.sum())
+        single_band_id = int(np.argmax(band_hits)) if n_bands == 1 else -1
+        slot_valid = mask_bin.sum(axis=1) > 0
+        if np.any(slot_valid):
+            tv = np.asarray(time_vec, dtype=np.float32)[slot_valid]
+            t_span = float(np.max(tv) - np.min(tv))
+        else:
+            t_span = 0.0
+        return n_det, n_bands, t_span, single_band_id
+
+    @classmethod
+    def _load_or_compute_meta_arrays(
+        cls,
+        h5_file: h5py.File,
+        group: str,
+        chunk_size: int = 8192,
+    ) -> dict:
+        if group not in h5_file:
+            raise KeyError(f"Group '{group}' not found in H5 file.")
+        grp = h5_file[group]
+        n_total = int(grp["values"].shape[0])
+        if (
+            "meta_n_obs" in grp
+            and "meta_n_det_snr5" in grp
+            and "meta_n_bands" in grp
+            and "meta_t_span" in grp
+            and "meta_single_band_id" in grp
+        ):
+            return {
+                "n_obs": np.asarray(grp["meta_n_obs"][:], dtype=np.float32).reshape(-1),
+                "n_det": np.asarray(grp["meta_n_det_snr5"][:], dtype=np.float32).reshape(-1),
+                "n_bands": np.asarray(grp["meta_n_bands"][:], dtype=np.float32).reshape(-1),
+                "t_span": np.asarray(grp["meta_t_span"][:], dtype=np.float32).reshape(-1),
+                "single_band_id": np.asarray(grp["meta_single_band_id"][:], dtype=np.int16).reshape(-1),
+            }
+        if (
+            "meta_n_det" in grp
+            and "meta_n_bands" in grp
+            and "meta_t_span" in grp
+            and "meta_single_band_id" in grp
+        ):
+            return {
+                "n_obs": np.asarray(grp["meta_n_det"][:], dtype=np.float32).reshape(-1),
+                "n_det": np.asarray(grp["meta_n_det"][:], dtype=np.float32).reshape(-1),
+                "n_bands": np.asarray(grp["meta_n_bands"][:], dtype=np.float32).reshape(-1),
+                "t_span": np.asarray(grp["meta_t_span"][:], dtype=np.float32).reshape(-1),
+                "single_band_id": np.asarray(grp["meta_single_band_id"][:], dtype=np.int16).reshape(-1),
+            }
+
+        ds_masks = grp["masks"]
+        ds_times = grp["times"]
+        ds_slot_is_detection = grp["slot_is_detection"] if "slot_is_detection" in grp else None
+        n_obs = np.zeros((n_total,), dtype=np.float32)
+        n_det = np.zeros((n_total,), dtype=np.float32)
+        n_bands = np.zeros((n_total,), dtype=np.float32)
+        t_span = np.zeros((n_total,), dtype=np.float32)
+        single_band_id = np.full((n_total,), -1, dtype=np.int16)
+        for s in range(0, n_total, int(chunk_size)):
+            e = min(s + int(chunk_size), n_total)
+            masks = np.asarray(ds_masks[s:e], dtype=np.float32)
+            times = np.asarray(ds_times[s:e], dtype=np.float32)
+            slot_det = (
+                np.asarray(ds_slot_is_detection[s:e], dtype=np.float32)
+                if ds_slot_is_detection is not None
+                else None
+            )
+            for i in range(masks.shape[0]):
+                nd_obs, nb, ts, sb = cls._compute_meta_from_sample(masks[i], times[i])
+                idx = s + i
+                n_obs[idx] = float(nd_obs)
+                if slot_det is not None:
+                    n_det[idx] = float(np.sum(np.asarray(slot_det[i], dtype=np.float32) > 0))
+                else:
+                    n_det[idx] = float(nd_obs)
+                n_bands[idx] = float(nb)
+                t_span[idx] = float(ts)
+                single_band_id[idx] = int(sb)
+        return {
+            "n_obs": n_obs,
+            "n_det": n_det,
+            "n_bands": n_bands,
+            "t_span": t_span,
+            "single_band_id": single_band_id,
+        }
+
+    def _ensure_meta_loaded(self):
+        if self._meta_loaded:
+            return
+        with h5py.File(self.pos_h5_path, "r") as f:
+            pos_meta_full = self._load_or_compute_meta_arrays(f, "events/optical_data")
+        with h5py.File(self.neg_h5_path, "r") as f:
+            neg_meta_full = self._load_or_compute_meta_arrays(f, self.neg_group)
+        self.pos_meta = {
+            "n_obs": np.asarray(pos_meta_full["n_obs"][self.pos_indices], dtype=np.float32),
+            "n_det": np.asarray(pos_meta_full["n_det"][self.pos_indices], dtype=np.float32),
+            "n_bands": np.asarray(pos_meta_full["n_bands"][self.pos_indices], dtype=np.float32),
+            "t_span": np.asarray(pos_meta_full["t_span"][self.pos_indices], dtype=np.float32),
+            "single_band_id": np.asarray(pos_meta_full["single_band_id"][self.pos_indices], dtype=np.int16),
+        }
+        self.neg_meta = {
+            "n_obs": np.asarray(neg_meta_full["n_obs"][self.neg_indices], dtype=np.float32),
+            "n_det": np.asarray(neg_meta_full["n_det"][self.neg_indices], dtype=np.float32),
+            "n_bands": np.asarray(neg_meta_full["n_bands"][self.neg_indices], dtype=np.float32),
+            "t_span": np.asarray(neg_meta_full["t_span"][self.neg_indices], dtype=np.float32),
+            "single_band_id": np.asarray(neg_meta_full["single_band_id"][self.neg_indices], dtype=np.int16),
+        }
+        self._meta_loaded = True
 
     def __len__(self):
         return self.length
@@ -1391,30 +1535,59 @@ class OpticalBinaryDataset(Dataset):
     def _as_tensor(arr):
         return torch.from_numpy(arr).to(torch.float32)
 
+    def _resolve_class_sample(self, label: int, class_local_idx: int):
+        self._ensure_files_open()
+        if int(label) == 1:
+            if class_local_idx < 0 or class_local_idx >= self.n_pos:
+                raise IndexError(f"Positive class index out of range: {class_local_idx}")
+            return self.pos_file, "events/optical_data", int(self.pos_indices[class_local_idx]), 1.0
+        if class_local_idx < 0 or class_local_idx >= self.n_neg:
+            raise IndexError(f"Negative class index out of range: {class_local_idx}")
+        return self.neg_file, self.neg_group, int(self.neg_indices[class_local_idx]), 0.0
+
+    def get_sample_arrays_by_class_index(self, label: int, class_local_idx: int):
+        f, grp, real_idx, target = self._resolve_class_sample(label, class_local_idx)
+        opt_val = np.asarray(f[f"{grp}/values"][real_idx], dtype=np.float32)
+        opt_err = np.asarray(f[f"{grp}/errors"][real_idx], dtype=np.float32)
+        opt_mask = np.asarray(f[f"{grp}/masks"][real_idx], dtype=np.float32)
+        opt_time = np.asarray(f[f"{grp}/times"][real_idx], dtype=np.float32)
+        slot_is_detection = None
+        if self.return_prefix_aux:
+            slot_is_detection = np.asarray(f[f"{grp}/slot_is_detection"][real_idx], dtype=np.float32)
+        return opt_time, opt_val, opt_mask, opt_err, slot_is_detection, float(target)
+
     def __getitem__(self, idx):
         if isinstance(idx, np.ndarray):
             idx = int(idx.item())
         idx = int(idx)
-        self._ensure_files_open()
 
         if idx < self.n_pos:
-            real_idx = int(self.pos_indices[idx])
-            grp = "events/optical_data"
-            f = self.pos_file
-            label = 1.0
+            opt_time, opt_val, opt_mask, opt_err, slot_is_detection, label = self.get_sample_arrays_by_class_index(
+                1, idx
+            )
         else:
-            real_idx = int(self.neg_indices[idx - self.n_pos])
-            grp = self.neg_group
-            f = self.neg_file
-            label = 0.0
-
-        opt_val = self._as_tensor(f[f"{grp}/values"][real_idx])
-        opt_err = self._as_tensor(f[f"{grp}/errors"][real_idx])
-        opt_mask = self._as_tensor(f[f"{grp}/masks"][real_idx])
-        opt_time = self._as_tensor(f[f"{grp}/times"][real_idx])
+            neg_local = idx - self.n_pos
+            opt_time, opt_val, opt_mask, opt_err, slot_is_detection, label = self.get_sample_arrays_by_class_index(
+                0, neg_local
+            )
 
         target = torch.tensor(label, dtype=torch.float32)
-        return opt_time, opt_val, opt_mask, opt_err, target
+        if self.return_prefix_aux:
+            return (
+                self._as_tensor(opt_time),
+                self._as_tensor(opt_val),
+                self._as_tensor(opt_mask),
+                self._as_tensor(opt_err),
+                target,
+                self._as_tensor(slot_is_detection),
+            )
+        return (
+            self._as_tensor(opt_time),
+            self._as_tensor(opt_val),
+            self._as_tensor(opt_mask),
+            self._as_tensor(opt_err),
+            target,
+        )
 
     def __del__(self):
         if self.pos_file is not None:
@@ -1427,6 +1600,136 @@ class OpticalBinaryDataset(Dataset):
                 self.neg_file.close()
             except Exception:
                 pass
+
+    def get_meta_for_sampling(self) -> dict:
+        self._ensure_meta_loaded()
+        return {
+            "pos": self.pos_meta,
+            "neg": self.neg_meta,
+        }
+
+
+class OpticalPrefixEvalDataset(Dataset):
+    """
+    Fixed-manifest prefix evaluation dataset built on top of OpticalBinaryDataset.
+    """
+
+    def __init__(
+        self,
+        base_dataset: OpticalBinaryDataset,
+        manifest_rows: List[Dict[str, object]],
+        prefix_min_det: int = 2,
+    ):
+        super().__init__()
+        if not base_dataset.return_prefix_aux:
+            raise ValueError("OpticalPrefixEvalDataset requires base_dataset.return_prefix_aux=True.")
+        self.base_dataset = base_dataset
+        self.prefix_min_det = int(prefix_min_det)
+        self.manifest = pd.DataFrame(manifest_rows).reset_index(drop=True)
+        if self.manifest.empty:
+            raise ValueError("OpticalPrefixEvalDataset received an empty manifest.")
+
+    def __len__(self):
+        return int(len(self.manifest))
+
+    def __getitem__(self, idx):
+        row = self.manifest.iloc[int(idx)]
+        label = int(row["label"])
+        class_idx = int(row["base_idx"])
+        target_k = int(row["prefix_det_target_k"])
+        opt_time, opt_val, opt_mask, opt_err, slot_is_detection, target = self.base_dataset.get_sample_arrays_by_class_index(
+            label, class_idx
+        )
+        opt_time, opt_val, opt_mask, opt_err, slot_is_detection, stats = apply_prefix_right_censoring_numpy(
+            opt_t=opt_time,
+            opt_v=opt_val,
+            opt_mask=opt_mask,
+            opt_err=opt_err,
+            slot_is_detection=slot_is_detection,
+            target_k=target_k,
+            min_det=self.prefix_min_det,
+        )
+        return (
+            torch.from_numpy(opt_time).to(torch.float32),
+            torch.from_numpy(opt_val).to(torch.float32),
+            torch.from_numpy(opt_mask).to(torch.float32),
+            torch.from_numpy(opt_err).to(torch.float32),
+            torch.tensor(target, dtype=torch.float32),
+            torch.from_numpy(slot_is_detection).to(torch.float32),
+            torch.tensor(int(stats["actual_target_k"]), dtype=torch.int64),
+            torch.tensor(1 if bool(stats["is_terminal_prefix"]) else 0, dtype=torch.int64),
+        )
+
+
+def _group_has_meta_features(h5_path: str, group: str) -> bool:
+    required_new = {"meta_n_obs", "meta_n_det_snr5", "meta_n_bands", "meta_t_span", "meta_single_band_id"}
+    required_old = {"meta_n_det", "meta_n_bands", "meta_t_span", "meta_single_band_id"}
+    with h5py.File(h5_path, "r") as f:
+        if group not in f:
+            return False
+        keys = set(f[group].keys())
+    return required_new.issubset(keys) or required_old.issubset(keys)
+
+
+def _group_has_slot_is_detection(h5_path: str, group: str) -> bool:
+    with h5py.File(h5_path, "r") as f:
+        if group not in f:
+            return False
+        return "slot_is_detection" in f[group]
+
+
+def _filter_indices_by_min_detection_count(
+    h5_path: str,
+    group: str,
+    indices: np.ndarray,
+    prefix_min_det: int,
+) -> np.ndarray:
+    idx = np.asarray(indices, dtype=np.int64).reshape(-1)
+    if idx.size == 0:
+        return idx
+    with h5py.File(h5_path, "r") as f:
+        meta = OpticalBinaryDataset._load_or_compute_meta_arrays(f, group)
+    det_counts = np.asarray(meta["n_det"][idx], dtype=np.float32)
+    keep = det_counts >= float(prefix_min_det)
+    return idx[keep]
+
+
+def _build_prefix_manifest_for_binary_dataset(
+    base_dataset: OpticalBinaryDataset,
+    det_support: Sequence[int],
+    prefix_min_det: int,
+    include_terminal: bool = True,
+) -> List[Dict[str, object]]:
+    manifest_rows: List[Dict[str, object]] = []
+    for pos_idx in range(base_dataset.n_pos):
+        opt_t, _, opt_mask, _, slot_is_detection, _ = base_dataset.get_sample_arrays_by_class_index(1, pos_idx)
+        manifest_rows.extend(
+            build_prefix_manifest_entries(
+                base_idx=pos_idx,
+                label=1,
+                opt_t=opt_t,
+                opt_mask=opt_mask,
+                slot_is_detection=slot_is_detection,
+                det_support=det_support,
+                min_det=prefix_min_det,
+                include_terminal=include_terminal,
+            )
+        )
+    for neg_idx in range(base_dataset.n_neg):
+        opt_t, _, opt_mask, _, slot_is_detection, _ = base_dataset.get_sample_arrays_by_class_index(0, neg_idx)
+        manifest_rows.extend(
+            build_prefix_manifest_entries(
+                base_idx=neg_idx,
+                label=0,
+                opt_t=opt_t,
+                opt_mask=opt_mask,
+                slot_is_detection=slot_is_detection,
+                det_support=det_support,
+                min_det=prefix_min_det,
+                include_terminal=include_terminal,
+            )
+        )
+    return manifest_rows
 
 
 class BalancedBinaryBatchSampler(Sampler):
@@ -1463,6 +1766,146 @@ class BalancedBinaryBatchSampler(Sampler):
             pos_idx = self.rng.integers(0, self.n_pos, size=self.pos_per_batch, endpoint=False)
             neg_idx = self.rng.integers(0, self.n_neg, size=self.neg_per_batch, endpoint=False) + self.n_pos
             batch = np.concatenate([pos_idx, neg_idx], axis=0)
+            if self.shuffle:
+                self.rng.shuffle(batch)
+            yield batch.tolist()
+
+    def __len__(self):
+        return self.steps_per_epoch
+
+
+class MetaMatchedBinaryBatchSampler(Sampler):
+    """
+    Balanced binary sampler that aligns negative draws to positive meta bins.
+
+    Each batch is still ~50/50 class-balanced. For each sampled positive index,
+    it tries to sample a negative from the same (n_det, n_bands, t_span) bin.
+    If no exact bin exists, it falls back to the nearest non-empty negative bin.
+    """
+
+    def __init__(
+        self,
+        pos_meta: dict,
+        neg_meta: dict,
+        batch_size: int,
+        steps_per_epoch: int,
+        seed: int = 42,
+        shuffle: bool = True,
+        bins_n_det: Sequence[float] = (3, 5, 8, 12, 20, 40, 80, 200),
+        bins_n_bands: Sequence[float] = (1, 2, 3, 4, 5, 6),
+        bins_t_span: Sequence[float] = (0.0, 0.01, 0.05, 0.1, 0.2, 0.5, 1.0),
+        fallback: str = "nearest",
+    ):
+        self.shuffle = bool(shuffle)
+        self.batch_size = int(batch_size)
+        self.steps_per_epoch = int(steps_per_epoch)
+        self.rng = np.random.default_rng(int(seed))
+        self.fallback = str(fallback).strip().lower()
+
+        if self.batch_size < 2:
+            raise ValueError("batch_size must be >= 2 for binary sampling.")
+        self.pos_per_batch = self.batch_size // 2
+        self.neg_per_batch = self.batch_size - self.pos_per_batch
+
+        self.pos_meta = pos_meta
+        self.neg_meta = neg_meta
+        self.n_pos = int(np.asarray(pos_meta["n_det"]).shape[0])
+        self.n_neg = int(np.asarray(neg_meta["n_det"]).shape[0])
+        if self.n_pos < 1 or self.n_neg < 1:
+            raise ValueError(
+                f"MetaMatchedBinaryBatchSampler requires both classes. got n_pos={self.n_pos}, n_neg={self.n_neg}"
+            )
+
+        self.edges_n_det = np.unique(np.asarray(list(bins_n_det), dtype=np.float64))
+        self.edges_n_bands = np.unique(np.asarray(list(bins_n_bands), dtype=np.float64))
+        self.edges_t_span = np.unique(np.asarray(list(bins_t_span), dtype=np.float64))
+        if (
+            self.edges_n_det.size == 0
+            or self.edges_n_bands.size == 0
+            or self.edges_t_span.size == 0
+        ):
+            raise ValueError("All meta bins must contain at least one edge.")
+
+        self.n_det_bins = int(self.edges_n_det.size + 1)
+        self.n_band_bins = int(self.edges_n_bands.size + 1)
+        self.n_span_bins = int(self.edges_t_span.size + 1)
+        self.n_joint_bins = int(self.n_det_bins * self.n_band_bins * self.n_span_bins)
+        self._nearest_cache = {}
+
+        self.pos_flat_bins = self._flat_bins_from_meta(self.pos_meta)
+        self.neg_flat_bins = self._flat_bins_from_meta(self.neg_meta)
+        self.neg_bins_to_indices = self._build_bin_index_map(self.neg_flat_bins)
+        self.neg_nonempty_bins = np.asarray(
+            sorted(self.neg_bins_to_indices.keys()), dtype=np.int64
+        ).reshape(-1)
+        if self.neg_nonempty_bins.size == 0:
+            raise ValueError("No non-empty negative bins available for meta-matched sampling.")
+        self.neg_nonempty_triplets = np.asarray(
+            [self._unflatten_bin(int(b)) for b in self.neg_nonempty_bins], dtype=np.int64
+        )
+
+    def _flat_bins_from_meta(self, meta: dict) -> np.ndarray:
+        n_det = np.asarray(meta["n_det"], dtype=np.float64).reshape(-1)
+        n_bands = np.asarray(meta["n_bands"], dtype=np.float64).reshape(-1)
+        t_span = np.asarray(meta["t_span"], dtype=np.float64).reshape(-1)
+        d = np.searchsorted(self.edges_n_det, n_det, side="right").astype(np.int64)
+        b = np.searchsorted(self.edges_n_bands, n_bands, side="right").astype(np.int64)
+        t = np.searchsorted(self.edges_t_span, t_span, side="right").astype(np.int64)
+        return ((d * self.n_band_bins) + b) * self.n_span_bins + t
+
+    @staticmethod
+    def _build_bin_index_map(flat_bins: np.ndarray) -> dict:
+        mapping = {}
+        for idx, b in enumerate(np.asarray(flat_bins, dtype=np.int64).tolist()):
+            mapping.setdefault(int(b), []).append(int(idx))
+        return {k: np.asarray(v, dtype=np.int64) for k, v in mapping.items()}
+
+    def _unflatten_bin(self, flat_bin: int) -> Tuple[int, int, int]:
+        x = int(flat_bin)
+        d = x // (self.n_band_bins * self.n_span_bins)
+        rem = x % (self.n_band_bins * self.n_span_bins)
+        b = rem // self.n_span_bins
+        t = rem % self.n_span_bins
+        return int(d), int(b), int(t)
+
+    def _nearest_nonempty_bin(self, flat_bin: int) -> int:
+        key = int(flat_bin)
+        cached = self._nearest_cache.get(key)
+        if cached is not None:
+            return int(cached)
+        q = np.asarray(self._unflatten_bin(key), dtype=np.int64)
+        d2 = np.sum((self.neg_nonempty_triplets - q[None, :]) ** 2, axis=1)
+        best_idx = int(np.argmin(d2))
+        best_bin = int(self.neg_nonempty_bins[best_idx])
+        self._nearest_cache[key] = best_bin
+        return best_bin
+
+    def _sample_negative_local_index(self, target_flat_bin: int) -> int:
+        if int(target_flat_bin) in self.neg_bins_to_indices:
+            arr = self.neg_bins_to_indices[int(target_flat_bin)]
+            return int(arr[self.rng.integers(0, arr.shape[0])])
+        if self.fallback == "nearest":
+            nearest_bin = self._nearest_nonempty_bin(int(target_flat_bin))
+            arr = self.neg_bins_to_indices[nearest_bin]
+            return int(arr[self.rng.integers(0, arr.shape[0])])
+        return int(self.rng.integers(0, self.n_neg))
+
+    def __iter__(self):
+        for _ in range(self.steps_per_epoch):
+            pos_local = self.rng.integers(0, self.n_pos, size=self.pos_per_batch, endpoint=False)
+            neg_local = []
+            for pidx in pos_local.tolist():
+                pbin = int(self.pos_flat_bins[int(pidx)])
+                neg_local.append(self._sample_negative_local_index(pbin))
+            neg_local = np.asarray(neg_local, dtype=np.int64)
+
+            if self.neg_per_batch > self.pos_per_batch:
+                extra = self.rng.integers(0, self.n_neg, size=(self.neg_per_batch - self.pos_per_batch), endpoint=False)
+                neg_local = np.concatenate([neg_local, extra], axis=0)
+            elif self.neg_per_batch < self.pos_per_batch:
+                neg_local = neg_local[: self.neg_per_batch]
+
+            batch = np.concatenate([pos_local, (neg_local + self.n_pos)], axis=0)
             if self.shuffle:
                 self.rng.shuffle(batch)
             yield batch.tolist()
@@ -1542,6 +1985,15 @@ def create_optical_binary_dataloaders(
     prefetch_factor: int = 4,
     neg_group: str = "ELASTICC2_TRAIN/optical_data",
     cache_in_memory: bool = False,
+    meta_matched_sampling: bool = True,
+    meta_match_fallback: str = "nearest",
+    meta_bins_n_det: Sequence[float] = (3, 5, 8, 12, 20, 40, 80, 200),
+    meta_bins_n_bands: Sequence[float] = (1, 2, 3, 4, 5, 6),
+    meta_bins_t_span: Sequence[float] = (0.0, 0.01, 0.05, 0.1, 0.2, 0.5, 1.0),
+    prefix_train_enable: bool = False,
+    prefix_min_det: int = 2,
+    prefix_eval_det_support: Sequence[int] | str = DEFAULT_PREFIX_DET_SUPPORT,
+    prefix_eval_include_terminal: bool = True,
 ):
     if cache_in_memory and num_workers > 0:
         print("cache_in_memory=True with num_workers>0 may increase RAM usage.")
@@ -1553,6 +2005,41 @@ def create_optical_binary_dataloaders(
         neg_h5_path, neg_group=neg_group, val_split=val_split, seed=split_seed
     )
 
+    prefix_train_enable = bool(prefix_train_enable)
+    prefix_min_det = int(prefix_min_det)
+    prefix_det_support = parse_prefix_det_support(prefix_eval_det_support)
+
+    if prefix_train_enable:
+        pos_group = "events/optical_data"
+        if not _group_has_slot_is_detection(pos_h5_path, pos_group):
+            raise ValueError(
+                "prefix_train_enable=true requires slot_is_detection in the positive H5 dataset."
+            )
+        if not _group_has_slot_is_detection(neg_h5_path, neg_group):
+            raise ValueError(
+                "prefix_train_enable=true requires slot_is_detection in the negative H5 dataset."
+            )
+        train_pos_idx = _filter_indices_by_min_detection_count(
+            pos_h5_path, pos_group, train_pos_idx, prefix_min_det
+        )
+        val_pos_idx = _filter_indices_by_min_detection_count(
+            pos_h5_path, pos_group, val_pos_idx, prefix_min_det
+        )
+        train_neg_idx = _filter_indices_by_min_detection_count(
+            neg_h5_path, neg_group, train_neg_idx, prefix_min_det
+        )
+        val_neg_idx = _filter_indices_by_min_detection_count(
+            neg_h5_path, neg_group, val_neg_idx, prefix_min_det
+        )
+        if train_pos_idx.size == 0 or train_neg_idx.size == 0:
+            raise ValueError(
+                "prefix_train_enable=true left an empty training split after prefix_min_det filtering."
+            )
+        if val_pos_idx.size == 0 or val_neg_idx.size == 0:
+            raise ValueError(
+                "prefix_train_enable=true left an empty validation split after prefix_min_det filtering."
+            )
+
     if val_batch_size is None:
         val_batch_size = batch_size
 
@@ -1562,6 +2049,17 @@ def create_optical_binary_dataloaders(
     if val_steps_per_epoch is None:
         val_steps_per_epoch = max(1, (2 * min(len(val_pos_idx), len(val_neg_idx))) // val_batch_size)
 
+    meta_available = (
+        _group_has_meta_features(pos_h5_path, "events/optical_data")
+        and _group_has_meta_features(neg_h5_path, neg_group)
+    )
+    if bool(meta_matched_sampling) and (not meta_available):
+        print(
+            "Meta matched sampling requested but meta_* fields are missing in one or both H5 datasets. "
+            "Falling back to BalancedBinaryBatchSampler."
+        )
+        meta_matched_sampling = False
+
     train_dataset = OpticalBinaryDataset(
         pos_h5_path=pos_h5_path,
         neg_h5_path=neg_h5_path,
@@ -1569,32 +2067,33 @@ def create_optical_binary_dataloaders(
         pos_indices=train_pos_idx,
         neg_indices=train_neg_idx,
         cache_in_memory=cache_in_memory,
-    )
-    val_dataset = OpticalBinaryDataset(
-        pos_h5_path=pos_h5_path,
-        neg_h5_path=neg_h5_path,
-        neg_group=neg_group,
-        pos_indices=val_pos_idx,
-        neg_indices=val_neg_idx,
-        cache_in_memory=cache_in_memory,
+        load_meta_features=bool(meta_matched_sampling),
+        return_prefix_aux=prefix_train_enable,
     )
 
-    train_sampler = BalancedBinaryBatchSampler(
-        n_pos=train_dataset.n_pos,
-        n_neg=train_dataset.n_neg,
-        batch_size=batch_size,
-        steps_per_epoch=steps_per_epoch,
-        seed=split_seed,
-        shuffle=True,
-    )
-    val_sampler = BalancedBinaryBatchSampler(
-        n_pos=val_dataset.n_pos,
-        n_neg=val_dataset.n_neg,
-        batch_size=val_batch_size,
-        steps_per_epoch=val_steps_per_epoch,
-        seed=split_seed + 1,
-        shuffle=True,
-    )
+    if bool(meta_matched_sampling):
+        train_meta = train_dataset.get_meta_for_sampling()
+        train_sampler = MetaMatchedBinaryBatchSampler(
+            pos_meta=train_meta["pos"],
+            neg_meta=train_meta["neg"],
+            batch_size=batch_size,
+            steps_per_epoch=steps_per_epoch,
+            seed=split_seed,
+            shuffle=True,
+            bins_n_det=meta_bins_n_det,
+            bins_n_bands=meta_bins_n_bands,
+            bins_t_span=meta_bins_t_span,
+            fallback=meta_match_fallback,
+        )
+    else:
+        train_sampler = BalancedBinaryBatchSampler(
+            n_pos=train_dataset.n_pos,
+            n_neg=train_dataset.n_neg,
+            batch_size=batch_size,
+            steps_per_epoch=steps_per_epoch,
+            seed=split_seed,
+            shuffle=True,
+        )
 
     train_loader = _build_dataloader(
         train_dataset,
@@ -1604,6 +2103,103 @@ def create_optical_binary_dataloaders(
         persistent_workers,
         prefetch_factor,
     )
+
+    if prefix_train_enable:
+        rng = np.random.default_rng(int(split_seed) + 17)
+        target_val_base_per_class = max(1, (int(val_steps_per_epoch) * int(val_batch_size)) // 2)
+
+        def _sample_eval_subset(idx: np.ndarray) -> np.ndarray:
+            idx = np.asarray(idx, dtype=np.int64).reshape(-1)
+            if idx.size <= target_val_base_per_class:
+                return np.sort(idx.copy())
+            picked = rng.choice(idx, size=int(target_val_base_per_class), replace=False)
+            return np.sort(np.asarray(picked, dtype=np.int64))
+
+        eval_pos_idx = _sample_eval_subset(val_pos_idx)
+        eval_neg_idx = _sample_eval_subset(val_neg_idx)
+        val_base_dataset = OpticalBinaryDataset(
+            pos_h5_path=pos_h5_path,
+            neg_h5_path=neg_h5_path,
+            neg_group=neg_group,
+            pos_indices=eval_pos_idx,
+            neg_indices=eval_neg_idx,
+            cache_in_memory=cache_in_memory,
+            load_meta_features=False,
+            return_prefix_aux=True,
+        )
+        manifest_rows = _build_prefix_manifest_for_binary_dataset(
+            base_dataset=val_base_dataset,
+            det_support=prefix_det_support,
+            prefix_min_det=prefix_min_det,
+            include_terminal=bool(prefix_eval_include_terminal),
+        )
+        if not manifest_rows:
+            raise ValueError("Prefix validation manifest is empty after filtering by prefix_min_det.")
+        val_dataset = OpticalPrefixEvalDataset(
+            base_dataset=val_base_dataset,
+            manifest_rows=manifest_rows,
+            prefix_min_det=prefix_min_det,
+        )
+        print(
+            "Prefix validation manifest: "
+            f"n_base_pos={val_base_dataset.n_pos}, n_base_neg={val_base_dataset.n_neg}, "
+            f"n_prefix_rows={len(val_dataset)}, det_support={prefix_det_support}, "
+            f"include_terminal={bool(prefix_eval_include_terminal)}"
+        )
+        if num_workers > 0:
+            val_loader = DataLoader(
+                val_dataset,
+                batch_size=val_batch_size,
+                shuffle=False,
+                num_workers=num_workers,
+                pin_memory=pin_memory,
+                persistent_workers=persistent_workers,
+                prefetch_factor=prefetch_factor,
+            )
+        else:
+            val_loader = DataLoader(
+                val_dataset,
+                batch_size=val_batch_size,
+                shuffle=False,
+                num_workers=0,
+                pin_memory=pin_memory,
+            )
+        return train_loader, val_loader, steps_per_epoch, len(val_loader)
+
+    val_dataset = OpticalBinaryDataset(
+        pos_h5_path=pos_h5_path,
+        neg_h5_path=neg_h5_path,
+        neg_group=neg_group,
+        pos_indices=val_pos_idx,
+        neg_indices=val_neg_idx,
+        cache_in_memory=cache_in_memory,
+        load_meta_features=bool(meta_matched_sampling),
+    )
+
+    if bool(meta_matched_sampling):
+        val_meta = val_dataset.get_meta_for_sampling()
+        val_sampler = MetaMatchedBinaryBatchSampler(
+            pos_meta=val_meta["pos"],
+            neg_meta=val_meta["neg"],
+            batch_size=val_batch_size,
+            steps_per_epoch=val_steps_per_epoch,
+            seed=split_seed + 1,
+            shuffle=True,
+            bins_n_det=meta_bins_n_det,
+            bins_n_bands=meta_bins_n_bands,
+            bins_t_span=meta_bins_t_span,
+            fallback=meta_match_fallback,
+        )
+    else:
+        val_sampler = BalancedBinaryBatchSampler(
+            n_pos=val_dataset.n_pos,
+            n_neg=val_dataset.n_neg,
+            batch_size=val_batch_size,
+            steps_per_epoch=val_steps_per_epoch,
+            seed=split_seed + 1,
+            shuffle=True,
+        )
+
     val_loader = _build_dataloader(
         val_dataset,
         val_sampler,

@@ -37,6 +37,12 @@ if str(MODEL_DIR) not in sys.path:
 from data_loader import create_optical_binary_dataloaders
 from metrics import compute_classification_metrics
 from model import OpticalKNClassifier
+from optical_prefix import (
+    apply_prefix_right_censoring_torch,
+    load_prefix_ndet_distribution,
+    parse_prefix_det_support,
+    sample_prefix_target_k,
+)
 
 
 def parse_quantiles(text: str) -> List[float]:
@@ -52,6 +58,297 @@ def parse_quantiles(text: str) -> List[float]:
     if not vals:
         raise ValueError("offset_eval_quantiles produced empty list.")
     return vals
+
+
+def parse_bin_edges(text: str, default: str) -> List[float]:
+    raw = str(default if text is None else text)
+    vals: List[float] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        vals.append(float(part))
+    if not vals:
+        raise ValueError("Meta bin edges must not be empty.")
+    arr = np.unique(np.asarray(vals, dtype=np.float64))
+    if np.any(~np.isfinite(arr)):
+        raise ValueError("Meta bin edges must be finite numeric values.")
+    return [float(v) for v in arr.tolist()]
+
+
+def compute_shortcut_audit(
+    n_det: np.ndarray,
+    n_bands: np.ndarray,
+    t_span: np.ndarray,
+    labels: np.ndarray,
+    max_samples: int = 50000,
+) -> Dict[str, float]:
+    out: Dict[str, float] = {}
+    n_det = np.asarray(n_det, dtype=np.float64).reshape(-1)
+    n_bands = np.asarray(n_bands, dtype=np.float64).reshape(-1)
+    t_span = np.asarray(t_span, dtype=np.float64).reshape(-1)
+    labels = np.asarray(labels, dtype=np.int64).reshape(-1)
+    n = int(labels.shape[0])
+    if n == 0:
+        return out
+    if n > int(max_samples):
+        rng = np.random.default_rng(42)
+        idx = rng.choice(n, size=int(max_samples), replace=False)
+        n_det = n_det[idx]
+        n_bands = n_bands[idx]
+        t_span = t_span[idx]
+        labels = labels[idx]
+
+    out["n_eval_samples"] = float(labels.shape[0])
+    out["n_det_pos_median"] = float(np.median(n_det[labels == 1])) if np.any(labels == 1) else 0.0
+    out["n_det_neg_median"] = float(np.median(n_det[labels == 0])) if np.any(labels == 0) else 0.0
+    out["n_bands_pos_median"] = float(np.median(n_bands[labels == 1])) if np.any(labels == 1) else 0.0
+    out["n_bands_neg_median"] = float(np.median(n_bands[labels == 0])) if np.any(labels == 0) else 0.0
+    out["t_span_pos_median"] = float(np.median(t_span[labels == 1])) if np.any(labels == 1) else 0.0
+    out["t_span_neg_median"] = float(np.median(t_span[labels == 0])) if np.any(labels == 0) else 0.0
+
+    try:
+        from sklearn.linear_model import LogisticRegression
+        from sklearn.metrics import roc_auc_score
+        from sklearn.model_selection import train_test_split
+
+        X = np.column_stack([n_det, n_bands, t_span]).astype(np.float64)
+        y = labels.astype(np.int64)
+        if np.unique(y).size >= 2 and X.shape[0] >= 32:
+            X_tr, X_te, y_tr, y_te = train_test_split(
+                X, y, test_size=0.3, random_state=42, stratify=y
+            )
+            clf = LogisticRegression(max_iter=1000)
+            clf.fit(X_tr, y_tr)
+            probs = clf.predict_proba(X_te)[:, 1]
+            out["shortcut_logreg_auc"] = float(roc_auc_score(y_te, probs))
+    except Exception:
+        pass
+
+    return out
+
+
+def unpack_optical_batch(batch):
+    if not isinstance(batch, (list, tuple)):
+        raise TypeError(f"Expected batch to be tuple/list, got {type(batch)!r}")
+
+    if len(batch) == 5:
+        opt_t, opt_v, opt_mask, opt_err, labels = batch
+        return {
+            "opt_t": opt_t,
+            "opt_v": opt_v,
+            "opt_mask": opt_mask,
+            "opt_err": opt_err,
+            "labels": labels,
+            "slot_is_detection": None,
+            "actual_target_k": None,
+            "is_terminal_prefix": None,
+        }
+    if len(batch) == 6:
+        opt_t, opt_v, opt_mask, opt_err, labels, slot_is_detection = batch
+        return {
+            "opt_t": opt_t,
+            "opt_v": opt_v,
+            "opt_mask": opt_mask,
+            "opt_err": opt_err,
+            "labels": labels,
+            "slot_is_detection": slot_is_detection,
+            "actual_target_k": None,
+            "is_terminal_prefix": None,
+        }
+    if len(batch) == 8:
+        opt_t, opt_v, opt_mask, opt_err, labels, slot_is_detection, actual_target_k, is_terminal_prefix = batch
+        return {
+            "opt_t": opt_t,
+            "opt_v": opt_v,
+            "opt_mask": opt_mask,
+            "opt_err": opt_err,
+            "labels": labels,
+            "slot_is_detection": slot_is_detection,
+            "actual_target_k": actual_target_k,
+            "is_terminal_prefix": is_terminal_prefix,
+        }
+    raise ValueError(f"Unsupported optical batch length: {len(batch)}")
+
+
+def compute_batch_sequence_meta(opt_t, opt_mask, slot_is_detection=None):
+    valid_rows = opt_mask.sum(dim=-1) > 0
+    if slot_is_detection is not None:
+        n_det = ((slot_is_detection > 0) & valid_rows).sum(dim=1)
+    else:
+        n_det = valid_rows.sum(dim=1)
+    n_bands = (opt_mask.sum(dim=1) > 0).sum(dim=1)
+    row_idx = torch.arange(opt_t.size(0), device=opt_t.device)
+    has_valid = valid_rows.any(dim=1)
+    first_idx = torch.argmax(valid_rows.to(torch.int64), dim=1)
+    rev_idx = torch.argmax(valid_rows.flip(dims=[1]).to(torch.int64), dim=1)
+    last_idx = valid_rows.size(1) - 1 - rev_idx
+    t_first = torch.where(has_valid, opt_t[row_idx, first_idx], torch.zeros(opt_t.size(0), device=opt_t.device, dtype=opt_t.dtype))
+    t_last = torch.where(has_valid, opt_t[row_idx, last_idx], torch.zeros(opt_t.size(0), device=opt_t.device, dtype=opt_t.dtype))
+    t_span = torch.where(has_valid, t_last - t_first, torch.zeros_like(t_last))
+    return n_det, n_bands, t_span
+
+
+def build_prefix_bucket_metrics(probs, labels, actual_target_k, is_terminal_prefix):
+    if actual_target_k is None or is_terminal_prefix is None:
+        return {}
+
+    probs = probs.detach().cpu()
+    labels = labels.detach().cpu().long()
+    actual_target_k = actual_target_k.detach().cpu().long()
+    is_terminal_prefix = is_terminal_prefix.detach().cpu().long()
+
+    bucket_defs = [
+        ("k2", actual_target_k == 2),
+        ("k3", actual_target_k == 3),
+        ("k4", actual_target_k == 4),
+        ("k5", actual_target_k == 5),
+        ("k6plus", actual_target_k >= 6),
+        ("terminal", is_terminal_prefix > 0),
+    ]
+
+    out: Dict[str, Dict[str, float]] = {}
+    for name, mask in bucket_defs:
+        mask = mask.bool()
+        if int(mask.sum().item()) <= 0:
+            continue
+        p = probs[mask]
+        y = labels[mask]
+        cls = compute_classification_metrics(p, y)
+        out[name] = {
+            "n_samples": int(mask.sum().item()),
+            "n_pos": int((y == 1).sum().item()),
+            "n_neg": int((y == 0).sum().item()),
+            "auroc": float(cls.get("auroc", 0.0)),
+            "auprc": float(cls.get("auprc", 0.0)),
+            "f1_optimal": float(cls.get("f1_optimal", 0.0)),
+            "ece": float(cls.get("ece", 0.0)),
+            "mean_prob": float(p.mean().item()),
+        }
+    return out
+
+
+class PrefixTrainPolicy:
+    def __init__(self, args):
+        self.enabled = bool(getattr(args, "prefix_train_enable", False))
+        self.min_det = int(getattr(args, "prefix_min_det", 2))
+        self.sampling = str(getattr(args, "prefix_train_sampling", "real_stream_ndet_empirical")).strip().lower()
+        self.terminal_mix_prob = float(getattr(args, "prefix_terminal_mix_prob", 0.2))
+        self.real_mix_weight = float(getattr(args, "prefix_real_mix_weight", 4.0))
+        self.bucket_uniform_mix_weight = float(getattr(args, "prefix_bucket_uniform_mix_weight", 4.0))
+        self.terminal_mix_weight = float(getattr(args, "prefix_terminal_mix_weight", 2.0))
+        self.hist_path = getattr(args, "prefix_real_hist_path", None)
+        self.rng = np.random.default_rng(int(args.seed) + 137)
+        self.support = None
+        self.probs = None
+        self.uniform_probs = None
+        self.hist_meta: Dict[str, object] = {}
+        self.info: Dict[str, object] = {
+            "enabled": self.enabled,
+            "min_det": self.min_det,
+            "sampling": self.sampling,
+            "terminal_mix_prob": self.terminal_mix_prob,
+            "real_mix_weight": self.real_mix_weight,
+            "bucket_uniform_mix_weight": self.bucket_uniform_mix_weight,
+            "terminal_mix_weight": self.terminal_mix_weight,
+        }
+
+        if not self.enabled:
+            return
+        if self.sampling not in {"real_stream_ndet_empirical", "real_stream_bucket_uniform_terminal_mixture"}:
+            raise ValueError(f"Unsupported prefix_train_sampling: {self.sampling}")
+        if self.hist_path is None:
+            raise ValueError("prefix_train_enable=true requires --prefix_real_hist_path.")
+        support, probs, hist_meta = load_prefix_ndet_distribution(self.hist_path, min_det=self.min_det)
+        self.support = support
+        self.probs = probs
+        self.uniform_probs = np.full_like(probs, fill_value=(1.0 / float(probs.shape[0])), dtype=np.float64)
+        self.hist_meta = hist_meta
+        self.info.update(
+            {
+                "hist_path": str(self.hist_path),
+                "hist_support": [int(v) for v in support.tolist()],
+                "hist_probabilities": [float(v) for v in probs.tolist()],
+            }
+        )
+        if self.sampling == "real_stream_bucket_uniform_terminal_mixture":
+            mix_raw = np.asarray(
+                [
+                    self.real_mix_weight,
+                    self.bucket_uniform_mix_weight,
+                    self.terminal_mix_weight,
+                ],
+                dtype=np.float64,
+            )
+            if np.any(mix_raw < 0):
+                raise ValueError("Prefix mixture weights must be >= 0.")
+            if float(mix_raw.sum()) <= 0:
+                raise ValueError("Prefix mixture weights must sum to > 0.")
+            mix_probs = mix_raw / mix_raw.sum()
+            self.info.update(
+                {
+                    "mixture_branch_names": ["real_stream", "bucket_uniform", "terminal"],
+                    "mixture_branch_probabilities": [float(v) for v in mix_probs.tolist()],
+                    "uniform_support": [int(v) for v in support.tolist()],
+                }
+            )
+
+    def sample_target_k(self, slot_is_detection: torch.Tensor) -> torch.Tensor:
+        if not self.enabled:
+            raise RuntimeError("PrefixTrainPolicy.sample_target_k called while disabled.")
+        det_counts = (slot_is_detection > 0).sum(dim=1).detach().cpu().numpy().astype(np.int64, copy=False)
+        if self.sampling == "real_stream_ndet_empirical":
+            sampled = sample_prefix_target_k(
+                det_counts=det_counts,
+                support=self.support,
+                probs=self.probs,
+                rng=self.rng,
+                min_det=self.min_det,
+                terminal_mix_prob=self.terminal_mix_prob,
+            )
+        else:
+            sampled = np.empty_like(det_counts)
+            mix_raw = np.asarray(
+                [
+                    self.real_mix_weight,
+                    self.bucket_uniform_mix_weight,
+                    self.terminal_mix_weight,
+                ],
+                dtype=np.float64,
+            )
+            mix_probs = mix_raw / mix_raw.sum()
+            branch_ids = self.rng.choice(3, size=det_counts.shape[0], replace=True, p=mix_probs)
+
+            real_mask = branch_ids == 0
+            if np.any(real_mask):
+                sampled[real_mask] = sample_prefix_target_k(
+                    det_counts=det_counts[real_mask],
+                    support=self.support,
+                    probs=self.probs,
+                    rng=self.rng,
+                    min_det=self.min_det,
+                    terminal_mix_prob=0.0,
+                )
+
+            uniform_mask = branch_ids == 1
+            if np.any(uniform_mask):
+                sampled[uniform_mask] = sample_prefix_target_k(
+                    det_counts=det_counts[uniform_mask],
+                    support=self.support,
+                    probs=self.uniform_probs,
+                    rng=self.rng,
+                    min_det=self.min_det,
+                    terminal_mix_prob=0.0,
+                )
+
+            terminal_mask = branch_ids == 2
+            if np.any(terminal_mask):
+                sampled[terminal_mask] = det_counts[terminal_mask]
+
+        return torch.from_numpy(sampled).to(device=slot_is_detection.device, dtype=torch.long)
+
+    def describe(self) -> Dict[str, object]:
+        return dict(self.info)
 
 
 class TimeOffsetPolicy:
@@ -172,6 +469,8 @@ def augment_optical_data(
     flux_noise=0.0,
     obs_dropout=0.0,
     band_dropout=0.0,
+    single_band_keep_prob=1.0,
+    target_ndet_jitter=0.0,
 ):
     if not training:
         return opt_t, opt_v, opt_mask, opt_err
@@ -203,6 +502,53 @@ def augment_optical_data(
             opt_v = opt_v.masked_fill(band_mask, 0.0)
             if opt_err is not None:
                 opt_err = opt_err.masked_fill(band_mask, 0.0)
+
+    if target_ndet_jitter > 0:
+        jitter = float(target_ndet_jitter)
+        valid = opt_mask > 0
+        for i in range(opt_mask.size(0)):
+            idx = torch.nonzero(valid[i], as_tuple=False)
+            n_obs = int(idx.size(0))
+            if n_obs <= 1:
+                continue
+            frac = 1.0 + float(torch.empty((1,), device=opt_mask.device).uniform_(-jitter, jitter).item())
+            target = int(round(n_obs * frac))
+            target = max(1, min(n_obs, target))
+            if target >= n_obs:
+                continue
+            perm = torch.randperm(n_obs, device=opt_mask.device)
+            keep = idx[perm[:target]]
+            keep_mask = torch.zeros_like(valid[i], dtype=torch.bool)
+            keep_mask[keep[:, 0], keep[:, 1]] = True
+            drop = valid[i] & (~keep_mask)
+            if drop.any():
+                opt_mask[i] = opt_mask[i].masked_fill(drop, 0)
+                opt_v[i] = opt_v[i].masked_fill(drop, 0.0)
+                if opt_err is not None:
+                    opt_err[i] = opt_err[i].masked_fill(drop, 0.0)
+
+    if single_band_keep_prob < 1.0:
+        keep_prob = float(single_band_keep_prob)
+        band_presence = opt_mask.sum(dim=1) > 0
+        n_bands = band_presence.sum(dim=1)
+        single_ids = torch.where(n_bands == 1)[0]
+        for i in single_ids.tolist():
+            if float(torch.rand((1,), device=opt_mask.device).item()) <= keep_prob:
+                continue
+            valid = opt_mask[i] > 0
+            n_valid = int(valid.sum().item())
+            if n_valid <= 1:
+                continue
+            drop = (torch.rand_like(opt_mask[i]) < 0.5) & valid
+            if int((valid & (~drop)).sum().item()) <= 0:
+                idx = torch.nonzero(valid, as_tuple=False)
+                keep_one = idx[torch.randint(0, idx.size(0), (1,), device=opt_mask.device)[0]]
+                drop[keep_one[0], keep_one[1]] = False
+            if drop.any():
+                opt_mask[i] = opt_mask[i].masked_fill(drop, 0)
+                opt_v[i] = opt_v[i].masked_fill(drop, 0.0)
+                if opt_err is not None:
+                    opt_err[i] = opt_err[i].masked_fill(drop, 0.0)
 
     return opt_t, opt_v, opt_mask, opt_err
 
@@ -297,16 +643,35 @@ def run_eval(model, loader, device, args, criterion, amp_dtype, offset_policy):
     n_batches = 0
     all_probs = []
     all_labels = []
+    all_n_det = []
+    all_n_bands = []
+    all_t_span = []
+    all_actual_target_k = []
+    all_is_terminal_prefix = []
     ref_time_cache = None
 
     with torch.no_grad():
         for batch in loader:
-            opt_t, opt_v, opt_mask, opt_err, labels = batch
+            batch_dict = unpack_optical_batch(batch)
+            opt_t = batch_dict["opt_t"]
+            opt_v = batch_dict["opt_v"]
+            opt_mask = batch_dict["opt_mask"]
+            opt_err = batch_dict["opt_err"]
+            labels = batch_dict["labels"]
+            slot_is_detection = batch_dict["slot_is_detection"]
+            actual_target_k = batch_dict["actual_target_k"]
+            is_terminal_prefix = batch_dict["is_terminal_prefix"]
             opt_t = opt_t.to(device, non_blocking=True)
             opt_v = opt_v.to(device, non_blocking=True)
             opt_mask = opt_mask.to(device, non_blocking=True)
             opt_err = opt_err.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True).float()
+            if slot_is_detection is not None:
+                slot_is_detection = slot_is_detection.to(device, non_blocking=True)
+            if actual_target_k is not None:
+                actual_target_k = actual_target_k.to(device, non_blocking=True)
+            if is_terminal_prefix is not None:
+                is_terminal_prefix = is_terminal_prefix.to(device, non_blocking=True)
 
             batch_size = opt_t.size(0)
             if (
@@ -338,6 +703,14 @@ def run_eval(model, loader, device, args, criterion, amp_dtype, offset_policy):
             n_batches += 1
             all_probs.append(probs.detach().cpu())
             all_labels.append(labels.detach().cpu().long())
+            n_det, n_bands, t_span = compute_batch_sequence_meta(opt_t, opt_mask, slot_is_detection)
+            all_n_det.append(n_det.detach().cpu())
+            all_n_bands.append(n_bands.detach().cpu())
+            all_t_span.append(t_span.detach().cpu())
+            if actual_target_k is not None:
+                all_actual_target_k.append(actual_target_k.detach().cpu())
+            if is_terminal_prefix is not None:
+                all_is_terminal_prefix.append(is_terminal_prefix.detach().cpu())
 
     if n_batches == 0:
         model.train()
@@ -347,9 +720,28 @@ def run_eval(model, loader, device, args, criterion, amp_dtype, offset_policy):
     labels = torch.cat(all_labels, dim=0)
     cls_metrics = compute_classification_metrics(probs, labels)
     op = select_threshold_for_target_recall(probs, labels, target_recall=args.target_recall)
+    shortcut_metrics: Dict[str, float] = {}
+    if bool(getattr(args, "shortcut_audit_enable", False)):
+        n_det_np = torch.cat(all_n_det, dim=0).numpy()
+        n_bands_np = torch.cat(all_n_bands, dim=0).numpy()
+        t_span_np = torch.cat(all_t_span, dim=0).numpy()
+        labels_np = labels.numpy()
+        shortcut_metrics = compute_shortcut_audit(
+            n_det=n_det_np,
+            n_bands=n_bands_np,
+            t_span=t_span_np,
+            labels=labels_np,
+            max_samples=int(getattr(args, "shortcut_audit_val_samples", 50000)),
+        )
+    prefix_bucket_metrics = build_prefix_bucket_metrics(
+        probs=probs,
+        labels=labels,
+        actual_target_k=(torch.cat(all_actual_target_k, dim=0) if all_actual_target_k else None),
+        is_terminal_prefix=(torch.cat(all_is_terminal_prefix, dim=0) if all_is_terminal_prefix else None),
+    )
 
     model.train()
-    return {
+    out = {
         "loss": losses / n_batches,
         "auroc": float(cls_metrics.get("auroc", 0.0)),
         "auprc": float(cls_metrics.get("auprc", 0.0)),
@@ -360,10 +752,27 @@ def run_eval(model, loader, device, args, criterion, amp_dtype, offset_policy):
         "op_fpr": op["fpr"],
         "op_meets_target_recall": bool(op["meets_target_recall"]),
         "offset_eval_count": int(len(offset_policy.eval_offsets_days)),
+        "task_mode": "prefix_right_censored" if bool(getattr(args, "prefix_train_enable", False)) else "full_window",
     }
+    for k, v in shortcut_metrics.items():
+        out[f"shortcut_{k}"] = float(v)
+    if prefix_bucket_metrics:
+        out["prefix_bucket_metrics"] = prefix_bucket_metrics
+    return out
 
 
-def train_one_epoch(model, loader, optimizer, device, args, criterion, scaler, amp_dtype, offset_policy):
+def train_one_epoch(
+    model,
+    loader,
+    optimizer,
+    device,
+    args,
+    criterion,
+    scaler,
+    amp_dtype,
+    offset_policy,
+    prefix_policy,
+):
     model.train()
     total_loss = 0.0
     n_batches = 0
@@ -371,12 +780,34 @@ def train_one_epoch(model, loader, optimizer, device, args, criterion, scaler, a
 
     pbar = tqdm(loader, desc="Train", mininterval=0.0, miniters=100)
     for batch in pbar:
-        opt_t, opt_v, opt_mask, opt_err, labels = batch
+        batch_dict = unpack_optical_batch(batch)
+        opt_t = batch_dict["opt_t"]
+        opt_v = batch_dict["opt_v"]
+        opt_mask = batch_dict["opt_mask"]
+        opt_err = batch_dict["opt_err"]
+        labels = batch_dict["labels"]
+        slot_is_detection = batch_dict["slot_is_detection"]
         opt_t = opt_t.to(device, non_blocking=True)
         opt_v = opt_v.to(device, non_blocking=True)
         opt_mask = opt_mask.to(device, non_blocking=True)
         opt_err = opt_err.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True).float()
+        if slot_is_detection is not None:
+            slot_is_detection = slot_is_detection.to(device, non_blocking=True)
+
+        if bool(getattr(args, "prefix_train_enable", False)):
+            if slot_is_detection is None:
+                raise ValueError("prefix_train_enable=true requires slot_is_detection in training batches.")
+            target_k = prefix_policy.sample_target_k(slot_is_detection)
+            opt_t, opt_v, opt_mask, opt_err, slot_is_detection, _ = apply_prefix_right_censoring_torch(
+                opt_t=opt_t,
+                opt_v=opt_v,
+                opt_mask=opt_mask,
+                opt_err=opt_err,
+                slot_is_detection=slot_is_detection,
+                target_k=target_k,
+                min_det=int(args.prefix_min_det),
+            )
 
         opt_t, opt_v, opt_mask, opt_err = augment_optical_data(
             opt_t,
@@ -388,6 +819,8 @@ def train_one_epoch(model, loader, optimizer, device, args, criterion, scaler, a
             flux_noise=args.opt_aug_noise,
             obs_dropout=args.opt_aug_dropout,
             band_dropout=args.opt_aug_band_dropout,
+            single_band_keep_prob=args.single_band_keep_prob,
+            target_ndet_jitter=(0.0 if bool(getattr(args, "prefix_train_enable", False)) else args.target_ndet_jitter),
         )
 
         batch_size = opt_t.size(0)
@@ -517,6 +950,28 @@ def train(args):
 
     offset_policy = TimeOffsetPolicy(args)
     print(f"Time offset policy: {json.dumps(offset_policy.describe(), indent=2)}")
+    prefix_policy = PrefixTrainPolicy(args)
+    print(f"Prefix train policy: {json.dumps(prefix_policy.describe(), indent=2)}")
+    if bool(args.prefix_train_enable) and float(args.target_ndet_jitter) > 0:
+        print("prefix_train_enable=true: target_ndet_jitter will be ignored in favor of causal right-censoring.")
+    meta_bins_n_det = parse_bin_edges(
+        getattr(args, "meta_bins_n_det", None),
+        default="3,5,8,12,20,40,80,200",
+    )
+    meta_bins_n_bands = parse_bin_edges(
+        getattr(args, "meta_bins_n_bands", None),
+        default="1,2,3,4,5,6",
+    )
+    meta_bins_t_span = parse_bin_edges(
+        getattr(args, "meta_bins_t_span", None),
+        default="0,0.01,0.05,0.1,0.2,0.5,1.0",
+    )
+    print(
+        "Meta matched sampling: "
+        f"enable={bool(args.meta_matched_sampling)} "
+        f"fallback={args.meta_match_fallback} "
+        f"bins_det={meta_bins_n_det} bins_band={meta_bins_n_bands} bins_tspan={meta_bins_t_span}"
+    )
 
     train_loader, val_loader, steps_per_epoch, val_steps = create_optical_binary_dataloaders(
         pos_h5_path=args.pos_data_path,
@@ -533,6 +988,15 @@ def train(args):
         persistent_workers=bool(args.persistent_workers),
         prefetch_factor=args.prefetch_factor,
         cache_in_memory=bool(args.cache_in_memory),
+        meta_matched_sampling=bool(args.meta_matched_sampling),
+        meta_match_fallback=str(args.meta_match_fallback),
+        meta_bins_n_det=meta_bins_n_det,
+        meta_bins_n_bands=meta_bins_n_bands,
+        meta_bins_t_span=meta_bins_t_span,
+        prefix_train_enable=bool(args.prefix_train_enable),
+        prefix_min_det=int(args.prefix_min_det),
+        prefix_eval_det_support=str(args.prefix_eval_det_support),
+        prefix_eval_include_terminal=True,
     )
     print(f"Train Steps/Epoch: {steps_per_epoch} | Val Steps/Epoch: {val_steps}")
 
@@ -611,6 +1075,7 @@ def train(args):
                 scaler,
                 amp_dtype,
                 offset_policy,
+                prefix_policy,
             )
             val_metrics = run_eval(model, val_loader, device, args, criterion, amp_dtype, offset_policy)
             if val_metrics is None:
@@ -744,6 +1209,8 @@ def train(args):
         "best_auroc_plus_auprc": best_score,
         "best_precision_at_target_recall": float(best_metrics.get("op_precision", 0.0)) if best_metrics else 0.0,
         "time_offset": offset_policy.describe(),
+        "prefix_task": prefix_policy.describe(),
+        "task_mode": "prefix_right_censored" if bool(args.prefix_train_enable) else "full_window",
         **best_metrics,
     }
     with open(save_root / "train_summary.json", "w", encoding="utf-8") as f:
@@ -807,8 +1274,28 @@ def parse_args():
 
     parser.add_argument("--opt_aug_noise", type=float, default=0.0)
     parser.add_argument("--opt_aug_time_jitter", type=float, default=0.0)
-    parser.add_argument("--opt_aug_dropout", type=float, default=0.0)
-    parser.add_argument("--opt_aug_band_dropout", type=float, default=0.0)
+    parser.add_argument("--opt_aug_dropout", type=float, default=0.35)
+    parser.add_argument("--opt_aug_band_dropout", type=float, default=0.30)
+    parser.add_argument("--single_band_keep_prob", type=float, default=0.35)
+    parser.add_argument("--target_ndet_jitter", type=float, default=0.0)
+    parser.add_argument("--prefix_train_enable", action="store_true")
+    parser.add_argument("--prefix_min_det", type=int, default=2)
+    parser.add_argument("--prefix_train_sampling", type=str, default="real_stream_ndet_empirical")
+    parser.add_argument("--prefix_terminal_mix_prob", type=float, default=0.2)
+    parser.add_argument("--prefix_real_mix_weight", type=float, default=4.0)
+    parser.add_argument("--prefix_bucket_uniform_mix_weight", type=float, default=4.0)
+    parser.add_argument("--prefix_terminal_mix_weight", type=float, default=2.0)
+    parser.add_argument("--prefix_eval_det_support", type=str, default="2,3,4,5,6,8,10,12")
+    parser.add_argument("--prefix_real_hist_path", type=str, default=None)
+
+    parser.add_argument("--meta_matched_sampling", type=int, default=1)
+    parser.add_argument("--meta_match_fallback", type=str, default="nearest")
+    parser.add_argument("--meta_bins_n_det", type=str, default="3,5,8,12,20,40,80,200")
+    parser.add_argument("--meta_bins_n_bands", type=str, default="1,2,3,4,5,6")
+    parser.add_argument("--meta_bins_t_span", type=str, default="0,0.01,0.05,0.1,0.2,0.5,1.0")
+
+    parser.add_argument("--shortcut_audit_enable", type=int, default=1)
+    parser.add_argument("--shortcut_audit_val_samples", type=int, default=50000)
 
     parser.add_argument("--target_recall", type=float, default=0.98)
     parser.add_argument("--early_stop_patience", type=int, default=5)
@@ -849,6 +1336,37 @@ def parse_args():
     args = parser.parse_args()
     if args.offset_seed is None:
         args.offset_seed = int(args.seed)
+    if not (0.0 <= float(args.single_band_keep_prob) <= 1.0):
+        raise ValueError("--single_band_keep_prob must be in [0, 1].")
+    if float(args.target_ndet_jitter) < 0:
+        raise ValueError("--target_ndet_jitter must be >= 0.")
+    if int(args.prefix_min_det) < 1:
+        raise ValueError("--prefix_min_det must be >= 1.")
+    if not (0.0 <= float(args.prefix_terminal_mix_prob) <= 1.0):
+        raise ValueError("--prefix_terminal_mix_prob must be in [0, 1].")
+    if float(args.prefix_real_mix_weight) < 0:
+        raise ValueError("--prefix_real_mix_weight must be >= 0.")
+    if float(args.prefix_bucket_uniform_mix_weight) < 0:
+        raise ValueError("--prefix_bucket_uniform_mix_weight must be >= 0.")
+    if float(args.prefix_terminal_mix_weight) < 0:
+        raise ValueError("--prefix_terminal_mix_weight must be >= 0.")
+    sampling_mode = str(args.prefix_train_sampling).strip().lower()
+    if sampling_mode not in {"real_stream_ndet_empirical", "real_stream_bucket_uniform_terminal_mixture"}:
+        raise ValueError(
+            "--prefix_train_sampling must be 'real_stream_ndet_empirical' or "
+            "'real_stream_bucket_uniform_terminal_mixture'."
+        )
+    if (
+        sampling_mode == "real_stream_bucket_uniform_terminal_mixture"
+        and float(args.prefix_real_mix_weight)
+        + float(args.prefix_bucket_uniform_mix_weight)
+        + float(args.prefix_terminal_mix_weight)
+        <= 0
+    ):
+        raise ValueError("Prefix mixture weights must sum to > 0.")
+    parse_prefix_det_support(args.prefix_eval_det_support)
+    if str(args.meta_match_fallback).strip().lower() not in {"nearest", "random"}:
+        raise ValueError("--meta_match_fallback must be 'nearest' or 'random'.")
     return args
 
 
@@ -866,6 +1384,11 @@ if __name__ == "__main__":
             raise ValueError("time_offset_enable=true requires --offset_dist_npz.")
         if not os.path.exists(args.offset_dist_npz):
             raise FileNotFoundError(f"Offset distribution file not found: {args.offset_dist_npz}")
+    if bool(args.prefix_train_enable):
+        if args.prefix_real_hist_path is None:
+            raise ValueError("prefix_train_enable=true requires --prefix_real_hist_path.")
+        if not os.path.exists(args.prefix_real_hist_path):
+            raise FileNotFoundError(f"Prefix real-stream histogram file not found: {args.prefix_real_hist_path}")
 
     os.makedirs(args.ckpt_path, exist_ok=True)
 
