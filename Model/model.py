@@ -3,6 +3,38 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 
+
+class GradientReversalFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, lambda_):
+        ctx.lambda_ = float(lambda_)
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output.neg() * ctx.lambda_, None
+
+
+class GradientReversalLayer(nn.Module):
+    def __init__(self, lambda_: float = 1.0):
+        super().__init__()
+        self.lambda_ = float(lambda_)
+
+    def forward(self, x):
+        return GradientReversalFunction.apply(x, self.lambda_)
+
+    def set_lambda(self, value: float):
+        self.lambda_ = float(value)
+
+
+def _build_mlp(in_dim, hidden_dim, out_dim, dropout=0.0, final_bias=True):
+    return nn.Sequential(
+        nn.Linear(in_dim, hidden_dim),
+        nn.ReLU(inplace=True),
+        nn.Dropout(dropout),
+        nn.Linear(hidden_dim, out_dim, bias=final_bias),
+    )
+
 # ==============================================================================
 # 1. Learnable Periodic Time Embedding (phi_h(t)) and Spatial Embedding Module
 # ==============================================================================
@@ -1352,9 +1384,17 @@ class OpticalKNClassifier(nn.Module):
         feature_dropout=0.0,
         head_hidden_dim=None,
         head_dropout=0.2,
+        universal_aux_enable=False,
+        proj_dim=64,
+        adv_hidden_dim=None,
+        n_det_bucket_classes=5,
+        n_bands_bucket_classes=4,
+        t_span_bucket_classes=5,
+        grl_lambda=1.0,
     ):
         super().__init__()
         self.feature_dropout = nn.Dropout(feature_dropout)
+        self.universal_aux_enable = bool(universal_aux_enable)
 
         self.optical_encoder = OpticalEncoderWithCLSNoCoord(
             input_dim=optical_input_dim,
@@ -1366,20 +1406,65 @@ class OpticalKNClassifier(nn.Module):
         )
 
         hidden = head_hidden_dim if head_hidden_dim is not None else enc_dim
+        self.feature_dim = enc_dim * 2
         self.classifier = nn.Sequential(
-            nn.Linear(enc_dim * 2, hidden),
+            nn.Linear(self.feature_dim, hidden),
             nn.ReLU(inplace=True),
             nn.Dropout(head_dropout),
             nn.Linear(hidden, 1),
         )
+        self.proj_dim = int(proj_dim)
+        self.adv_hidden_dim = int(hidden if adv_hidden_dim is None else adv_hidden_dim)
+        self.n_det_bucket_classes = int(n_det_bucket_classes)
+        self.n_bands_bucket_classes = int(n_bands_bucket_classes)
+        self.t_span_bucket_classes = int(t_span_bucket_classes)
+        self.grl_lambda = float(grl_lambda)
+        if self.universal_aux_enable:
+            self.projection_head = _build_mlp(
+                self.feature_dim,
+                self.adv_hidden_dim,
+                self.proj_dim,
+                dropout=head_dropout,
+                final_bias=True,
+            )
+            self.grl = GradientReversalLayer(lambda_=self.grl_lambda)
+            self.adv_head_n_det = _build_mlp(
+                self.feature_dim,
+                self.adv_hidden_dim,
+                self.n_det_bucket_classes,
+                dropout=head_dropout,
+            )
+            self.adv_head_n_bands = _build_mlp(
+                self.feature_dim,
+                self.adv_hidden_dim,
+                self.n_bands_bucket_classes,
+                dropout=head_dropout,
+            )
+            self.adv_head_t_span = _build_mlp(
+                self.feature_dim,
+                self.adv_hidden_dim,
+                self.t_span_bucket_classes,
+                dropout=head_dropout,
+            )
         self._init_head_weights()
 
     def _init_head_weights(self):
-        for m in self.classifier:
-            if isinstance(m, nn.Linear):
-                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
+        modules = [self.classifier]
+        if self.universal_aux_enable:
+            modules.extend(
+                [
+                    self.projection_head,
+                    self.adv_head_n_det,
+                    self.adv_head_n_bands,
+                    self.adv_head_t_span,
+                ]
+            )
+        for module in modules:
+            for m in module.modules():
+                if isinstance(m, nn.Linear):
+                    nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+                    if m.bias is not None:
+                        nn.init.constant_(m.bias, 0)
 
     def encode_optical(self, opt_t, opt_v, opt_ref_t, opt_mask, opt_err):
         z_l, h_l = self.optical_encoder(
@@ -1390,13 +1475,48 @@ class OpticalKNClassifier(nn.Module):
             h_l = self.feature_dropout(h_l)
         return z_l, h_l
 
-    def forward(self, opt_t, opt_v, opt_ref_t, opt_mask, opt_err):
+    def compute_joint_features(self, opt_t, opt_v, opt_ref_t, opt_mask, opt_err):
         z_l, h_l = self.encode_optical(opt_t, opt_v, opt_ref_t, opt_mask, opt_err)
-        # Concatenate CLS and pooled temporal features for robust single-modal classification.
         h_pool = h_l.mean(dim=1)
         feat = torch.cat([z_l, h_pool], dim=1)
+        return feat, z_l, h_l
+
+    def forward(self, opt_t, opt_v, opt_ref_t, opt_mask, opt_err):
+        feat, _, _ = self.compute_joint_features(opt_t, opt_v, opt_ref_t, opt_mask, opt_err)
         logits = self.classifier(feat)
         return logits
+
+    def forward_with_aux(self, opt_t, opt_v, opt_ref_t, opt_mask, opt_err, return_aux=True):
+        feat, z_l, h_l = self.compute_joint_features(opt_t, opt_v, opt_ref_t, opt_mask, opt_err)
+        logits = self.classifier(feat)
+        if not return_aux or (not self.universal_aux_enable):
+            return {
+                "logits": logits,
+                "joint_feat": feat,
+                "proj_feat": None,
+                "adv_logits_n_det": None,
+                "adv_logits_n_bands": None,
+                "adv_logits_t_span": None,
+                "cls_feat": z_l,
+                "temporal_feat": h_l,
+            }
+        proj_feat = F.normalize(self.projection_head(feat), dim=-1)
+        feat_adv = self.grl(feat)
+        return {
+            "logits": logits,
+            "joint_feat": feat,
+            "proj_feat": proj_feat,
+            "adv_logits_n_det": self.adv_head_n_det(feat_adv),
+            "adv_logits_n_bands": self.adv_head_n_bands(feat_adv),
+            "adv_logits_t_span": self.adv_head_t_span(feat_adv),
+            "cls_feat": z_l,
+            "temporal_feat": h_l,
+        }
+
+    def set_grl_lambda(self, value: float):
+        self.grl_lambda = float(value)
+        if self.universal_aux_enable:
+            self.grl.set_lambda(value)
 
     def set_encoder_trainable(self, trainable):
         for p in self.optical_encoder.parameters():

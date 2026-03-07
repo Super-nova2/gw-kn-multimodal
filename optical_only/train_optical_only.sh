@@ -179,6 +179,23 @@ PREFIX_REAL_HIST_PATH=$(jq -r '.prefix_real_hist_path // empty' "$args_file")
 PREFIX_EVAL_ENABLE=$(jq -r '.prefix_eval_enable // empty' "$args_file")
 PREFIX_MANIFEST_OUT=$(jq -r '(.prefix_manifest_out // .eval_prefix_manifest_out) // empty' "$args_file")
 SECONDARY_PREFIX_EVAL_DET_SUPPORT=$(jq -r '.secondary_prefix_eval_det_support // empty' "$args_file")
+UNIVERSAL_TRAIN_ENABLE=$(jq -r '.universal_train_enable // false' "$args_file")
+UNIVERSAL_STAGE1_EPOCHS=$(jq -r '.universal_stage1_epochs // empty' "$args_file")
+UNIVERSAL_STAGE2_EPOCHS=$(jq -r '.universal_stage2_epochs // empty' "$args_file")
+UNIVERSAL_STAGE3_EPOCHS=$(jq -r '.universal_stage3_epochs // empty' "$args_file")
+VIEW_KEEP_PROB_MIN=$(jq -r '.view_keep_prob_min // empty' "$args_file")
+VIEW_KEEP_PROB_MAX=$(jq -r '.view_keep_prob_max // empty' "$args_file")
+VIEW_BAND_DROPOUT_MAX=$(jq -r '.view_band_dropout_max // empty' "$args_file")
+CONSISTENCY_EMBED_WEIGHT=$(jq -r '.consistency_embed_weight // empty' "$args_file")
+CONSISTENCY_PROB_WEIGHT=$(jq -r '.consistency_prob_weight // empty' "$args_file")
+ADV_DET_WEIGHT=$(jq -r '.adv_det_weight // empty' "$args_file")
+ADV_BAND_WEIGHT=$(jq -r '.adv_band_weight // empty' "$args_file")
+ADV_SPAN_WEIGHT=$(jq -r '.adv_span_weight // empty' "$args_file")
+GRL_LAMBDA=$(jq -r '.grl_lambda // empty' "$args_file")
+OOD_REJECT_ENABLE=$(jq -r '.ood_reject_enable // false' "$args_file")
+OOD_UNCERTAINTY_METRIC=$(jq -r '.ood_uncertainty_metric // empty' "$args_file")
+OOD_UNCERTAINTY_THRESHOLD=$(jq -r '.ood_uncertainty_threshold // empty' "$args_file")
+REGIME_EVAL_ENABLE=$(jq -r '.regime_eval_enable // false' "$args_file")
 
 OPTICAL_V2_EVAL_POS_DEFAULT="/fred/oz016/bgao_kn/data/Optical_Only_dataset/combined_dataset_test.h5"
 OPTICAL_V2_EVAL_NEG_DEFAULT="/fred/oz016/bgao_kn/data/Optical_Only_dataset/Tutorial_negative_dataset.h5"
@@ -497,6 +514,45 @@ fi
 if [[ -n "$PREFIX_REAL_HIST_PATH" && "$PREFIX_REAL_HIST_PATH" != "null" ]]; then
     cmd+=(--prefix_real_hist_path "$PREFIX_REAL_HIST_PATH")
 fi
+if is_truthy "$UNIVERSAL_TRAIN_ENABLE"; then
+    cmd+=(--universal_train_enable)
+fi
+if [[ -n "$UNIVERSAL_STAGE1_EPOCHS" && "$UNIVERSAL_STAGE1_EPOCHS" != "null" ]]; then
+    cmd+=(--universal_stage1_epochs "$UNIVERSAL_STAGE1_EPOCHS")
+fi
+if [[ -n "$UNIVERSAL_STAGE2_EPOCHS" && "$UNIVERSAL_STAGE2_EPOCHS" != "null" ]]; then
+    cmd+=(--universal_stage2_epochs "$UNIVERSAL_STAGE2_EPOCHS")
+fi
+if [[ -n "$UNIVERSAL_STAGE3_EPOCHS" && "$UNIVERSAL_STAGE3_EPOCHS" != "null" ]]; then
+    cmd+=(--universal_stage3_epochs "$UNIVERSAL_STAGE3_EPOCHS")
+fi
+if [[ -n "$VIEW_KEEP_PROB_MIN" && "$VIEW_KEEP_PROB_MIN" != "null" ]]; then
+    cmd+=(--view_keep_prob_min "$VIEW_KEEP_PROB_MIN")
+fi
+if [[ -n "$VIEW_KEEP_PROB_MAX" && "$VIEW_KEEP_PROB_MAX" != "null" ]]; then
+    cmd+=(--view_keep_prob_max "$VIEW_KEEP_PROB_MAX")
+fi
+if [[ -n "$VIEW_BAND_DROPOUT_MAX" && "$VIEW_BAND_DROPOUT_MAX" != "null" ]]; then
+    cmd+=(--view_band_dropout_max "$VIEW_BAND_DROPOUT_MAX")
+fi
+if [[ -n "$CONSISTENCY_EMBED_WEIGHT" && "$CONSISTENCY_EMBED_WEIGHT" != "null" ]]; then
+    cmd+=(--consistency_embed_weight "$CONSISTENCY_EMBED_WEIGHT")
+fi
+if [[ -n "$CONSISTENCY_PROB_WEIGHT" && "$CONSISTENCY_PROB_WEIGHT" != "null" ]]; then
+    cmd+=(--consistency_prob_weight "$CONSISTENCY_PROB_WEIGHT")
+fi
+if [[ -n "$ADV_DET_WEIGHT" && "$ADV_DET_WEIGHT" != "null" ]]; then
+    cmd+=(--adv_det_weight "$ADV_DET_WEIGHT")
+fi
+if [[ -n "$ADV_BAND_WEIGHT" && "$ADV_BAND_WEIGHT" != "null" ]]; then
+    cmd+=(--adv_band_weight "$ADV_BAND_WEIGHT")
+fi
+if [[ -n "$ADV_SPAN_WEIGHT" && "$ADV_SPAN_WEIGHT" != "null" ]]; then
+    cmd+=(--adv_span_weight "$ADV_SPAN_WEIGHT")
+fi
+if [[ -n "$GRL_LAMBDA" && "$GRL_LAMBDA" != "null" ]]; then
+    cmd+=(--grl_lambda "$GRL_LAMBDA")
+fi
 if [[ -n "$META_FILTER_N_DET_MIN" && "$META_FILTER_N_DET_MIN" != "null" ]]; then
     cmd+=(--meta_filter_n_det_min "$META_FILTER_N_DET_MIN")
 fi
@@ -517,7 +573,7 @@ if [[ -n "$REAL_STREAM_PROFILE_PATH" && "$REAL_STREAM_PROFILE_PATH" != "null" ]]
 fi
 
 echo "Training Command: ${cmd[*]}"
-echo "Optical controls (from config): meta_matched_sampling=${META_MATCHED_SAMPLING:-<default>}, meta_match_fallback=${META_MATCH_FALLBACK:-<default>}, meta_filter_n_det=[${META_FILTER_N_DET_MIN:-<default>},${META_FILTER_N_DET_MAX:-<default>}], meta_filter_n_bands_max=${META_FILTER_N_BANDS_MAX:-<default>}, meta_filter_t_span_max=${META_FILTER_T_SPAN_MAX:-<default>}, meta_filter_relax=${META_FILTER_RELAX_T_SPAN_IF_BELOW_ROWS:-<default>}, real_stream_profile=${REAL_STREAM_PROFILE_PATH:-<default>}, single_band_keep_prob=${SINGLE_BAND_KEEP_PROB:-<default>}, target_ndet_jitter=${TARGET_NDET_JITTER:-<default>}, shortcut_audit_enable=${SHORTCUT_AUDIT_ENABLE:-<default>}, shortcut_audit_val_samples=${SHORTCUT_AUDIT_VAL_SAMPLES:-<default>}, prefix_train_enable=${PREFIX_TRAIN_ENABLE:-<default>}, prefix_min_det=${PREFIX_MIN_DET:-<default>}, prefix_train_sampling=${PREFIX_TRAIN_SAMPLING:-<default>}, prefix_mix_weights=${PREFIX_REAL_MIX_WEIGHT:-<default>}:${PREFIX_BUCKET_UNIFORM_MIX_WEIGHT:-<default>}:${PREFIX_TERMINAL_MIX_WEIGHT:-<default>}"
+echo "Optical controls (from config): meta_matched_sampling=${META_MATCHED_SAMPLING:-<default>}, meta_match_fallback=${META_MATCH_FALLBACK:-<default>}, meta_filter_n_det=[${META_FILTER_N_DET_MIN:-<default>},${META_FILTER_N_DET_MAX:-<default>}], meta_filter_n_bands_max=${META_FILTER_N_BANDS_MAX:-<default>}, meta_filter_t_span_max=${META_FILTER_T_SPAN_MAX:-<default>}, meta_filter_relax=${META_FILTER_RELAX_T_SPAN_IF_BELOW_ROWS:-<default>}, real_stream_profile=${REAL_STREAM_PROFILE_PATH:-<default>}, universal_train_enable=${UNIVERSAL_TRAIN_ENABLE:-<default>}, universal_epochs=${UNIVERSAL_STAGE1_EPOCHS:-<default>}/${UNIVERSAL_STAGE2_EPOCHS:-<default>}/${UNIVERSAL_STAGE3_EPOCHS:-<default>}, view_keep_prob=${VIEW_KEEP_PROB_MIN:-<default>}..${VIEW_KEEP_PROB_MAX:-<default>}, view_band_dropout_max=${VIEW_BAND_DROPOUT_MAX:-<default>}, cons_weights=${CONSISTENCY_EMBED_WEIGHT:-<default>}/${CONSISTENCY_PROB_WEIGHT:-<default>}, adv_weights=${ADV_DET_WEIGHT:-<default>}/${ADV_BAND_WEIGHT:-<default>}/${ADV_SPAN_WEIGHT:-<default>}, grl_lambda=${GRL_LAMBDA:-<default>}, single_band_keep_prob=${SINGLE_BAND_KEEP_PROB:-<default>}, target_ndet_jitter=${TARGET_NDET_JITTER:-<default>}, shortcut_audit_enable=${SHORTCUT_AUDIT_ENABLE:-<default>}, shortcut_audit_val_samples=${SHORTCUT_AUDIT_VAL_SAMPLES:-<default>}, prefix_train_enable=${PREFIX_TRAIN_ENABLE:-<default>}, prefix_min_det=${PREFIX_MIN_DET:-<default>}, prefix_train_sampling=${PREFIX_TRAIN_SAMPLING:-<default>}, prefix_mix_weights=${PREFIX_REAL_MIX_WEIGHT:-<default>}:${PREFIX_BUCKET_UNIFORM_MIX_WEIGHT:-<default>}:${PREFIX_TERMINAL_MIX_WEIGHT:-<default>}"
 set +e
 "${cmd[@]}"
 train_exit_code=$?
@@ -659,6 +715,18 @@ if [[ -n "$META_FILTER_RELAX_T_SPAN_IF_BELOW_ROWS" && "$META_FILTER_RELAX_T_SPAN
 fi
 if [[ -n "$REAL_STREAM_PROFILE_PATH" && "$REAL_STREAM_PROFILE_PATH" != "null" ]]; then
     eval_cmd+=(--real_stream_profile_path "$REAL_STREAM_PROFILE_PATH")
+fi
+if is_truthy "$OOD_REJECT_ENABLE"; then
+    eval_cmd+=(--ood_reject_enable)
+fi
+if [[ -n "$OOD_UNCERTAINTY_METRIC" && "$OOD_UNCERTAINTY_METRIC" != "null" ]]; then
+    eval_cmd+=(--ood_uncertainty_metric "$OOD_UNCERTAINTY_METRIC")
+fi
+if [[ -n "$OOD_UNCERTAINTY_THRESHOLD" && "$OOD_UNCERTAINTY_THRESHOLD" != "null" ]]; then
+    eval_cmd+=(--ood_uncertainty_threshold "$OOD_UNCERTAINTY_THRESHOLD")
+fi
+if is_truthy "$REGIME_EVAL_ENABLE"; then
+    eval_cmd+=(--regime_eval_enable)
 fi
 
 echo "Evaluation Command: ${eval_cmd[*]}"
