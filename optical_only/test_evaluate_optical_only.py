@@ -13,6 +13,7 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Optional
 
+import h5py
 import numpy as np
 import torch
 import torch.nn as nn
@@ -128,6 +129,10 @@ def parse_args():
     p.add_argument("--meta_filter_t_span_max", type=float, default=None)
     p.add_argument("--meta_filter_relax_t_span_if_below_rows", type=str, default=None)
     p.add_argument("--real_stream_profile_path", type=str, default=None)
+    p.add_argument("--ood_reject_enable", action="store_true", default=None)
+    p.add_argument("--ood_uncertainty_metric", type=str, default=None)
+    p.add_argument("--ood_uncertainty_threshold", type=float, default=None)
+    p.add_argument("--regime_eval_enable", action="store_true", default=None)
 
     p.add_argument("--time_offset_enable", action="store_true", default=None)
     p.add_argument("--offset_dist_npz", type=str, default=None)
@@ -416,6 +421,16 @@ def load_model(checkpoint_path, device, config_dict):
             return config_dict[key]
         return default
 
+    state_dict = ckpt.get("model_state_dict", ckpt)
+    if not isinstance(state_dict, dict):
+        raise ValueError("Checkpoint does not contain valid state_dict.")
+    cleaned_state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
+    has_universal_aux = (
+        bool(ckpt_args.get("universal_train_enable", False))
+        or any(k.startswith("projection_head.") for k in cleaned_state_dict.keys())
+        or any(k.startswith("adv_head_n_det.") for k in cleaned_state_dict.keys())
+    )
+
     model = OpticalKNClassifier(
         optical_input_dim=6,
         ref_time_dim=_get("ref_dim", 64),
@@ -424,12 +439,15 @@ def load_model(checkpoint_path, device, config_dict):
         feature_dropout=_get("feature_dropout", 0.0),
         head_hidden_dim=_get("head_hidden_dim", None),
         head_dropout=_get("head_dropout", 0.2),
+        universal_aux_enable=bool(has_universal_aux),
+        proj_dim=64,
+        adv_hidden_dim=(_get("head_hidden_dim", None) if _get("head_hidden_dim", None) is not None else _get("enc_dim", 64)),
+        n_det_bucket_classes=5,
+        n_bands_bucket_classes=4,
+        t_span_bucket_classes=5,
+        grl_lambda=float(_get("grl_lambda", 1.0)),
     )
-
-    state_dict = ckpt.get("model_state_dict", ckpt)
-    if not isinstance(state_dict, dict):
-        raise ValueError("Checkpoint does not contain valid state_dict.")
-    state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
+    state_dict = cleaned_state_dict
     model_state = model.state_dict()
     missing = sorted(set(model_state.keys()) - set(state_dict.keys()))
     unexpected = sorted(set(state_dict.keys()) - set(model_state.keys()))
@@ -736,6 +754,134 @@ def build_eval_loader(dataset, args):
         num_workers=0,
         pin_memory=bool(args.pin_memory),
     )
+
+
+def filter_indices_by_regime(
+    h5_path: str,
+    group: str,
+    indices: np.ndarray,
+    *,
+    n_det_min: Optional[int] = None,
+    n_det_max: Optional[int] = None,
+    n_bands_min: Optional[int] = None,
+    n_bands_max: Optional[int] = None,
+    t_span_min: Optional[float] = None,
+    t_span_max: Optional[float] = None,
+) -> np.ndarray:
+    idx = np.asarray(indices, dtype=np.int64).reshape(-1)
+    if idx.size == 0:
+        return idx
+    with h5py.File(h5_path, "r") as f:
+        meta = OpticalBinaryDataset._load_or_compute_meta_arrays(f, group)
+    n_det = np.asarray(meta["n_det"][idx], dtype=np.float32)
+    n_bands = np.asarray(meta["n_bands"][idx], dtype=np.float32)
+    t_span = np.asarray(meta["t_span"][idx], dtype=np.float32)
+    keep = np.ones((idx.shape[0],), dtype=bool)
+    if n_det_min is not None:
+        keep &= n_det >= float(n_det_min)
+    if n_det_max is not None:
+        keep &= n_det <= float(n_det_max)
+    if n_bands_min is not None:
+        keep &= n_bands >= float(n_bands_min)
+    if n_bands_max is not None:
+        keep &= n_bands <= float(n_bands_max)
+    if t_span_min is not None:
+        keep &= t_span > float(t_span_min)
+    if t_span_max is not None:
+        keep &= t_span <= float(t_span_max)
+    return idx[keep]
+
+
+def build_regime_dataset(
+    *,
+    pos_data_path: str,
+    neg_data_path: str,
+    neg_group: str,
+    prefix_eval_enable: bool,
+    prefix_min_det: int,
+    prefix_eval_det_support: List[int],
+    sample_seed: int,
+    max_pos_samples: Optional[int],
+    max_neg_samples: Optional[int],
+    regime_spec: Dict[str, object],
+):
+    pos_indices = np.arange(
+        OpticalBinaryDataset(
+            pos_h5_path=pos_data_path,
+            neg_h5_path=neg_data_path,
+            neg_group=neg_group,
+            cache_in_memory=False,
+        ).n_pos,
+        dtype=np.int64,
+    )
+    neg_indices = np.arange(
+        OpticalBinaryDataset(
+            pos_h5_path=pos_data_path,
+            neg_h5_path=neg_data_path,
+            neg_group=neg_group,
+            cache_in_memory=False,
+        ).n_neg,
+        dtype=np.int64,
+    )
+    regime_kwargs = dict(regime_spec)
+    pos_indices = filter_indices_by_regime(pos_data_path, "events/optical_data", pos_indices, **regime_kwargs)
+    neg_indices = filter_indices_by_regime(neg_data_path, neg_group, neg_indices, **regime_kwargs)
+    if prefix_eval_enable:
+        pos_indices = _filter_indices_by_min_detection_count(
+            pos_data_path, "events/optical_data", pos_indices, prefix_min_det
+        )
+        neg_indices = _filter_indices_by_min_detection_count(
+            neg_data_path, neg_group, neg_indices, prefix_min_det
+        )
+    if pos_indices.size == 0 or neg_indices.size == 0:
+        return None, {
+            "n_pos": int(pos_indices.size),
+            "n_neg": int(neg_indices.size),
+        }
+
+    rng = np.random.default_rng(int(sample_seed))
+    if max_pos_samples is not None and max_pos_samples < len(pos_indices):
+        pos_indices = np.sort(rng.choice(pos_indices, size=int(max_pos_samples), replace=False))
+    if max_neg_samples is not None and max_neg_samples < len(neg_indices):
+        neg_indices = np.sort(rng.choice(neg_indices, size=int(max_neg_samples), replace=False))
+
+    base_dataset = OpticalBinaryDataset(
+        pos_h5_path=pos_data_path,
+        neg_h5_path=neg_data_path,
+        neg_group=neg_group,
+        pos_indices=pos_indices,
+        neg_indices=neg_indices,
+        cache_in_memory=False,
+        return_prefix_aux=prefix_eval_enable,
+    )
+    if not prefix_eval_enable:
+        return base_dataset, {
+            "n_pos": int(base_dataset.n_pos),
+            "n_neg": int(base_dataset.n_neg),
+            "n_rows": int(len(base_dataset)),
+        }
+    manifest_rows = _build_prefix_manifest_for_binary_dataset(
+        base_dataset=base_dataset,
+        det_support=prefix_eval_det_support,
+        prefix_min_det=prefix_min_det,
+        include_terminal=True,
+    )
+    if not manifest_rows:
+        return None, {
+            "n_pos": int(base_dataset.n_pos),
+            "n_neg": int(base_dataset.n_neg),
+            "n_rows": 0,
+        }
+    dataset = OpticalPrefixEvalDataset(
+        base_dataset=base_dataset,
+        manifest_rows=manifest_rows,
+        prefix_min_det=prefix_min_det,
+    )
+    return dataset, {
+        "n_pos": int(base_dataset.n_pos),
+        "n_neg": int(base_dataset.n_neg),
+        "n_rows": int(len(dataset)),
+    }
 
 
 @torch.no_grad()
@@ -1096,9 +1242,78 @@ def main():
         )
         legacy_results = legacy_metrics
 
+    regime_eval_enable = bool(
+        choose_value(args.regime_eval_enable, config_dict, ckpt_args, "regime_eval_enable", default=False)
+    )
+    regime_results = None
+    if regime_eval_enable:
+        regime_specs = {
+            "short_sparse": {
+                "n_det_min": 3,
+                "n_det_max": 4,
+                "n_bands_max": 2,
+                "t_span_max": 0.01,
+            },
+            "short_multiband": {
+                "n_det_min": 3,
+                "n_det_max": 4,
+                "n_bands_min": 3,
+                "t_span_max": 0.05,
+            },
+            "mid_regime": {
+                "n_det_min": 5,
+                "n_det_max": 6,
+                "t_span_min": 0.05,
+                "t_span_max": 0.2,
+            },
+            "long_regime": {
+                "n_det_min": 7,
+                "t_span_min": 0.2,
+            },
+        }
+        regime_results = {}
+        for idx, (regime_name, regime_spec) in enumerate(regime_specs.items(), start=1):
+            regime_dataset, regime_meta = build_regime_dataset(
+                pos_data_path=data_meta["pos_data_path"],
+                neg_data_path=data_meta["neg_data_path"],
+                neg_group=data_meta["neg_group"],
+                prefix_eval_enable=bool(data_meta.get("prefix_eval_enable", False)),
+                prefix_min_det=int(data_meta.get("prefix_min_det", 2)),
+                prefix_eval_det_support=[int(v) for v in data_meta.get("prefix_eval_det_support", [])],
+                sample_seed=int(args.sample_seed) + idx,
+                max_pos_samples=args.max_pos_samples,
+                max_neg_samples=args.max_neg_samples,
+                regime_spec=regime_spec,
+            )
+            if regime_dataset is None:
+                regime_results[regime_name] = {
+                    "skipped": True,
+                    "spec": regime_spec,
+                    **regime_meta,
+                }
+                continue
+            regime_loader = build_eval_loader(regime_dataset, args)
+            regime_metrics, _, _, _ = run_evaluation(
+                model=model,
+                loader=regime_loader,
+                device=device,
+                n_ref=n_ref,
+                ref_start=ref_start,
+                ref_end=ref_end,
+                target_recall=target_recall,
+                offset_policy=offset_policy,
+            )
+            regime_results[regime_name] = {
+                "skipped": False,
+                "spec": regime_spec,
+                **regime_meta,
+                **regime_metrics,
+            }
+
     results = {
         "classification": metrics,
         "legacy_full_window": legacy_results,
+        "regime_eval": regime_results,
         "meta": {
             "checkpoint": args.checkpoint,
             "device": str(device),
@@ -1110,6 +1325,7 @@ def main():
             "ref_end": ref_end,
             "batch_size": int(args.batch_size),
             "time_offset": offset_policy.info,
+            "regime_eval_enable": bool(regime_eval_enable),
             **data_meta,
         },
     }
@@ -1137,6 +1353,21 @@ def main():
             f"AUPRC={legacy_results.get('auprc', 0.0):.4f}, "
             f"thr={legacy_results.get('op_threshold', 0.0):.3f}"
         )
+    if regime_results is not None:
+        for regime_name, regime_info in regime_results.items():
+            if regime_info.get("skipped", False):
+                print(
+                    f"Regime {regime_name}: skipped "
+                    f"(n_pos={regime_info.get('n_pos', 0)}, n_neg={regime_info.get('n_neg', 0)})"
+                )
+                continue
+            print(
+                f"Regime {regime_name}: "
+                f"AUROC={regime_info.get('auroc', 0.0):.4f}, "
+                f"AUPRC={regime_info.get('auprc', 0.0):.4f}, "
+                f"precision={regime_info.get('op_precision', 0.0):.4f}, "
+                f"recall={regime_info.get('op_recall', 0.0):.4f}"
+            )
     print(f"Saved: {out_json}")
 
     if not args.no_plots:

@@ -15,11 +15,12 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.amp import GradScaler, autocast
 
 try:
@@ -700,6 +701,217 @@ def augment_optical_data(
     return opt_t, opt_v, opt_mask, opt_err
 
 
+def sample_universal_target_k(
+    slot_is_detection: torch.Tensor,
+    opt_mask: torch.Tensor,
+    min_det: int,
+    max_det: int = 12,
+    terminal_prob: float = 0.2,
+) -> torch.Tensor:
+    valid_rows = opt_mask.sum(dim=-1) > 0
+    det_counts = ((slot_is_detection > 0) & valid_rows).sum(dim=1).to(dtype=torch.long)
+    if bool((det_counts < int(min_det)).any().item()):
+        raise ValueError("Universal prefix sampling received samples below prefix_min_det.")
+    capped_upper = torch.minimum(det_counts, torch.full_like(det_counts, int(max_det)))
+    rand_u = torch.rand(det_counts.shape[0], device=slot_is_detection.device)
+    terminal_mask = rand_u < float(terminal_prob)
+    range_size = torch.clamp(capped_upper - int(min_det) + 1, min=1)
+    draw = (torch.rand(det_counts.shape[0], device=slot_is_detection.device) * range_size.to(torch.float32)).floor().to(torch.long)
+    sampled = draw + int(min_det)
+    sampled = torch.minimum(sampled, capped_upper)
+    sampled = torch.where(terminal_mask, det_counts, sampled)
+    sampled = torch.clamp(sampled, min=int(min_det))
+    return sampled
+
+
+def bucketize_n_det(n_det: torch.Tensor) -> torch.Tensor:
+    out = torch.zeros_like(n_det, dtype=torch.long)
+    out = torch.where(n_det == 4, torch.ones_like(out), out)
+    out = torch.where((n_det >= 5) & (n_det <= 6), torch.full_like(out, 2), out)
+    out = torch.where((n_det >= 7) & (n_det <= 12), torch.full_like(out, 3), out)
+    out = torch.where(n_det >= 13, torch.full_like(out, 4), out)
+    return out
+
+
+def bucketize_n_bands(n_bands: torch.Tensor) -> torch.Tensor:
+    out = torch.zeros_like(n_bands, dtype=torch.long)
+    out = torch.where(n_bands == 2, torch.ones_like(out), out)
+    out = torch.where(n_bands == 3, torch.full_like(out, 2), out)
+    out = torch.where(n_bands >= 4, torch.full_like(out, 3), out)
+    return out
+
+
+def bucketize_t_span(t_span: torch.Tensor) -> torch.Tensor:
+    out = torch.zeros_like(t_span, dtype=torch.long)
+    out = torch.where(t_span > 0.01, torch.ones_like(out), out)
+    out = torch.where(t_span > 0.05, torch.full_like(out, 2), out)
+    out = torch.where(t_span > 0.2, torch.full_like(out, 3), out)
+    out = torch.where(t_span > 0.6, torch.full_like(out, 4), out)
+    return out
+
+
+def build_universal_view(
+    opt_t: torch.Tensor,
+    opt_v: torch.Tensor,
+    opt_mask: torch.Tensor,
+    opt_err: torch.Tensor,
+    slot_is_detection: torch.Tensor,
+    args,
+) -> Dict[str, torch.Tensor]:
+    target_k = sample_universal_target_k(
+        slot_is_detection=slot_is_detection,
+        opt_mask=opt_mask,
+        min_det=int(args.prefix_min_det),
+        max_det=12,
+        terminal_prob=float(args.prefix_terminal_mix_prob),
+    )
+    total_det = ((slot_is_detection > 0) & (opt_mask.sum(dim=-1) > 0)).sum(dim=1).to(dtype=torch.long)
+    opt_t, opt_v, opt_mask, opt_err, slot_is_detection, stats = apply_prefix_right_censoring_torch(
+        opt_t=opt_t,
+        opt_v=opt_v,
+        opt_mask=opt_mask,
+        opt_err=opt_err,
+        slot_is_detection=slot_is_detection,
+        target_k=target_k,
+        min_det=int(args.prefix_min_det),
+    )
+
+    valid_rows = opt_mask.sum(dim=-1) > 0
+    keep_prob = torch.empty((opt_mask.size(0), 1), device=opt_mask.device).uniform_(
+        float(args.view_keep_prob_min),
+        float(args.view_keep_prob_max),
+    )
+    row_keep = (~valid_rows) | (torch.rand(valid_rows.shape, device=opt_mask.device) < keep_prob)
+    det_rows = (slot_is_detection > 0) & valid_rows
+    det_after_row = (det_rows & row_keep).sum(dim=1)
+    failed_row = det_after_row < int(args.prefix_min_det)
+    if bool(failed_row.any().item()):
+        row_keep[failed_row] = row_keep[failed_row] | det_rows[failed_row]
+
+    row_keep_3d = row_keep.unsqueeze(-1)
+    opt_t = torch.where(row_keep, opt_t, torch.zeros_like(opt_t))
+    opt_v = torch.where(row_keep_3d, opt_v, torch.zeros_like(opt_v))
+    opt_mask = torch.where(row_keep_3d, opt_mask, torch.zeros_like(opt_mask))
+    opt_err = torch.where(row_keep_3d, opt_err, torch.zeros_like(opt_err))
+    slot_is_detection = torch.where(row_keep, slot_is_detection, torch.zeros_like(slot_is_detection))
+
+    pre_band_opt_v = opt_v.clone()
+    pre_band_opt_mask = opt_mask.clone()
+    pre_band_opt_err = opt_err.clone()
+    pre_band_slot = slot_is_detection.clone()
+
+    observed_bands = opt_mask.sum(dim=1) > 0
+    band_drop = torch.empty((opt_mask.size(0), 1), device=opt_mask.device).uniform_(
+        0.0,
+        float(args.view_band_dropout_max),
+    )
+    band_keep = torch.rand((opt_mask.size(0), opt_mask.size(2)), device=opt_mask.device) >= band_drop
+    band_keep = band_keep & observed_bands
+    missing_any_band = ~band_keep.any(dim=1)
+    if bool(missing_any_band.any().item()):
+        band_counts = pre_band_opt_mask.sum(dim=1)
+        best_band = torch.argmax(band_counts, dim=1)
+        band_keep[missing_any_band] = False
+        band_keep[missing_any_band, best_band[missing_any_band]] = True
+    band_keep_3d = band_keep.unsqueeze(1)
+    opt_v = torch.where(band_keep_3d, opt_v, torch.zeros_like(opt_v))
+    opt_mask = torch.where(band_keep_3d, opt_mask, torch.zeros_like(opt_mask))
+    opt_err = torch.where(band_keep_3d, opt_err, torch.zeros_like(opt_err))
+    slot_is_detection = torch.where(opt_mask.sum(dim=-1) > 0, slot_is_detection, torch.zeros_like(slot_is_detection))
+
+    det_after_band = ((slot_is_detection > 0) & (opt_mask.sum(dim=-1) > 0)).sum(dim=1)
+    failed_band = det_after_band < int(args.prefix_min_det)
+    if bool(failed_band.any().item()):
+        opt_v[failed_band] = pre_band_opt_v[failed_band]
+        opt_mask[failed_band] = pre_band_opt_mask[failed_band]
+        opt_err[failed_band] = pre_band_opt_err[failed_band]
+        slot_is_detection[failed_band] = pre_band_slot[failed_band]
+
+    n_det, n_bands, t_span = compute_batch_sequence_meta(opt_t, opt_mask, slot_is_detection)
+    return {
+        "opt_t": opt_t,
+        "opt_v": opt_v,
+        "opt_mask": opt_mask,
+        "opt_err": opt_err,
+        "slot_is_detection": slot_is_detection,
+        "target_k": target_k,
+        "is_terminal_prefix": (target_k >= total_det).to(dtype=torch.long),
+        "n_det": n_det.to(dtype=torch.long),
+        "n_bands": n_bands.to(dtype=torch.long),
+        "t_span": t_span,
+        "bucket_n_det": bucketize_n_det(n_det.to(dtype=torch.long)),
+        "bucket_n_bands": bucketize_n_bands(n_bands.to(dtype=torch.long)),
+        "bucket_t_span": bucketize_t_span(t_span),
+    }
+
+
+def symmetric_bernoulli_kl_from_logits(logits_a: torch.Tensor, logits_b: torch.Tensor, eps: float = 1.0e-6) -> torch.Tensor:
+    pa = torch.sigmoid(logits_a).clamp(min=eps, max=1.0 - eps)
+    pb = torch.sigmoid(logits_b).clamp(min=eps, max=1.0 - eps)
+    kl_ab = pa * torch.log(pa / pb) + (1.0 - pa) * torch.log((1.0 - pa) / (1.0 - pb))
+    kl_ba = pb * torch.log(pb / pa) + (1.0 - pb) * torch.log((1.0 - pb) / (1.0 - pa))
+    return 0.5 * (kl_ab.mean() + kl_ba.mean())
+
+
+def compute_universal_loss(
+    view_a: Dict[str, torch.Tensor],
+    view_b: Optional[Dict[str, torch.Tensor]],
+    labels: torch.Tensor,
+    criterion,
+    args,
+    stage_mode: str,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    logits_a = view_a["logits"]
+    cls_a = criterion(logits_a, labels)
+    metrics = {
+        "cls_a": float(cls_a.detach().item()),
+    }
+    if view_b is None:
+        return cls_a, metrics
+
+    logits_b = view_b["logits"]
+    cls_b = criterion(logits_b, labels)
+    loss = 0.5 * (cls_a + cls_b)
+    metrics["cls_b"] = float(cls_b.detach().item())
+
+    if stage_mode in {"dual", "dual_adv"}:
+        cons_embed = 1.0 - F.cosine_similarity(view_a["proj_feat"], view_b["proj_feat"], dim=-1).mean()
+        cons_prob = symmetric_bernoulli_kl_from_logits(logits_a, logits_b)
+        loss = (
+            loss
+            + float(args.consistency_embed_weight) * cons_embed
+            + float(args.consistency_prob_weight) * cons_prob
+        )
+        metrics["cons_embed"] = float(cons_embed.detach().item())
+        metrics["cons_prob"] = float(cons_prob.detach().item())
+
+    if stage_mode == "dual_adv":
+        adv_criterion = nn.CrossEntropyLoss()
+        adv_det = 0.5 * (
+            adv_criterion(view_a["adv_logits_n_det"], view_a["bucket_n_det"])
+            + adv_criterion(view_b["adv_logits_n_det"], view_b["bucket_n_det"])
+        )
+        adv_band = 0.5 * (
+            adv_criterion(view_a["adv_logits_n_bands"], view_a["bucket_n_bands"])
+            + adv_criterion(view_b["adv_logits_n_bands"], view_b["bucket_n_bands"])
+        )
+        adv_span = 0.5 * (
+            adv_criterion(view_a["adv_logits_t_span"], view_a["bucket_t_span"])
+            + adv_criterion(view_b["adv_logits_t_span"], view_b["bucket_t_span"])
+        )
+        loss = (
+            loss
+            + float(args.adv_det_weight) * adv_det
+            + float(args.adv_band_weight) * adv_band
+            + float(args.adv_span_weight) * adv_span
+        )
+        metrics["adv_det"] = float(adv_det.detach().item())
+        metrics["adv_band"] = float(adv_band.detach().item())
+        metrics["adv_span"] = float(adv_span.detach().item())
+
+    return loss, metrics
+
+
 def select_threshold_for_target_recall(probs, labels, target_recall=0.98):
     thresholds = torch.linspace(1.0, 0.0, 1001, device=probs.device)
     best = None
@@ -759,29 +971,78 @@ def forward_logits_with_offsets(
     offset_policy,
     training,
 ):
+    out = forward_outputs_with_offsets(
+        model=model,
+        opt_t=opt_t,
+        opt_v=opt_v,
+        ref_time=ref_time,
+        opt_mask=opt_mask,
+        opt_err=opt_err,
+        device=device,
+        amp_dtype=amp_dtype,
+        args=args,
+        offset_policy=offset_policy,
+        training=training,
+        return_aux=False,
+    )
+    return out["logits"]
+
+
+def forward_outputs_with_offsets(
+    model,
+    opt_t,
+    opt_v,
+    ref_time,
+    opt_mask,
+    opt_err,
+    device,
+    amp_dtype,
+    args,
+    offset_policy,
+    training,
+    return_aux,
+):
     if not offset_policy.enabled:
         with autocast(device_type="cuda", dtype=amp_dtype, enabled=(device.type == "cuda")):
-            logits = model(opt_t, opt_v, ref_time, opt_mask, opt_err).squeeze(-1)
-        return logits.float()
+            out = model.forward_with_aux(opt_t, opt_v, ref_time, opt_mask, opt_err, return_aux=return_aux)
+        out["logits"] = out["logits"].squeeze(-1).float()
+        return out
 
     if training:
         delta_np = offset_policy.sample_train_offsets(opt_t.size(0))
         delta_days = torch.from_numpy(delta_np).to(device=device, dtype=torch.float32)
         shifted_opt_t = apply_time_offsets(opt_t, opt_mask, delta_days, args.offset_scale_days_divisor)
         with autocast(device_type="cuda", dtype=amp_dtype, enabled=(device.type == "cuda")):
-            logits = model(shifted_opt_t, opt_v, ref_time, opt_mask, opt_err).squeeze(-1)
-        return logits.float()
+            out = model.forward_with_aux(
+                shifted_opt_t,
+                opt_v,
+                ref_time,
+                opt_mask,
+                opt_err,
+                return_aux=return_aux,
+            )
+        out["logits"] = out["logits"].squeeze(-1).float()
+        return out
 
     logits_sum = None
     for off_days in offset_policy.eval_offsets_days:
         delta_days = torch.full((opt_t.size(0),), float(off_days), device=device, dtype=torch.float32)
         shifted_opt_t = apply_time_offsets(opt_t, opt_mask, delta_days, args.offset_scale_days_divisor)
         with autocast(device_type="cuda", dtype=amp_dtype, enabled=(device.type == "cuda")):
-            logits = model(shifted_opt_t, opt_v, ref_time, opt_mask, opt_err).squeeze(-1)
-        logits = logits.float()
+            out = model.forward_with_aux(
+                shifted_opt_t,
+                opt_v,
+                ref_time,
+                opt_mask,
+                opt_err,
+                return_aux=return_aux,
+            )
+        logits = out["logits"].squeeze(-1).float()
         logits_sum = logits if logits_sum is None else logits_sum + logits
 
-    return logits_sum / float(max(1, len(offset_policy.eval_offsets_days)))
+    return {
+        "logits": logits_sum / float(max(1, len(offset_policy.eval_offsets_days))),
+    }
 
 
 def run_eval(model, loader, device, args, criterion, amp_dtype, offset_policy):
@@ -899,7 +1160,9 @@ def run_eval(model, loader, device, args, criterion, amp_dtype, offset_policy):
         "op_fpr": op["fpr"],
         "op_meets_target_recall": bool(op["meets_target_recall"]),
         "offset_eval_count": int(len(offset_policy.eval_offsets_days)),
-        "task_mode": "prefix_right_censored" if bool(getattr(args, "prefix_train_enable", False)) else "full_window",
+        "task_mode": "prefix_right_censored"
+        if (bool(getattr(args, "prefix_train_enable", False)) or bool(getattr(args, "universal_train_enable", False)))
+        else "full_window",
     }
     for k, v in shortcut_metrics.items():
         out[f"shortcut_{k}"] = float(v)
@@ -930,6 +1193,7 @@ def train_one_epoch(
     amp_dtype,
     offset_policy,
     prefix_policy,
+    universal_stage_mode: Optional[str] = None,
 ):
     model.train()
     total_loss = 0.0
@@ -955,7 +1219,12 @@ def train_one_epoch(
             slot_is_detection = slot_is_detection.to(device, non_blocking=True)
         target_k = None
 
-        if bool(getattr(args, "prefix_train_enable", False)):
+        if bool(getattr(args, "universal_train_enable", False)):
+            if slot_is_detection is None:
+                raise ValueError("universal_train_enable=true requires slot_is_detection in training batches.")
+            if not getattr(model, "universal_aux_enable", False):
+                raise ValueError("universal_train_enable=true requires model.universal_aux_enable=True.")
+        elif bool(getattr(args, "prefix_train_enable", False)):
             if slot_is_detection is None:
                 raise ValueError("prefix_train_enable=true requires slot_is_detection in training batches.")
             target_k = prefix_policy.sample_target_k(slot_is_detection)
@@ -969,19 +1238,33 @@ def train_one_epoch(
                 min_det=int(args.prefix_min_det),
             )
 
-        opt_t, opt_v, opt_mask, opt_err = augment_optical_data(
-            opt_t,
-            opt_v,
-            opt_mask,
-            opt_err,
-            training=True,
-            time_jitter=args.opt_aug_time_jitter,
-            flux_noise=args.opt_aug_noise,
-            obs_dropout=args.opt_aug_dropout,
-            band_dropout=args.opt_aug_band_dropout,
-            single_band_keep_prob=args.single_band_keep_prob,
-            target_ndet_jitter=(0.0 if bool(getattr(args, "prefix_train_enable", False)) else args.target_ndet_jitter),
-        )
+            opt_t, opt_v, opt_mask, opt_err = augment_optical_data(
+                opt_t,
+                opt_v,
+                opt_mask,
+                opt_err,
+                training=True,
+                time_jitter=args.opt_aug_time_jitter,
+                flux_noise=args.opt_aug_noise,
+                obs_dropout=args.opt_aug_dropout,
+                band_dropout=args.opt_aug_band_dropout,
+                single_band_keep_prob=args.single_band_keep_prob,
+                target_ndet_jitter=0.0,
+            )
+        else:
+            opt_t, opt_v, opt_mask, opt_err = augment_optical_data(
+                opt_t,
+                opt_v,
+                opt_mask,
+                opt_err,
+                training=True,
+                time_jitter=args.opt_aug_time_jitter,
+                flux_noise=args.opt_aug_noise,
+                obs_dropout=args.opt_aug_dropout,
+                band_dropout=args.opt_aug_band_dropout,
+                single_band_keep_prob=args.single_band_keep_prob,
+                target_ndet_jitter=args.target_ndet_jitter,
+            )
 
         batch_size = opt_t.size(0)
         if (
@@ -994,20 +1277,77 @@ def train_one_epoch(
             )
 
         optimizer.zero_grad(set_to_none=True)
-        logits = forward_logits_with_offsets(
-            model=model,
-            opt_t=opt_t,
-            opt_v=opt_v,
-            ref_time=ref_time_cache,
-            opt_mask=opt_mask,
-            opt_err=opt_err,
-            device=device,
-            amp_dtype=amp_dtype,
-            args=args,
-            offset_policy=offset_policy,
-            training=True,
-        )
-        loss = criterion(logits, labels)
+        if bool(getattr(args, "universal_train_enable", False)):
+            view_a = build_universal_view(opt_t, opt_v, opt_mask, opt_err, slot_is_detection, args)
+            out_a = forward_outputs_with_offsets(
+                model=model,
+                opt_t=view_a["opt_t"],
+                opt_v=view_a["opt_v"],
+                ref_time=ref_time_cache,
+                opt_mask=view_a["opt_mask"],
+                opt_err=view_a["opt_err"],
+                device=device,
+                amp_dtype=amp_dtype,
+                args=args,
+                offset_policy=offset_policy,
+                training=True,
+                return_aux=(universal_stage_mode in {"dual", "dual_adv"}),
+            )
+            out_a.update(
+                {
+                    "bucket_n_det": view_a["bucket_n_det"],
+                    "bucket_n_bands": view_a["bucket_n_bands"],
+                    "bucket_t_span": view_a["bucket_t_span"],
+                }
+            )
+            out_b = None
+            if universal_stage_mode in {"dual", "dual_adv"}:
+                view_b = build_universal_view(opt_t, opt_v, opt_mask, opt_err, slot_is_detection, args)
+                out_b = forward_outputs_with_offsets(
+                    model=model,
+                    opt_t=view_b["opt_t"],
+                    opt_v=view_b["opt_v"],
+                    ref_time=ref_time_cache,
+                    opt_mask=view_b["opt_mask"],
+                    opt_err=view_b["opt_err"],
+                    device=device,
+                    amp_dtype=amp_dtype,
+                    args=args,
+                    offset_policy=offset_policy,
+                    training=True,
+                    return_aux=True,
+                )
+                out_b.update(
+                    {
+                        "bucket_n_det": view_b["bucket_n_det"],
+                        "bucket_n_bands": view_b["bucket_n_bands"],
+                        "bucket_t_span": view_b["bucket_t_span"],
+                    }
+                )
+            loss, loss_metrics = compute_universal_loss(
+                view_a=out_a,
+                view_b=out_b,
+                labels=labels,
+                criterion=criterion,
+                args=args,
+                stage_mode=("single" if universal_stage_mode is None else universal_stage_mode),
+            )
+        else:
+            logits = forward_logits_with_offsets(
+                model=model,
+                opt_t=opt_t,
+                opt_v=opt_v,
+                ref_time=ref_time_cache,
+                opt_mask=opt_mask,
+                opt_err=opt_err,
+                device=device,
+                amp_dtype=amp_dtype,
+                args=args,
+                offset_policy=offset_policy,
+                training=True,
+            )
+            loss = criterion(logits, labels)
+            loss_metrics = None
 
         scaler.scale(loss).backward()
         if args.grad_clip_norm > 0:
@@ -1019,13 +1359,24 @@ def train_one_epoch(
         total_loss += loss.item()
         n_batches += 1
         if n_batches % 50 == 0:
-            pbar.set_postfix({"loss": f"{(total_loss / n_batches):.4f}"})
+            postfix = {"loss": f"{(total_loss / n_batches):.4f}"}
+            if loss_metrics and "cons_embed" in loss_metrics:
+                postfix["cons"] = f"{loss_metrics['cons_embed']:.3f}"
+            if loss_metrics and "adv_det" in loss_metrics:
+                postfix["adv"] = f"{loss_metrics['adv_det']:.3f}"
+            pbar.set_postfix(postfix)
 
-        del batch, batch_dict, opt_t, opt_v, opt_mask, opt_err, labels, logits, loss
+        del batch, batch_dict, opt_t, opt_v, opt_mask, opt_err, labels, loss
         if slot_is_detection is not None:
             del slot_is_detection
         if target_k is not None:
             del target_k
+        if bool(getattr(args, "universal_train_enable", False)):
+            del view_a, out_a
+            if out_b is not None:
+                del out_b, view_b
+        else:
+            del logits
         if step_cleanup_interval > 0 and (n_batches % step_cleanup_interval) == 0:
             run_memory_maintenance(
                 device,
@@ -1099,7 +1450,9 @@ def build_train_summary_payload(
             ),
         },
         "real_stream_profile_path": getattr(args, "real_stream_profile_path", None),
-        "task_mode": "prefix_right_censored" if bool(args.prefix_train_enable) else "full_window",
+        "task_mode": "prefix_right_censored"
+        if (bool(args.prefix_train_enable) or bool(getattr(args, "universal_train_enable", False)))
+        else "full_window",
         "current_epoch": int(current_epoch),
         "current_stage": str(current_stage),
     }
@@ -1151,10 +1504,16 @@ def resolve_run_name(args):
 
 
 def build_stage_optimizer(model, args, freeze_encoder):
+    head_params = list(model.classifier.parameters())
+    if getattr(model, "universal_aux_enable", False):
+        head_params += list(model.projection_head.parameters())
+        head_params += list(model.adv_head_n_det.parameters())
+        head_params += list(model.adv_head_n_bands.parameters())
+        head_params += list(model.adv_head_t_span.parameters())
     if freeze_encoder:
         model.set_encoder_trainable(False)
         return torch.optim.AdamW(
-            model.classifier.parameters(),
+            head_params,
             lr=args.lr_head_stage1,
             weight_decay=args.weight_decay,
         )
@@ -1162,7 +1521,7 @@ def build_stage_optimizer(model, args, freeze_encoder):
     model.set_encoder_trainable(True)
     return torch.optim.AdamW(
         [
-            {"params": model.classifier.parameters(), "lr": args.lr_head_stage2},
+            {"params": head_params, "lr": args.lr_head_stage2},
             {"params": model.optical_encoder.parameters(), "lr": args.lr_encoder_stage2},
         ],
         weight_decay=args.weight_decay,
@@ -1239,7 +1598,7 @@ def train(args):
         meta_bins_n_det=meta_bins_n_det,
         meta_bins_n_bands=meta_bins_n_bands,
         meta_bins_t_span=meta_bins_t_span,
-        prefix_train_enable=bool(args.prefix_train_enable),
+        prefix_train_enable=(bool(args.prefix_train_enable) or bool(getattr(args, "universal_train_enable", False))),
         prefix_min_det=int(args.prefix_min_det),
         prefix_eval_det_support=str(args.prefix_eval_det_support),
         prefix_eval_include_terminal=True,
@@ -1259,6 +1618,13 @@ def train(args):
         feature_dropout=args.feature_dropout,
         head_hidden_dim=args.head_hidden_dim,
         head_dropout=args.head_dropout,
+        universal_aux_enable=bool(getattr(args, "universal_train_enable", False)),
+        proj_dim=64,
+        adv_hidden_dim=(args.head_hidden_dim if args.head_hidden_dim is not None else args.enc_dim),
+        n_det_bucket_classes=5,
+        n_bands_bucket_classes=4,
+        t_span_bucket_classes=5,
+        grl_lambda=float(getattr(args, "grl_lambda", 1.0)),
     ).to(device)
 
     if args.pretrained_albef_ckpt:
@@ -1274,10 +1640,17 @@ def train(args):
 
     criterion = nn.BCEWithLogitsLoss()
 
-    stage_plan = [
-        ("stage1_head_only", int(args.epochs_stage1), True),
-        ("stage2_finetune", int(args.epochs_stage2), False),
-    ]
+    if bool(getattr(args, "universal_train_enable", False)):
+        stage_plan = [
+            ("stage1_head_only", int(getattr(args, "universal_stage1_epochs", 2)), True, "single"),
+            ("stage2_finetune", int(getattr(args, "universal_stage2_epochs", 6)), False, "dual"),
+            ("stage3_finetune_adv", int(getattr(args, "universal_stage3_epochs", 6)), False, "dual_adv"),
+        ]
+    else:
+        stage_plan = [
+            ("stage1_head_only", int(args.epochs_stage1), True, None),
+            ("stage2_finetune", int(args.epochs_stage2), False, None),
+        ]
 
     best_score = float("-inf")
     best_metrics = {}
@@ -1313,12 +1686,12 @@ def train(args):
         )
 
     optimizer = None
-    for stage_name, stage_epochs, freeze_encoder in stage_plan:
+    for stage_name, stage_epochs, freeze_encoder, universal_stage_mode in stage_plan:
         if stage_epochs <= 0:
             continue
 
         optimizer = build_stage_optimizer(model, args, freeze_encoder=freeze_encoder)
-        if stage_name == "stage2_finetune":
+        if stage_name in {"stage2_finetune", "stage3_finetune_adv"}:
             no_improve = 0
 
         print(
@@ -1339,6 +1712,7 @@ def train(args):
                 amp_dtype,
                 offset_policy,
                 prefix_policy,
+                universal_stage_mode=universal_stage_mode,
             )
             val_metrics = run_eval(model, val_loader, device, args, criterion, amp_dtype, offset_policy)
             if val_metrics is None:
@@ -1448,10 +1822,10 @@ def train(args):
                     tb_writer.add_scalar("best/auprc", float(val_metrics["auprc"]), global_epoch)
                     tb_writer.add_scalar("best/epoch", float(best_epoch), global_epoch)
             else:
-                if stage_name == "stage2_finetune":
+                if stage_name in {"stage2_finetune", "stage3_finetune_adv"}:
                     no_improve += 1
                     if args.early_stop_patience > 0 and no_improve >= args.early_stop_patience:
-                        print("Early stopping triggered in stage2.")
+                        print(f"Early stopping triggered in {stage_name}.")
                         break
 
             write_train_summary_files(
@@ -1491,7 +1865,7 @@ def train(args):
             gc.collect()
 
         if (
-            stage_name == "stage2_finetune"
+            stage_name in {"stage2_finetune", "stage3_finetune_adv"}
             and args.early_stop_patience > 0
             and no_improve >= args.early_stop_patience
         ):
@@ -1506,7 +1880,9 @@ def train(args):
         "best_precision_at_target_recall": float(best_metrics.get("op_precision", 0.0)) if best_metrics else 0.0,
         "time_offset": offset_policy.describe(),
         "prefix_task": prefix_policy.describe(),
-        "task_mode": "prefix_right_censored" if bool(args.prefix_train_enable) else "full_window",
+        "task_mode": "prefix_right_censored"
+        if (bool(args.prefix_train_enable) or bool(getattr(args, "universal_train_enable", False)))
+        else "full_window",
         **best_metrics,
     }
     write_train_summary_files(
@@ -1608,6 +1984,19 @@ def parse_args():
     parser.add_argument("--prefix_terminal_mix_weight", type=float, default=2.0)
     parser.add_argument("--prefix_eval_det_support", type=str, default="2,3,4,5,6,8,10,12")
     parser.add_argument("--prefix_real_hist_path", type=str, default=None)
+    parser.add_argument("--universal_train_enable", action="store_true")
+    parser.add_argument("--universal_stage1_epochs", type=int, default=2)
+    parser.add_argument("--universal_stage2_epochs", type=int, default=6)
+    parser.add_argument("--universal_stage3_epochs", type=int, default=6)
+    parser.add_argument("--view_keep_prob_min", type=float, default=0.55)
+    parser.add_argument("--view_keep_prob_max", type=float, default=1.0)
+    parser.add_argument("--view_band_dropout_max", type=float, default=0.5)
+    parser.add_argument("--consistency_embed_weight", type=float, default=0.10)
+    parser.add_argument("--consistency_prob_weight", type=float, default=0.05)
+    parser.add_argument("--adv_det_weight", type=float, default=0.05)
+    parser.add_argument("--adv_band_weight", type=float, default=0.03)
+    parser.add_argument("--adv_span_weight", type=float, default=0.05)
+    parser.add_argument("--grl_lambda", type=float, default=1.0)
 
     parser.add_argument("--meta_matched_sampling", type=int, default=1)
     parser.add_argument("--meta_match_fallback", type=str, default="nearest")
@@ -1653,6 +2042,10 @@ def parse_args():
     parser.add_argument("--offset_scale_days_divisor", type=float, default=100.0)
     parser.add_argument("--offset_seed", type=int, default=None)
     parser.add_argument("--offset_bank_size", type=int, default=1000000)
+    parser.add_argument("--ood_reject_enable", action="store_true")
+    parser.add_argument("--ood_uncertainty_metric", type=str, default="logit_std")
+    parser.add_argument("--ood_uncertainty_threshold", type=float, default=0.75)
+    parser.add_argument("--regime_eval_enable", action="store_true")
 
     pre_args, _ = parser.parse_known_args()
     if pre_args.config is not None:
@@ -1711,6 +2104,18 @@ def parse_args():
     if args.meta_filter_t_span_max is not None and float(args.meta_filter_t_span_max) <= 0:
         raise ValueError("--meta_filter_t_span_max must be > 0.")
     parse_relax_t_span_thresholds(args.meta_filter_relax_t_span_if_below_rows)
+    if not (0.0 < float(args.view_keep_prob_min) <= float(args.view_keep_prob_max) <= 1.0):
+        raise ValueError("view_keep_prob_min/view_keep_prob_max must satisfy 0 < min <= max <= 1.")
+    if not (0.0 <= float(args.view_band_dropout_max) <= 1.0):
+        raise ValueError("--view_band_dropout_max must be in [0, 1].")
+    if float(args.consistency_embed_weight) < 0 or float(args.consistency_prob_weight) < 0:
+        raise ValueError("Consistency weights must be >= 0.")
+    if float(args.adv_det_weight) < 0 or float(args.adv_band_weight) < 0 or float(args.adv_span_weight) < 0:
+        raise ValueError("Adversarial weights must be >= 0.")
+    if int(args.universal_stage1_epochs) < 0 or int(args.universal_stage2_epochs) < 0 or int(args.universal_stage3_epochs) < 0:
+        raise ValueError("Universal stage epochs must be >= 0.")
+    if float(args.grl_lambda) < 0:
+        raise ValueError("--grl_lambda must be >= 0.")
     return args
 
 
