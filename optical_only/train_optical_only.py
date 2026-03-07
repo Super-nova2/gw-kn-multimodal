@@ -8,6 +8,7 @@ Key additions versus baseline train script:
 """
 
 import argparse
+import ctypes
 import datetime
 import gc
 import json
@@ -45,6 +46,110 @@ from optical_prefix import (
 )
 
 
+try:
+    _LIBC = ctypes.CDLL("libc.so.6")
+except Exception:  # pragma: no cover - libc availability depends on runtime
+    _LIBC = None
+
+
+def _trim_process_heap() -> bool:
+    if _LIBC is None:
+        return False
+    try:
+        return bool(_LIBC.malloc_trim(0))
+    except Exception:
+        return False
+
+
+def _cleanup_cuda_caches(device: torch.device) -> None:
+    if device.type != "cuda":
+        return
+    try:
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
+    try:
+        torch.cuda.ipc_collect()
+    except Exception:
+        pass
+
+
+def close_dataset_file_handles(dataset, seen: Optional[set] = None) -> int:
+    if dataset is None:
+        return 0
+    if seen is None:
+        seen = set()
+    obj_id = id(dataset)
+    if obj_id in seen:
+        return 0
+    seen.add(obj_id)
+
+    n_closed = 0
+    for attr in ("pos_file", "neg_file", "h5_file"):
+        handle = getattr(dataset, attr, None)
+        if handle is not None:
+            try:
+                handle.close()
+                n_closed += 1
+            except Exception:
+                pass
+            try:
+                setattr(dataset, attr, None)
+            except Exception:
+                pass
+
+    nested = getattr(dataset, "base_dataset", None)
+    if nested is not None:
+        n_closed += close_dataset_file_handles(nested, seen=seen)
+    return n_closed
+
+
+def recycle_dataloader_workers(loader) -> bool:
+    if loader is None:
+        return False
+    iterator = getattr(loader, "_iterator", None)
+    if iterator is None:
+        return False
+    shutdown = getattr(iterator, "_shutdown_workers", None)
+    if callable(shutdown):
+        try:
+            shutdown()
+        except Exception:
+            pass
+    try:
+        loader._iterator = None
+    except Exception:
+        pass
+    return True
+
+
+def run_memory_maintenance(
+    device: torch.device,
+    loaders: Optional[List[object]] = None,
+    recycle_workers: bool = False,
+    close_loader_files: bool = False,
+    trim_heap: bool = False,
+) -> Dict[str, int]:
+    loader_list = [ldr for ldr in (loaders or []) if ldr is not None]
+    recycled = 0
+    closed = 0
+    if recycle_workers:
+        for loader in loader_list:
+            recycled += int(recycle_dataloader_workers(loader))
+    if close_loader_files:
+        for loader in loader_list:
+            closed += int(close_dataset_file_handles(getattr(loader, "dataset", None)))
+    collected = int(gc.collect())
+    _cleanup_cuda_caches(device)
+    trimmed = int(_trim_process_heap()) if trim_heap else 0
+    return {
+        "gc_collected": collected,
+        "workers_recycled": recycled,
+        "file_handles_closed": closed,
+        "heap_trimmed": trimmed,
+    }
+
+
 def parse_quantiles(text: str) -> List[float]:
     vals: List[float] = []
     for part in str(text).split(","):
@@ -74,6 +179,48 @@ def parse_bin_edges(text: str, default: str) -> List[float]:
     if np.any(~np.isfinite(arr)):
         raise ValueError("Meta bin edges must be finite numeric values.")
     return [float(v) for v in arr.tolist()]
+
+
+def parse_relax_t_span_thresholds(value, default_train: int = 500000, default_eval: int = 20000) -> Dict[str, int]:
+    out = {
+        "train": int(default_train),
+        "eval": int(default_eval),
+    }
+    if value is None:
+        return out
+    if isinstance(value, dict):
+        for key in ("train", "eval"):
+            if key in value and value[key] is not None:
+                out[key] = int(value[key])
+        return out
+    text = str(value).strip()
+    if text == "":
+        return out
+    if text.isdigit():
+        n = int(text)
+        out["train"] = n
+        out["eval"] = n
+        return out
+    for part in text.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if ":" in part:
+            key, raw_val = part.split(":", 1)
+        elif "=" in part:
+            key, raw_val = part.split("=", 1)
+        else:
+            raise ValueError(
+                "meta_filter_relax_t_span_if_below_rows must be an int or "
+                "'train:500000,eval:20000' style mapping."
+            )
+        key = key.strip().lower()
+        if key not in out:
+            raise ValueError(
+                f"Unsupported key '{key}' in meta_filter_relax_t_span_if_below_rows; expected train/eval."
+            )
+        out[key] = int(raw_val.strip())
+    return out
 
 
 def compute_shortcut_audit(
@@ -758,6 +905,17 @@ def run_eval(model, loader, device, args, criterion, amp_dtype, offset_policy):
         out[f"shortcut_{k}"] = float(v)
     if prefix_bucket_metrics:
         out["prefix_bucket_metrics"] = prefix_bucket_metrics
+    del all_probs, all_labels, all_n_det, all_n_bands, all_t_span
+    del all_actual_target_k, all_is_terminal_prefix
+    del probs, labels, cls_metrics, op, shortcut_metrics, prefix_bucket_metrics
+    del ref_time_cache
+    run_memory_maintenance(
+        device,
+        loaders=None,
+        recycle_workers=False,
+        close_loader_files=False,
+        trim_heap=bool(getattr(args, "memory_trim_enable", True)),
+    )
     return out
 
 
@@ -777,6 +935,7 @@ def train_one_epoch(
     total_loss = 0.0
     n_batches = 0
     ref_time_cache = None
+    step_cleanup_interval = max(0, int(getattr(args, "step_memory_cleanup_interval", 0)))
 
     pbar = tqdm(loader, desc="Train", mininterval=0.0, miniters=100)
     for batch in pbar:
@@ -794,6 +953,7 @@ def train_one_epoch(
         labels = labels.to(device, non_blocking=True).float()
         if slot_is_detection is not None:
             slot_is_detection = slot_is_detection.to(device, non_blocking=True)
+        target_k = None
 
         if bool(getattr(args, "prefix_train_enable", False)):
             if slot_is_detection is None:
@@ -861,7 +1021,22 @@ def train_one_epoch(
         if n_batches % 50 == 0:
             pbar.set_postfix({"loss": f"{(total_loss / n_batches):.4f}"})
 
+        del batch, batch_dict, opt_t, opt_v, opt_mask, opt_err, labels, logits, loss
+        if slot_is_detection is not None:
+            del slot_is_detection
+        if target_k is not None:
+            del target_k
+        if step_cleanup_interval > 0 and (n_batches % step_cleanup_interval) == 0:
+            run_memory_maintenance(
+                device,
+                loaders=None,
+                recycle_workers=False,
+                close_loader_files=False,
+                trim_heap=False,
+            )
+
     pbar.close()
+    del ref_time_cache
     return total_loss / max(1, n_batches)
 
 
@@ -877,6 +1052,68 @@ def save_checkpoint(path, model, optimizer, epoch, args, val_metrics):
         },
         path,
     )
+
+
+def build_train_summary_payload(
+    *,
+    run_name: str,
+    save_root: Path,
+    args,
+    offset_policy,
+    prefix_policy,
+    best_score: float,
+    best_epoch: int,
+    best_metrics: Dict[str, object],
+    current_epoch: int,
+    current_stage: str,
+    last_epoch_metrics: Optional[Dict[str, object]] = None,
+) -> Dict[str, object]:
+    payload = {
+        "run_name": run_name,
+        "save_root": str(save_root),
+        "arch_version": str(args.arch_version),
+        "best_epoch": int(best_epoch),
+        "best_auroc_plus_auprc": float(best_score),
+        "best_precision_at_target_recall": float(best_metrics.get("op_precision", 0.0)) if best_metrics else 0.0,
+        "time_offset": offset_policy.describe(),
+        "prefix_task": prefix_policy.describe(),
+        "meta_filter": {
+            "n_det_min": (
+                None if getattr(args, "meta_filter_n_det_min", None) is None else int(args.meta_filter_n_det_min)
+            ),
+            "n_det_max": (
+                None if getattr(args, "meta_filter_n_det_max", None) is None else int(args.meta_filter_n_det_max)
+            ),
+            "n_bands_max": (
+                None
+                if getattr(args, "meta_filter_n_bands_max", None) is None
+                else int(args.meta_filter_n_bands_max)
+            ),
+            "t_span_max": (
+                None
+                if getattr(args, "meta_filter_t_span_max", None) is None
+                else float(args.meta_filter_t_span_max)
+            ),
+            "relax_t_span_if_below_rows": parse_relax_t_span_thresholds(
+                getattr(args, "meta_filter_relax_t_span_if_below_rows", None)
+            ),
+        },
+        "real_stream_profile_path": getattr(args, "real_stream_profile_path", None),
+        "task_mode": "prefix_right_censored" if bool(args.prefix_train_enable) else "full_window",
+        "current_epoch": int(current_epoch),
+        "current_stage": str(current_stage),
+    }
+    if last_epoch_metrics:
+        payload["last_epoch_metrics"] = dict(last_epoch_metrics)
+    if best_metrics:
+        payload.update(best_metrics)
+    return payload
+
+
+def write_train_summary_files(save_root: Path, payload: Dict[str, object]) -> None:
+    for name in ("train_summary.json", "best_checkpoint_summary.json"):
+        with (save_root / name).open("w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
 
 
 def init_tensorboard_writer(args, save_root):
@@ -972,6 +1209,15 @@ def train(args):
         f"fallback={args.meta_match_fallback} "
         f"bins_det={meta_bins_n_det} bins_band={meta_bins_n_bands} bins_tspan={meta_bins_t_span}"
     )
+    relax_thresholds = parse_relax_t_span_thresholds(getattr(args, "meta_filter_relax_t_span_if_below_rows", None))
+    print(
+        "Meta filter policy: "
+        f"n_det=[{getattr(args, 'meta_filter_n_det_min', None)},{getattr(args, 'meta_filter_n_det_max', None)}] "
+        f"| n_bands<={getattr(args, 'meta_filter_n_bands_max', None)} "
+        f"| t_span<={getattr(args, 'meta_filter_t_span_max', None)} "
+        f"| relax_if_below_rows={json.dumps(relax_thresholds)} "
+        f"| real_stream_profile={getattr(args, 'real_stream_profile_path', None)}"
+    )
 
     train_loader, val_loader, steps_per_epoch, val_steps = create_optical_binary_dataloaders(
         pos_h5_path=args.pos_data_path,
@@ -997,6 +1243,11 @@ def train(args):
         prefix_min_det=int(args.prefix_min_det),
         prefix_eval_det_support=str(args.prefix_eval_det_support),
         prefix_eval_include_terminal=True,
+        meta_filter_n_det_min=getattr(args, "meta_filter_n_det_min", None),
+        meta_filter_n_det_max=getattr(args, "meta_filter_n_det_max", None),
+        meta_filter_n_bands_max=getattr(args, "meta_filter_n_bands_max", None),
+        meta_filter_t_span_max=getattr(args, "meta_filter_t_span_max", None),
+        meta_filter_relax_t_span_if_below_rows=int(relax_thresholds["train"]),
     )
     print(f"Train Steps/Epoch: {steps_per_epoch} | Val Steps/Epoch: {val_steps}")
 
@@ -1033,6 +1284,7 @@ def train(args):
     best_epoch = -1
     global_epoch = 0
     no_improve = 0
+    last_epoch_metrics: Dict[str, object] = {}
 
     run_name = resolve_run_name(args)
     args.run_name = run_name
@@ -1048,6 +1300,17 @@ def train(args):
     print(f"Run name: {run_name}")
     print(f"Checkpoint directory: {save_root}")
     tb_writer = init_tensorboard_writer(args, save_root)
+    recycle_every = max(0, int(getattr(args, "recycle_dataloader_workers_every_n_epochs", 1)))
+    cleanup_enable = bool(getattr(args, "memory_cleanup_enable", True))
+    trim_heap_enable = bool(getattr(args, "memory_trim_enable", True))
+    cleanup_close_files = bool(getattr(args, "memory_cleanup_close_loader_files", True))
+    if cleanup_enable:
+        print(
+            "Memory cleanup policy: "
+            f"recycle_workers_every_n_epochs={recycle_every}, "
+            f"close_loader_files={cleanup_close_files}, trim_heap={trim_heap_enable}, "
+            f"step_cleanup_interval={int(getattr(args, 'step_memory_cleanup_interval', 0))}"
+        )
 
     optimizer = None
     for stage_name, stage_epochs, freeze_encoder in stage_plan:
@@ -1146,6 +1409,7 @@ def train(args):
                 "score_auroc_plus_auprc": score,
                 **val_metrics,
             }
+            last_epoch_metrics = dict(epoch_metrics)
             save_checkpoint(
                 str(epoch_ckpt_root / f"optical_only_epoch_{global_epoch:04d}.pth"),
                 model,
@@ -1190,6 +1454,38 @@ def train(args):
                         print("Early stopping triggered in stage2.")
                         break
 
+            write_train_summary_files(
+                save_root,
+                build_train_summary_payload(
+                    run_name=run_name,
+                    save_root=save_root,
+                    args=args,
+                    offset_policy=offset_policy,
+                    prefix_policy=prefix_policy,
+                    best_score=best_score,
+                    best_epoch=best_epoch,
+                    best_metrics=best_metrics,
+                    current_epoch=global_epoch,
+                    current_stage=stage_name,
+                    last_epoch_metrics=last_epoch_metrics,
+                ),
+            )
+
+            if cleanup_enable:
+                maintenance = run_memory_maintenance(
+                    device,
+                    loaders=[train_loader, val_loader],
+                    recycle_workers=(recycle_every > 0 and (global_epoch % recycle_every) == 0),
+                    close_loader_files=cleanup_close_files,
+                    trim_heap=trim_heap_enable,
+                )
+                print(
+                    f"Epoch {global_epoch} memory cleanup | "
+                    f"gc={maintenance['gc_collected']} "
+                    f"| workers_recycled={maintenance['workers_recycled']} "
+                    f"| file_handles_closed={maintenance['file_handles_closed']} "
+                    f"| heap_trimmed={maintenance['heap_trimmed']}"
+                )
             if device.type == "cuda":
                 torch.cuda.empty_cache()
             gc.collect()
@@ -1213,8 +1509,22 @@ def train(args):
         "task_mode": "prefix_right_censored" if bool(args.prefix_train_enable) else "full_window",
         **best_metrics,
     }
-    with open(save_root / "train_summary.json", "w", encoding="utf-8") as f:
-        json.dump(final_metrics, f, indent=2)
+    write_train_summary_files(
+        save_root,
+        build_train_summary_payload(
+            run_name=run_name,
+            save_root=save_root,
+            args=args,
+            offset_policy=offset_policy,
+            prefix_policy=prefix_policy,
+            best_score=best_score,
+            best_epoch=best_epoch,
+            best_metrics=best_metrics,
+            current_epoch=global_epoch,
+            current_stage="complete",
+            last_epoch_metrics=last_epoch_metrics,
+        ),
+    )
 
     if optimizer is not None:
         save_checkpoint(
@@ -1226,10 +1536,21 @@ def train(args):
             final_metrics,
         )
 
+    run_memory_maintenance(
+        device,
+        loaders=[train_loader, val_loader],
+        recycle_workers=True,
+        close_loader_files=True,
+        trim_heap=trim_heap_enable,
+    )
+
     if tb_writer is not None:
-        tb_writer.add_text("run/final_metrics", json.dumps(final_metrics, indent=2), global_step=global_epoch)
-        tb_writer.flush()
-        tb_writer.close()
+        try:
+            tb_writer.add_text("run/final_metrics", json.dumps(final_metrics, indent=2), global_step=global_epoch)
+            tb_writer.flush()
+            tb_writer.close()
+        except Exception:
+            pass
 
     print("\nTraining complete.")
     print(f"Best epoch: {best_epoch}")
@@ -1293,6 +1614,12 @@ def parse_args():
     parser.add_argument("--meta_bins_n_det", type=str, default="3,5,8,12,20,40,80,200")
     parser.add_argument("--meta_bins_n_bands", type=str, default="1,2,3,4,5,6")
     parser.add_argument("--meta_bins_t_span", type=str, default="0,0.01,0.05,0.1,0.2,0.5,1.0")
+    parser.add_argument("--meta_filter_n_det_min", type=int, default=None)
+    parser.add_argument("--meta_filter_n_det_max", type=int, default=None)
+    parser.add_argument("--meta_filter_n_bands_max", type=int, default=None)
+    parser.add_argument("--meta_filter_t_span_max", type=float, default=None)
+    parser.add_argument("--meta_filter_relax_t_span_if_below_rows", type=str, default=None)
+    parser.add_argument("--real_stream_profile_path", type=str, default=None)
 
     parser.add_argument("--shortcut_audit_enable", type=int, default=1)
     parser.add_argument("--shortcut_audit_val_samples", type=int, default=50000)
@@ -1305,6 +1632,11 @@ def parse_args():
     parser.add_argument("--pin_memory", type=int, default=1)
     parser.add_argument("--persistent_workers", type=int, default=1)
     parser.add_argument("--prefetch_factor", type=int, default=4)
+    parser.add_argument("--memory_cleanup_enable", type=int, default=1)
+    parser.add_argument("--memory_trim_enable", type=int, default=1)
+    parser.add_argument("--memory_cleanup_close_loader_files", type=int, default=1)
+    parser.add_argument("--recycle_dataloader_workers_every_n_epochs", type=int, default=1)
+    parser.add_argument("--step_memory_cleanup_interval", type=int, default=0)
     parser.add_argument("--cache_in_memory", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--run_name", type=str, default=None)
@@ -1340,6 +1672,10 @@ def parse_args():
         raise ValueError("--single_band_keep_prob must be in [0, 1].")
     if float(args.target_ndet_jitter) < 0:
         raise ValueError("--target_ndet_jitter must be >= 0.")
+    if int(args.recycle_dataloader_workers_every_n_epochs) < 0:
+        raise ValueError("--recycle_dataloader_workers_every_n_epochs must be >= 0.")
+    if int(args.step_memory_cleanup_interval) < 0:
+        raise ValueError("--step_memory_cleanup_interval must be >= 0.")
     if int(args.prefix_min_det) < 1:
         raise ValueError("--prefix_min_det must be >= 1.")
     if not (0.0 <= float(args.prefix_terminal_mix_prob) <= 1.0):
@@ -1367,6 +1703,14 @@ def parse_args():
     parse_prefix_det_support(args.prefix_eval_det_support)
     if str(args.meta_match_fallback).strip().lower() not in {"nearest", "random"}:
         raise ValueError("--meta_match_fallback must be 'nearest' or 'random'.")
+    if args.meta_filter_n_det_min is not None and args.meta_filter_n_det_max is not None:
+        if int(args.meta_filter_n_det_min) > int(args.meta_filter_n_det_max):
+            raise ValueError("--meta_filter_n_det_min must be <= --meta_filter_n_det_max.")
+    if args.meta_filter_n_bands_max is not None and int(args.meta_filter_n_bands_max) < 1:
+        raise ValueError("--meta_filter_n_bands_max must be >= 1.")
+    if args.meta_filter_t_span_max is not None and float(args.meta_filter_t_span_max) <= 0:
+        raise ValueError("--meta_filter_t_span_max must be > 0.")
+    parse_relax_t_span_thresholds(args.meta_filter_relax_t_span_if_below_rows)
     return args
 
 
@@ -1389,6 +1733,9 @@ if __name__ == "__main__":
             raise ValueError("prefix_train_enable=true requires --prefix_real_hist_path.")
         if not os.path.exists(args.prefix_real_hist_path):
             raise FileNotFoundError(f"Prefix real-stream histogram file not found: {args.prefix_real_hist_path}")
+    if args.real_stream_profile_path is not None and str(args.real_stream_profile_path).strip() != "":
+        if not os.path.exists(args.real_stream_profile_path):
+            raise FileNotFoundError(f"Real-stream profile file not found: {args.real_stream_profile_path}")
 
     os.makedirs(args.ckpt_path, exist_ok=True)
 

@@ -1678,6 +1678,115 @@ def _group_has_slot_is_detection(h5_path: str, group: str) -> bool:
         return "slot_is_detection" in f[group]
 
 
+def _read_group_meta_array_for_indices(
+    grp: h5py.Group,
+    indices: np.ndarray,
+    candidate_names: Sequence[str],
+    dtype,
+) -> Tuple[np.ndarray, str]:
+    idx = np.asarray(indices, dtype=np.int64).reshape(-1)
+    if idx.size == 0:
+        return np.empty((0,), dtype=dtype), ""
+
+    for name in candidate_names:
+        if name not in grp:
+            continue
+        order = np.argsort(idx)
+        sorted_idx = np.asarray(idx[order], dtype=np.int64)
+        vals_sorted = np.asarray(grp[name][sorted_idx], dtype=dtype).reshape(-1)
+        vals = np.empty_like(vals_sorted)
+        vals[order] = vals_sorted
+        return vals, str(name)
+
+    raise KeyError(
+        f"None of the requested meta arrays were found in group '{grp.name}': {list(candidate_names)}"
+    )
+
+
+def _filter_indices_by_meta_constraints(
+    h5_path: str,
+    group: str,
+    indices: np.ndarray,
+    n_det_min: Optional[int] = None,
+    n_det_max: Optional[int] = None,
+    n_bands_max: Optional[int] = None,
+    t_span_max: Optional[float] = None,
+) -> Tuple[np.ndarray, Dict[str, object]]:
+    idx = np.asarray(indices, dtype=np.int64).reshape(-1)
+    summary: Dict[str, object] = {
+        "input_rows": int(idx.size),
+        "output_rows": int(idx.size),
+        "n_det_min": (None if n_det_min is None else int(n_det_min)),
+        "n_det_max": (None if n_det_max is None else int(n_det_max)),
+        "n_bands_max": (None if n_bands_max is None else int(n_bands_max)),
+        "t_span_max": (None if t_span_max is None else float(t_span_max)),
+        "applied": False,
+    }
+    if idx.size == 0:
+        return idx, summary
+    if (
+        n_det_min is None
+        and n_det_max is None
+        and n_bands_max is None
+        and t_span_max is None
+    ):
+        return idx, summary
+
+    keep = np.ones((idx.shape[0],), dtype=bool)
+    with h5py.File(h5_path, "r") as f:
+        if group not in f:
+            raise KeyError(f"Group '{group}' not found in {h5_path}")
+        grp = f[group]
+        try:
+            det_counts, det_name = _read_group_meta_array_for_indices(
+                grp,
+                idx,
+                ("meta_n_det_snr5", "meta_n_det"),
+                np.float32,
+            )
+            n_bands, n_bands_name = _read_group_meta_array_for_indices(
+                grp,
+                idx,
+                ("meta_n_bands",),
+                np.float32,
+            )
+            t_span, t_span_name = _read_group_meta_array_for_indices(
+                grp,
+                idx,
+                ("meta_t_span",),
+                np.float32,
+            )
+        except KeyError:
+            meta = OpticalBinaryDataset._load_or_compute_meta_arrays(f, group)
+            det_counts = np.asarray(meta["n_det"][idx], dtype=np.float32).reshape(-1)
+            n_bands = np.asarray(meta["n_bands"][idx], dtype=np.float32).reshape(-1)
+            t_span = np.asarray(meta["t_span"][idx], dtype=np.float32).reshape(-1)
+            det_name = "computed_n_det"
+            n_bands_name = "computed_n_bands"
+            t_span_name = "computed_t_span"
+
+    if n_det_min is not None:
+        keep &= det_counts >= float(n_det_min)
+    if n_det_max is not None:
+        keep &= det_counts <= float(n_det_max)
+    if n_bands_max is not None:
+        keep &= n_bands <= float(n_bands_max)
+    if t_span_max is not None:
+        keep &= t_span <= float(t_span_max)
+
+    out = np.asarray(idx[keep], dtype=np.int64)
+    summary.update(
+        {
+            "output_rows": int(out.size),
+            "applied": True,
+            "det_source": det_name,
+            "n_bands_source": n_bands_name,
+            "t_span_source": t_span_name,
+        }
+    )
+    return out, summary
+
+
 def _filter_indices_by_min_detection_count(
     h5_path: str,
     group: str,
@@ -1994,6 +2103,11 @@ def create_optical_binary_dataloaders(
     prefix_min_det: int = 2,
     prefix_eval_det_support: Sequence[int] | str = DEFAULT_PREFIX_DET_SUPPORT,
     prefix_eval_include_terminal: bool = True,
+    meta_filter_n_det_min: Optional[int] = None,
+    meta_filter_n_det_max: Optional[int] = None,
+    meta_filter_n_bands_max: Optional[int] = None,
+    meta_filter_t_span_max: Optional[float] = None,
+    meta_filter_relax_t_span_if_below_rows: Optional[int] = None,
 ):
     if cache_in_memory and num_workers > 0:
         print("cache_in_memory=True with num_workers>0 may increase RAM usage.")
@@ -2004,10 +2118,109 @@ def create_optical_binary_dataloaders(
     train_neg_idx, val_neg_idx = split_negative_optical_indices(
         neg_h5_path, neg_group=neg_group, val_split=val_split, seed=split_seed
     )
+    train_pos_idx_raw = np.asarray(train_pos_idx, dtype=np.int64)
+    val_pos_idx_raw = np.asarray(val_pos_idx, dtype=np.int64)
+    train_neg_idx_raw = np.asarray(train_neg_idx, dtype=np.int64)
+    val_neg_idx_raw = np.asarray(val_neg_idx, dtype=np.int64)
 
     prefix_train_enable = bool(prefix_train_enable)
     prefix_min_det = int(prefix_min_det)
     prefix_det_support = parse_prefix_det_support(prefix_eval_det_support)
+
+    meta_filter_n_det_min = None if meta_filter_n_det_min is None else int(meta_filter_n_det_min)
+    meta_filter_n_det_max = None if meta_filter_n_det_max is None else int(meta_filter_n_det_max)
+    meta_filter_n_bands_max = None if meta_filter_n_bands_max is None else int(meta_filter_n_bands_max)
+    meta_filter_t_span_max = None if meta_filter_t_span_max is None else float(meta_filter_t_span_max)
+    meta_filter_relax_t_span_if_below_rows = (
+        None
+        if meta_filter_relax_t_span_if_below_rows is None
+        else int(meta_filter_relax_t_span_if_below_rows)
+    )
+
+    meta_filter_enabled = any(
+        v is not None
+        for v in (
+            meta_filter_n_det_min,
+            meta_filter_n_det_max,
+            meta_filter_n_bands_max,
+            meta_filter_t_span_max,
+        )
+    )
+    if meta_filter_enabled:
+        def _run_meta_filter_split(
+            pos_idx: np.ndarray,
+            neg_idx: np.ndarray,
+            t_span_limit: Optional[float],
+        ) -> Tuple[np.ndarray, np.ndarray, Dict[str, object]]:
+            pos_out, pos_summary = _filter_indices_by_meta_constraints(
+                pos_h5_path,
+                "events/optical_data",
+                pos_idx,
+                n_det_min=meta_filter_n_det_min,
+                n_det_max=meta_filter_n_det_max,
+                n_bands_max=meta_filter_n_bands_max,
+                t_span_max=t_span_limit,
+            )
+            neg_out, neg_summary = _filter_indices_by_meta_constraints(
+                neg_h5_path,
+                neg_group,
+                neg_idx,
+                n_det_min=meta_filter_n_det_min,
+                n_det_max=meta_filter_n_det_max,
+                n_bands_max=meta_filter_n_bands_max,
+                t_span_max=t_span_limit,
+            )
+            return pos_out, neg_out, {
+                "pos": pos_summary,
+                "neg": neg_summary,
+                "t_span_max": (None if t_span_limit is None else float(t_span_limit)),
+            }
+
+        train_pos_idx, train_neg_idx, train_meta_filter_summary = _run_meta_filter_split(
+            train_pos_idx_raw,
+            train_neg_idx_raw,
+            meta_filter_t_span_max,
+        )
+        val_pos_idx, val_neg_idx, val_meta_filter_summary = _run_meta_filter_split(
+            val_pos_idx_raw,
+            val_neg_idx_raw,
+            meta_filter_t_span_max,
+        )
+        relaxed_t_span_max = meta_filter_t_span_max
+        relaxed = False
+        if (
+            meta_filter_t_span_max is not None
+            and meta_filter_relax_t_span_if_below_rows is not None
+            and train_pos_idx.size < int(meta_filter_relax_t_span_if_below_rows)
+            and float(meta_filter_t_span_max) < 0.05
+        ):
+            relaxed = True
+            relaxed_t_span_max = 0.05
+            train_pos_idx, train_neg_idx, train_meta_filter_summary = _run_meta_filter_split(
+                train_pos_idx_raw,
+                train_neg_idx_raw,
+                relaxed_t_span_max,
+            )
+            val_pos_idx, val_neg_idx, val_meta_filter_summary = _run_meta_filter_split(
+                val_pos_idx_raw,
+                val_neg_idx_raw,
+                relaxed_t_span_max,
+            )
+        print(
+            "Meta filter split summary: "
+            f"train_pos={train_meta_filter_summary['pos']['output_rows']} "
+            f"train_neg={train_meta_filter_summary['neg']['output_rows']} "
+            f"val_pos={val_meta_filter_summary['pos']['output_rows']} "
+            f"val_neg={val_meta_filter_summary['neg']['output_rows']} "
+            f"| n_det=[{meta_filter_n_det_min},{meta_filter_n_det_max}] "
+            f"| n_bands<={meta_filter_n_bands_max} "
+            f"| t_span<={relaxed_t_span_max} "
+            f"| relaxed={relaxed}"
+        )
+        if train_pos_idx.size == 0 or train_neg_idx.size == 0:
+            raise ValueError("Meta filtering left an empty training split.")
+        if val_pos_idx.size == 0 or val_neg_idx.size == 0:
+            raise ValueError("Meta filtering left an empty validation split.")
 
     if prefix_train_enable:
         pos_group = "events/optical_data"
