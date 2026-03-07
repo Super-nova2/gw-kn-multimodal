@@ -30,6 +30,7 @@ from data_loader import (
     OpticalBinaryDataset,
     OpticalPrefixEvalDataset,
     _build_prefix_manifest_for_binary_dataset,
+    _filter_indices_by_meta_constraints,
     _filter_indices_by_min_detection_count,
 )
 from metrics import compute_classification_metrics
@@ -50,6 +51,48 @@ def parse_quantiles(text: str) -> List[float]:
     if not vals:
         raise ValueError("offset_eval_quantiles produced empty list.")
     return vals
+
+
+def parse_relax_t_span_thresholds(value, default_train: int = 500000, default_eval: int = 20000) -> Dict[str, int]:
+    out = {
+        "train": int(default_train),
+        "eval": int(default_eval),
+    }
+    if value is None:
+        return out
+    if isinstance(value, dict):
+        for key in ("train", "eval"):
+            if key in value and value[key] is not None:
+                out[key] = int(value[key])
+        return out
+    text = str(value).strip()
+    if text == "":
+        return out
+    if text.isdigit():
+        n = int(text)
+        out["train"] = n
+        out["eval"] = n
+        return out
+    for part in text.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if ":" in part:
+            key, raw_val = part.split(":", 1)
+        elif "=" in part:
+            key, raw_val = part.split("=", 1)
+        else:
+            raise ValueError(
+                "meta_filter_relax_t_span_if_below_rows must be an int or "
+                "'train:500000,eval:20000' style mapping."
+            )
+        key = key.strip().lower()
+        if key not in out:
+            raise ValueError(
+                f"Unsupported key '{key}' in meta_filter_relax_t_span_if_below_rows; expected train/eval."
+            )
+        out[key] = int(raw_val.strip())
+    return out
 
 
 def parse_args():
@@ -79,6 +122,12 @@ def parse_args():
     p.add_argument("--prefix_min_det", type=int, default=None)
     p.add_argument("--prefix_eval_det_support", type=str, default=None)
     p.add_argument("--prefix_manifest_out", type=str, default=None)
+    p.add_argument("--meta_filter_n_det_min", type=int, default=None)
+    p.add_argument("--meta_filter_n_det_max", type=int, default=None)
+    p.add_argument("--meta_filter_n_bands_max", type=int, default=None)
+    p.add_argument("--meta_filter_t_span_max", type=float, default=None)
+    p.add_argument("--meta_filter_relax_t_span_if_below_rows", type=str, default=None)
+    p.add_argument("--real_stream_profile_path", type=str, default=None)
 
     p.add_argument("--time_offset_enable", action="store_true", default=None)
     p.add_argument("--offset_dist_npz", type=str, default=None)
@@ -92,6 +141,14 @@ def parse_args():
         raise ValueError("--prefix_min_det must be >= 1.")
     if args.prefix_eval_det_support is not None:
         parse_prefix_det_support(args.prefix_eval_det_support)
+    if args.meta_filter_n_det_min is not None and args.meta_filter_n_det_max is not None:
+        if int(args.meta_filter_n_det_min) > int(args.meta_filter_n_det_max):
+            raise ValueError("--meta_filter_n_det_min must be <= --meta_filter_n_det_max.")
+    if args.meta_filter_n_bands_max is not None and int(args.meta_filter_n_bands_max) < 1:
+        raise ValueError("--meta_filter_n_bands_max must be >= 1.")
+    if args.meta_filter_t_span_max is not None and float(args.meta_filter_t_span_max) <= 0:
+        raise ValueError("--meta_filter_t_span_max must be > 0.")
+    parse_relax_t_span_thresholds(args.meta_filter_relax_t_span_if_below_rows)
     return args
 
 
@@ -427,6 +484,53 @@ def build_eval_datasets(args, ckpt_args, config_dict):
             default="2,3,4,5,6,8,10,12",
         )
     )
+    meta_filter_n_det_min = choose_value(
+        args.meta_filter_n_det_min,
+        config_dict,
+        ckpt_args,
+        "meta_filter_n_det_min",
+        default=None,
+    )
+    meta_filter_n_det_max = choose_value(
+        args.meta_filter_n_det_max,
+        config_dict,
+        ckpt_args,
+        "meta_filter_n_det_max",
+        default=None,
+    )
+    meta_filter_n_bands_max = choose_value(
+        args.meta_filter_n_bands_max,
+        config_dict,
+        ckpt_args,
+        "meta_filter_n_bands_max",
+        default=None,
+    )
+    meta_filter_t_span_max = choose_value(
+        args.meta_filter_t_span_max,
+        config_dict,
+        ckpt_args,
+        "meta_filter_t_span_max",
+        default=None,
+    )
+    meta_filter_relax_cfg = choose_value(
+        args.meta_filter_relax_t_span_if_below_rows,
+        config_dict,
+        ckpt_args,
+        "meta_filter_relax_t_span_if_below_rows",
+        default=None,
+    )
+    meta_filter_relax_thresholds = parse_relax_t_span_thresholds(meta_filter_relax_cfg)
+    real_stream_profile_path = choose_value(
+        args.real_stream_profile_path,
+        config_dict,
+        ckpt_args,
+        "real_stream_profile_path",
+        default=None,
+    )
+    meta_filter_n_det_min = None if meta_filter_n_det_min is None else int(meta_filter_n_det_min)
+    meta_filter_n_det_max = None if meta_filter_n_det_max is None else int(meta_filter_n_det_max)
+    meta_filter_n_bands_max = None if meta_filter_n_bands_max is None else int(meta_filter_n_bands_max)
+    meta_filter_t_span_max = None if meta_filter_t_span_max is None else float(meta_filter_t_span_max)
 
     if pos_data_path is None or neg_data_path is None:
         raise ValueError(
@@ -458,6 +562,72 @@ def build_eval_datasets(args, ckpt_args, config_dict):
         ).n_neg,
         dtype=np.int64,
     )
+    pos_indices_raw = np.asarray(pos_indices, dtype=np.int64)
+    neg_indices_raw = np.asarray(neg_indices, dtype=np.int64)
+
+    meta_filter_enabled = any(
+        v is not None
+        for v in (
+            meta_filter_n_det_min,
+            meta_filter_n_det_max,
+            meta_filter_n_bands_max,
+            meta_filter_t_span_max,
+        )
+    )
+    meta_filter_t_span_used = meta_filter_t_span_max
+    meta_filter_relaxed = False
+    if meta_filter_enabled:
+        pos_indices, _ = _filter_indices_by_meta_constraints(
+            pos_data_path,
+            "events/optical_data",
+            pos_indices_raw,
+            n_det_min=meta_filter_n_det_min,
+            n_det_max=meta_filter_n_det_max,
+            n_bands_max=meta_filter_n_bands_max,
+            t_span_max=meta_filter_t_span_max,
+        )
+        neg_indices, _ = _filter_indices_by_meta_constraints(
+            neg_data_path,
+            neg_group,
+            neg_indices_raw,
+            n_det_min=meta_filter_n_det_min,
+            n_det_max=meta_filter_n_det_max,
+            n_bands_max=meta_filter_n_bands_max,
+            t_span_max=meta_filter_t_span_max,
+        )
+        if (
+            meta_filter_t_span_max is not None
+            and pos_indices.size < int(meta_filter_relax_thresholds["eval"])
+            and float(meta_filter_t_span_max) < 0.05
+        ):
+            meta_filter_relaxed = True
+            meta_filter_t_span_used = 0.05
+            pos_indices, _ = _filter_indices_by_meta_constraints(
+                pos_data_path,
+                "events/optical_data",
+                pos_indices_raw,
+                n_det_min=meta_filter_n_det_min,
+                n_det_max=meta_filter_n_det_max,
+                n_bands_max=meta_filter_n_bands_max,
+                t_span_max=meta_filter_t_span_used,
+            )
+            neg_indices, _ = _filter_indices_by_meta_constraints(
+                neg_data_path,
+                neg_group,
+                neg_indices_raw,
+                n_det_min=meta_filter_n_det_min,
+                n_det_max=meta_filter_n_det_max,
+                n_bands_max=meta_filter_n_bands_max,
+                t_span_max=meta_filter_t_span_used,
+            )
+        print(
+            "Evaluation meta filter: "
+            f"n_det=[{meta_filter_n_det_min},{meta_filter_n_det_max}] "
+            f"| n_bands<={meta_filter_n_bands_max} "
+            f"| t_span<={meta_filter_t_span_used} "
+            f"| relaxed={meta_filter_relaxed} "
+            f"| pos={pos_indices.size} neg={neg_indices.size}"
+        )
 
     if prefix_eval_enable:
         pos_indices = _filter_indices_by_min_detection_count(
@@ -535,6 +705,16 @@ def build_eval_datasets(args, ckpt_args, config_dict):
         "prefix_min_det": int(prefix_min_det),
         "prefix_eval_det_support": [int(v) for v in prefix_eval_det_support],
         "prefix_manifest_rows": int(len(manifest_rows)),
+        "meta_filter": {
+            "n_det_min": (None if meta_filter_n_det_min is None else int(meta_filter_n_det_min)),
+            "n_det_max": (None if meta_filter_n_det_max is None else int(meta_filter_n_det_max)),
+            "n_bands_max": (None if meta_filter_n_bands_max is None else int(meta_filter_n_bands_max)),
+            "t_span_max": (None if meta_filter_t_span_max is None else float(meta_filter_t_span_max)),
+            "t_span_used": (None if meta_filter_t_span_used is None else float(meta_filter_t_span_used)),
+            "relaxed": bool(meta_filter_relaxed),
+            "relax_t_span_if_below_rows": meta_filter_relax_thresholds,
+        },
+        "real_stream_profile_path": real_stream_profile_path,
     }
 
 

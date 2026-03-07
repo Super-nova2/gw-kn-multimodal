@@ -157,6 +157,12 @@ OFFSET_SEED=$(jq -r '.offset_seed // empty' "$args_file")
 OFFSET_BANK_SIZE=$(jq -r '.offset_bank_size // empty' "$args_file")
 META_MATCHED_SAMPLING=$(jq -r '.meta_matched_sampling // empty' "$args_file")
 META_MATCH_FALLBACK=$(jq -r '.meta_match_fallback // empty' "$args_file")
+META_FILTER_N_DET_MIN=$(jq -r '.meta_filter_n_det_min // empty' "$args_file")
+META_FILTER_N_DET_MAX=$(jq -r '.meta_filter_n_det_max // empty' "$args_file")
+META_FILTER_N_BANDS_MAX=$(jq -r '.meta_filter_n_bands_max // empty' "$args_file")
+META_FILTER_T_SPAN_MAX=$(jq -r '.meta_filter_t_span_max // empty' "$args_file")
+META_FILTER_RELAX_T_SPAN_IF_BELOW_ROWS=$(jq -r '.meta_filter_relax_t_span_if_below_rows // empty' "$args_file")
+REAL_STREAM_PROFILE_PATH=$(jq -r '.real_stream_profile_path // empty' "$args_file")
 SINGLE_BAND_KEEP_PROB=$(jq -r '.single_band_keep_prob // empty' "$args_file")
 TARGET_NDET_JITTER=$(jq -r '.target_ndet_jitter // empty' "$args_file")
 SHORTCUT_AUDIT_ENABLE=$(jq -r '.shortcut_audit_enable // empty' "$args_file")
@@ -172,6 +178,7 @@ PREFIX_EVAL_DET_SUPPORT=$(jq -r '.prefix_eval_det_support // empty' "$args_file"
 PREFIX_REAL_HIST_PATH=$(jq -r '.prefix_real_hist_path // empty' "$args_file")
 PREFIX_EVAL_ENABLE=$(jq -r '.prefix_eval_enable // empty' "$args_file")
 PREFIX_MANIFEST_OUT=$(jq -r '(.prefix_manifest_out // .eval_prefix_manifest_out) // empty' "$args_file")
+SECONDARY_PREFIX_EVAL_DET_SUPPORT=$(jq -r '.secondary_prefix_eval_det_support // empty' "$args_file")
 
 OPTICAL_V2_EVAL_POS_DEFAULT="/fred/oz016/bgao_kn/data/Optical_Only_dataset/combined_dataset_test.h5"
 OPTICAL_V2_EVAL_NEG_DEFAULT="/fred/oz016/bgao_kn/data/Optical_Only_dataset/Tutorial_negative_dataset.h5"
@@ -490,9 +497,27 @@ fi
 if [[ -n "$PREFIX_REAL_HIST_PATH" && "$PREFIX_REAL_HIST_PATH" != "null" ]]; then
     cmd+=(--prefix_real_hist_path "$PREFIX_REAL_HIST_PATH")
 fi
+if [[ -n "$META_FILTER_N_DET_MIN" && "$META_FILTER_N_DET_MIN" != "null" ]]; then
+    cmd+=(--meta_filter_n_det_min "$META_FILTER_N_DET_MIN")
+fi
+if [[ -n "$META_FILTER_N_DET_MAX" && "$META_FILTER_N_DET_MAX" != "null" ]]; then
+    cmd+=(--meta_filter_n_det_max "$META_FILTER_N_DET_MAX")
+fi
+if [[ -n "$META_FILTER_N_BANDS_MAX" && "$META_FILTER_N_BANDS_MAX" != "null" ]]; then
+    cmd+=(--meta_filter_n_bands_max "$META_FILTER_N_BANDS_MAX")
+fi
+if [[ -n "$META_FILTER_T_SPAN_MAX" && "$META_FILTER_T_SPAN_MAX" != "null" ]]; then
+    cmd+=(--meta_filter_t_span_max "$META_FILTER_T_SPAN_MAX")
+fi
+if [[ -n "$META_FILTER_RELAX_T_SPAN_IF_BELOW_ROWS" && "$META_FILTER_RELAX_T_SPAN_IF_BELOW_ROWS" != "null" ]]; then
+    cmd+=(--meta_filter_relax_t_span_if_below_rows "$META_FILTER_RELAX_T_SPAN_IF_BELOW_ROWS")
+fi
+if [[ -n "$REAL_STREAM_PROFILE_PATH" && "$REAL_STREAM_PROFILE_PATH" != "null" ]]; then
+    cmd+=(--real_stream_profile_path "$REAL_STREAM_PROFILE_PATH")
+fi
 
 echo "Training Command: ${cmd[*]}"
-echo "Optical controls (from config): meta_matched_sampling=${META_MATCHED_SAMPLING:-<default>}, meta_match_fallback=${META_MATCH_FALLBACK:-<default>}, single_band_keep_prob=${SINGLE_BAND_KEEP_PROB:-<default>}, target_ndet_jitter=${TARGET_NDET_JITTER:-<default>}, shortcut_audit_enable=${SHORTCUT_AUDIT_ENABLE:-<default>}, shortcut_audit_val_samples=${SHORTCUT_AUDIT_VAL_SAMPLES:-<default>}, prefix_train_enable=${PREFIX_TRAIN_ENABLE:-<default>}, prefix_min_det=${PREFIX_MIN_DET:-<default>}, prefix_train_sampling=${PREFIX_TRAIN_SAMPLING:-<default>}, prefix_mix_weights=${PREFIX_REAL_MIX_WEIGHT:-<default>}:${PREFIX_BUCKET_UNIFORM_MIX_WEIGHT:-<default>}:${PREFIX_TERMINAL_MIX_WEIGHT:-<default>}"
+echo "Optical controls (from config): meta_matched_sampling=${META_MATCHED_SAMPLING:-<default>}, meta_match_fallback=${META_MATCH_FALLBACK:-<default>}, meta_filter_n_det=[${META_FILTER_N_DET_MIN:-<default>},${META_FILTER_N_DET_MAX:-<default>}], meta_filter_n_bands_max=${META_FILTER_N_BANDS_MAX:-<default>}, meta_filter_t_span_max=${META_FILTER_T_SPAN_MAX:-<default>}, meta_filter_relax=${META_FILTER_RELAX_T_SPAN_IF_BELOW_ROWS:-<default>}, real_stream_profile=${REAL_STREAM_PROFILE_PATH:-<default>}, single_band_keep_prob=${SINGLE_BAND_KEEP_PROB:-<default>}, target_ndet_jitter=${TARGET_NDET_JITTER:-<default>}, shortcut_audit_enable=${SHORTCUT_AUDIT_ENABLE:-<default>}, shortcut_audit_val_samples=${SHORTCUT_AUDIT_VAL_SAMPLES:-<default>}, prefix_train_enable=${PREFIX_TRAIN_ENABLE:-<default>}, prefix_min_det=${PREFIX_MIN_DET:-<default>}, prefix_train_sampling=${PREFIX_TRAIN_SAMPLING:-<default>}, prefix_mix_weights=${PREFIX_REAL_MIX_WEIGHT:-<default>}:${PREFIX_BUCKET_UNIFORM_MIX_WEIGHT:-<default>}:${PREFIX_TERMINAL_MIX_WEIGHT:-<default>}"
 set +e
 "${cmd[@]}"
 train_exit_code=$?
@@ -617,6 +642,24 @@ fi
 if [[ -n "$PREFIX_MANIFEST_OUT" && "$PREFIX_MANIFEST_OUT" != "null" ]]; then
     eval_cmd+=(--prefix_manifest_out "$PREFIX_MANIFEST_OUT")
 fi
+if [[ -n "$META_FILTER_N_DET_MIN" && "$META_FILTER_N_DET_MIN" != "null" ]]; then
+    eval_cmd+=(--meta_filter_n_det_min "$META_FILTER_N_DET_MIN")
+fi
+if [[ -n "$META_FILTER_N_DET_MAX" && "$META_FILTER_N_DET_MAX" != "null" ]]; then
+    eval_cmd+=(--meta_filter_n_det_max "$META_FILTER_N_DET_MAX")
+fi
+if [[ -n "$META_FILTER_N_BANDS_MAX" && "$META_FILTER_N_BANDS_MAX" != "null" ]]; then
+    eval_cmd+=(--meta_filter_n_bands_max "$META_FILTER_N_BANDS_MAX")
+fi
+if [[ -n "$META_FILTER_T_SPAN_MAX" && "$META_FILTER_T_SPAN_MAX" != "null" ]]; then
+    eval_cmd+=(--meta_filter_t_span_max "$META_FILTER_T_SPAN_MAX")
+fi
+if [[ -n "$META_FILTER_RELAX_T_SPAN_IF_BELOW_ROWS" && "$META_FILTER_RELAX_T_SPAN_IF_BELOW_ROWS" != "null" ]]; then
+    eval_cmd+=(--meta_filter_relax_t_span_if_below_rows "$META_FILTER_RELAX_T_SPAN_IF_BELOW_ROWS")
+fi
+if [[ -n "$REAL_STREAM_PROFILE_PATH" && "$REAL_STREAM_PROFILE_PATH" != "null" ]]; then
+    eval_cmd+=(--real_stream_profile_path "$REAL_STREAM_PROFILE_PATH")
+fi
 
 echo "Evaluation Command: ${eval_cmd[*]}"
 set +e
@@ -629,6 +672,32 @@ if [ $eval_exit_code -ne 0 ]; then
     echo "End time: $(date)"
     echo "Exit code: $eval_exit_code"
     exit $eval_exit_code
+fi
+
+compat_prefix_support="${SECONDARY_PREFIX_EVAL_DET_SUPPORT:-3,4,5,6,8,10,12}"
+if is_truthy "$PREFIX_EVAL_ENABLE" && [[ -n "$compat_prefix_support" && "$compat_prefix_support" != "$PREFIX_EVAL_DET_SUPPORT" ]]; then
+    compat_output_dir="${EVAL_OUTPUT_DIR}/compat_prefix_support"
+    compat_manifest_out=""
+    if [[ -n "$PREFIX_MANIFEST_OUT" && "$PREFIX_MANIFEST_OUT" != "null" ]]; then
+        compat_manifest_out="${PREFIX_MANIFEST_OUT%.csv}_compat.csv"
+    fi
+    compat_eval_cmd=("${eval_cmd[@]}")
+    compat_eval_cmd+=(--output_dir "$compat_output_dir" --prefix_eval_det_support "$compat_prefix_support")
+    if [[ -n "$compat_manifest_out" ]]; then
+        compat_eval_cmd+=(--prefix_manifest_out "$compat_manifest_out")
+    fi
+    echo "Compatibility Evaluation Command: ${compat_eval_cmd[*]}"
+    set +e
+    "${compat_eval_cmd[@]}"
+    compat_eval_exit_code=$?
+    set -e
+    if [ $compat_eval_exit_code -ne 0 ]; then
+        echo "Compatibility evaluation failed with exit code $compat_eval_exit_code"
+        echo "------------------------------------------------"
+        echo "End time: $(date)"
+        echo "Exit code: $compat_eval_exit_code"
+        exit $compat_eval_exit_code
+    fi
 fi
 
 echo "Evaluation complete. Results saved to: $EVAL_OUTPUT_DIR"
