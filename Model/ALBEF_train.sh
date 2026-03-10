@@ -152,6 +152,9 @@ CLS_START_EPOCH=$(jq -r '.cls_start_epoch // empty' "$args_file")
 MASK_ITC=$(jq -r '.mask_itc // false' "$args_file")
 USE_LIGHTWEIGHT_GW=$(jq -r '.use_lightweight_gw // false' "$args_file")
 DUAL_FUSION=$(jq -r '.dual_fusion // false' "$args_file")
+FUSION_MODE=$(jq -r '.fusion_mode // empty' "$args_file")
+USE_SIMILARITY_AS_CLS_INPUT_STATE=$(jq -r 'if has("use_similarity_as_cls_input") then (.use_similarity_as_cls_input | tostring) else "unset" end' "$args_file")
+USE_CRED_LEVEL_FEATURE_STATE=$(jq -r 'if has("use_cred_level_feature") then (.use_cred_level_feature | tostring) else "unset" end' "$args_file")
 GW_AUG_NOISE=$(jq -r '.gw_aug_noise // empty' "$args_file")
 GW_AUG_JITTER=$(jq -r '.gw_aug_jitter // empty' "$args_file")
 GW_AUG_DROPOUT=$(jq -r '.gw_aug_dropout // empty' "$args_file")
@@ -494,6 +497,19 @@ if [[ "$USE_LIGHTWEIGHT_GW" == "true" ]]; then
 fi
 if [[ "$DUAL_FUSION" == "true" ]]; then
     cmd+=(--dual_fusion)
+fi
+if [[ -n "$FUSION_MODE" && "$FUSION_MODE" != "null" ]]; then
+    cmd+=(--fusion_mode "$FUSION_MODE")
+fi
+if [[ "$USE_SIMILARITY_AS_CLS_INPUT_STATE" == "true" ]]; then
+    cmd+=(--use_similarity_as_cls_input)
+elif [[ "$USE_SIMILARITY_AS_CLS_INPUT_STATE" == "false" ]]; then
+    cmd+=(--no-use_similarity_as_cls_input)
+fi
+if [[ "$USE_CRED_LEVEL_FEATURE_STATE" == "true" ]]; then
+    cmd+=(--use_cred_level_feature)
+elif [[ "$USE_CRED_LEVEL_FEATURE_STATE" == "false" ]]; then
+    cmd+=(--no-use_cred_level_feature)
 fi
 if [[ -n "$GW_AUG_NOISE" && "$GW_AUG_NOISE" != "null" ]]; then
     cmd+=(--gw_aug_noise "$GW_AUG_NOISE")
