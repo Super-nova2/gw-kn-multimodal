@@ -206,8 +206,7 @@ def check_5_embedding_stats(model, gw_s, gw_m, opt_t, opt_v, opt_mask,
             opt_t.to(device), opt_v.to(device), opt_ref_t,
             opt_mask.to(device), opt_err.to(device)
         )
-        feat_g = F.normalize(model.gw_proj(g), p=2, dim=1, eps=1e-8)
-        feat_o = F.normalize(model.opt_proj(z_l), p=2, dim=1, eps=1e-8)
+        feat_g, feat_o = model.get_contrastive_embeddings(g, z_l)
 
     print("GW encoder output (g):")
     print(f"  shape: {g.shape}, norm mean: {g.norm(dim=1).mean():.4f}, "

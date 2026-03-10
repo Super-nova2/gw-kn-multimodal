@@ -30,3 +30,4 @@ Model/script/check_eval_consistency.py
 Model/script/generate_shortcut_eval_args.py
 Model/script/shortcut_eval_gate.py
 Model/script/submit_shortcut_eval_matrix.sh
+Model/framework/gw_optical_architecture_v5_clean
