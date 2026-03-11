@@ -177,6 +177,39 @@ def choose_value(cli_value, config_dict, ckpt_args, key, default=None):
     return default
 
 
+def _jsonify_metadata_value(value):
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value
+
+
+def _read_optical_h5_window_metadata(path: Optional[str]) -> Dict[str, object]:
+    out: Dict[str, object] = {"path": None if path is None else str(path)}
+    if path is None:
+        return out
+    if not os.path.exists(path):
+        out["exists"] = False
+        return out
+    out["exists"] = True
+    with h5py.File(path, "r") as f:
+        for key in (
+            "observation_window_mode",
+            "pre_first_detection_points_kept",
+            "post_last_detection_points_kept",
+            "enforce_time_window",
+            "time_window_start",
+            "time_window_end",
+            "fixed_offset_days",
+        ):
+            if key in f.attrs:
+                out[key] = _jsonify_metadata_value(f.attrs[key])
+    return out
+
+
 def _preview_keys(keys: List[str], limit: int = 8) -> str:
     if not keys:
         return "[]"
@@ -413,6 +446,9 @@ def load_model(checkpoint_path, device, config_dict):
     ckpt_args = ckpt.get("args", {})
     if not isinstance(ckpt_args, dict):
         ckpt_args = {}
+    ckpt_args = dict(ckpt_args)
+    ckpt_args["_init_source_metadata"] = ckpt.get("init_source_metadata")
+    ckpt_args["_dataset_window_metadata"] = ckpt.get("dataset_window_metadata")
 
     def _get(key, default):
         if key in ckpt_args and ckpt_args[key] is not None:
@@ -733,6 +769,16 @@ def build_eval_datasets(args, ckpt_args, config_dict):
             "relax_t_span_if_below_rows": meta_filter_relax_thresholds,
         },
         "real_stream_profile_path": real_stream_profile_path,
+        "dataset_window_metadata": {
+            "positive": _read_optical_h5_window_metadata(pos_data_path),
+            "negative": _read_optical_h5_window_metadata(neg_data_path),
+        },
+        "init_source_metadata": ckpt_args.get("_init_source_metadata"),
+        "checkpoint_dataset_window_metadata": ckpt_args.get("_dataset_window_metadata"),
+        "detspan_training": {
+            "enabled": bool(choose_value(None, config_dict, ckpt_args, "detspan_train_enable", default=False)),
+            "view_prob": float(choose_value(None, config_dict, ckpt_args, "detspan_view_prob", default=0.0)),
+        },
     }
 
 

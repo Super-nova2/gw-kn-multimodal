@@ -1892,6 +1892,7 @@ class OpticalKNClassifier(nn.Module):
         super().__init__()
         self.feature_dropout = nn.Dropout(feature_dropout)
         self.universal_aux_enable = bool(universal_aux_enable)
+        self.optical_encoder_init_info = None
 
         self.optical_encoder = OpticalEncoderWithCLSNoCoord(
             input_dim=optical_input_dim,
@@ -2033,6 +2034,7 @@ class OpticalKNClassifier(nn.Module):
         }
         if not optical_state:
             raise KeyError("No optical_encoder.* keys found in provided state_dict.")
+        source_mode = "full_optical_encoder"
         if any(k.startswith("curve_encoder.") for k in optical_state):
             curve_prefix = "curve_encoder."
             optical_state = {
@@ -2042,8 +2044,50 @@ class OpticalKNClassifier(nn.Module):
             }
             if not optical_state:
                 raise KeyError("No optical_encoder.curve_encoder.* keys found in provided state_dict.")
+            source_mode = "curve_encoder_only"
+
+        target_state = self.optical_encoder.state_dict()
+        matched_keys = []
+        shape_mismatch = []
+        for key, value in optical_state.items():
+            if key not in target_state:
+                continue
+            if tuple(target_state[key].shape) != tuple(value.shape):
+                shape_mismatch.append(
+                    {
+                        "key": key,
+                        "expected": tuple(target_state[key].shape),
+                        "got": tuple(value.shape),
+                    }
+                )
+                continue
+            matched_keys.append(key)
+
+        if not matched_keys:
+            raise KeyError(
+                "No compatible optical curve-encoder keys matched the optical-only backbone. "
+                f"source_mode={source_mode}"
+            )
+        if shape_mismatch:
+            preview = ", ".join(
+                f"{entry['key']} expected={entry['expected']} got={entry['got']}"
+                for entry in shape_mismatch[:5]
+            )
+            raise RuntimeError(
+                "Optical encoder initialization aborted due to shape mismatch: "
+                f"{preview}"
+            )
 
         missing, unexpected = self.optical_encoder.load_state_dict(optical_state, strict=False)
+        self.optical_encoder_init_info = {
+            "source_mode": str(source_mode),
+            "matched_key_count": int(len(matched_keys)),
+            "missing_key_count": int(len(missing)),
+            "unexpected_key_count": int(len(unexpected)),
+            "matched_keys_preview": matched_keys[:10],
+            "missing_keys_preview": list(missing[:10]),
+            "unexpected_keys_preview": list(unexpected[:10]),
+        }
         if strict and (missing or unexpected):
             raise RuntimeError(
                 f"Optical encoder load strict check failed. Missing={missing}, Unexpected={unexpected}"

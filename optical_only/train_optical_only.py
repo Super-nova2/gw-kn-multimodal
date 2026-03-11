@@ -11,6 +11,7 @@ import argparse
 import ctypes
 import datetime
 import gc
+import h5py
 import json
 import os
 import sys
@@ -103,6 +104,64 @@ def close_dataset_file_handles(dataset, seen: Optional[set] = None) -> int:
     if nested is not None:
         n_closed += close_dataset_file_handles(nested, seen=seen)
     return n_closed
+
+
+def _jsonify_metadata_value(value):
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value
+
+
+def _infer_init_source_family(path: Optional[str]) -> Optional[str]:
+    if path is None:
+        return None
+    text = str(path)
+    lower = text.lower()
+    if "bns_nsbh_v6_sim" in lower:
+        return "albef_v6_sim"
+    if "bns_nsbh_v6" in lower:
+        return "albef_v6"
+    if "bns_nsbh_v5" in lower:
+        return "albef_v5"
+    if "albef" in lower:
+        return "albef"
+    return "external"
+
+
+def _read_optical_h5_window_metadata(path: Optional[str]) -> Dict[str, object]:
+    out: Dict[str, object] = {"path": None if path is None else str(path)}
+    if path is None:
+        return out
+    if not os.path.exists(path):
+        out["exists"] = False
+        return out
+    out["exists"] = True
+    with h5py.File(path, "r") as f:
+        for key in (
+            "observation_window_mode",
+            "pre_first_detection_points_kept",
+            "post_last_detection_points_kept",
+            "enforce_time_window",
+            "time_window_start",
+            "time_window_end",
+            "fixed_offset_days",
+        ):
+            if key in f.attrs:
+                out[key] = _jsonify_metadata_value(f.attrs[key])
+    return out
+
+
+def _collect_dataset_window_metadata(args) -> Dict[str, object]:
+    return {
+        "train_positive": _read_optical_h5_window_metadata(getattr(args, "pos_data_path", None)),
+        "train_negative": _read_optical_h5_window_metadata(getattr(args, "neg_data_path", None)),
+        "eval_positive": _read_optical_h5_window_metadata(getattr(args, "eval_pos_data_path", None)),
+        "eval_negative": _read_optical_h5_window_metadata(getattr(args, "eval_neg_data_path", None)),
+    }
 
 
 def recycle_dataloader_workers(loader) -> bool:
@@ -701,6 +760,39 @@ def augment_optical_data(
     return opt_t, opt_v, opt_mask, opt_err
 
 
+def apply_detspan_window_torch(
+    opt_t: torch.Tensor,
+    opt_v: torch.Tensor,
+    opt_mask: torch.Tensor,
+    opt_err: torch.Tensor,
+    slot_is_detection: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if opt_t.ndim != 2:
+        raise ValueError(f"opt_t must be [B,T], got shape={tuple(opt_t.shape)}")
+    if opt_v.ndim != 3 or opt_mask.ndim != 3:
+        raise ValueError("opt_v and opt_mask must be [B,T,C].")
+    if slot_is_detection.ndim != 2:
+        raise ValueError("slot_is_detection must be [B,T].")
+
+    row_valid = opt_mask.sum(dim=-1) > 0
+    det_rows = (slot_is_detection > 0) & row_valid
+    has_det = det_rows.any(dim=1)
+
+    row_pos = torch.arange(opt_t.size(1), device=opt_t.device).unsqueeze(0)
+    first_idx = torch.argmax(det_rows.to(torch.int64), dim=1)
+    last_idx = det_rows.size(1) - 1 - torch.argmax(det_rows.flip(dims=[1]).to(torch.int64), dim=1)
+    keep_rows = row_valid & (row_pos >= first_idx.unsqueeze(1)) & (row_pos <= last_idx.unsqueeze(1))
+    keep_rows = torch.where(has_det.unsqueeze(1), keep_rows, row_valid)
+    keep_rows_3d = keep_rows.unsqueeze(-1)
+
+    out_t = torch.where(keep_rows, opt_t, torch.zeros_like(opt_t))
+    out_v = torch.where(keep_rows_3d, opt_v, torch.zeros_like(opt_v))
+    out_mask = torch.where(keep_rows_3d, opt_mask, torch.zeros_like(opt_mask))
+    out_err = torch.where(keep_rows_3d, opt_err, torch.zeros_like(opt_err))
+    out_det = torch.where(keep_rows, slot_is_detection, torch.zeros_like(slot_is_detection))
+    return out_t, out_v, out_mask, out_err, out_det
+
+
 def sample_universal_target_k(
     slot_is_detection: torch.Tensor,
     opt_mask: torch.Tensor,
@@ -775,6 +867,18 @@ def build_universal_view(
         target_k=target_k,
         min_det=int(args.prefix_min_det),
     )
+    detspan_applied = False
+    if bool(getattr(args, "detspan_train_enable", False)):
+        detspan_prob = float(getattr(args, "detspan_view_prob", 0.0))
+        if detspan_prob > 0 and float(torch.rand((), device=opt_t.device).item()) < detspan_prob:
+            opt_t, opt_v, opt_mask, opt_err, slot_is_detection = apply_detspan_window_torch(
+                opt_t=opt_t,
+                opt_v=opt_v,
+                opt_mask=opt_mask,
+                opt_err=opt_err,
+                slot_is_detection=slot_is_detection,
+            )
+            detspan_applied = True
 
     valid_rows = opt_mask.sum(dim=-1) > 0
     keep_prob = torch.empty((opt_mask.size(0), 1), device=opt_mask.device).uniform_(
@@ -836,6 +940,7 @@ def build_universal_view(
         "slot_is_detection": slot_is_detection,
         "target_k": target_k,
         "is_terminal_prefix": (target_k >= total_det).to(dtype=torch.long),
+        "detspan_applied": int(detspan_applied),
         "n_det": n_det.to(dtype=torch.long),
         "n_bands": n_bands.to(dtype=torch.long),
         "t_span": t_span,
@@ -1400,6 +1505,8 @@ def save_checkpoint(path, model, optimizer, epoch, args, val_metrics):
             "optimizer_state_dict": optimizer.state_dict() if optimizer is not None else None,
             "val_metrics": val_metrics,
             "args": vars(args),
+            "init_source_metadata": getattr(args, "_init_source_metadata", None),
+            "dataset_window_metadata": getattr(args, "_dataset_window_metadata", None),
         },
         path,
     )
@@ -1453,8 +1560,14 @@ def build_train_summary_payload(
         "task_mode": "prefix_right_censored"
         if (bool(args.prefix_train_enable) or bool(getattr(args, "universal_train_enable", False)))
         else "full_window",
+        "detspan_training": {
+            "enabled": bool(getattr(args, "detspan_train_enable", False)),
+            "view_prob": float(getattr(args, "detspan_view_prob", 0.0)),
+        },
         "current_epoch": int(current_epoch),
         "current_stage": str(current_stage),
+        "dataset_window_metadata": getattr(args, "_dataset_window_metadata", None),
+        "init_source_metadata": getattr(args, "_init_source_metadata", None),
     }
     if last_epoch_metrics:
         payload["last_epoch_metrics"] = dict(last_epoch_metrics)
@@ -1531,6 +1644,8 @@ def build_stage_optimizer(model, args, freeze_encoder):
 def train(args):
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
+    args._dataset_window_metadata = _collect_dataset_window_metadata(args)
+    print(f"Dataset window metadata: {json.dumps(args._dataset_window_metadata, indent=2)}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type == "cuda":
@@ -1550,6 +1665,12 @@ def train(args):
     print(f"Prefix train policy: {json.dumps(prefix_policy.describe(), indent=2)}")
     if bool(args.prefix_train_enable) and float(args.target_ndet_jitter) > 0:
         print("prefix_train_enable=true: target_ndet_jitter will be ignored in favor of causal right-censoring.")
+    print(
+        "Det-span training: "
+        f"enabled={bool(getattr(args, 'detspan_train_enable', False))} "
+        f"view_prob={float(getattr(args, 'detspan_view_prob', 0.0)):.3f} "
+        f"(universal_only={bool(getattr(args, 'universal_train_enable', False))})"
+    )
     meta_bins_n_det = parse_bin_edges(
         getattr(args, "meta_bins_n_det", None),
         default="3,5,8,12,20,40,80,200",
@@ -1633,10 +1754,21 @@ def train(args):
         ckpt = torch.load(args.pretrained_albef_ckpt, map_location=device)
         state_dict = ckpt.get("model_state_dict", ckpt)
         missing, unexpected = model.load_optical_encoder_from_albef_state_dict(state_dict, strict=False)
+        init_info = dict(getattr(model, "optical_encoder_init_info", {}) or {})
+        init_info.update(
+            {
+                "init_source_ckpt": str(args.pretrained_albef_ckpt),
+                "init_source_family": _infer_init_source_family(args.pretrained_albef_ckpt),
+            }
+        )
+        args._init_source_metadata = init_info
         print(
             "Loaded optical encoder from ALBEF checkpoint "
             f"(missing={len(missing)}, unexpected={len(unexpected)})."
         )
+        print(f"Optical init metadata: {json.dumps(args._init_source_metadata, indent=2)}")
+    else:
+        args._init_source_metadata = None
 
     criterion = nn.BCEWithLogitsLoss()
 
@@ -1883,6 +2015,12 @@ def train(args):
         "task_mode": "prefix_right_censored"
         if (bool(args.prefix_train_enable) or bool(getattr(args, "universal_train_enable", False)))
         else "full_window",
+        "detspan_training": {
+            "enabled": bool(getattr(args, "detspan_train_enable", False)),
+            "view_prob": float(getattr(args, "detspan_view_prob", 0.0)),
+        },
+        "dataset_window_metadata": getattr(args, "_dataset_window_metadata", None),
+        "init_source_metadata": getattr(args, "_init_source_metadata", None),
         **best_metrics,
     }
     write_train_summary_files(
@@ -1988,6 +2126,8 @@ def parse_args():
     parser.add_argument("--universal_stage1_epochs", type=int, default=2)
     parser.add_argument("--universal_stage2_epochs", type=int, default=6)
     parser.add_argument("--universal_stage3_epochs", type=int, default=6)
+    parser.add_argument("--detspan_train_enable", action="store_true")
+    parser.add_argument("--detspan_view_prob", type=float, default=0.0)
     parser.add_argument("--view_keep_prob_min", type=float, default=0.55)
     parser.add_argument("--view_keep_prob_max", type=float, default=1.0)
     parser.add_argument("--view_band_dropout_max", type=float, default=0.5)
@@ -2114,6 +2254,10 @@ def parse_args():
         raise ValueError("Adversarial weights must be >= 0.")
     if int(args.universal_stage1_epochs) < 0 or int(args.universal_stage2_epochs) < 0 or int(args.universal_stage3_epochs) < 0:
         raise ValueError("Universal stage epochs must be >= 0.")
+    if not (0.0 <= float(args.detspan_view_prob) <= 1.0):
+        raise ValueError("--detspan_view_prob must be in [0, 1].")
+    if bool(args.detspan_train_enable) and (not bool(args.universal_train_enable)):
+        raise ValueError("detspan_train_enable=true requires universal_train_enable=true.")
     if float(args.grl_lambda) < 0:
         raise ValueError("--grl_lambda must be >= 0.")
     return args
