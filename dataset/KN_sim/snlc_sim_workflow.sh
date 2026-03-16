@@ -25,6 +25,10 @@ out_dir=$(jq -r '.OUTPUT_DIR' $args_file)
 log_dir=$(jq -r '.LOG_DIR' $args_file)
 tem_input=$(jq -r '.TEMPLATE_INPUT' $args_file)
 
+# derive SIMLIB filename prefix from the OpSim database filename stem
+# (opsimsummaryv2 names SIMLIB as <db_stem><file_suffix>.SIMLIB)
+opsim_stem=$(basename "$opsim_db" .db)   # e.g. "baseline_v5.1.1_10yrs"
+
 echo "Start time: $(date '+%Y-%m-%d %H:%M:%S')"
 echo "Starting SNANA doc generation for simulation: $sim_name"
 echo "Using Opsim DB: $opsim_db"
@@ -79,7 +83,7 @@ python /fred/oz016/bgao_kn/ML+GW+KN/dataset/KN_sim/gen_SNANA_doc.py --sim_name $
 
 failed_ids=()
 for sim_id in "${group_ids[@]}"; do
-    simlib="${simlib_dir}baseline_v5.0.1_10yrs_${sim_name}_${sim_id}.SIMLIB"
+    simlib="${simlib_dir}${opsim_stem}_${sim_name}_${sim_id}.SIMLIB"
     input="${input_dir}SIMGEN_${sim_name}_${sim_id}.INPUT"
 
     echo "sim_id=$sim_id : checking files"
@@ -101,19 +105,9 @@ for sim_id in "${group_ids[@]}"; do
         continue
     fi
 
-    # generate COADD SIMLIB
-    echo "    generating COADD SIMLIB for $sim_id"
-    if ! simlib_coadd.exe "$simlib" > /dev/null; then
-        echo "    simlib_coadd.exe failed for $sim_id"
-        rm -f "$simlib"   # remove SIMLIB if COADD SIMLIB generation fails
-        echo "    removed SIMLIB $simlib due to simlib_coadd.exe failure"
-        failed_ids+=("$sim_id")
-        continue
-    fi
-
     if [[ ! -f "$input" ]]; then
         echo "    ERROR: INPUT not found: $input"
-        rm -f "$simlib" "${simlib}.COADD"   # remove SIMLIB if INPUT is missing
+        rm -f "$simlib"
         echo "    removed SIMLIB $simlib due to missing INPUT"
         failed_ids+=("$sim_id")
         continue
@@ -123,15 +117,15 @@ for sim_id in "${group_ids[@]}"; do
     if ! snlc_sim.exe "$input" > /dev/null ; then
         echo "    snlc_sim failed for $sim_id"
         echo "  [$sim_id] Failed."
-        rm -f "$simlib" "${simlib}.COADD" "${input}"  # remove SIMLIB if snlc_sim fails
+        rm -f "$simlib" "${input}"
         failed_ids+=("$sim_id")
         continue
     fi
 
-    # clean up SIMLIB file to save space
+    # clean up SIMLIB and INPUT files to save space
     echo "    snlc_sim success for $sim_id"
-    echo "    removing SIMLIB $simlib, SIMLIB.COADD, and INPUT to save space"
-    rm -f "$simlib" "${simlib}.COADD" "${input}"    # remove INPUT file as well
+    echo "    removing SIMLIB $simlib and INPUT to save space"
+    rm -f "$simlib" "${input}"
 
     echo "  [$sim_id] done."
 done

@@ -1,16 +1,16 @@
 {
-    "SIM_NAME": "LSST_KN_BNS",
+    "SIM_NAME": "LSST_KN_BNS_AUG",
     "GW_type": "bns",
-    "skymap_path": "/fred/oz016/bgao_kn/data/skymap/bns_skymap_v0/",
-    "OpsimDB": "/fred/oz016/bgao_kn/data/rubin_sim/baseline/baseline_v5.0.1_10yrs.db",
+    "skymap_path": "/fred/oz016/bgao_kn/data/skymap/bns_skymap/",
+    "OpsimDB": "/fred/oz016/bgao_kn/data/rubin_sim/baseline_v5.1/baseline_v5.1.1_10yrs.db",
     "Nside": 256,
     "SNANA_DIR": "/fred/oz016/bgao_kn/SNANA/SNANA",
     "SNDATA_ROOT": "/fred/oz016/bgao_kn/SNANA/SNDATA_ROOT",
-    "DATA_DIR": "/fred/oz016/bgao_kn/data/LSST_KN_BNS/",
-    "INPUT_DIR": "/fred/oz016/bgao_kn/data/LSST_KN_BNS/SIM_INPUT/",
-    "SIMLIB_DIR": "/fred/oz016/bgao_kn/data/LSST_KN_BNS/SIMLIB/",
+    "DATA_DIR": "/fred/oz016/bgao_kn/data/LSST_KN_BNS_AUG/",
+    "INPUT_DIR": "/fred/oz016/bgao_kn/data/LSST_KN_BNS_AUG/SIM_INPUT/",
+    "SIMLIB_DIR": "/fred/oz016/bgao_kn/data/LSST_KN_BNS_AUG/SIMLIB/",
     "OUTPUT_DIR": "/fred/oz016/bgao_kn/SNANA/SNDATA_ROOT/SIM/",
-    "injections_file": "/fred/oz016/bgao_kn/ML+GW+KN/dataset/O5_sim_bns/injections_final.csv",
+    "injections_file": "/fred/oz016/bgao_kn/ML+GW+KN/dataset/O5_sim_bns_aug/injections_final.csv",
     "LOG_DIR": "/fred/oz016/bgao_kn/logs/",
     "TEMPLATE_INPUT": "/fred/oz016/bgao_kn/ML+GW+KN/dataset/KN_sim/Template_doc/SIMGEN_KN_LSST_TEMPLATE.INPUT"
 }

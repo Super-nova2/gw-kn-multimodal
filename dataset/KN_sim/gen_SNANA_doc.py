@@ -161,7 +161,7 @@ parser.add_argument("--skymap_path", type=str, default="/fred/oz016/bgao_kn/data
 parser.add_argument("--sim_name", type=str, default="LSST_KN_BNS", help="Name of simulation, eg:LSST_KN_BNS/NSBH")
 parser.add_argument("--sim_ids", nargs="+", type=int, required=True, help="a list of simulation_id, at most 10")
 parser.add_argument("--GW_params", type=str, default="/fred/oz016/bgao_kn/ML+GW+KN/dataset/O5_sim_bns/injections_final.csv", help="CSV file containing GW parameters")
-parser.add_argument("--Opsim", type=str, default="/fred/oz016/bgao_kn/data/rubin_sim/baseline/baseline_v5.0.1_10yrs.db", help="Opsim database file")
+parser.add_argument("--Opsim", type=str, default="/fred/oz016/bgao_kn/data/rubin_sim/baseline_v5.1/baseline_v5.1.1_10yrs.db", help="Opsim database file")
 parser.add_argument("--within", action='store_true', help="sample within credible level")
 parser.add_argument("--level", type=float, default=0.9, help="credible level to sample sky position")
 parser.add_argument("--outdir", type=str, default="./data/", help="output directory for SIMLIB")
@@ -176,6 +176,10 @@ os.makedirs(args.outdir + "SIM_INPUT/", exist_ok=True)
 os.makedirs(args.outdir + "SIMLIB/", exist_ok=True)
 simlib_dir = args.outdir + "SIMLIB/"
 input_dir = args.outdir + "SIM_INPUT/"
+
+# derive SIMLIB filename prefix from the OpSim database filename stem
+# (opsimsummaryv2 names the output file as <db_stem><file_suffix>.SIMLIB)
+opsim_stem = Path(args.Opsim).stem  # e.g. "baseline_v5.1.1_10yrs"
 
 # load GW parameters
 injections = pd.read_csv(args.GW_params)
@@ -217,7 +221,7 @@ for sim_id in sim_ids:
     print(f"SIMLIB for simulation ID {sim_id} written to {simlib_dir}")
 
     # generate corresponding SIMGEN INPUT file
-    NLIBID = get_NLIBID(os.path.join(simlib_dir, f"baseline_v5.0.1_10yrs_{sim_name}_{sim_id}.SIMLIB"))
+    NLIBID = get_NLIBID(os.path.join(simlib_dir, f"{opsim_stem}_{sim_name}_{sim_id}.SIMLIB"))
     print(f"NLIBID for simulation ID {sim_id}: {NLIBID}")
 
     # replace NLIBID and GENVERSION in the template
@@ -235,13 +239,21 @@ for sim_id in sim_ids:
         text,
         flags=re.MULTILINE
     )
-    # MODIFY SIMLIB FILE
-    simlib_file = f"{simlib_dir}baseline_v5.0.1_10yrs_{sim_name}_{sim_id}.SIMLIB.COADD"
+    # MODIFY SIMLIB FILE (use raw SIMLIB, not COADD — keep per-visit resolution)
+    simlib_file = f"{simlib_dir}{opsim_stem}_{sim_name}_{sim_id}.SIMLIB"
     text = re.sub(
-        r"^(SIMLIB_FILE:\s*)\S+/*$",
+        r"^(SIMLIB_FILE:\s*)\S+.*$",
         fr"\1{simlib_file}",
         text,
         flags=re.MULTILINE
+    )
+
+    # set unique RANSEED per event to avoid correlated noise realisations
+    text = re.sub(
+        r"^(RANSEED:\s*)\S+.*$",
+        rf"\1 {100000 + sim_id}",
+        text,
+        flags=re.MULTILINE,
     )
 
     # modify other parameters based on GW parameters and simlib file

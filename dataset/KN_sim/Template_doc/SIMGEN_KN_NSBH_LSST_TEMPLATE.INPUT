@@ -63,7 +63,7 @@ APPLY_SEARCHEFF_OPT:  0   # No filtering, keep write mask into output
 APPLY_CUTWIN_OPT: 1 # implement selection cuts
 CUTWIN_NEPOCH: 2 +5 # require 1 epoch with SNR>5
 
-NEWMJD_DIF: 7.0000e-03   # min MJD dif to count NEW MJD(10 min)
+NEWMJD_DIF: 0.0003   # min MJD dif to count NEW MJD(26s, per exposure)
 
 # convert SED into binary 
 SIMSED_USE_BINARY:  1   # speed up the initialization of SED files
