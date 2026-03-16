@@ -8,6 +8,7 @@ __pycache__/
 *.csv
 *.dat
 notebook/
+docs/
 
 hpo_results/
 logs/
