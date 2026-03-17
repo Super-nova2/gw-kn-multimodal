@@ -182,6 +182,7 @@ NEG_OFFSET_SEED=$(jq -r '.neg_offset_seed // empty' "$args_file")
 NEG_OFFSET_BANK_SIZE=$(jq -r '.neg_offset_bank_size // empty' "$args_file")
 TEST_DATA_PATH=$(jq -r '.test_data_path // empty' "$args_file")
 TEST_STEPS=$(jq -r '.test_steps // empty' "$args_file")
+ENABLE_OOD_MONITORING=$(jq -r '\.enable_ood_monitoring // false' "$args_file")
 mkdir -p "$CKPT_PATH"
 
 echo "========================================"
@@ -569,6 +570,9 @@ if [[ -n "$TEST_DATA_PATH" && "$TEST_DATA_PATH" != "null" ]]; then
 fi
 if [[ -n "$TEST_STEPS" && "$TEST_STEPS" != "null" ]]; then
     cmd+=(--test_steps "$TEST_STEPS")
+fi
+if [[ "$ENABLE_OOD_MONITORING" == "true" ]]; then
+    cmd+=(--enable_ood_monitoring)
 fi
 echo "Command: ${cmd[*]}"
 "${cmd[@]}"

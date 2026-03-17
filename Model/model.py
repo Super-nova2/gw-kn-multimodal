@@ -252,7 +252,7 @@ class MultiTimeAttention(nn.Module):
         b_used = b_used.to(device=values_lupt.device, dtype=values_lupt.dtype).view(1, 1, 1, 1, d_obs)
         two_b = 2.0 * b_used
 
-        x = (self.lupt_psfflux_zp - values_lupt) / self.asinh_mag_factor
+        x = (self.lupt_psfflux_zp - values_lupt) / self.asinh_mag_factor - torch.log(b_used)
         flux_raw = two_b * torch.sinh(x)
         fluxerr_raw = (
             torch.abs(errors_lupt)

@@ -6,9 +6,10 @@ This script is intentionally independent from existing ALBEF preprocessing scrip
 It does not modify existing code paths; it creates new H5 artifacts for optical-only.
 
 First-detection rule:
-1) Prefer PHOTFLAG != 0
-2) Fallback to SNR > 5 (FLUXCAL / FLUXCALERR)
-3) If still no detection in a realization, drop that realization
+1) Convert FLUXCAL / FLUXCALERR to psfFlux / psfFluxErr
+2) Merge same-band points within 2 hours using inverse-variance weighting
+3) Use merged psfFlux SNR > threshold to define detections
+4) If still no detection in a realization, drop that realization
 
 Saved time vector:
     times = (MJD - t0) / 100
@@ -18,6 +19,7 @@ where t0 is first-detection MJD (+ optional fixed offset in days).
 from __future__ import annotations
 
 import argparse
+import importlib.util
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 import hashlib
 import os
@@ -30,6 +32,17 @@ import numpy as np
 from astropy.io import fits
 from tqdm import tqdm
 
+_MERGE_HELPER_PATH = Path(__file__).resolve().parents[1] / "Model" / "lightcurve_merge.py"
+_merge_spec = importlib.util.spec_from_file_location("lightcurve_merge", _MERGE_HELPER_PATH)
+if _merge_spec is None or _merge_spec.loader is None:
+    raise ImportError(f"Unable to load shared merge helper from {_MERGE_HELPER_PATH}")
+_lightcurve_merge = importlib.util.module_from_spec(_merge_spec)
+_merge_spec.loader.exec_module(_lightcurve_merge)  # type: ignore[attr-defined]
+MERGE_WINDOW_HOURS = _lightcurve_merge.MERGE_WINDOW_HOURS
+MERGE_MODE = _lightcurve_merge.MERGE_MODE
+MERGE_FLUX_DOMAIN = _lightcurve_merge.MERGE_FLUX_DOMAIN
+merge_photometry_psfflux = _lightcurve_merge.merge_photometry_psfflux
+
 
 NUM_BANDS = 6
 MAX_LC_LENGTH = 200
@@ -40,7 +53,7 @@ DEFAULT_TIME_WINDOW_END = 0.6
 DEFAULT_DENSITY_BINS_N_DET = (3.0, 5.0, 8.0, 12.0, 20.0, 40.0, 80.0, 200.0)
 DEFAULT_DENSITY_BINS_N_BANDS = (1.0, 2.0, 3.0, 4.0, 5.0, 6.0)
 DEFAULT_DENSITY_BINS_T_SPAN = (0.0, 0.01, 0.05, 0.1, 0.2, 0.5, 1.0)
-DEFAULT_ZERO_TIME_WINDOW_START = 6100.0
+DEFAULT_ZERO_TIME_WINDOW_START = 61000.0
 DEFAULT_ZERO_TIME_WINDOW_END = 64500.0
 
 BAND_TO_INDEX = {
@@ -305,9 +318,7 @@ def first_detection_index(
         snr_threshold=snr_threshold,
     )
     if np.any(det_mask):
-        if photflag is not None and np.any(photflag.astype(np.int64) != 0):
-            return int(np.argmax(det_mask)), "photflag"
-        return int(np.argmax(det_mask)), "snr"
+        return int(np.argmax(det_mask)), "merged_snr"
     return None, None
 
 
@@ -317,15 +328,11 @@ def build_detection_mask(
     photflag: Optional[np.ndarray],
     snr_threshold: float,
 ) -> np.ndarray:
+    _ = photflag
     if flux.size == 0:
         return np.zeros((0,), dtype=bool)
 
-    if photflag is not None:
-        det_mask = photflag.astype(np.int64) != 0
-        if np.any(det_mask):
-            return np.asarray(det_mask, dtype=bool)
-
-    valid = np.isfinite(fluxerr) & (fluxerr > 0)
+    valid = np.isfinite(flux) & np.isfinite(fluxerr) & (fluxerr > 0)
     if np.any(valid):
         snr = np.full(flux.shape, -np.inf, dtype=np.float64)
         snr[valid] = flux[valid] / fluxerr[valid]
@@ -429,6 +436,72 @@ def transform_fluxcal_to_luptitude(
 
     f_psf = fluxcal[idx_valid] * float(fluxcal_to_psfflux_factor)
     sigma_psf = np.abs(fluxcalerr[idx_valid]) * float(fluxcal_to_psfflux_factor)
+    m_lupt = float(psfflux_zp) - ASINH_MAG_FACTOR * (
+        np.arcsinh(f_psf / (2.0 * b_valid)) + np.log(b_valid)
+    )
+    sigma_lupt = ASINH_MAG_FACTOR * sigma_psf / np.sqrt((f_psf * f_psf) + (2.0 * b_valid) ** 2)
+
+    finite_valid = np.isfinite(m_lupt) & np.isfinite(sigma_lupt) & (sigma_lupt > 0)
+    if not np.any(finite_valid):
+        return (
+            np.asarray([], dtype=np.float64),
+            np.asarray([], dtype=np.float64),
+            np.asarray([], dtype=np.float64),
+            np.asarray([], dtype=flt.dtype),
+            np.asarray([], dtype=np.int64),
+        )
+
+    keep = idx_valid[finite_valid]
+    return (
+        np.asarray(mjd[keep], dtype=np.float64),
+        np.asarray(m_lupt[finite_valid], dtype=np.float64),
+        np.asarray(sigma_lupt[finite_valid], dtype=np.float64),
+        np.asarray(flt[keep]),
+        np.asarray(keep, dtype=np.int64),
+    )
+
+
+def transform_psfflux_to_luptitude(
+    mjd: np.ndarray,
+    psfflux: np.ndarray,
+    psffluxerr: np.ndarray,
+    flt: np.ndarray,
+    psfflux_zp: float,
+    lupt_b_njy: Sequence[float],
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    lupt_b_arr = np.asarray(lupt_b_njy, dtype=np.float64)
+    if lupt_b_arr.shape != (NUM_BANDS,):
+        raise ValueError(
+            f"lupt_b_njy must contain {NUM_BANDS} values in order u,g,r,i,z,Y."
+        )
+
+    band_idx_list: List[int] = []
+    for band_raw in flt:
+        idx = band_index(band_raw)
+        band_idx_list.append(-1 if idx is None else int(idx))
+    band_idx = np.asarray(band_idx_list, dtype=np.int64)
+    base_valid = (
+        np.isfinite(mjd)
+        & np.isfinite(psfflux)
+        & np.isfinite(psffluxerr)
+        & (psffluxerr > 0)
+        & (band_idx >= 0)
+    )
+    if not np.any(base_valid):
+        return (
+            np.asarray([], dtype=np.float64),
+            np.asarray([], dtype=np.float64),
+            np.asarray([], dtype=np.float64),
+            np.asarray([], dtype=flt.dtype),
+            np.asarray([], dtype=np.int64),
+        )
+
+    idx_valid = np.nonzero(base_valid)[0]
+    band_valid = band_idx[idx_valid]
+    b_valid = lupt_b_arr[band_valid]
+
+    f_psf = np.asarray(psfflux[idx_valid], dtype=np.float64)
+    sigma_psf = np.asarray(np.abs(psffluxerr[idx_valid]), dtype=np.float64)
     m_lupt = float(psfflux_zp) - ASINH_MAG_FACTOR * (
         np.arcsinh(f_psf / (2.0 * b_valid)) + np.log(b_valid)
     )
@@ -567,11 +640,6 @@ def parse_kn_event(
 
             stats["n_realizations_total"] = int(len(data_head))
             for i in range(len(data_head)):
-                nobs = int(data_head["NOBS"][i])
-                if nobs < int(min_nobs):
-                    stats["drop_nobs"] += 1
-                    continue
-
                 start_idx = int(ptrobs_min[i]) - 1
                 end_idx = int(ptrobs_max[i])
                 if start_idx < 0 or end_idx <= start_idx or end_idx > len(mjd_all):
@@ -592,35 +660,37 @@ def parse_kn_event(
                     stats["drop_empty_or_invalid"] += 1
                     continue
 
+                merged_mjd, merged_psfflux, merged_psffluxerr, merged_flt = merge_photometry_psfflux(
+                    mjd=lc_mjd,
+                    fluxcal=lc_flux,
+                    fluxcalerr=lc_fluxerr,
+                    flt=lc_flt,
+                    fluxcal_to_psfflux_factor=fluxcal_to_psfflux_factor,
+                )
+                if merged_mjd.size < int(min_nobs):
+                    stats["drop_nobs"] += 1
+                    continue
                 det_idx, _ = first_detection_index(
-                    flux=lc_flux,
-                    fluxerr=lc_fluxerr,
-                    photflag=lc_photflag,
+                    flux=merged_psfflux,
+                    fluxerr=merged_psffluxerr,
+                    photflag=None,
                     snr_threshold=snr_threshold,
                 )
                 if det_idx is None:
                     stats["drop_no_detection"] += 1
                     continue
                 det_mask_obs = build_detection_mask(
-                    flux=lc_flux,
-                    fluxerr=lc_fluxerr,
-                    photflag=lc_photflag,
+                    flux=merged_psfflux,
+                    fluxerr=merged_psffluxerr,
+                    photflag=None,
                     snr_threshold=snr_threshold,
                 )
-
-                _ = fixed_offset_days
-                t0_key = f"{event_dir}:{i}"
-                t0_mjd = deterministic_uniform_sample(
-                    low=DEFAULT_ZERO_TIME_WINDOW_START,
-                    high=DEFAULT_ZERO_TIME_WINDOW_END,
-                    key=t0_key,
-                )
-                lc_mjd_lupt, lc_lupt, lc_lupt_err, lc_flt_lupt, lc_keep_idx = transform_fluxcal_to_luptitude(
-                    mjd=lc_mjd,
-                    fluxcal=lc_flux,
-                    fluxcalerr=lc_fluxerr,
-                    flt=lc_flt,
-                    fluxcal_to_psfflux_factor=fluxcal_to_psfflux_factor,
+                t0_mjd = float(merged_mjd[int(det_idx)]) + float(fixed_offset_days)
+                lc_mjd_lupt, lc_lupt, lc_lupt_err, lc_flt_lupt, lc_keep_idx = transform_psfflux_to_luptitude(
+                    mjd=merged_mjd,
+                    psfflux=merged_psfflux,
+                    psffluxerr=merged_psffluxerr,
+                    flt=merged_flt,
                     psfflux_zp=psfflux_zp,
                     lupt_b_njy=lupt_b_njy,
                 )
@@ -760,11 +830,6 @@ def parse_negative_file(
 
             stats["n_realizations_total"] = int(len(data_head))
             for i in range(len(data_head)):
-                nobs = int(data_head["NOBS"][i])
-                if nobs < int(min_nobs):
-                    stats["drop_nobs"] += 1
-                    continue
-
                 start_idx = int(ptrobs_min[i]) - 1
                 end_idx = int(ptrobs_max[i])
                 if start_idx < 0 or end_idx <= start_idx or end_idx > len(mjd_all):
@@ -785,35 +850,44 @@ def parse_negative_file(
                     stats["drop_empty_or_invalid"] += 1
                     continue
 
+                merged_mjd, merged_psfflux, merged_psffluxerr, merged_flt = merge_photometry_psfflux(
+                    mjd=lc_mjd,
+                    fluxcal=lc_flux,
+                    fluxcalerr=lc_fluxerr,
+                    flt=lc_flt,
+                    fluxcal_to_psfflux_factor=fluxcal_to_psfflux_factor,
+                )
+                if merged_mjd.size < int(min_nobs):
+                    stats["drop_nobs"] += 1
+                    continue
                 det_idx, _ = first_detection_index(
-                    flux=lc_flux,
-                    fluxerr=lc_fluxerr,
-                    photflag=lc_photflag,
+                    flux=merged_psfflux,
+                    fluxerr=merged_psffluxerr,
+                    photflag=None,
                     snr_threshold=snr_threshold,
                 )
                 if det_idx is None:
                     stats["drop_no_detection"] += 1
                     continue
                 det_mask_obs = build_detection_mask(
-                    flux=lc_flux,
-                    fluxerr=lc_fluxerr,
-                    photflag=lc_photflag,
+                    flux=merged_psfflux,
+                    fluxerr=merged_psffluxerr,
+                    photflag=None,
                     snr_threshold=snr_threshold,
                 )
-
-                _ = fixed_offset_days
-                t0_key = f"{head_path}:{i}"
-                t0_mjd = deterministic_uniform_sample(
+                det_mjd_real = float(merged_mjd[int(det_idx)])
+                sampled_fd_mjd = deterministic_uniform_sample(
                     low=DEFAULT_ZERO_TIME_WINDOW_START,
                     high=DEFAULT_ZERO_TIME_WINDOW_END,
-                    key=t0_key,
+                    key=f"{head_path}:{i}",
                 )
-                lc_mjd_lupt, lc_lupt, lc_lupt_err, lc_flt_lupt, lc_keep_idx = transform_fluxcal_to_luptitude(
-                    mjd=lc_mjd,
-                    fluxcal=lc_flux,
-                    fluxcalerr=lc_fluxerr,
-                    flt=lc_flt,
-                    fluxcal_to_psfflux_factor=fluxcal_to_psfflux_factor,
+                merged_mjd = merged_mjd - det_mjd_real + sampled_fd_mjd
+                t0_mjd = float(sampled_fd_mjd)
+                lc_mjd_lupt, lc_lupt, lc_lupt_err, lc_flt_lupt, lc_keep_idx = transform_psfflux_to_luptitude(
+                    mjd=merged_mjd,
+                    psfflux=merged_psfflux,
+                    psffluxerr=merged_psffluxerr,
+                    flt=merged_flt,
                     psfflux_zp=psfflux_zp,
                     lupt_b_njy=lupt_b_njy,
                 )
@@ -1063,6 +1137,9 @@ def write_luptitude_metadata_attrs(
     h5_obj.attrs["lupt_b_njy"] = np.asarray(lupt_b_njy, dtype=np.float64)
     h5_obj.attrs["values_semantics"] = "luptitude"
     h5_obj.attrs["errors_semantics"] = "luptitude_sigma"
+    h5_obj.attrs["lightcurve_merge_window_hours"] = float(MERGE_WINDOW_HOURS)
+    h5_obj.attrs["lightcurve_merge_mode"] = MERGE_MODE
+    h5_obj.attrs["lightcurve_merge_flux_domain"] = MERGE_FLUX_DOMAIN
 
 
 def create_positive_h5(
@@ -1091,16 +1168,9 @@ def create_positive_h5(
     write_meta_features: bool,
 ) -> None:
     output_h5.parent.mkdir(parents=True, exist_ok=True)
-    dt_str = h5py.string_dtype(encoding="utf-8")
     chunk_size = 1024
 
     with h5py.File(output_h5, "w") as f:
-        gw_grp = f.create_group("events/gw_data")
-        ds_gw_ids = gw_grp.create_dataset("ids", (0,), maxshape=(None,), dtype=dt_str, chunks=(chunk_size,))
-        ds_gw_source = gw_grp.create_dataset(
-            "source_type", (0,), maxshape=(None,), dtype=dt_str, chunks=(chunk_size,)
-        )
-
         opt_grp = f.create_group("events/optical_data")
         (
             ds_values,
@@ -1118,7 +1188,7 @@ def create_positive_h5(
             ds_meta_single_band_id,
         ) = _create_optical_group(opt_grp, chunk_size, write_meta_features=bool(write_meta_features))
         ds_parent = opt_grp.create_dataset(
-            "parent_gw_idx",
+            "parent_event_idx",
             (0,),
             maxshape=(None,),
             dtype="i4",
@@ -1232,10 +1302,6 @@ def create_positive_h5(
                 lcs = lcs[: int(max_lcs_per_event)]
 
             gw_idx = gw_count
-            ds_gw_ids.resize(gw_count + 1, axis=0)
-            ds_gw_source.resize(gw_count + 1, axis=0)
-            ds_gw_ids[gw_idx] = event_name
-            ds_gw_source[gw_idx] = source_tag
             gw_count += 1
             stats[key_written] += 1
 
@@ -1346,24 +1412,23 @@ def create_positive_h5(
         for k, v in stats.items():
             f.attrs[k] = int(v)
 
-        f.attrs["time_zero_anchor"] = "uniform_window"
-        f.attrs["first_detection_rule"] = "photflag_nonzero_else_snr_gt_5"
+        f.attrs["time_zero_anchor"] = "first_detection_plus_fixed_offset"
+        f.attrs["first_detection_rule"] = "merged_psfflux_snr_gt_threshold"
         f.attrs["time_scale_divisor_days"] = 100.0
         f.attrs["time_zero_version"] = "fd_v1"
         f.attrs["drop_no_detection_count"] = int(stats["drop_no_detection"])
         f.attrs["snr_threshold"] = float(snr_threshold)
-        f.attrs["detection_photflags"] = "nonzero"
+        f.attrs["detection_photflags"] = "unused"
         f.attrs["fixed_offset_days"] = float(fixed_offset_days)
         f.attrs["num_workers"] = int(worker_count)
-        f.attrs["time_zero_base_semantics"] = "uniform_sampled_mjd_in_fixed_window"
-        f.attrs["zero_time_window_start"] = float(DEFAULT_ZERO_TIME_WINDOW_START)
-        f.attrs["zero_time_window_end"] = float(DEFAULT_ZERO_TIME_WINDOW_END)
+        f.attrs["time_zero_base_semantics"] = "first_detection_mjd_plus_fixed_offset_days"
         f.attrs["time_unit"] = "mjd_days"
-        f.attrs["runtime_offset_applied"] = 1
+        f.attrs["runtime_offset_applied"] = int(abs(float(fixed_offset_days)) > 0.0)
         f.attrs["enforce_time_window"] = int(bool(enforce_time_window))
         f.attrs["time_window_start"] = float(time_window_start)
         f.attrs["time_window_end"] = float(time_window_end)
         f.attrs["write_meta_features"] = int(bool(write_meta_features))
+        f.attrs["min_nobs_stage"] = "post_merge"
         f.attrs["slot_is_detection_semantics"] = "formatted_slot_is_detection_snr_gt_threshold"
         f.attrs["meta_n_obs_semantics"] = "formatted_observation_count"
         f.attrs["meta_n_det_snr5_semantics"] = "formatted_detection_count_snr_gt_threshold"
@@ -1763,24 +1828,25 @@ def create_negative_h5(
         f.attrs["n_total_optical"] = int(total_optical)
         for k, v in stats.items():
             f.attrs[k] = int(v)
-        f.attrs["time_zero_anchor"] = "uniform_window"
-        f.attrs["first_detection_rule"] = "photflag_nonzero_else_snr_gt_5"
+        f.attrs["time_zero_anchor"] = "sampled_first_detection_window"
+        f.attrs["first_detection_rule"] = "merged_psfflux_snr_gt_threshold"
         f.attrs["time_scale_divisor_days"] = 100.0
         f.attrs["time_zero_version"] = "fd_v1"
         f.attrs["drop_no_detection_count"] = int(stats["drop_no_detection"])
         f.attrs["snr_threshold"] = float(snr_threshold)
-        f.attrs["detection_photflags"] = "nonzero"
+        f.attrs["detection_photflags"] = "unused"
         f.attrs["fixed_offset_days"] = float(fixed_offset_days)
         f.attrs["num_workers"] = int(worker_count)
-        f.attrs["time_zero_base_semantics"] = "uniform_sampled_mjd_in_fixed_window"
+        f.attrs["time_zero_base_semantics"] = "synthetic_first_detection_mjd_sampled_in_fixed_window"
+        f.attrs["time_unit"] = "mjd_days"
+        f.attrs["runtime_offset_applied"] = 0
         f.attrs["zero_time_window_start"] = float(DEFAULT_ZERO_TIME_WINDOW_START)
         f.attrs["zero_time_window_end"] = float(DEFAULT_ZERO_TIME_WINDOW_END)
-        f.attrs["time_unit"] = "mjd_days"
-        f.attrs["runtime_offset_applied"] = 1
         f.attrs["enforce_time_window"] = int(bool(enforce_time_window))
         f.attrs["time_window_start"] = float(time_window_start)
         f.attrs["time_window_end"] = float(time_window_end)
         f.attrs["write_meta_features"] = int(bool(write_meta_features))
+        f.attrs["min_nobs_stage"] = "post_merge"
         f.attrs["slot_is_detection_semantics"] = "formatted_slot_is_detection_snr_gt_threshold"
         f.attrs["meta_n_obs_semantics"] = "formatted_observation_count"
         f.attrs["meta_n_det_snr5_semantics"] = "formatted_detection_count_snr_gt_threshold"

@@ -64,7 +64,7 @@ class SelectionResult:
     typical_score: float
     source_label: str
     source_id: str
-    parent_gw_idx: Optional[int]
+    parent_event_idx: Optional[int]
     n_obs: int
     n_det_snr5: int
     n_bands: int
@@ -230,9 +230,15 @@ def select_typical_subset(
     combined_scores = robust_scores(combined_features)
     order = np.argsort(combined_scores)
 
-    if cfg.unique_mode == "parent_gw_idx" and "parent_gw_idx" in grp:
-        parent_gw_idx_all = np.asarray(grp["parent_gw_idx"][:], dtype=np.int64)
-        unique_values = parent_gw_idx_all[shortlist]
+    if cfg.unique_mode == "parent_event_idx":
+        if "parent_event_idx" in grp:
+            parent_event_idx_all = np.asarray(grp["parent_event_idx"][:], dtype=np.int64)
+            unique_values = parent_event_idx_all[shortlist]
+        elif "parent_gw_idx" in grp:
+            parent_event_idx_all = np.asarray(grp["parent_gw_idx"][:], dtype=np.int64)
+            unique_values = parent_event_idx_all[shortlist]
+        else:
+            unique_values = None
     else:
         unique_values = None
 
@@ -258,23 +264,18 @@ def select_typical_subset(
             if len(selected_short_positions) >= max_results:
                 break
 
-    gw_ids = None
-    gw_source_types = None
-    if cfg.class_name == "positive":
-        gw_ids = h5f["events/gw_data/ids"]
-        gw_source_types = h5f["events/gw_data/source_type"]
-
     results: List[SelectionResult] = []
     for short_pos in selected_short_positions:
         sample_idx = int(shortlist[short_pos])
-        parent_gw_idx: Optional[int] = None
+        parent_event_idx: Optional[int] = None
         source_label = ""
         source_id = ""
 
         if cfg.class_name == "positive":
-            parent_gw_idx = int(grp["parent_gw_idx"][sample_idx])
-            source_label = decode_scalar(gw_source_types[parent_gw_idx])
-            source_id = decode_scalar(gw_ids[parent_gw_idx])
+            if "parent_event_idx" in grp:
+                parent_event_idx = int(grp["parent_event_idx"][sample_idx])
+            else:
+                parent_event_idx = int(grp["parent_gw_idx"][sample_idx])
         else:
             source_label = source_label_override or (
                 decode_scalar(grp["types"][sample_idx]) if "types" in grp else "unknown"
@@ -289,7 +290,7 @@ def select_typical_subset(
                 typical_score=float(combined_scores[short_pos]),
                 source_label=source_label,
                 source_id=source_id,
-                parent_gw_idx=parent_gw_idx,
+                parent_event_idx=parent_event_idx,
                 n_obs=int(n_obs),
                 n_det_snr5=int(n_det_snr5),
                 n_bands=int(n_bands_all[sample_idx]),
@@ -398,11 +399,13 @@ def extract_sample_plot_data(
 def make_title(result: SelectionResult, rank: int) -> str:
     label_bits = [f"{result.class_name.capitalize()} #{rank}", f"idx={result.sample_index}"]
     if result.class_name == "positive":
-        label_bits.append(result.source_label)
-        if result.parent_gw_idx is not None:
-            label_bits.append(f"gw_parent={result.parent_gw_idx}")
+        if result.parent_event_idx is not None:
+            label_bits.append(f"parent_event={result.parent_event_idx}")
+        if result.source_label:
+            label_bits.append(result.source_label)
     else:
-        label_bits.append(result.source_label)
+        if result.source_label:
+            label_bits.append(result.source_label)
 
     line1 = " | ".join(label_bits)
     line2 = (
@@ -552,7 +555,7 @@ def write_manifest(manifest_path: Path, results_by_class: Dict[str, List[Selecti
         "sample_index",
         "source_label",
         "source_id",
-        "parent_gw_idx",
+        "parent_event_idx",
         "n_obs",
         "n_det_snr5",
         "n_bands",
@@ -578,7 +581,7 @@ def write_manifest(manifest_path: Path, results_by_class: Dict[str, List[Selecti
                         "sample_index": result.sample_index,
                         "source_label": result.source_label,
                         "source_id": result.source_id,
-                        "parent_gw_idx": "" if result.parent_gw_idx is None else result.parent_gw_idx,
+                        "parent_event_idx": "" if result.parent_event_idx is None else result.parent_event_idx,
                         "n_obs": result.n_obs,
                         "n_det_snr5": result.n_det_snr5,
                         "n_bands": result.n_bands,
@@ -616,7 +619,7 @@ def main() -> None:
             class_name="positive",
             h5_path=args.pos_h5,
             group="events/optical_data",
-            unique_mode="parent_gw_idx",
+            unique_mode="parent_event_idx",
         ),
         "negative": DatasetConfig(
             class_name="negative",

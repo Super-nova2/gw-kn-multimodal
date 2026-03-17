@@ -20,6 +20,9 @@ parse_snana_fits = _data_loader.parse_snana_fits
 sample_moc_skymap = _data_loader.sample_moc_skymap
 MAX_LC_LENGTH = _data_loader.MAX_LC_LENGTH
 NUM_BANDS = _data_loader.NUM_BANDS
+MERGE_WINDOW_HOURS = _data_loader.MERGE_WINDOW_HOURS
+MERGE_MODE = _data_loader.MERGE_MODE
+MERGE_FLUX_DOMAIN = _data_loader.MERGE_FLUX_DOMAIN
 
 GW_PARAM_COLUMNS = [
     "mass1_detector",
@@ -129,6 +132,9 @@ def write_luptitude_metadata_attrs(
     h5_obj.attrs["lupt_b_njy"] = np.asarray(lupt_b_njy, dtype=np.float64)
     h5_obj.attrs["values_semantics"] = "luptitude"
     h5_obj.attrs["errors_semantics"] = "luptitude_sigma"
+    h5_obj.attrs["lightcurve_merge_window_hours"] = float(MERGE_WINDOW_HOURS)
+    h5_obj.attrs["lightcurve_merge_mode"] = MERGE_MODE
+    h5_obj.attrs["lightcurve_merge_flux_domain"] = MERGE_FLUX_DOMAIN
     h5_obj.attrs["mtan_snr_s0"] = float(DEFAULT_MTAN_SNR_S0)
     h5_obj.attrs["mtan_snr_beta"] = float(DEFAULT_MTAN_SNR_BETA)
     h5_obj.attrs["mtan_snr_clip_min"] = float(DEFAULT_MTAN_SNR_CLIP_MIN)
@@ -1056,6 +1062,7 @@ def create_dataset_with_neg_gw_bns_nsbh_fast(
         f.attrs["time_zero_base_semantics"] = "optical zero_time_mjd_base stores parent GW event_time_mjd"
         f.attrs["time_unit"] = "mjd_days"
         f.attrs["runtime_offset_applied"] = 1
+        f.attrs["min_nobs_stage"] = "post_merge"
         write_luptitude_metadata_attrs(
             h5_obj=f,
             fluxcal_zp=float(fluxcal_zp),

@@ -502,42 +502,42 @@ class PrefixTrainPolicy:
             raise RuntimeError("PrefixTrainPolicy.sample_target_k called while disabled.")
         det_counts = (slot_is_detection > 0).sum(dim=1).detach().cpu().numpy().astype(np.int64, copy=False)
         sampled = np.empty_like(det_counts)
-            mix_raw = np.asarray(
-                [
-                    self.real_mix_weight,
-                    self.bucket_uniform_mix_weight,
-                    self.terminal_mix_weight,
-                ],
-                dtype=np.float64,
+        mix_raw = np.asarray(
+            [
+                self.real_mix_weight,
+                self.bucket_uniform_mix_weight,
+                self.terminal_mix_weight,
+            ],
+            dtype=np.float64,
+        )
+        mix_probs = mix_raw / mix_raw.sum()
+        branch_ids = self.rng.choice(3, size=det_counts.shape[0], replace=True, p=mix_probs)
+
+        real_mask = branch_ids == 0
+        if np.any(real_mask):
+            sampled[real_mask] = sample_prefix_target_k(
+                det_counts=det_counts[real_mask],
+                support=self.support,
+                probs=self.probs,
+                rng=self.rng,
+                min_det=self.min_det,
+                terminal_mix_prob=0.0,
             )
-            mix_probs = mix_raw / mix_raw.sum()
-            branch_ids = self.rng.choice(3, size=det_counts.shape[0], replace=True, p=mix_probs)
 
-            real_mask = branch_ids == 0
-            if np.any(real_mask):
-                sampled[real_mask] = sample_prefix_target_k(
-                    det_counts=det_counts[real_mask],
-                    support=self.support,
-                    probs=self.probs,
-                    rng=self.rng,
-                    min_det=self.min_det,
-                    terminal_mix_prob=0.0,
-                )
+        uniform_mask = branch_ids == 1
+        if np.any(uniform_mask):
+            sampled[uniform_mask] = sample_prefix_target_k(
+                det_counts=det_counts[uniform_mask],
+                support=self.support,
+                probs=self.uniform_probs,
+                rng=self.rng,
+                min_det=self.min_det,
+                terminal_mix_prob=0.0,
+            )
 
-            uniform_mask = branch_ids == 1
-            if np.any(uniform_mask):
-                sampled[uniform_mask] = sample_prefix_target_k(
-                    det_counts=det_counts[uniform_mask],
-                    support=self.support,
-                    probs=self.uniform_probs,
-                    rng=self.rng,
-                    min_det=self.min_det,
-                    terminal_mix_prob=0.0,
-                )
-
-            terminal_mask = branch_ids == 2
-            if np.any(terminal_mask):
-                sampled[terminal_mask] = det_counts[terminal_mask]
+        terminal_mask = branch_ids == 2
+        if np.any(terminal_mask):
+            sampled[terminal_mask] = det_counts[terminal_mask]
 
         return torch.from_numpy(sampled).to(device=slot_is_detection.device, dtype=torch.long)
 
