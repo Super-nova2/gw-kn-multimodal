@@ -173,6 +173,43 @@ def parse_day_windows(text: str) -> List[float]:
     return vals
 
 
+def resolve_mtan_eval_config(test_data_path: str, saved_args: Dict[str, object]) -> Dict[str, object]:
+    cfg: Dict[str, object] = {
+        "mtan_snr_s0": float(saved_args.get("mtan_snr_s0", 3.0)),
+        "mtan_snr_beta": float(saved_args.get("mtan_snr_beta", 1.0)),
+        "mtan_snr_clip_min": float(saved_args.get("mtan_snr_clip_min", -8.0)),
+        "mtan_snr_clip_max": float(saved_args.get("mtan_snr_clip_max", 20.0)),
+        "mtan_snr_eps": float(saved_args.get("mtan_snr_eps", 1e-9)),
+        "mtan_lupt_psfflux_zp": float(saved_args.get("mtan_lupt_psfflux_zp", 31.4)),
+        "mtan_lupt_k": float(saved_args.get("mtan_lupt_k", 1.0)),
+        "mtan_lupt_m5_mag": tuple(saved_args.get("mtan_lupt_m5_mag", (23.9, 25.0, 24.7, 24.0, 23.3, 22.1))),
+    }
+    if test_data_path and os.path.exists(test_data_path):
+        try:
+            with h5py.File(test_data_path, "r") as f:
+                if "mtan_snr_s0" in f.attrs:
+                    cfg["mtan_snr_s0"] = float(f.attrs["mtan_snr_s0"])
+                if "mtan_snr_beta" in f.attrs:
+                    cfg["mtan_snr_beta"] = float(f.attrs["mtan_snr_beta"])
+                if "mtan_snr_clip_min" in f.attrs:
+                    cfg["mtan_snr_clip_min"] = float(f.attrs["mtan_snr_clip_min"])
+                if "mtan_snr_clip_max" in f.attrs:
+                    cfg["mtan_snr_clip_max"] = float(f.attrs["mtan_snr_clip_max"])
+                if "mtan_snr_eps" in f.attrs:
+                    cfg["mtan_snr_eps"] = float(f.attrs["mtan_snr_eps"])
+                if "psfflux_zp" in f.attrs:
+                    cfg["mtan_lupt_psfflux_zp"] = float(f.attrs["psfflux_zp"])
+                if "lupt_k" in f.attrs:
+                    cfg["mtan_lupt_k"] = float(f.attrs["lupt_k"])
+                if "lupt_m5_mag" in f.attrs:
+                    m5 = np.asarray(f.attrs["lupt_m5_mag"], dtype=np.float64).reshape(-1)
+                    if m5.shape == (6,) and np.all(np.isfinite(m5)):
+                        cfg["mtan_lupt_m5_mag"] = tuple(float(x) for x in m5.tolist())
+        except Exception as exc:
+            print(f"WARNING: failed to read mTAN attrs from test H5 ({test_data_path}): {exc}")
+    return cfg
+
+
 def parse_dt_bin_edges(text: str) -> List[float]:
     vals: List[float] = []
     for part in str(text).split(","):
@@ -670,6 +707,8 @@ def load_model(args, device):
             )
         ),
     }
+    mtan_cfg = resolve_mtan_eval_config(args.test_data_path, saved_args)
+    model_args.update(mtan_cfg)
     model_args["dual_fusion"] = model_args["fusion_mode"] != "legacy_g2o"
 
     model = GWOpticalALBEFModel(
@@ -697,6 +736,14 @@ def load_model(args, device):
         time_compat_tau_days=model_args["time_compat_tau_days"],
         time_compat_power=model_args["time_compat_power"],
         time_compat_max_penalty=model_args["time_compat_max_penalty"],
+        mtan_snr_s0=float(model_args["mtan_snr_s0"]),
+        mtan_snr_beta=float(model_args["mtan_snr_beta"]),
+        mtan_snr_clip_min=float(model_args["mtan_snr_clip_min"]),
+        mtan_snr_clip_max=float(model_args["mtan_snr_clip_max"]),
+        mtan_snr_eps=float(model_args["mtan_snr_eps"]),
+        mtan_lupt_psfflux_zp=float(model_args["mtan_lupt_psfflux_zp"]),
+        mtan_lupt_k=float(model_args["mtan_lupt_k"]),
+        mtan_lupt_m5_mag=tuple(model_args["mtan_lupt_m5_mag"]),
     )
     # Strip _orig_mod. prefix from torch.compile'd checkpoints
     state_dict = ckpt["model_state_dict"]

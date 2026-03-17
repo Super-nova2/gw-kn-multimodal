@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+import hashlib
 import os
 import re
 from pathlib import Path
@@ -39,6 +40,8 @@ DEFAULT_TIME_WINDOW_END = 0.6
 DEFAULT_DENSITY_BINS_N_DET = (3.0, 5.0, 8.0, 12.0, 20.0, 40.0, 80.0, 200.0)
 DEFAULT_DENSITY_BINS_N_BANDS = (1.0, 2.0, 3.0, 4.0, 5.0, 6.0)
 DEFAULT_DENSITY_BINS_T_SPAN = (0.0, 0.01, 0.05, 0.1, 0.2, 0.5, 1.0)
+DEFAULT_ZERO_TIME_WINDOW_START = 6100.0
+DEFAULT_ZERO_TIME_WINDOW_END = 64500.0
 
 BAND_TO_INDEX = {
     "LSST-u": 0,
@@ -81,6 +84,15 @@ def parse_bin_edges(text: Optional[str], default_vals: Sequence[float], *, name:
         raise ValueError(f"{name} must contain finite numeric values.")
     vals = np.unique(np.sort(vals))
     return vals.astype(np.float64, copy=False)
+
+
+def deterministic_uniform_sample(low: float, high: float, key: str) -> float:
+    if not (np.isfinite(low) and np.isfinite(high) and high > low):
+        raise ValueError(f"Invalid sampling window: [{low}, {high}]")
+    digest = hashlib.blake2b(key.encode("utf-8"), digest_size=8).digest()
+    u64 = int.from_bytes(digest, byteorder="big", signed=False)
+    u = float(u64) / float((1 << 64) - 1)
+    return float(low + (high - low) * u)
 
 
 def compute_meta_features_from_formatted(
@@ -596,7 +608,13 @@ def parse_kn_event(
                     snr_threshold=snr_threshold,
                 )
 
-                t0_mjd = float(lc_mjd[det_idx]) + float(fixed_offset_days)
+                _ = fixed_offset_days
+                t0_key = f"{event_dir}:{i}"
+                t0_mjd = deterministic_uniform_sample(
+                    low=DEFAULT_ZERO_TIME_WINDOW_START,
+                    high=DEFAULT_ZERO_TIME_WINDOW_END,
+                    key=t0_key,
+                )
                 lc_mjd_lupt, lc_lupt, lc_lupt_err, lc_flt_lupt, lc_keep_idx = transform_fluxcal_to_luptitude(
                     mjd=lc_mjd,
                     fluxcal=lc_flux,
@@ -783,7 +801,13 @@ def parse_negative_file(
                     snr_threshold=snr_threshold,
                 )
 
-                t0_mjd = float(lc_mjd[det_idx]) + float(fixed_offset_days)
+                _ = fixed_offset_days
+                t0_key = f"{head_path}:{i}"
+                t0_mjd = deterministic_uniform_sample(
+                    low=DEFAULT_ZERO_TIME_WINDOW_START,
+                    high=DEFAULT_ZERO_TIME_WINDOW_END,
+                    key=t0_key,
+                )
                 lc_mjd_lupt, lc_lupt, lc_lupt_err, lc_flt_lupt, lc_keep_idx = transform_fluxcal_to_luptitude(
                     mjd=lc_mjd,
                     fluxcal=lc_flux,
@@ -1014,25 +1038,6 @@ def _create_optical_group(
         ds_meta_t_span,
         ds_meta_single_band_id,
     )
-
-
-def load_gw_event_time_prior(gw_h5_path: Optional[Path]) -> Optional[np.ndarray]:
-    """
-    Load finite GW event times (MJD) as an empirical sampling prior.
-    """
-    if gw_h5_path is None:
-        return None
-    if not gw_h5_path.exists():
-        raise FileNotFoundError(f"GW anchor H5 not found: {gw_h5_path}")
-    ds_path = "events/gw_data/event_time_mjd"
-    with h5py.File(gw_h5_path, "r") as f:
-        if ds_path not in f:
-            raise KeyError(f"Missing '{ds_path}' in {gw_h5_path}")
-        arr = np.asarray(f[ds_path][:], dtype=np.float64).reshape(-1)
-    arr = arr[np.isfinite(arr)]
-    if arr.size == 0:
-        raise ValueError(f"No finite GW event_time_mjd found in {gw_h5_path}")
-    return arr
 
 
 def write_luptitude_metadata_attrs(
@@ -1341,7 +1346,7 @@ def create_positive_h5(
         for k, v in stats.items():
             f.attrs[k] = int(v)
 
-        f.attrs["time_zero_anchor"] = "first_detection"
+        f.attrs["time_zero_anchor"] = "uniform_window"
         f.attrs["first_detection_rule"] = "photflag_nonzero_else_snr_gt_5"
         f.attrs["time_scale_divisor_days"] = 100.0
         f.attrs["time_zero_version"] = "fd_v1"
@@ -1350,7 +1355,9 @@ def create_positive_h5(
         f.attrs["detection_photflags"] = "nonzero"
         f.attrs["fixed_offset_days"] = float(fixed_offset_days)
         f.attrs["num_workers"] = int(worker_count)
-        f.attrs["time_zero_base_semantics"] = "first_detection_mjd_plus_fixed_offset_days"
+        f.attrs["time_zero_base_semantics"] = "uniform_sampled_mjd_in_fixed_window"
+        f.attrs["zero_time_window_start"] = float(DEFAULT_ZERO_TIME_WINDOW_START)
+        f.attrs["zero_time_window_end"] = float(DEFAULT_ZERO_TIME_WINDOW_END)
         f.attrs["time_unit"] = "mjd_days"
         f.attrs["runtime_offset_applied"] = 1
         f.attrs["enforce_time_window"] = int(bool(enforce_time_window))
@@ -1393,8 +1400,6 @@ def create_negative_h5(
     max_negative_heads: Optional[int],
     buffer_limit: int,
     num_workers: int,
-    cls_time_anchor_gw_h5: Optional[Path],
-    cls_time_anchor_seed: int,
     enforce_time_window: bool,
     time_window_start: float,
     time_window_end: float,
@@ -1427,18 +1432,13 @@ def create_negative_h5(
             ds_meta_single_band_id,
         ) = _create_optical_group(grp, chunk_size, write_meta_features=bool(write_meta_features))
         ds_types = grp.create_dataset("types", (0,), maxshape=(None,), dtype=dt_str, chunks=(chunk_size,))
-        gw_time_prior = load_gw_event_time_prior(cls_time_anchor_gw_h5)
-        rng_anchor = np.random.default_rng(int(cls_time_anchor_seed))
-        ds_zero_time_mjd_cls_base = None
-        if gw_time_prior is not None:
-            # Legacy ALBEF-oriented anchor field; not consumed by optical-only training/eval.
-            ds_zero_time_mjd_cls_base = grp.create_dataset(
-                "zero_time_mjd_cls_base",
-                (0,),
-                maxshape=(None,),
-                dtype="f8",
-                chunks=(chunk_size,),
-            )
+        ds_zero_time_mjd_cls_base = grp.create_dataset(
+            "zero_time_mjd_cls_base",
+            (0,),
+            maxshape=(None,),
+            dtype="f8",
+            chunks=(chunk_size,),
+        )
 
         total_optical = 0
         b_vals: List[np.ndarray] = []
@@ -1483,8 +1483,7 @@ def create_negative_h5(
             ds_zero_time_mjd_base.resize(new_size, axis=0)
             ds_coords.resize(new_size, axis=0)
             ds_types.resize(new_size, axis=0)
-            if ds_zero_time_mjd_cls_base is not None:
-                ds_zero_time_mjd_cls_base.resize(new_size, axis=0)
+            ds_zero_time_mjd_cls_base.resize(new_size, axis=0)
             if ds_meta_n_det is not None:
                 ds_meta_n_obs.resize(new_size, axis=0)
                 ds_meta_n_det.resize(new_size, axis=0)
@@ -1500,10 +1499,9 @@ def create_negative_h5(
             ds_zero_time_mjd_base[cur:new_size] = np.asarray(b_zero_time_mjd_base, dtype=np.float64)
             ds_coords[cur:new_size] = np.asarray(b_coords, dtype=np.float32)
             ds_types[cur:new_size] = np.asarray(b_types, dtype=object)
-            if ds_zero_time_mjd_cls_base is not None:
-                ds_zero_time_mjd_cls_base[cur:new_size] = np.asarray(
-                    b_zero_time_mjd_cls_base, dtype=np.float64
-                )
+            ds_zero_time_mjd_cls_base[cur:new_size] = np.asarray(
+                b_zero_time_mjd_cls_base, dtype=np.float64
+            )
             if ds_meta_n_det is not None:
                 ds_meta_n_obs[cur:new_size] = np.asarray(b_meta_n_obs, dtype=np.int16)
                 ds_meta_n_det[cur:new_size] = np.asarray(b_meta_n_det, dtype=np.int16)
@@ -1586,11 +1584,7 @@ def create_negative_h5(
                 b_times.append(times)
                 b_slot_is_detection.append(slot_is_detection)
                 b_zero_time_mjd_base.append(float(zero_time_mjd_base))
-                if gw_time_prior is not None:
-                    sampled = float(
-                        gw_time_prior[rng_anchor.integers(0, int(gw_time_prior.shape[0]))]
-                    )
-                    b_zero_time_mjd_cls_base.append(sampled)
+                b_zero_time_mjd_cls_base.append(float(zero_time_mjd_base))
                 b_coords.append(coords)
                 b_types.append(transient_type)
                 if ds_meta_n_det is not None:
@@ -1769,7 +1763,7 @@ def create_negative_h5(
         f.attrs["n_total_optical"] = int(total_optical)
         for k, v in stats.items():
             f.attrs[k] = int(v)
-        f.attrs["time_zero_anchor"] = "first_detection"
+        f.attrs["time_zero_anchor"] = "uniform_window"
         f.attrs["first_detection_rule"] = "photflag_nonzero_else_snr_gt_5"
         f.attrs["time_scale_divisor_days"] = 100.0
         f.attrs["time_zero_version"] = "fd_v1"
@@ -1778,7 +1772,9 @@ def create_negative_h5(
         f.attrs["detection_photflags"] = "nonzero"
         f.attrs["fixed_offset_days"] = float(fixed_offset_days)
         f.attrs["num_workers"] = int(worker_count)
-        f.attrs["time_zero_base_semantics"] = "first_detection_mjd_plus_fixed_offset_days"
+        f.attrs["time_zero_base_semantics"] = "uniform_sampled_mjd_in_fixed_window"
+        f.attrs["zero_time_window_start"] = float(DEFAULT_ZERO_TIME_WINDOW_START)
+        f.attrs["zero_time_window_end"] = float(DEFAULT_ZERO_TIME_WINDOW_END)
         f.attrs["time_unit"] = "mjd_days"
         f.attrs["runtime_offset_applied"] = 1
         f.attrs["enforce_time_window"] = int(bool(enforce_time_window))
@@ -1794,13 +1790,7 @@ def create_negative_h5(
         f.attrs["density_bins_t_span"] = np.asarray(density_bins_t_span, dtype=np.float64)
         if density_match_pos_h5 is not None:
             f.attrs["density_match_pos_h5"] = str(density_match_pos_h5)
-        if gw_time_prior is not None:
-            f.attrs["cls_anchor_policy"] = "global_gw_prior"
-            f.attrs["cls_anchor_source_h5"] = str(cls_time_anchor_gw_h5)
-            f.attrs["cls_anchor_seed"] = int(cls_time_anchor_seed)
-            f.attrs["cls_anchor_samples"] = int(gw_time_prior.shape[0])
-        else:
-            f.attrs["cls_anchor_policy"] = "disabled"
+        f.attrs["cls_anchor_policy"] = "equal_to_zero_time_mjd_base"
         write_luptitude_metadata_attrs(
             h5_obj=f,
             fluxcal_zp=fluxcal_zp,
@@ -1902,18 +1892,6 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default="23.9,25.0,24.7,24.0,23.3,22.1",
         help="Comma-separated 6 Rubin single-exposure m5 values (AB mag) in order u,g,r,i,z,Y.",
-    )
-    p.add_argument(
-        "--cls_time_anchor_gw_h5",
-        type=str,
-        default=None,
-        help="H5 path providing events/gw_data/event_time_mjd prior for zero_time_mjd_cls_base.",
-    )
-    p.add_argument(
-        "--cls_time_anchor_seed",
-        type=int,
-        default=42,
-        help="Sampling seed for zero_time_mjd_cls_base generation.",
     )
     p.add_argument(
         "--num_workers",
@@ -2023,8 +2001,6 @@ def main():
             max_negative_heads=args.max_negative_heads,
             buffer_limit=int(args.buffer_limit),
             num_workers=int(args.num_workers),
-            cls_time_anchor_gw_h5=Path(args.cls_time_anchor_gw_h5) if args.cls_time_anchor_gw_h5 else None,
-            cls_time_anchor_seed=int(args.cls_time_anchor_seed),
             enforce_time_window=bool(enforce_time_window),
             time_window_start=float(time_window_start),
             time_window_end=float(time_window_end),

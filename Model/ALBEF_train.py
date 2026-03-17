@@ -20,8 +20,11 @@ import gc
 import json
 import time
 import warnings
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 warnings.filterwarnings("ignore", "Wswiglal-redir-stdio")
+
+
+DEFAULT_MTAN_LUPT_M5 = np.asarray([23.9, 25.0, 24.7, 24.0, 23.3, 22.1], dtype=np.float64)
 
 
 def build_ref_time(batch_size, n_ref, ref_start, ref_end, device, dtype):
@@ -58,6 +61,74 @@ def parse_day_windows(text: str) -> List[float]:
         raise ValueError("hardneg_time_window_days produced empty list.")
     vals = sorted(set(vals))
     return vals
+
+
+def parse_lupt_m5_mag_text(text: str) -> np.ndarray:
+    parts = [p.strip() for p in str(text).split(",") if p.strip()]
+    if len(parts) != 6:
+        raise ValueError("mtan_lupt_m5_mag must provide exactly 6 comma-separated values in order u,g,r,i,z,Y.")
+    try:
+        vals = np.asarray([float(p) for p in parts], dtype=np.float64)
+    except ValueError as exc:
+        raise ValueError("mtan_lupt_m5_mag contains non-numeric values.") from exc
+    if not np.all(np.isfinite(vals)):
+        raise ValueError("mtan_lupt_m5_mag must contain finite values.")
+    return vals
+
+
+def resolve_mtan_runtime_config(args) -> Dict[str, object]:
+    cfg: Dict[str, object] = {
+        "mtan_snr_s0": float(getattr(args, "mtan_snr_s0", 3.0)),
+        "mtan_snr_beta": float(getattr(args, "mtan_snr_beta", 1.0)),
+        "mtan_snr_clip_min": float(getattr(args, "mtan_snr_clip_min", -8.0)),
+        "mtan_snr_clip_max": float(getattr(args, "mtan_snr_clip_max", 20.0)),
+        "mtan_snr_eps": float(getattr(args, "mtan_snr_eps", 1e-9)),
+        "mtan_lupt_psfflux_zp": 31.4,
+        "mtan_lupt_k": 1.0,
+        "mtan_lupt_m5_mag": DEFAULT_MTAN_LUPT_M5.copy(),
+    }
+
+    data_path = str(getattr(args, "data_path", "") or "")
+    if data_path and os.path.exists(data_path):
+        try:
+            with h5py.File(data_path, "r") as f:
+                if "mtan_snr_s0" in f.attrs:
+                    cfg["mtan_snr_s0"] = float(f.attrs["mtan_snr_s0"])
+                if "mtan_snr_beta" in f.attrs:
+                    cfg["mtan_snr_beta"] = float(f.attrs["mtan_snr_beta"])
+                if "mtan_snr_clip_min" in f.attrs:
+                    cfg["mtan_snr_clip_min"] = float(f.attrs["mtan_snr_clip_min"])
+                if "mtan_snr_clip_max" in f.attrs:
+                    cfg["mtan_snr_clip_max"] = float(f.attrs["mtan_snr_clip_max"])
+                if "mtan_snr_eps" in f.attrs:
+                    cfg["mtan_snr_eps"] = float(f.attrs["mtan_snr_eps"])
+                if "psfflux_zp" in f.attrs:
+                    cfg["mtan_lupt_psfflux_zp"] = float(f.attrs["psfflux_zp"])
+                if "lupt_k" in f.attrs:
+                    cfg["mtan_lupt_k"] = float(f.attrs["lupt_k"])
+                if "lupt_m5_mag" in f.attrs:
+                    m5 = np.asarray(f.attrs["lupt_m5_mag"], dtype=np.float64).reshape(-1)
+                    if m5.shape == (6,) and np.all(np.isfinite(m5)):
+                        cfg["mtan_lupt_m5_mag"] = m5
+        except Exception as exc:
+            print(f"[WARN] Failed to read mTAN luptitude attrs from {data_path}: {exc}")
+
+    if getattr(args, "mtan_lupt_psfflux_zp", None) is not None:
+        cfg["mtan_lupt_psfflux_zp"] = float(args.mtan_lupt_psfflux_zp)
+    if getattr(args, "mtan_lupt_k", None) is not None:
+        cfg["mtan_lupt_k"] = float(args.mtan_lupt_k)
+    if getattr(args, "mtan_lupt_m5_mag", None):
+        cfg["mtan_lupt_m5_mag"] = parse_lupt_m5_mag_text(args.mtan_lupt_m5_mag)
+
+    if float(cfg["mtan_lupt_k"]) <= 0:
+        raise ValueError("mtan_lupt_k must be > 0.")
+    if float(cfg["mtan_lupt_psfflux_zp"]) <= 0:
+        raise ValueError("mtan_lupt_psfflux_zp must be > 0.")
+    m5_arr = np.asarray(cfg["mtan_lupt_m5_mag"], dtype=np.float64).reshape(-1)
+    if m5_arr.shape != (6,) or (not np.all(np.isfinite(m5_arr))):
+        raise ValueError("mtan_lupt_m5_mag must be 6 finite values.")
+    cfg["mtan_lupt_m5_mag"] = tuple(float(x) for x in m5_arr.tolist())
+    return cfg
 
 
 def _start_cuda_timer(enabled: bool):
@@ -1444,6 +1515,10 @@ def train(args):
             extra_negative_timeaware_seed=extra_neg_timeaware_seed,
         )
 
+    mtan_cfg = resolve_mtan_runtime_config(args)
+    print("mTAN runtime config:")
+    print(json.dumps({k: (list(v) if isinstance(v, tuple) else v) for k, v in mtan_cfg.items()}, indent=2))
+
     model = GWOpticalALBEFModel(
         gw_scalar_dim=7,
         gw_skymap_channels=7,
@@ -1472,6 +1547,14 @@ def train(args):
         time_compat_tau_days=args.time_compat_tau_days,
         time_compat_power=args.time_compat_power,
         time_compat_max_penalty=args.time_compat_max_penalty,
+        mtan_snr_s0=float(mtan_cfg["mtan_snr_s0"]),
+        mtan_snr_beta=float(mtan_cfg["mtan_snr_beta"]),
+        mtan_snr_clip_min=float(mtan_cfg["mtan_snr_clip_min"]),
+        mtan_snr_clip_max=float(mtan_cfg["mtan_snr_clip_max"]),
+        mtan_snr_eps=float(mtan_cfg["mtan_snr_eps"]),
+        mtan_lupt_psfflux_zp=float(mtan_cfg["mtan_lupt_psfflux_zp"]),
+        mtan_lupt_k=float(mtan_cfg["mtan_lupt_k"]),
+        mtan_lupt_m5_mag=tuple(mtan_cfg["mtan_lupt_m5_mag"]),
     ).to(device)
 
     if args.use_lightweight_gw:
@@ -2439,6 +2522,22 @@ if __name__ == "__main__":
                         help="Power for |Δt/tau|^power in time-compatibility penalty.")
     parser.add_argument("--time_compat_max_penalty", type=float, default=8.0,
                         help="Maximum absolute logit penalty for time compatibility.")
+    parser.add_argument("--mtan_snr_s0", type=float, default=3.0,
+                        help="mTAN SNR compatibility threshold s0.")
+    parser.add_argument("--mtan_snr_beta", type=float, default=1.0,
+                        help="mTAN SNR compatibility slope beta.")
+    parser.add_argument("--mtan_snr_clip_min", type=float, default=-8.0,
+                        help="mTAN SNR clipping lower bound.")
+    parser.add_argument("--mtan_snr_clip_max", type=float, default=20.0,
+                        help="mTAN SNR clipping upper bound.")
+    parser.add_argument("--mtan_snr_eps", type=float, default=1e-9,
+                        help="Numerical epsilon for mTAN SNR denominator.")
+    parser.add_argument("--mtan_lupt_psfflux_zp", type=float, default=None,
+                        help="Optional override for luptitude psfFlux zero point used by mTAN.")
+    parser.add_argument("--mtan_lupt_k", type=float, default=None,
+                        help="Optional override for luptitude softening scale k used by mTAN.")
+    parser.add_argument("--mtan_lupt_m5_mag", type=str, default=None,
+                        help="Optional override: 6 comma-separated m5 mags in order u,g,r,i,z,Y.")
     parser.add_argument("--nonkn_cls_base_field", type=str, default="zero_time_mjd_cls_base",
                         help="Negative H5 field used as base absolute time for extra-negative dt.")
     parser.add_argument("--gw_dropout", type=float, default=0.1)

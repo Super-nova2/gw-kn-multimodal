@@ -47,6 +47,11 @@ GPS_TIME_COLUMN_CANDIDATES = (
     "trigger_time_gps",
 )
 LUPT_BAND_ORDER = ("u", "g", "r", "i", "z", "Y")
+DEFAULT_MTAN_SNR_S0 = 3.0
+DEFAULT_MTAN_SNR_BETA = 1.0
+DEFAULT_MTAN_SNR_CLIP_MIN = -8.0
+DEFAULT_MTAN_SNR_CLIP_MAX = 20.0
+DEFAULT_MTAN_SNR_EPS = 1e-9
 
 
 def parse_lupt_m5_mag(text: str) -> np.ndarray:
@@ -124,6 +129,12 @@ def write_luptitude_metadata_attrs(
     h5_obj.attrs["lupt_b_njy"] = np.asarray(lupt_b_njy, dtype=np.float64)
     h5_obj.attrs["values_semantics"] = "luptitude"
     h5_obj.attrs["errors_semantics"] = "luptitude_sigma"
+    h5_obj.attrs["mtan_snr_s0"] = float(DEFAULT_MTAN_SNR_S0)
+    h5_obj.attrs["mtan_snr_beta"] = float(DEFAULT_MTAN_SNR_BETA)
+    h5_obj.attrs["mtan_snr_clip_min"] = float(DEFAULT_MTAN_SNR_CLIP_MIN)
+    h5_obj.attrs["mtan_snr_clip_max"] = float(DEFAULT_MTAN_SNR_CLIP_MAX)
+    h5_obj.attrs["mtan_snr_eps"] = float(DEFAULT_MTAN_SNR_EPS)
+    h5_obj.attrs["mtan_snr_source"] = "flux_snr_from_luptitude"
 
 
 @dataclass

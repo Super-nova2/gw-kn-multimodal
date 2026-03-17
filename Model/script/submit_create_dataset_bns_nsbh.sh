@@ -10,8 +10,8 @@
 
 set -euo pipefail
 
-PROFILE="${PROFILE:-final_train}"          # test_aug | final_train
-DATASET_MODE="${DATASET_MODE:-train}"   # train | test
+PROFILE="${PROFILE:-test_aug}"          # test_aug | final_train
+DATASET_MODE="${DATASET_MODE:-test}"   # train | test
 
 BUFFER_LIMIT="${BUFFER_LIMIT:-10000}"
 SEED="${SEED:-42}"

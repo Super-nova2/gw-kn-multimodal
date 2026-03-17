@@ -11,13 +11,13 @@
 
 set -euo pipefail
 
-DATASET_MODE="${DATASET_MODE:-train}"   # train | test
+DATASET_MODE="${DATASET_MODE:-test}"   # train | test
 BUILD_POSITIVE="${BUILD_POSITIVE:-true}" # true|false
 BUILD_NEGATIVE="${BUILD_NEGATIVE:-true}" # true|false
 ENFORCE_TIME_WINDOW="${ENFORCE_TIME_WINDOW:-true}"  # true|false
 WRITE_META_FEATURES="${WRITE_META_FEATURES:-true}"  # true|false
 NEG_MATCH_POS_DENSITY="${NEG_MATCH_POS_DENSITY:-true}" # true|false
-PREFIX_TASK_ENABLE="${PREFIX_TASK_ENABLE:-true}"   # true|false
+PREFIX_TASK_ENABLE="${PREFIX_TASK_ENABLE:-false}"   # true|false
 DATASET_TAG="${DATASET_TAG:-}"
 
 normalize_bool() {
@@ -98,7 +98,6 @@ case "${DATASET_MODE}" in
             OUTPUT_POS_H5_DEFAULT="/fred/oz016/bgao_kn/data/Optical_Only_dataset/combined_dataset_train.h5"
             OUTPUT_NEG_H5_DEFAULT="/fred/oz016/bgao_kn/data/Optical_Only_dataset/ELASTICC2_negative_dataset.h5"
         fi
-        CLS_TIME_ANCHOR_GW_H5_DEFAULT="/fred/oz016/bgao_kn/data/ALBEF_dataset/combined_dataset_train.h5"
         ;;
     test)
         BNS_SIM_ROOT="/fred/oz016/bgao_kn/SNANA/SNDATA_ROOT/SIM/LSST_KN_BNS"
@@ -117,8 +116,6 @@ case "${DATASET_MODE}" in
             OUTPUT_POS_H5_DEFAULT="/fred/oz016/bgao_kn/data/Optical_Only_dataset/combined_dataset_test.h5"
             OUTPUT_NEG_H5_DEFAULT="/fred/oz016/bgao_kn/data/Optical_Only_dataset/Tutorial_negative_dataset.h5"
         fi
-        # C2: use a global GW-time prior from training set for cls base anchoring.
-        CLS_TIME_ANCHOR_GW_H5_DEFAULT="/fred/oz016/bgao_kn/data/ALBEF_dataset/combined_dataset_train.h5"
         ;;
     *)
         echo "Unsupported DATASET_MODE='${DATASET_MODE}'. Use train or test."
@@ -128,8 +125,6 @@ esac
 
 OUTPUT_POS_H5="${OUTPUT_POS_H5:-$OUTPUT_POS_H5_DEFAULT}"
 OUTPUT_NEG_H5="${OUTPUT_NEG_H5:-$OUTPUT_NEG_H5_DEFAULT}"
-CLS_TIME_ANCHOR_GW_H5="${CLS_TIME_ANCHOR_GW_H5:-$CLS_TIME_ANCHOR_GW_H5_DEFAULT}"
-CLS_TIME_ANCHOR_SEED="${CLS_TIME_ANCHOR_SEED:-42}"
 
 if [[ "${PREFIX_TASK_ENABLE}" == "true" ]]; then
     MIN_NOBS_DEFAULT=2
@@ -200,9 +195,9 @@ echo "Output NEG: ${OUTPUT_NEG_H5}"
 echo "Lock file: ${LOCK_FILE}"
 echo "Detection rule: PHOTFLAG!=0, fallback SNR>${SNR_THRESHOLD}"
 echo "Workers: ${NUM_WORKERS}"
-echo "CLS anchor GW prior: ${CLS_TIME_ANCHOR_GW_H5}"
 echo "Flux zeropoints: FLUXCAL_ZP=${FLUXCAL_ZP}, PSFFLUX_ZP=${PSFFLUX_ZP}"
 echo "Luptitude params: LUPT_K=${LUPT_K}, LUPT_M5_MAG=${LUPT_M5_MAG}"
+echo "zero_time_mjd_base policy: uniform sample in fixed window [6100,64500]"
 echo "Time window: enforce=${ENFORCE_TIME_WINDOW}, range=[${TIME_WINDOW_START}, ${TIME_WINDOW_END}]"
 echo "Meta features: write_meta_features=${WRITE_META_FEATURES}"
 echo "Density matching: neg_match_pos_density=${NEG_MATCH_POS_DENSITY}"
@@ -212,10 +207,6 @@ echo "Density bins: n_bands=${DENSITY_BINS_N_BANDS}"
 echo "Density bins: t_span=${DENSITY_BINS_T_SPAN}"
 echo "========================================"
 
-if [[ "${BUILD_NEGATIVE}" == "true" && ! -f "${CLS_TIME_ANCHOR_GW_H5}" ]]; then
-    echo "GW anchor H5 not found: ${CLS_TIME_ANCHOR_GW_H5}"
-    exit 1
-fi
 if [[ "${BUILD_NEGATIVE}" == "true" && "${NEG_MATCH_POS_DENSITY}" == "true" ]]; then
     if [[ "${BUILD_POSITIVE}" == "true" && "${DENSITY_MATCH_POS_H5}" == "${OUTPUT_POS_H5}" ]]; then
         :
@@ -269,8 +260,6 @@ if [[ "${BUILD_NEGATIVE}" == "true" ]]; then
         --output_neg_h5 "${OUTPUT_NEG_H5}"
         --neg_group "${NEG_GROUP}"
         --neg_sim_root "${NEG_SIM_ROOT}"
-        --cls_time_anchor_gw_h5 "${CLS_TIME_ANCHOR_GW_H5}"
-        --cls_time_anchor_seed "${CLS_TIME_ANCHOR_SEED}"
         --density_match_pos_h5 "${DENSITY_MATCH_POS_H5}"
     )
 fi

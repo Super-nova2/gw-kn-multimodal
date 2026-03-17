@@ -111,6 +111,14 @@ TEMP_FINAL=$(jq -r '.temp_final // empty' "$args_file")
 TEMP_MIN=$(jq -r '.temp_min // empty' "$args_file")
 TEMP_MAX=$(jq -r '.temp_max // empty' "$args_file")
 TEMP_SCHEDULE=$(jq -r '.temp_schedule // empty' "$args_file")
+MTAN_SNR_S0=$(jq -r '.mtan_snr_s0 // empty' "$args_file")
+MTAN_SNR_BETA=$(jq -r '.mtan_snr_beta // empty' "$args_file")
+MTAN_SNR_CLIP_MIN=$(jq -r '.mtan_snr_clip_min // empty' "$args_file")
+MTAN_SNR_CLIP_MAX=$(jq -r '.mtan_snr_clip_max // empty' "$args_file")
+MTAN_SNR_EPS=$(jq -r '.mtan_snr_eps // empty' "$args_file")
+MTAN_LUPT_PSFFLUX_ZP=$(jq -r '.mtan_lupt_psfflux_zp // empty' "$args_file")
+MTAN_LUPT_K=$(jq -r '.mtan_lupt_k // empty' "$args_file")
+MTAN_LUPT_M5_MAG=$(jq -r '.mtan_lupt_m5_mag // empty' "$args_file")
 TIME_COMPAT_WEIGHT=$(jq -r '.time_compat_weight // empty' "$args_file")
 TIME_COMPAT_TAU_DAYS=$(jq -r '.time_compat_tau_days // empty' "$args_file")
 TIME_COMPAT_POWER=$(jq -r '.time_compat_power // empty' "$args_file")
@@ -374,6 +382,30 @@ if [[ -n "$TEMP_MAX" && "$TEMP_MAX" != "null" ]]; then
 fi
 if [[ -n "$TEMP_SCHEDULE" && "$TEMP_SCHEDULE" != "null" ]]; then
     cmd+=(--temp_schedule "$TEMP_SCHEDULE")
+fi
+if [[ -n "$MTAN_SNR_S0" && "$MTAN_SNR_S0" != "null" ]]; then
+    cmd+=(--mtan_snr_s0 "$MTAN_SNR_S0")
+fi
+if [[ -n "$MTAN_SNR_BETA" && "$MTAN_SNR_BETA" != "null" ]]; then
+    cmd+=(--mtan_snr_beta "$MTAN_SNR_BETA")
+fi
+if [[ -n "$MTAN_SNR_CLIP_MIN" && "$MTAN_SNR_CLIP_MIN" != "null" ]]; then
+    cmd+=(--mtan_snr_clip_min "$MTAN_SNR_CLIP_MIN")
+fi
+if [[ -n "$MTAN_SNR_CLIP_MAX" && "$MTAN_SNR_CLIP_MAX" != "null" ]]; then
+    cmd+=(--mtan_snr_clip_max "$MTAN_SNR_CLIP_MAX")
+fi
+if [[ -n "$MTAN_SNR_EPS" && "$MTAN_SNR_EPS" != "null" ]]; then
+    cmd+=(--mtan_snr_eps "$MTAN_SNR_EPS")
+fi
+if [[ -n "$MTAN_LUPT_PSFFLUX_ZP" && "$MTAN_LUPT_PSFFLUX_ZP" != "null" ]]; then
+    cmd+=(--mtan_lupt_psfflux_zp "$MTAN_LUPT_PSFFLUX_ZP")
+fi
+if [[ -n "$MTAN_LUPT_K" && "$MTAN_LUPT_K" != "null" ]]; then
+    cmd+=(--mtan_lupt_k "$MTAN_LUPT_K")
+fi
+if [[ -n "$MTAN_LUPT_M5_MAG" && "$MTAN_LUPT_M5_MAG" != "null" ]]; then
+    cmd+=(--mtan_lupt_m5_mag "$MTAN_LUPT_M5_MAG")
 fi
 if [[ -n "$TIME_COMPAT_WEIGHT" && "$TIME_COMPAT_WEIGHT" != "null" ]]; then
     cmd+=(--time_compat_weight "$TIME_COMPAT_WEIGHT")
