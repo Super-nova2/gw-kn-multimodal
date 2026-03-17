@@ -183,7 +183,22 @@ class MultiTimeAttention(nn.Module):
     - Accepts mask of shape [Batch, L, D] (per-variable masking).
     - Computes attention scores independently for each dimension D.
     """
-    def __init__(self, input_dim, num_heads, ref_dim, k_dim, output_dim):
+    def __init__(
+        self,
+        input_dim,
+        num_heads,
+        ref_dim,
+        k_dim,
+        output_dim,
+        snr_s0: float = 3.0,
+        snr_beta: float = 1.0,
+        snr_clip_min: float = -8.0,
+        snr_clip_max: float = 20.0,
+        snr_eps: float = 1e-9,
+        lupt_psfflux_zp: float = 31.4,
+        lupt_k: float = 1.0,
+        lupt_m5_mag=(23.9, 25.0, 24.7, 24.0, 23.3, 22.1),
+    ):
         super().__init__()
         self.H = num_heads
         self.D = input_dim
@@ -195,8 +210,56 @@ class MultiTimeAttention(nn.Module):
         self.U = nn.Linear(num_heads * input_dim, output_dim)
 
         self.lambda_param = nn.Parameter(torch.tensor(1.0))  # Learnable scalar parameter
+        self.snr_s0 = float(snr_s0)
+        self.snr_beta = float(snr_beta)
+        self.snr_clip_min = float(snr_clip_min)
+        self.snr_clip_max = float(snr_clip_max)
+        self.snr_eps = float(snr_eps)
+        self.lupt_psfflux_zp = float(lupt_psfflux_zp)
+        self.lupt_k = float(lupt_k)
+        self.asinh_mag_factor = float(2.5 / math.log(10.0))
+
+        lupt_m5 = torch.tensor(lupt_m5_mag, dtype=torch.float32)
+        lupt_f5sigma_njy = torch.pow(
+            torch.tensor(10.0, dtype=torch.float32),
+            (self.lupt_psfflux_zp - lupt_m5) / 2.5,
+        )
+        lupt_b_njy = self.lupt_k * (lupt_f5sigma_njy / 5.0)
+        self.register_buffer("lupt_b_njy", lupt_b_njy, persistent=False)
 
         self.reset_parameters()
+
+    def _luptitude_to_flux_and_sigma(self, values_lupt: torch.Tensor, errors_lupt: torch.Tensor):
+        """
+        Convert luptitude representation back to raw flux space.
+
+        Args:
+            values_lupt: [B, 1, 1, L, D], luptitude values
+            errors_lupt: [B, 1, 1, L, D], luptitude sigma
+
+        Returns:
+            flux_raw: [B, 1, 1, L, D]
+            fluxerr_raw: [B, 1, 1, L, D]
+        """
+        d_obs = int(values_lupt.size(-1))
+        b_band = self.lupt_b_njy
+        if int(b_band.numel()) >= d_obs:
+            b_used = b_band[:d_obs]
+        else:
+            repeat_n = int(math.ceil(float(d_obs) / float(b_band.numel())))
+            b_used = b_band.repeat(repeat_n)[:d_obs]
+
+        b_used = b_used.to(device=values_lupt.device, dtype=values_lupt.dtype).view(1, 1, 1, 1, d_obs)
+        two_b = 2.0 * b_used
+
+        x = (self.lupt_psfflux_zp - values_lupt) / self.asinh_mag_factor
+        flux_raw = two_b * torch.sinh(x)
+        fluxerr_raw = (
+            torch.abs(errors_lupt)
+            * torch.sqrt(torch.square(flux_raw) + torch.square(two_b))
+            / self.asinh_mag_factor
+        )
+        return flux_raw, fluxerr_raw
     
     def reset_parameters(self):
         """
@@ -250,22 +313,23 @@ class MultiTimeAttention(nn.Module):
         scores_expanded = scores.unsqueeze(-1).expand(-1, -1, -1, -1, self.D)
 
         if errors is not None:
-            # errors shape: [Batch, L, D]
-            # We treat 'errors' as sigma. We want to add log(1 / sigma^2) to logits.
-            # Formula: Logit_new = Logit_original - log(sigma^2 + epsilon)
-            
-            # Expand errors to match scores shape: [B, 1, 1, L, D]
+            # SNR-compatible bias in flux space:
+            #   snr = x_raw / sqrt(sigma^2 + eps)
+            #   s_bar = clip(snr, s_min, s_max)
+            #   psi(s_bar) = log(1 + softplus(beta * (s_bar - s0)))
+            #   score <- score + lambda * psi
+
+            # [B, 1, 1, L, D]
+            values_expanded = values.unsqueeze(1).unsqueeze(1)
             errors_expanded = errors.unsqueeze(1).unsqueeze(1)
-            
-            # Compute bias term
-            # Adding epsilon (1e-9) to avoid log(0) for perfect measurements or zero-padding
-            # Note: For zero-padding (error=0), this bias becomes large positive, 
-            # BUT the 'mask' step below will force them to -inf anyway.
-            sigma_sq = torch.square(errors_expanded)
-            error_bias = - self.lambda_param * torch.log(sigma_sq + 1e-9)
-            
-            # Add bias to scores
-            scores_expanded = scores_expanded + error_bias
+
+            flux_raw, fluxerr_raw = self._luptitude_to_flux_and_sigma(values_expanded, errors_expanded)
+            snr = flux_raw / torch.sqrt(torch.square(fluxerr_raw) + self.snr_eps)
+            snr_clipped = torch.clamp(snr, min=self.snr_clip_min, max=self.snr_clip_max)
+            psi_snr = torch.log1p(F.softplus(self.snr_beta * (snr_clipped - self.snr_s0)))
+            snr_bias = self.lambda_param * psi_snr
+
+            scores_expanded = scores_expanded + snr_bias
         
         if mask is not None:
             # Mask input: [B, L, D]
@@ -310,7 +374,23 @@ class OpticalEncoderWithCLS(nn.Module):
       2. CLS Token Injection
       3. mTAN Attention Module
     """
-    def __init__(self, input_dim, num_heads=4, ref_dim=64, k_dim=64, output_dim=128, dropout=0.0):
+    def __init__(
+        self,
+        input_dim,
+        num_heads=4,
+        ref_dim=64,
+        k_dim=64,
+        output_dim=128,
+        dropout=0.0,
+        mtan_snr_s0: float = 3.0,
+        mtan_snr_beta: float = 1.0,
+        mtan_snr_clip_min: float = -8.0,
+        mtan_snr_clip_max: float = 20.0,
+        mtan_snr_eps: float = 1e-9,
+        mtan_lupt_psfflux_zp: float = 31.4,
+        mtan_lupt_k: float = 1.0,
+        mtan_lupt_m5_mag=(23.9, 25.0, 24.7, 24.0, 23.3, 22.1),
+    ):
         super().__init__()
         self.num_heads = num_heads
         self.ref_dim = ref_dim
@@ -326,7 +406,21 @@ class OpticalEncoderWithCLS(nn.Module):
         # self.cls_token.requires_grad = True
         
         # 3. mTAN Core Module [cite: 3, 4]
-        self.mtan = MultiTimeAttention(input_dim, num_heads, ref_dim, k_dim, output_dim)
+        self.mtan = MultiTimeAttention(
+            input_dim,
+            num_heads,
+            ref_dim,
+            k_dim,
+            output_dim,
+            snr_s0=mtan_snr_s0,
+            snr_beta=mtan_snr_beta,
+            snr_clip_min=mtan_snr_clip_min,
+            snr_clip_max=mtan_snr_clip_max,
+            snr_eps=mtan_snr_eps,
+            lupt_psfflux_zp=mtan_lupt_psfflux_zp,
+            lupt_k=mtan_lupt_k,
+            lupt_m5_mag=mtan_lupt_m5_mag,
+        )
 
         # 4. spatial embedding
         self.spatial_embedding = SpatialEmbedding(output_dim=ref_dim)
@@ -394,12 +488,42 @@ class OpticalEncoderWithCLSNoCoord(nn.Module):
     Optical encoder variant without coordinate conditioning.
     Used by optical-only pipeline to avoid spatial branch dependence.
     """
-    def __init__(self, input_dim, num_heads=4, ref_dim=64, k_dim=64, output_dim=128, dropout=0.0):
+    def __init__(
+        self,
+        input_dim,
+        num_heads=4,
+        ref_dim=64,
+        k_dim=64,
+        output_dim=128,
+        dropout=0.0,
+        mtan_snr_s0: float = 3.0,
+        mtan_snr_beta: float = 1.0,
+        mtan_snr_clip_min: float = -8.0,
+        mtan_snr_clip_max: float = 20.0,
+        mtan_snr_eps: float = 1e-9,
+        mtan_lupt_psfflux_zp: float = 31.4,
+        mtan_lupt_k: float = 1.0,
+        mtan_lupt_m5_mag=(23.9, 25.0, 24.7, 24.0, 23.3, 22.1),
+    ):
         super().__init__()
         self.time_embedding = LearnablePeriodicEmbedding(num_heads, ref_dim)
         self.cls_token = nn.Parameter(torch.empty(1, 1, num_heads, ref_dim))
         nn.init.normal_(self.cls_token, mean=0.0, std=0.02)
-        self.mtan = MultiTimeAttention(input_dim, num_heads, ref_dim, k_dim, output_dim)
+        self.mtan = MultiTimeAttention(
+            input_dim,
+            num_heads,
+            ref_dim,
+            k_dim,
+            output_dim,
+            snr_s0=mtan_snr_s0,
+            snr_beta=mtan_snr_beta,
+            snr_clip_min=mtan_snr_clip_min,
+            snr_clip_max=mtan_snr_clip_max,
+            snr_eps=mtan_snr_eps,
+            lupt_psfflux_zp=mtan_lupt_psfflux_zp,
+            lupt_k=mtan_lupt_k,
+            lupt_m5_mag=mtan_lupt_m5_mag,
+        )
         self.output_dropout = nn.Dropout(dropout)
 
     def forward(self, t_obs, values_obs, t_ref, mask=None, errors_obs=None):
@@ -869,6 +993,14 @@ class PhysicalDualOpticalEncoder(nn.Module):
         curve_dropout=0.0,
         proj_dim=256,
         proj_dropout=0.0,
+        mtan_snr_s0: float = 3.0,
+        mtan_snr_beta: float = 1.0,
+        mtan_snr_clip_min: float = -8.0,
+        mtan_snr_clip_max: float = 20.0,
+        mtan_snr_eps: float = 1e-9,
+        mtan_lupt_psfflux_zp: float = 31.4,
+        mtan_lupt_k: float = 1.0,
+        mtan_lupt_m5_mag=(23.9, 25.0, 24.7, 24.0, 23.3, 22.1),
     ):
         super().__init__()
         self.curve_encoder = OpticalLightCurveEncoder(
@@ -878,6 +1010,14 @@ class PhysicalDualOpticalEncoder(nn.Module):
             k_dim=k_dim,
             output_dim=enc_dim,
             dropout=curve_dropout,
+            mtan_snr_s0=mtan_snr_s0,
+            mtan_snr_beta=mtan_snr_beta,
+            mtan_snr_clip_min=mtan_snr_clip_min,
+            mtan_snr_clip_max=mtan_snr_clip_max,
+            mtan_snr_eps=mtan_snr_eps,
+            mtan_lupt_psfflux_zp=mtan_lupt_psfflux_zp,
+            mtan_lupt_k=mtan_lupt_k,
+            mtan_lupt_m5_mag=mtan_lupt_m5_mag,
         )
         self.coord_encoder = OpticalCoordEncoder(output_dim=enc_dim)
         self.contrastive_head = OptContrastiveFuseProj(
@@ -1289,6 +1429,14 @@ class GWOpticalALBEFModel(nn.Module):
         time_compat_tau_days=30.0,
         time_compat_power=2.0,
         time_compat_max_penalty=8.0,
+        mtan_snr_s0=3.0,
+        mtan_snr_beta=1.0,
+        mtan_snr_clip_min=-8.0,
+        mtan_snr_clip_max=20.0,
+        mtan_snr_eps=1e-9,
+        mtan_lupt_psfflux_zp=31.4,
+        mtan_lupt_k=1.0,
+        mtan_lupt_m5_mag=(23.9, 25.0, 24.7, 24.0, 23.3, 22.1),
     ):
         super().__init__()
         self.fusion_mode = normalize_fusion_mode(fusion_mode, dual_fusion=dual_fusion)
@@ -1315,6 +1463,14 @@ class GWOpticalALBEFModel(nn.Module):
                 curve_dropout=opt_dropout,
                 proj_dim=proj_dim,
                 proj_dropout=proj_dropout,
+                mtan_snr_s0=mtan_snr_s0,
+                mtan_snr_beta=mtan_snr_beta,
+                mtan_snr_clip_min=mtan_snr_clip_min,
+                mtan_snr_clip_max=mtan_snr_clip_max,
+                mtan_snr_eps=mtan_snr_eps,
+                mtan_lupt_psfflux_zp=mtan_lupt_psfflux_zp,
+                mtan_lupt_k=mtan_lupt_k,
+                mtan_lupt_m5_mag=mtan_lupt_m5_mag,
             )
             self.gw_proj = None
             self.opt_proj = None
@@ -1341,7 +1497,15 @@ class GWOpticalALBEFModel(nn.Module):
                 output_dim=enc_dim,
                 num_heads=4,
                 ref_dim=ref_time_dim,
-                dropout=opt_dropout
+                dropout=opt_dropout,
+                mtan_snr_s0=mtan_snr_s0,
+                mtan_snr_beta=mtan_snr_beta,
+                mtan_snr_clip_min=mtan_snr_clip_min,
+                mtan_snr_clip_max=mtan_snr_clip_max,
+                mtan_snr_eps=mtan_snr_eps,
+                mtan_lupt_psfflux_zp=mtan_lupt_psfflux_zp,
+                mtan_lupt_k=mtan_lupt_k,
+                mtan_lupt_m5_mag=mtan_lupt_m5_mag,
             )
             self.gw_proj = ProjectionHead(enc_dim, enc_dim, proj_dim, dropout=proj_dropout)
             self.opt_proj = ProjectionHead(enc_dim, enc_dim, proj_dim, dropout=proj_dropout)

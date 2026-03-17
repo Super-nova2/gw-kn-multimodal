@@ -439,8 +439,7 @@ class PrefixTrainPolicy:
     def __init__(self, args):
         self.enabled = bool(getattr(args, "prefix_train_enable", False))
         self.min_det = int(getattr(args, "prefix_min_det", 2))
-        self.sampling = str(getattr(args, "prefix_train_sampling", "real_stream_ndet_empirical")).strip().lower()
-        self.terminal_mix_prob = float(getattr(args, "prefix_terminal_mix_prob", 0.2))
+        self.sampling = str(getattr(args, "prefix_train_sampling", "real_stream_bucket_uniform_terminal_mixture")).strip().lower()
         self.real_mix_weight = float(getattr(args, "prefix_real_mix_weight", 4.0))
         self.bucket_uniform_mix_weight = float(getattr(args, "prefix_bucket_uniform_mix_weight", 4.0))
         self.terminal_mix_weight = float(getattr(args, "prefix_terminal_mix_weight", 2.0))
@@ -454,7 +453,6 @@ class PrefixTrainPolicy:
             "enabled": self.enabled,
             "min_det": self.min_det,
             "sampling": self.sampling,
-            "terminal_mix_prob": self.terminal_mix_prob,
             "real_mix_weight": self.real_mix_weight,
             "bucket_uniform_mix_weight": self.bucket_uniform_mix_weight,
             "terminal_mix_weight": self.terminal_mix_weight,
@@ -462,7 +460,7 @@ class PrefixTrainPolicy:
 
         if not self.enabled:
             return
-        if self.sampling not in {"real_stream_ndet_empirical", "real_stream_bucket_uniform_terminal_mixture"}:
+        if self.sampling != "real_stream_bucket_uniform_terminal_mixture":
             raise ValueError(f"Unsupported prefix_train_sampling: {self.sampling}")
         if self.hist_path is None:
             raise ValueError("prefix_train_enable=true requires --prefix_real_hist_path.")
@@ -478,43 +476,32 @@ class PrefixTrainPolicy:
                 "hist_probabilities": [float(v) for v in probs.tolist()],
             }
         )
-        if self.sampling == "real_stream_bucket_uniform_terminal_mixture":
-            mix_raw = np.asarray(
-                [
-                    self.real_mix_weight,
-                    self.bucket_uniform_mix_weight,
-                    self.terminal_mix_weight,
-                ],
-                dtype=np.float64,
-            )
-            if np.any(mix_raw < 0):
-                raise ValueError("Prefix mixture weights must be >= 0.")
-            if float(mix_raw.sum()) <= 0:
-                raise ValueError("Prefix mixture weights must sum to > 0.")
-            mix_probs = mix_raw / mix_raw.sum()
-            self.info.update(
-                {
-                    "mixture_branch_names": ["real_stream", "bucket_uniform", "terminal"],
-                    "mixture_branch_probabilities": [float(v) for v in mix_probs.tolist()],
-                    "uniform_support": [int(v) for v in support.tolist()],
-                }
-            )
+        mix_raw = np.asarray(
+            [
+                self.real_mix_weight,
+                self.bucket_uniform_mix_weight,
+                self.terminal_mix_weight,
+            ],
+            dtype=np.float64,
+        )
+        if np.any(mix_raw < 0):
+            raise ValueError("Prefix mixture weights must be >= 0.")
+        if float(mix_raw.sum()) <= 0:
+            raise ValueError("Prefix mixture weights must sum to > 0.")
+        mix_probs = mix_raw / mix_raw.sum()
+        self.info.update(
+            {
+                "mixture_branch_names": ["real_stream", "bucket_uniform", "terminal"],
+                "mixture_branch_probabilities": [float(v) for v in mix_probs.tolist()],
+                "uniform_support": [int(v) for v in support.tolist()],
+            }
+        )
 
     def sample_target_k(self, slot_is_detection: torch.Tensor) -> torch.Tensor:
         if not self.enabled:
             raise RuntimeError("PrefixTrainPolicy.sample_target_k called while disabled.")
         det_counts = (slot_is_detection > 0).sum(dim=1).detach().cpu().numpy().astype(np.int64, copy=False)
-        if self.sampling == "real_stream_ndet_empirical":
-            sampled = sample_prefix_target_k(
-                det_counts=det_counts,
-                support=self.support,
-                probs=self.probs,
-                rng=self.rng,
-                min_det=self.min_det,
-                terminal_mix_prob=self.terminal_mix_prob,
-            )
-        else:
-            sampled = np.empty_like(det_counts)
+        sampled = np.empty_like(det_counts)
             mix_raw = np.asarray(
                 [
                     self.real_mix_weight,
@@ -760,38 +747,6 @@ def augment_optical_data(
     return opt_t, opt_v, opt_mask, opt_err
 
 
-def apply_detspan_window_torch(
-    opt_t: torch.Tensor,
-    opt_v: torch.Tensor,
-    opt_mask: torch.Tensor,
-    opt_err: torch.Tensor,
-    slot_is_detection: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    if opt_t.ndim != 2:
-        raise ValueError(f"opt_t must be [B,T], got shape={tuple(opt_t.shape)}")
-    if opt_v.ndim != 3 or opt_mask.ndim != 3:
-        raise ValueError("opt_v and opt_mask must be [B,T,C].")
-    if slot_is_detection.ndim != 2:
-        raise ValueError("slot_is_detection must be [B,T].")
-
-    row_valid = opt_mask.sum(dim=-1) > 0
-    det_rows = (slot_is_detection > 0) & row_valid
-    has_det = det_rows.any(dim=1)
-
-    row_pos = torch.arange(opt_t.size(1), device=opt_t.device).unsqueeze(0)
-    first_idx = torch.argmax(det_rows.to(torch.int64), dim=1)
-    last_idx = det_rows.size(1) - 1 - torch.argmax(det_rows.flip(dims=[1]).to(torch.int64), dim=1)
-    keep_rows = row_valid & (row_pos >= first_idx.unsqueeze(1)) & (row_pos <= last_idx.unsqueeze(1))
-    keep_rows = torch.where(has_det.unsqueeze(1), keep_rows, row_valid)
-    keep_rows_3d = keep_rows.unsqueeze(-1)
-
-    out_t = torch.where(keep_rows, opt_t, torch.zeros_like(opt_t))
-    out_v = torch.where(keep_rows_3d, opt_v, torch.zeros_like(opt_v))
-    out_mask = torch.where(keep_rows_3d, opt_mask, torch.zeros_like(opt_mask))
-    out_err = torch.where(keep_rows_3d, opt_err, torch.zeros_like(opt_err))
-    out_det = torch.where(keep_rows, slot_is_detection, torch.zeros_like(slot_is_detection))
-    return out_t, out_v, out_mask, out_err, out_det
-
 
 def sample_universal_target_k(
     slot_is_detection: torch.Tensor,
@@ -867,18 +822,6 @@ def build_universal_view(
         target_k=target_k,
         min_det=int(args.prefix_min_det),
     )
-    detspan_applied = False
-    if bool(getattr(args, "detspan_train_enable", False)):
-        detspan_prob = float(getattr(args, "detspan_view_prob", 0.0))
-        if detspan_prob > 0 and float(torch.rand((), device=opt_t.device).item()) < detspan_prob:
-            opt_t, opt_v, opt_mask, opt_err, slot_is_detection = apply_detspan_window_torch(
-                opt_t=opt_t,
-                opt_v=opt_v,
-                opt_mask=opt_mask,
-                opt_err=opt_err,
-                slot_is_detection=slot_is_detection,
-            )
-            detspan_applied = True
 
     valid_rows = opt_mask.sum(dim=-1) > 0
     keep_prob = torch.empty((opt_mask.size(0), 1), device=opt_mask.device).uniform_(
@@ -940,7 +883,6 @@ def build_universal_view(
         "slot_is_detection": slot_is_detection,
         "target_k": target_k,
         "is_terminal_prefix": (target_k >= total_det).to(dtype=torch.long),
-        "detspan_applied": int(detspan_applied),
         "n_det": n_det.to(dtype=torch.long),
         "n_bands": n_bands.to(dtype=torch.long),
         "t_span": t_span,
@@ -1560,10 +1502,6 @@ def build_train_summary_payload(
         "task_mode": "prefix_right_censored"
         if (bool(args.prefix_train_enable) or bool(getattr(args, "universal_train_enable", False)))
         else "full_window",
-        "detspan_training": {
-            "enabled": bool(getattr(args, "detspan_train_enable", False)),
-            "view_prob": float(getattr(args, "detspan_view_prob", 0.0)),
-        },
         "current_epoch": int(current_epoch),
         "current_stage": str(current_stage),
         "dataset_window_metadata": getattr(args, "_dataset_window_metadata", None),
@@ -1665,12 +1603,7 @@ def train(args):
     print(f"Prefix train policy: {json.dumps(prefix_policy.describe(), indent=2)}")
     if bool(args.prefix_train_enable) and float(args.target_ndet_jitter) > 0:
         print("prefix_train_enable=true: target_ndet_jitter will be ignored in favor of causal right-censoring.")
-    print(
-        "Det-span training: "
-        f"enabled={bool(getattr(args, 'detspan_train_enable', False))} "
-        f"view_prob={float(getattr(args, 'detspan_view_prob', 0.0)):.3f} "
-        f"(universal_only={bool(getattr(args, 'universal_train_enable', False))})"
-    )
+
     meta_bins_n_det = parse_bin_edges(
         getattr(args, "meta_bins_n_det", None),
         default="3,5,8,12,20,40,80,200",
@@ -2015,10 +1948,6 @@ def train(args):
         "task_mode": "prefix_right_censored"
         if (bool(args.prefix_train_enable) or bool(getattr(args, "universal_train_enable", False)))
         else "full_window",
-        "detspan_training": {
-            "enabled": bool(getattr(args, "detspan_train_enable", False)),
-            "view_prob": float(getattr(args, "detspan_view_prob", 0.0)),
-        },
         "dataset_window_metadata": getattr(args, "_dataset_window_metadata", None),
         "init_source_metadata": getattr(args, "_init_source_metadata", None),
         **best_metrics,
@@ -2126,8 +2055,7 @@ def parse_args():
     parser.add_argument("--universal_stage1_epochs", type=int, default=2)
     parser.add_argument("--universal_stage2_epochs", type=int, default=6)
     parser.add_argument("--universal_stage3_epochs", type=int, default=6)
-    parser.add_argument("--detspan_train_enable", action="store_true")
-    parser.add_argument("--detspan_view_prob", type=float, default=0.0)
+
     parser.add_argument("--view_keep_prob_min", type=float, default=0.55)
     parser.add_argument("--view_keep_prob_max", type=float, default=1.0)
     parser.add_argument("--view_band_dropout_max", type=float, default=0.5)
@@ -2220,10 +2148,9 @@ def parse_args():
     if float(args.prefix_terminal_mix_weight) < 0:
         raise ValueError("--prefix_terminal_mix_weight must be >= 0.")
     sampling_mode = str(args.prefix_train_sampling).strip().lower()
-    if sampling_mode not in {"real_stream_ndet_empirical", "real_stream_bucket_uniform_terminal_mixture"}:
+    if sampling_mode != "real_stream_bucket_uniform_terminal_mixture":
         raise ValueError(
-            "--prefix_train_sampling must be 'real_stream_ndet_empirical' or "
-            "'real_stream_bucket_uniform_terminal_mixture'."
+            "--prefix_train_sampling must be 'real_stream_bucket_uniform_terminal_mixture'."
         )
     if (
         sampling_mode == "real_stream_bucket_uniform_terminal_mixture"
@@ -2254,10 +2181,7 @@ def parse_args():
         raise ValueError("Adversarial weights must be >= 0.")
     if int(args.universal_stage1_epochs) < 0 or int(args.universal_stage2_epochs) < 0 or int(args.universal_stage3_epochs) < 0:
         raise ValueError("Universal stage epochs must be >= 0.")
-    if not (0.0 <= float(args.detspan_view_prob) <= 1.0):
-        raise ValueError("--detspan_view_prob must be in [0, 1].")
-    if bool(args.detspan_train_enable) and (not bool(args.universal_train_enable)):
-        raise ValueError("detspan_train_enable=true requires universal_train_enable=true.")
+
     if float(args.grl_lambda) < 0:
         raise ValueError("--grl_lambda must be >= 0.")
     return args

@@ -4,6 +4,7 @@ import pandas as pd
 from astropy.io import fits
 from tqdm import tqdm
 import os
+import sys
 import healpy as hp
 from ligo.skymap.io.fits import read_sky_map
 from ligo.skymap.moc import uniq2nest, uniq2pixarea
@@ -16,12 +17,26 @@ from torch.utils.data import Dataset, DataLoader, Sampler
 from pathlib import Path
 import subprocess
 
-from optical_prefix import (
-    DEFAULT_PREFIX_DET_SUPPORT,
-    apply_prefix_right_censoring_numpy,
-    build_prefix_manifest_entries,
-    parse_prefix_det_support,
-)
+try:
+    from optical_prefix import (
+        DEFAULT_PREFIX_DET_SUPPORT,
+        apply_prefix_right_censoring_numpy,
+        build_prefix_manifest_entries,
+        parse_prefix_det_support,
+    )
+except ModuleNotFoundError as exc:
+    if exc.name != "optical_prefix":
+        raise
+    # Support importlib-loaded entry scripts where Model/ is not on sys.path.
+    this_dir = str(Path(__file__).resolve().parent)
+    if this_dir not in sys.path:
+        sys.path.insert(0, this_dir)
+    from optical_prefix import (
+        DEFAULT_PREFIX_DET_SUPPORT,
+        apply_prefix_right_censoring_numpy,
+        build_prefix_manifest_entries,
+        parse_prefix_det_support,
+    )
 
 
 def _normalize_day_windows(windows) -> List[float]:
