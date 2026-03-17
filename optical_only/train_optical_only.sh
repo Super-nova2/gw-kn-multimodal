@@ -162,7 +162,6 @@ META_FILTER_N_DET_MAX=$(jq -r '.meta_filter_n_det_max // empty' "$args_file")
 META_FILTER_N_BANDS_MAX=$(jq -r '.meta_filter_n_bands_max // empty' "$args_file")
 META_FILTER_T_SPAN_MAX=$(jq -r '.meta_filter_t_span_max // empty' "$args_file")
 META_FILTER_RELAX_T_SPAN_IF_BELOW_ROWS=$(jq -r '.meta_filter_relax_t_span_if_below_rows // empty' "$args_file")
-REAL_STREAM_PROFILE_PATH=$(jq -r '.real_stream_profile_path // empty' "$args_file")
 SINGLE_BAND_KEEP_PROB=$(jq -r '.single_band_keep_prob // empty' "$args_file")
 TARGET_NDET_JITTER=$(jq -r '.target_ndet_jitter // empty' "$args_file")
 SHORTCUT_AUDIT_ENABLE=$(jq -r '.shortcut_audit_enable // empty' "$args_file")
@@ -171,11 +170,9 @@ PREFIX_TRAIN_ENABLE=$(jq -r '.prefix_train_enable // false' "$args_file")
 PREFIX_MIN_DET=$(jq -r '.prefix_min_det // empty' "$args_file")
 PREFIX_TRAIN_SAMPLING=$(jq -r '.prefix_train_sampling // empty' "$args_file")
 PREFIX_TERMINAL_MIX_PROB=$(jq -r '.prefix_terminal_mix_prob // empty' "$args_file")
-PREFIX_REAL_MIX_WEIGHT=$(jq -r '.prefix_real_mix_weight // empty' "$args_file")
 PREFIX_BUCKET_UNIFORM_MIX_WEIGHT=$(jq -r '.prefix_bucket_uniform_mix_weight // empty' "$args_file")
 PREFIX_TERMINAL_MIX_WEIGHT=$(jq -r '.prefix_terminal_mix_weight // empty' "$args_file")
 PREFIX_EVAL_DET_SUPPORT=$(jq -r '.prefix_eval_det_support // empty' "$args_file")
-PREFIX_REAL_HIST_PATH=$(jq -r '.prefix_real_hist_path // empty' "$args_file")
 PREFIX_EVAL_ENABLE=$(jq -r '.prefix_eval_enable // empty' "$args_file")
 PREFIX_MANIFEST_OUT=$(jq -r '(.prefix_manifest_out // .eval_prefix_manifest_out) // empty' "$args_file")
 SECONDARY_PREFIX_EVAL_DET_SUPPORT=$(jq -r '.secondary_prefix_eval_det_support // empty' "$args_file")
@@ -265,23 +262,11 @@ if is_truthy "$PREFIX_TRAIN_ENABLE"; then
     echo "Prefix train sampling: ${PREFIX_TRAIN_SAMPLING:-<default>}"
     echo "Prefix terminal mix prob: ${PREFIX_TERMINAL_MIX_PROB:-<default>}"
     echo "Prefix eval det support: ${PREFIX_EVAL_DET_SUPPORT:-<default>}"
-    echo "Prefix real-stream hist: ${PREFIX_REAL_HIST_PATH:-<missing>}"
 fi
 echo "Eval POS data (resolved): $EVAL_POS_DATA_PATH"
 echo "Eval NEG data (resolved): $EVAL_NEG_DATA_PATH"
 echo "Eval NEG group (resolved): $EVAL_NEG_GROUP"
 echo ""
-
-if is_truthy "$PREFIX_TRAIN_ENABLE"; then
-    if [[ -z "$PREFIX_REAL_HIST_PATH" || "$PREFIX_REAL_HIST_PATH" == "null" ]]; then
-        echo "prefix_train_enable=true but prefix_real_hist_path is missing in $args_file"
-        exit 1
-    fi
-    if [[ ! -f "$PREFIX_REAL_HIST_PATH" ]]; then
-        echo "Prefix real-stream histogram file not found: $PREFIX_REAL_HIST_PATH"
-        exit 1
-    fi
-fi
 
 # Optional: stage large HDF5 to local disk to reduce shared filesystem I/O
 if is_truthy "$STAGE_TO_JOBFS"; then
@@ -307,11 +292,6 @@ if is_truthy "$STAGE_TO_JOBFS"; then
             OFFSET_DIST_LOCAL="$JOBFS_DIR/offset_dist_$(basename "$OFFSET_DIST_NPZ")"
             cp -f "$OFFSET_DIST_NPZ" "$OFFSET_DIST_LOCAL"
             OFFSET_DIST_NPZ="$OFFSET_DIST_LOCAL"
-        fi
-        if is_truthy "$PREFIX_TRAIN_ENABLE" && [[ -n "$PREFIX_REAL_HIST_PATH" && "$PREFIX_REAL_HIST_PATH" != "null" ]]; then
-            PREFIX_REAL_HIST_LOCAL="$JOBFS_DIR/prefix_hist_$(basename "$PREFIX_REAL_HIST_PATH")"
-            cp -f "$PREFIX_REAL_HIST_PATH" "$PREFIX_REAL_HIST_LOCAL"
-            PREFIX_REAL_HIST_PATH="$PREFIX_REAL_HIST_LOCAL"
         fi
         echo "Staging complete."
     else
@@ -499,9 +479,6 @@ fi
 if [[ -n "$PREFIX_TERMINAL_MIX_PROB" && "$PREFIX_TERMINAL_MIX_PROB" != "null" ]]; then
     cmd+=(--prefix_terminal_mix_prob "$PREFIX_TERMINAL_MIX_PROB")
 fi
-if [[ -n "$PREFIX_REAL_MIX_WEIGHT" && "$PREFIX_REAL_MIX_WEIGHT" != "null" ]]; then
-    cmd+=(--prefix_real_mix_weight "$PREFIX_REAL_MIX_WEIGHT")
-fi
 if [[ -n "$PREFIX_BUCKET_UNIFORM_MIX_WEIGHT" && "$PREFIX_BUCKET_UNIFORM_MIX_WEIGHT" != "null" ]]; then
     cmd+=(--prefix_bucket_uniform_mix_weight "$PREFIX_BUCKET_UNIFORM_MIX_WEIGHT")
 fi
@@ -510,9 +487,6 @@ if [[ -n "$PREFIX_TERMINAL_MIX_WEIGHT" && "$PREFIX_TERMINAL_MIX_WEIGHT" != "null
 fi
 if [[ -n "$PREFIX_EVAL_DET_SUPPORT" && "$PREFIX_EVAL_DET_SUPPORT" != "null" ]]; then
     cmd+=(--prefix_eval_det_support "$PREFIX_EVAL_DET_SUPPORT")
-fi
-if [[ -n "$PREFIX_REAL_HIST_PATH" && "$PREFIX_REAL_HIST_PATH" != "null" ]]; then
-    cmd+=(--prefix_real_hist_path "$PREFIX_REAL_HIST_PATH")
 fi
 if is_truthy "$UNIVERSAL_TRAIN_ENABLE"; then
     cmd+=(--universal_train_enable)
@@ -568,12 +542,9 @@ fi
 if [[ -n "$META_FILTER_RELAX_T_SPAN_IF_BELOW_ROWS" && "$META_FILTER_RELAX_T_SPAN_IF_BELOW_ROWS" != "null" ]]; then
     cmd+=(--meta_filter_relax_t_span_if_below_rows "$META_FILTER_RELAX_T_SPAN_IF_BELOW_ROWS")
 fi
-if [[ -n "$REAL_STREAM_PROFILE_PATH" && "$REAL_STREAM_PROFILE_PATH" != "null" ]]; then
-    cmd+=(--real_stream_profile_path "$REAL_STREAM_PROFILE_PATH")
-fi
 
 echo "Training Command: ${cmd[*]}"
-echo "Optical controls (from config): meta_matched_sampling=${META_MATCHED_SAMPLING:-<default>}, meta_match_fallback=${META_MATCH_FALLBACK:-<default>}, meta_filter_n_det=[${META_FILTER_N_DET_MIN:-<default>},${META_FILTER_N_DET_MAX:-<default>}], meta_filter_n_bands_max=${META_FILTER_N_BANDS_MAX:-<default>}, meta_filter_t_span_max=${META_FILTER_T_SPAN_MAX:-<default>}, meta_filter_relax=${META_FILTER_RELAX_T_SPAN_IF_BELOW_ROWS:-<default>}, real_stream_profile=${REAL_STREAM_PROFILE_PATH:-<default>}, universal_train_enable=${UNIVERSAL_TRAIN_ENABLE:-<default>}, universal_epochs=${UNIVERSAL_STAGE1_EPOCHS:-<default>}/${UNIVERSAL_STAGE2_EPOCHS:-<default>}/${UNIVERSAL_STAGE3_EPOCHS:-<default>}, view_keep_prob=${VIEW_KEEP_PROB_MIN:-<default>}..${VIEW_KEEP_PROB_MAX:-<default>}, view_band_dropout_max=${VIEW_BAND_DROPOUT_MAX:-<default>}, cons_weights=${CONSISTENCY_EMBED_WEIGHT:-<default>}/${CONSISTENCY_PROB_WEIGHT:-<default>}, adv_weights=${ADV_DET_WEIGHT:-<default>}/${ADV_BAND_WEIGHT:-<default>}/${ADV_SPAN_WEIGHT:-<default>}, grl_lambda=${GRL_LAMBDA:-<default>}, single_band_keep_prob=${SINGLE_BAND_KEEP_PROB:-<default>}, target_ndet_jitter=${TARGET_NDET_JITTER:-<default>}, shortcut_audit_enable=${SHORTCUT_AUDIT_ENABLE:-<default>}, shortcut_audit_val_samples=${SHORTCUT_AUDIT_VAL_SAMPLES:-<default>}, prefix_train_enable=${PREFIX_TRAIN_ENABLE:-<default>}, prefix_min_det=${PREFIX_MIN_DET:-<default>}, prefix_train_sampling=${PREFIX_TRAIN_SAMPLING:-<default>}, prefix_mix_weights=${PREFIX_REAL_MIX_WEIGHT:-<default>}:${PREFIX_BUCKET_UNIFORM_MIX_WEIGHT:-<default>}:${PREFIX_TERMINAL_MIX_WEIGHT:-<default>}"
+echo "Optical controls (from config): meta_matched_sampling=${META_MATCHED_SAMPLING:-<default>}, meta_match_fallback=${META_MATCH_FALLBACK:-<default>}, meta_filter_n_det=[${META_FILTER_N_DET_MIN:-<default>},${META_FILTER_N_DET_MAX:-<default>}], meta_filter_n_bands_max=${META_FILTER_N_BANDS_MAX:-<default>}, meta_filter_t_span_max=${META_FILTER_T_SPAN_MAX:-<default>}, meta_filter_relax=${META_FILTER_RELAX_T_SPAN_IF_BELOW_ROWS:-<default>}, universal_train_enable=${UNIVERSAL_TRAIN_ENABLE:-<default>}, universal_epochs=${UNIVERSAL_STAGE1_EPOCHS:-<default>}/${UNIVERSAL_STAGE2_EPOCHS:-<default>}/${UNIVERSAL_STAGE3_EPOCHS:-<default>}, view_keep_prob=${VIEW_KEEP_PROB_MIN:-<default>}..${VIEW_KEEP_PROB_MAX:-<default>}, view_band_dropout_max=${VIEW_BAND_DROPOUT_MAX:-<default>}, cons_weights=${CONSISTENCY_EMBED_WEIGHT:-<default>}/${CONSISTENCY_PROB_WEIGHT:-<default>}, adv_weights=${ADV_DET_WEIGHT:-<default>}/${ADV_BAND_WEIGHT:-<default>}/${ADV_SPAN_WEIGHT:-<default>}, grl_lambda=${GRL_LAMBDA:-<default>}, single_band_keep_prob=${SINGLE_BAND_KEEP_PROB:-<default>}, target_ndet_jitter=${TARGET_NDET_JITTER:-<default>}, shortcut_audit_enable=${SHORTCUT_AUDIT_ENABLE:-<default>}, shortcut_audit_val_samples=${SHORTCUT_AUDIT_VAL_SAMPLES:-<default>}, prefix_train_enable=${PREFIX_TRAIN_ENABLE:-<default>}, prefix_min_det=${PREFIX_MIN_DET:-<default>}, prefix_train_sampling=${PREFIX_TRAIN_SAMPLING:-<default>}, prefix_mix_weights=${PREFIX_BUCKET_UNIFORM_MIX_WEIGHT:-<default>}:${PREFIX_TERMINAL_MIX_WEIGHT:-<default>}"
 set +e
 "${cmd[@]}"
 train_exit_code=$?
@@ -712,9 +683,6 @@ if [[ -n "$META_FILTER_T_SPAN_MAX" && "$META_FILTER_T_SPAN_MAX" != "null" ]]; th
 fi
 if [[ -n "$META_FILTER_RELAX_T_SPAN_IF_BELOW_ROWS" && "$META_FILTER_RELAX_T_SPAN_IF_BELOW_ROWS" != "null" ]]; then
     eval_cmd+=(--meta_filter_relax_t_span_if_below_rows "$META_FILTER_RELAX_T_SPAN_IF_BELOW_ROWS")
-fi
-if [[ -n "$REAL_STREAM_PROFILE_PATH" && "$REAL_STREAM_PROFILE_PATH" != "null" ]]; then
-    eval_cmd+=(--real_stream_profile_path "$REAL_STREAM_PROFILE_PATH")
 fi
 if is_truthy "$OOD_REJECT_ENABLE"; then
     eval_cmd+=(--ood_reject_enable)

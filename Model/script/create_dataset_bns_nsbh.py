@@ -1,5 +1,7 @@
 import os
 import importlib.util
+import multiprocessing as mp
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -181,6 +183,135 @@ class SourcePrepared:
     n_filtered_non_success_mej_pos: int = 0
     nsbh_mej_col_resolved: Optional[str] = None
     success_ids_mej_pos: Optional[Set[int]] = None
+
+
+@dataclass(frozen=True)
+class EventProcessTask:
+    tag: str
+    event_id: int
+    sim_root: str
+    sim_name: str
+    skymap_dir: str
+    include_lightcurves: bool
+    fluxcal_to_psfflux_factor: float
+    psfflux_zp: float
+    lupt_b_njy: Tuple[float, ...]
+
+
+@dataclass
+class EventProcessResult:
+    tag: str
+    event_id: int
+    include_lightcurves: bool
+    status: str
+    lcs: Optional[List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]]] = None
+    skymap: Optional[np.ndarray] = None
+
+
+def _build_event_process_task(
+    src: SourcePrepared,
+    event_id: int,
+    include_lightcurves: bool,
+    fluxcal_to_psfflux_factor: float,
+    psfflux_zp: float,
+    lupt_b_njy: np.ndarray,
+) -> EventProcessTask:
+    return EventProcessTask(
+        tag=str(src.cfg.tag),
+        event_id=int(event_id),
+        sim_root=str(src.cfg.sim_root),
+        sim_name=str(src.cfg.sim_name),
+        skymap_dir=str(src.cfg.skymap_dir),
+        include_lightcurves=bool(include_lightcurves),
+        fluxcal_to_psfflux_factor=float(fluxcal_to_psfflux_factor),
+        psfflux_zp=float(psfflux_zp),
+        lupt_b_njy=tuple(float(x) for x in np.asarray(lupt_b_njy, dtype=np.float64).tolist()),
+    )
+
+
+def _sampled_skymap_to_numpy(skymap_obj) -> np.ndarray:
+    arr = skymap_obj
+    if hasattr(arr, "detach"):
+        arr = arr.detach()
+    if hasattr(arr, "cpu"):
+        arr = arr.cpu()
+    if hasattr(arr, "numpy"):
+        arr = arr.numpy()
+    return np.asarray(arr, dtype=np.float32)
+
+
+def _process_event_task(task: EventProcessTask) -> EventProcessResult:
+    lcs: Optional[List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]]] = None
+    if task.include_lightcurves:
+        lcs = parse_snana_fits(
+            event_id=int(task.event_id),
+            sim_dir=task.sim_root,
+            sim_name=task.sim_name,
+            fluxcal_to_psfflux_factor=float(task.fluxcal_to_psfflux_factor),
+            psfflux_zp=float(task.psfflux_zp),
+            lupt_b_njy=np.asarray(task.lupt_b_njy, dtype=np.float64),
+        )
+        if len(lcs) == 0:
+            return EventProcessResult(
+                tag=task.tag,
+                event_id=int(task.event_id),
+                include_lightcurves=True,
+                status="empty_lc",
+                lcs=[],
+                skymap=None,
+            )
+
+    skymap_path = os.path.join(task.skymap_dir, f"{int(task.event_id)}.fits")
+    try:
+        skymap = _sampled_skymap_to_numpy(sample_moc_skymap(skymap_path))
+    except Exception:
+        return EventProcessResult(
+            tag=task.tag,
+            event_id=int(task.event_id),
+            include_lightcurves=bool(task.include_lightcurves),
+            status="missing_skymap",
+            lcs=lcs,
+            skymap=None,
+        )
+
+    return EventProcessResult(
+        tag=task.tag,
+        event_id=int(task.event_id),
+        include_lightcurves=bool(task.include_lightcurves),
+        status="ok",
+        lcs=lcs,
+        skymap=skymap,
+    )
+
+
+def _iter_event_task_results(
+    tasks: List[EventProcessTask],
+    num_workers: int,
+    desc: str,
+):
+    if not tasks:
+        return
+
+    effective_workers = max(1, min(int(num_workers), len(tasks)))
+    if effective_workers <= 1:
+        iterator = (_process_event_task(task) for task in tasks)
+        for result in tqdm(iterator, total=len(tasks), desc=desc, mininterval=0.5, miniters=100):
+            yield result
+        return
+
+    chunksize = max(1, len(tasks) // (effective_workers * 8))
+    executor_kwargs = {"max_workers": effective_workers}
+    if os.name != "nt":
+        try:
+            executor_kwargs["mp_context"] = mp.get_context("fork")
+        except ValueError:
+            pass
+
+    print(f"[{desc}] using ordered process pool with {effective_workers} workers (chunksize={chunksize})")
+    with ProcessPoolExecutor(**executor_kwargs) as executor:
+        iterator = executor.map(_process_event_task, tasks, chunksize=chunksize)
+        for result in tqdm(iterator, total=len(tasks), desc=desc, mininterval=0.5, miniters=100):
+            yield result
 
 
 def _find_column_case_insensitive(df: pd.DataFrame, candidates: Tuple[str, ...]) -> Optional[str]:
@@ -609,6 +740,7 @@ def create_dataset_with_neg_gw_bns_nsbh_fast(
     bns_cfg: SourceConfig,
     nsbh_cfg: SourceConfig,
     buffer_limit: int = 10000,
+    num_workers: int = 1,
     seed: int = 42,
     fluxcal_zp: float = 27.5,
     psfflux_zp: float = 31.4,
@@ -623,6 +755,8 @@ def create_dataset_with_neg_gw_bns_nsbh_fast(
         raise ValueError(f"dataset_mode must be 'train' or 'test', got: {dataset_mode}")
     if buffer_limit <= 0:
         raise ValueError("buffer_limit must be positive")
+    if int(num_workers) <= 0:
+        raise ValueError("num_workers must be positive")
     if not np.isfinite(fluxcal_to_psfflux_factor) or fluxcal_to_psfflux_factor <= 0:
         raise ValueError("fluxcal_to_psfflux_factor must be finite and > 0.")
     if lupt_m5_mag is None or np.asarray(lupt_m5_mag).shape != (NUM_BANDS,):
@@ -656,7 +790,7 @@ def create_dataset_with_neg_gw_bns_nsbh_fast(
     print(
         f"\nCreating combined dataset ({dataset_mode} mode): "
         f"expected_pos={len(pos_events)} expected_neg={len(neg_events)} "
-        f"expected_total={n_expected_gw}"
+        f"expected_total={n_expected_gw} num_workers={int(num_workers)}"
     )
 
     dt_str = h5py.string_dtype(encoding="utf-8")
@@ -877,21 +1011,37 @@ def create_dataset_with_neg_gw_bns_nsbh_fast(
             opt_buffer_coordinates.clear()
             opt_buffer_parent_idx.clear()
 
-        print("\nWriting positive GW events...")
-        for tag, event_id in tqdm(pos_events, desc="Positive GW", mininterval=0.5, miniters=100):
+        pos_event_records: List[Tuple[str, int, int]] = []
+        pos_tasks: List[EventProcessTask] = []
+        for tag, event_id in pos_events:
             src = prepared[tag]
             row_idx = src.event_to_row.get(event_id)
             if row_idx is None:
                 continue
-
-            lcs = parse_snana_fits(
-                event_id=event_id,
-                sim_dir=src.cfg.sim_root,
-                sim_name=src.cfg.sim_name,
-                fluxcal_to_psfflux_factor=float(fluxcal_to_psfflux_factor),
-                psfflux_zp=float(psfflux_zp),
-                lupt_b_njy=lupt_b_njy,
+            pos_event_records.append((tag, int(event_id), int(row_idx)))
+            pos_tasks.append(
+                _build_event_process_task(
+                    src=src,
+                    event_id=int(event_id),
+                    include_lightcurves=True,
+                    fluxcal_to_psfflux_factor=float(fluxcal_to_psfflux_factor),
+                    psfflux_zp=float(psfflux_zp),
+                    lupt_b_njy=np.asarray(lupt_b_njy, dtype=np.float64),
+                )
             )
+
+        print("\nWriting positive GW events...")
+        for (tag, event_id, row_idx), task_result in zip(
+            pos_event_records,
+            _iter_event_task_results(pos_tasks, num_workers=int(num_workers), desc="Positive GW"),
+        ):
+            if task_result.tag != tag or int(task_result.event_id) != int(event_id):
+                raise RuntimeError(
+                    f"Mismatched positive task result ordering: expected {tag}_{event_id}, got {task_result.tag}_{task_result.event_id}"
+                )
+
+            src = prepared[tag]
+            lcs = list(task_result.lcs or [])
             max_lc = _normalize_max_count(src.cfg.max_lc_per_gw)
             if max_lc is not None and len(lcs) > max_lc:
                 keep_idx = rng.choice(len(lcs), size=max_lc, replace=False)
@@ -900,17 +1050,17 @@ def create_dataset_with_neg_gw_bns_nsbh_fast(
             if len(lcs) == 0:
                 source_counts[tag]["drop_empty_lc"] += 1
                 continue
-
-            skymap_path = os.path.join(src.cfg.skymap_dir, f"{event_id}.fits")
-            try:
-                skymap = sample_moc_skymap(skymap_path).numpy()
-            except Exception:
+            if task_result.status == "missing_skymap" or task_result.skymap is None:
                 source_counts[tag]["drop_skymap"] += 1
                 continue
+            if task_result.status != "ok":
+                raise RuntimeError(
+                    f"Unexpected positive task status for {tag}_{event_id}: {task_result.status}"
+                )
 
+            skymap = np.asarray(task_result.skymap, dtype=np.float32)
             gw_id = f"{tag}_{event_id}"
             if gw_id in written_id_set:
-                # Keep strict uniqueness guarantee for ids.
                 continue
             written_id_set.add(gw_id)
 
@@ -957,20 +1107,44 @@ def create_dataset_with_neg_gw_bns_nsbh_fast(
         flush_opt_buffer()
 
         if dataset_mode == "test":
-            print("\nWriting negative GW events...")
-            for tag, event_id in tqdm(neg_events, desc="Negative GW", mininterval=0.5, miniters=100):
+            neg_event_records: List[Tuple[str, int, int]] = []
+            neg_tasks: List[EventProcessTask] = []
+            for tag, event_id in neg_events:
                 src = prepared[tag]
                 row_idx = src.event_to_row.get(event_id)
                 if row_idx is None:
                     continue
+                neg_event_records.append((tag, int(event_id), int(row_idx)))
+                neg_tasks.append(
+                    _build_event_process_task(
+                        src=src,
+                        event_id=int(event_id),
+                        include_lightcurves=False,
+                        fluxcal_to_psfflux_factor=float(fluxcal_to_psfflux_factor),
+                        psfflux_zp=float(psfflux_zp),
+                        lupt_b_njy=np.asarray(lupt_b_njy, dtype=np.float64),
+                    )
+                )
 
-                skymap_path = os.path.join(src.cfg.skymap_dir, f"{event_id}.fits")
-                try:
-                    skymap = sample_moc_skymap(skymap_path).numpy()
-                except Exception:
+            print("\nWriting negative GW events...")
+            for (tag, event_id, row_idx), task_result in zip(
+                neg_event_records,
+                _iter_event_task_results(neg_tasks, num_workers=int(num_workers), desc="Negative GW"),
+            ):
+                if task_result.tag != tag or int(task_result.event_id) != int(event_id):
+                    raise RuntimeError(
+                        f"Mismatched negative task result ordering: expected {tag}_{event_id}, got {task_result.tag}_{task_result.event_id}"
+                    )
+                if task_result.status == "missing_skymap" or task_result.skymap is None:
                     source_counts[tag]["drop_skymap"] += 1
                     continue
+                if task_result.status != "ok":
+                    raise RuntimeError(
+                        f"Unexpected negative task status for {tag}_{event_id}: {task_result.status}"
+                    )
 
+                src = prepared[tag]
+                skymap = np.asarray(task_result.skymap, dtype=np.float32)
                 gw_id = f"{tag}_{event_id}"
                 if gw_id in written_id_set:
                     continue
@@ -1032,6 +1206,7 @@ def create_dataset_with_neg_gw_bns_nsbh_fast(
         f.attrs["n_neg_type2_gw_nsbh"] = n_neg_type2_nsbh
         f.attrs["n_total_gw"] = int(gw_count)
         f.attrs["n_total_optical"] = int(total_optical_count)
+        f.attrs["preprocess_num_workers"] = int(num_workers)
 
         f.attrs["dropped_empty_lc_bns"] = int(source_counts["bns"]["drop_empty_lc"])
         f.attrs["dropped_empty_lc_nsbh"] = int(source_counts["nsbh"]["drop_empty_lc"])
@@ -1125,6 +1300,7 @@ def _build_arg_parser():
     p.add_argument("--output_h5_path", required=True)
     p.add_argument("--dataset_mode", choices=["train", "test"], default="train")
     p.add_argument("--buffer_limit", type=int, default=10000)
+    p.add_argument("--num_workers", type=int, default=1, help="Parallel worker count for per-event preprocessing.")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--fluxcal_zp", type=float, default=27.5)
     p.add_argument("--psfflux_zp", type=float, default=31.4)
@@ -1214,6 +1390,7 @@ if __name__ == "__main__":
         bns_cfg=bns_cfg,
         nsbh_cfg=nsbh_cfg,
         buffer_limit=args.buffer_limit,
+        num_workers=int(args.num_workers),
         seed=args.seed,
         fluxcal_zp=float(args.fluxcal_zp),
         psfflux_zp=float(args.psfflux_zp),

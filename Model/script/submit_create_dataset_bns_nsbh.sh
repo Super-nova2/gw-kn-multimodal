@@ -4,8 +4,8 @@
 #SBATCH --output=logs/data/%x_%j.out
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=1
-#SBATCH --mem=8G
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=140G
 #SBATCH --time=8:00:00
 
 set -euo pipefail
@@ -14,6 +14,7 @@ PROFILE="${PROFILE:-final_train}"          # test_aug | final_train
 DATASET_MODE="${DATASET_MODE:-train}"   # train | test
 
 BUFFER_LIMIT="${BUFFER_LIMIT:-10000}"
+NUM_WORKERS="${NUM_WORKERS:-8}"
 SEED="${SEED:-42}"
 
 BNS_MAX_LC_PER_GW="${BNS_MAX_LC_PER_GW:-1000}"
@@ -168,8 +169,9 @@ if [[ -z "${SLURM_JOB_ID:-}" ]]; then
     if [[ -n "${PARTITION:-}" ]]; then
         sbatch_opts+=(--partition="${PARTITION}")
     fi
-    if [[ -n "${CPUS_PER_TASK:-}" ]]; then
-        sbatch_opts+=(--cpus-per-task="${CPUS_PER_TASK}")
+    REQUESTED_CPUS_PER_TASK="${CPUS_PER_TASK:-${NUM_WORKERS:-}}"
+    if [[ -n "${REQUESTED_CPUS_PER_TASK:-}" ]]; then
+        sbatch_opts+=(--cpus-per-task="${REQUESTED_CPUS_PER_TASK}")
     fi
     if [[ -n "${MEM_PER_TASK:-}" ]]; then
         sbatch_opts+=(--mem="${MEM_PER_TASK}")
@@ -214,6 +216,18 @@ fi
 
 mkdir -p "$(dirname "$OUTPUT_H5_PATH")"
 
+if [[ -z "${NUM_WORKERS:-}" || "${NUM_WORKERS}" == "null" ]]; then
+    NUM_WORKERS="${SLURM_CPUS_PER_TASK:-1}"
+fi
+if ! [[ "$NUM_WORKERS" =~ ^[0-9]+$ ]] || [[ "$NUM_WORKERS" -lt 1 ]]; then
+    echo "NUM_WORKERS must be a positive integer, got: $NUM_WORKERS"
+    exit 1
+fi
+if [[ -n "${SLURM_CPUS_PER_TASK:-}" && "$NUM_WORKERS" -gt "$SLURM_CPUS_PER_TASK" ]]; then
+    echo "NUM_WORKERS=$NUM_WORKERS exceeds SLURM_CPUS_PER_TASK=$SLURM_CPUS_PER_TASK; capping to allocated CPUs."
+    NUM_WORKERS="$SLURM_CPUS_PER_TASK"
+fi
+
 py_script="/fred/oz016/bgao_kn/ML+GW+KN/Model/script/create_dataset_bns_nsbh.py"
 
 cmd=(
@@ -221,6 +235,7 @@ cmd=(
     --output_h5_path "$OUTPUT_H5_PATH"
     --dataset_mode "$DATASET_MODE"
     --buffer_limit "$BUFFER_LIMIT"
+    --num_workers "$NUM_WORKERS"
     --seed "$SEED"
     --fluxcal_zp "$FLUXCAL_ZP"
     --psfflux_zp "$PSFFLUX_ZP"
@@ -253,6 +268,7 @@ append_optional_arg --nsbh_max_neg_type2_gw "${NSBH_MAX_NEG_TYPE2_GW:-}"
 echo "PROFILE=$PROFILE DATASET_MODE=$DATASET_MODE"
 echo "Output H5: $OUTPUT_H5_PATH"
 echo "Luptitude params: FLUXCAL_ZP=$FLUXCAL_ZP PSFFLUX_ZP=$PSFFLUX_ZP LUPT_K=$LUPT_K LUPT_M5_MAG=$LUPT_M5_MAG"
+echo "Parallel preprocessing workers: $NUM_WORKERS"
 echo "Light-curve preprocessing: 2h same-band inverse-variance merge in psfFlux domain before luptitude conversion"
 "${cmd[@]}"
 validate_output_h5_schema "$OUTPUT_H5_PATH"
