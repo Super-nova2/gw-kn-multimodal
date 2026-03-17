@@ -42,9 +42,7 @@ from metrics import compute_classification_metrics
 from model import OpticalKNClassifier
 from optical_prefix import (
     apply_prefix_right_censoring_torch,
-    load_prefix_ndet_distribution,
     parse_prefix_det_support,
-    sample_prefix_target_k,
 )
 
 
@@ -439,46 +437,24 @@ class PrefixTrainPolicy:
     def __init__(self, args):
         self.enabled = bool(getattr(args, "prefix_train_enable", False))
         self.min_det = int(getattr(args, "prefix_min_det", 2))
-        self.sampling = str(getattr(args, "prefix_train_sampling", "real_stream_bucket_uniform_terminal_mixture")).strip().lower()
-        self.real_mix_weight = float(getattr(args, "prefix_real_mix_weight", 4.0))
+        self.sampling = str(getattr(args, "prefix_train_sampling", "bucket_uniform_terminal_mixture")).strip().lower()
         self.bucket_uniform_mix_weight = float(getattr(args, "prefix_bucket_uniform_mix_weight", 4.0))
         self.terminal_mix_weight = float(getattr(args, "prefix_terminal_mix_weight", 2.0))
-        self.hist_path = getattr(args, "prefix_real_hist_path", None)
         self.rng = np.random.default_rng(int(args.seed) + 137)
-        self.support = None
-        self.probs = None
-        self.uniform_probs = None
-        self.hist_meta: Dict[str, object] = {}
         self.info: Dict[str, object] = {
             "enabled": self.enabled,
             "min_det": self.min_det,
             "sampling": self.sampling,
-            "real_mix_weight": self.real_mix_weight,
             "bucket_uniform_mix_weight": self.bucket_uniform_mix_weight,
             "terminal_mix_weight": self.terminal_mix_weight,
         }
 
         if not self.enabled:
             return
-        if self.sampling != "real_stream_bucket_uniform_terminal_mixture":
+        if self.sampling != "bucket_uniform_terminal_mixture":
             raise ValueError(f"Unsupported prefix_train_sampling: {self.sampling}")
-        if self.hist_path is None:
-            raise ValueError("prefix_train_enable=true requires --prefix_real_hist_path.")
-        support, probs, hist_meta = load_prefix_ndet_distribution(self.hist_path, min_det=self.min_det)
-        self.support = support
-        self.probs = probs
-        self.uniform_probs = np.full_like(probs, fill_value=(1.0 / float(probs.shape[0])), dtype=np.float64)
-        self.hist_meta = hist_meta
-        self.info.update(
-            {
-                "hist_path": str(self.hist_path),
-                "hist_support": [int(v) for v in support.tolist()],
-                "hist_probabilities": [float(v) for v in probs.tolist()],
-            }
-        )
         mix_raw = np.asarray(
             [
-                self.real_mix_weight,
                 self.bucket_uniform_mix_weight,
                 self.terminal_mix_weight,
             ],
@@ -491,9 +467,8 @@ class PrefixTrainPolicy:
         mix_probs = mix_raw / mix_raw.sum()
         self.info.update(
             {
-                "mixture_branch_names": ["real_stream", "bucket_uniform", "terminal"],
+                "mixture_branch_names": ["bucket_uniform", "terminal"],
                 "mixture_branch_probabilities": [float(v) for v in mix_probs.tolist()],
-                "uniform_support": [int(v) for v in support.tolist()],
             }
         )
 
@@ -504,38 +479,23 @@ class PrefixTrainPolicy:
         sampled = np.empty_like(det_counts)
         mix_raw = np.asarray(
             [
-                self.real_mix_weight,
                 self.bucket_uniform_mix_weight,
                 self.terminal_mix_weight,
             ],
             dtype=np.float64,
         )
         mix_probs = mix_raw / mix_raw.sum()
-        branch_ids = self.rng.choice(3, size=det_counts.shape[0], replace=True, p=mix_probs)
+        branch_ids = self.rng.choice(2, size=det_counts.shape[0], replace=True, p=mix_probs)
 
-        real_mask = branch_ids == 0
-        if np.any(real_mask):
-            sampled[real_mask] = sample_prefix_target_k(
-                det_counts=det_counts[real_mask],
-                support=self.support,
-                probs=self.probs,
-                rng=self.rng,
-                min_det=self.min_det,
-                terminal_mix_prob=0.0,
-            )
-
-        uniform_mask = branch_ids == 1
+        uniform_mask = branch_ids == 0
         if np.any(uniform_mask):
-            sampled[uniform_mask] = sample_prefix_target_k(
-                det_counts=det_counts[uniform_mask],
-                support=self.support,
-                probs=self.uniform_probs,
-                rng=self.rng,
-                min_det=self.min_det,
-                terminal_mix_prob=0.0,
-            )
+            uniform_counts = det_counts[uniform_mask]
+            range_size = np.maximum(uniform_counts - int(self.min_det) + 1, 1)
+            draws = (self.rng.random(uniform_counts.shape[0]) * range_size.astype(np.float64)).astype(np.int64)
+            sampled_uniform = draws + int(self.min_det)
+            sampled[uniform_mask] = np.minimum(sampled_uniform, uniform_counts)
 
-        terminal_mask = branch_ids == 2
+        terminal_mask = branch_ids == 1
         if np.any(terminal_mask):
             sampled[terminal_mask] = det_counts[terminal_mask]
 
@@ -752,20 +712,18 @@ def sample_universal_target_k(
     slot_is_detection: torch.Tensor,
     opt_mask: torch.Tensor,
     min_det: int,
-    max_det: int = 12,
     terminal_prob: float = 0.2,
 ) -> torch.Tensor:
     valid_rows = opt_mask.sum(dim=-1) > 0
     det_counts = ((slot_is_detection > 0) & valid_rows).sum(dim=1).to(dtype=torch.long)
     if bool((det_counts < int(min_det)).any().item()):
         raise ValueError("Universal prefix sampling received samples below prefix_min_det.")
-    capped_upper = torch.minimum(det_counts, torch.full_like(det_counts, int(max_det)))
     rand_u = torch.rand(det_counts.shape[0], device=slot_is_detection.device)
     terminal_mask = rand_u < float(terminal_prob)
-    range_size = torch.clamp(capped_upper - int(min_det) + 1, min=1)
+    range_size = torch.clamp(det_counts - int(min_det) + 1, min=1)
     draw = (torch.rand(det_counts.shape[0], device=slot_is_detection.device) * range_size.to(torch.float32)).floor().to(torch.long)
     sampled = draw + int(min_det)
-    sampled = torch.minimum(sampled, capped_upper)
+    sampled = torch.minimum(sampled, det_counts)
     sampled = torch.where(terminal_mask, det_counts, sampled)
     sampled = torch.clamp(sampled, min=int(min_det))
     return sampled
@@ -809,7 +767,6 @@ def build_universal_view(
         slot_is_detection=slot_is_detection,
         opt_mask=opt_mask,
         min_det=int(args.prefix_min_det),
-        max_det=12,
         terminal_prob=float(args.prefix_terminal_mix_prob),
     )
     total_det = ((slot_is_detection > 0) & (opt_mask.sum(dim=-1) > 0)).sum(dim=1).to(dtype=torch.long)
@@ -1498,7 +1455,6 @@ def build_train_summary_payload(
                 getattr(args, "meta_filter_relax_t_span_if_below_rows", None)
             ),
         },
-        "real_stream_profile_path": getattr(args, "real_stream_profile_path", None),
         "task_mode": "prefix_right_censored"
         if (bool(args.prefix_train_enable) or bool(getattr(args, "universal_train_enable", False)))
         else "full_window",
@@ -1628,8 +1584,7 @@ def train(args):
         f"n_det=[{getattr(args, 'meta_filter_n_det_min', None)},{getattr(args, 'meta_filter_n_det_max', None)}] "
         f"| n_bands<={getattr(args, 'meta_filter_n_bands_max', None)} "
         f"| t_span<={getattr(args, 'meta_filter_t_span_max', None)} "
-        f"| relax_if_below_rows={json.dumps(relax_thresholds)} "
-        f"| real_stream_profile={getattr(args, 'real_stream_profile_path', None)}"
+        f"| relax_if_below_rows={json.dumps(relax_thresholds)}"
     )
 
     train_loader, val_loader, steps_per_epoch, val_steps = create_optical_binary_dataloaders(
@@ -2044,13 +1999,11 @@ def parse_args():
     parser.add_argument("--target_ndet_jitter", type=float, default=0.0)
     parser.add_argument("--prefix_train_enable", action="store_true")
     parser.add_argument("--prefix_min_det", type=int, default=2)
-    parser.add_argument("--prefix_train_sampling", type=str, default="real_stream_ndet_empirical")
+    parser.add_argument("--prefix_train_sampling", type=str, default="bucket_uniform_terminal_mixture")
     parser.add_argument("--prefix_terminal_mix_prob", type=float, default=0.2)
-    parser.add_argument("--prefix_real_mix_weight", type=float, default=4.0)
     parser.add_argument("--prefix_bucket_uniform_mix_weight", type=float, default=4.0)
     parser.add_argument("--prefix_terminal_mix_weight", type=float, default=2.0)
     parser.add_argument("--prefix_eval_det_support", type=str, default="2,3,4,5,6,8,10,12")
-    parser.add_argument("--prefix_real_hist_path", type=str, default=None)
     parser.add_argument("--universal_train_enable", action="store_true")
     parser.add_argument("--universal_stage1_epochs", type=int, default=2)
     parser.add_argument("--universal_stage2_epochs", type=int, default=6)
@@ -2076,7 +2029,6 @@ def parse_args():
     parser.add_argument("--meta_filter_n_bands_max", type=int, default=None)
     parser.add_argument("--meta_filter_t_span_max", type=float, default=None)
     parser.add_argument("--meta_filter_relax_t_span_if_below_rows", type=str, default=None)
-    parser.add_argument("--real_stream_profile_path", type=str, default=None)
 
     parser.add_argument("--shortcut_audit_enable", type=int, default=1)
     parser.add_argument("--shortcut_audit_val_samples", type=int, default=50000)
@@ -2141,21 +2093,17 @@ def parse_args():
         raise ValueError("--prefix_min_det must be >= 1.")
     if not (0.0 <= float(args.prefix_terminal_mix_prob) <= 1.0):
         raise ValueError("--prefix_terminal_mix_prob must be in [0, 1].")
-    if float(args.prefix_real_mix_weight) < 0:
-        raise ValueError("--prefix_real_mix_weight must be >= 0.")
     if float(args.prefix_bucket_uniform_mix_weight) < 0:
         raise ValueError("--prefix_bucket_uniform_mix_weight must be >= 0.")
     if float(args.prefix_terminal_mix_weight) < 0:
         raise ValueError("--prefix_terminal_mix_weight must be >= 0.")
     sampling_mode = str(args.prefix_train_sampling).strip().lower()
-    if sampling_mode != "real_stream_bucket_uniform_terminal_mixture":
+    if sampling_mode != "bucket_uniform_terminal_mixture":
         raise ValueError(
-            "--prefix_train_sampling must be 'real_stream_bucket_uniform_terminal_mixture'."
+            "--prefix_train_sampling must be 'bucket_uniform_terminal_mixture'."
         )
     if (
-        sampling_mode == "real_stream_bucket_uniform_terminal_mixture"
-        and float(args.prefix_real_mix_weight)
-        + float(args.prefix_bucket_uniform_mix_weight)
+        float(args.prefix_bucket_uniform_mix_weight)
         + float(args.prefix_terminal_mix_weight)
         <= 0
     ):
@@ -2201,14 +2149,6 @@ if __name__ == "__main__":
             raise ValueError("time_offset_enable=true requires --offset_dist_npz.")
         if not os.path.exists(args.offset_dist_npz):
             raise FileNotFoundError(f"Offset distribution file not found: {args.offset_dist_npz}")
-    if bool(args.prefix_train_enable):
-        if args.prefix_real_hist_path is None:
-            raise ValueError("prefix_train_enable=true requires --prefix_real_hist_path.")
-        if not os.path.exists(args.prefix_real_hist_path):
-            raise FileNotFoundError(f"Prefix real-stream histogram file not found: {args.prefix_real_hist_path}")
-    if args.real_stream_profile_path is not None and str(args.real_stream_profile_path).strip() != "":
-        if not os.path.exists(args.real_stream_profile_path):
-            raise FileNotFoundError(f"Real-stream profile file not found: {args.real_stream_profile_path}")
 
     os.makedirs(args.ckpt_path, exist_ok=True)
 

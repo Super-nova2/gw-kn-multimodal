@@ -128,7 +128,6 @@ def parse_args():
     p.add_argument("--meta_filter_n_bands_max", type=int, default=None)
     p.add_argument("--meta_filter_t_span_max", type=float, default=None)
     p.add_argument("--meta_filter_relax_t_span_if_below_rows", type=str, default=None)
-    p.add_argument("--real_stream_profile_path", type=str, default=None)
     p.add_argument("--ood_reject_enable", action="store_true", default=None)
     p.add_argument("--ood_uncertainty_metric", type=str, default=None)
     p.add_argument("--ood_uncertainty_threshold", type=float, default=None)
@@ -574,13 +573,6 @@ def build_eval_datasets(args, ckpt_args, config_dict):
         default=None,
     )
     meta_filter_relax_thresholds = parse_relax_t_span_thresholds(meta_filter_relax_cfg)
-    real_stream_profile_path = choose_value(
-        args.real_stream_profile_path,
-        config_dict,
-        ckpt_args,
-        "real_stream_profile_path",
-        default=None,
-    )
     meta_filter_n_det_min = None if meta_filter_n_det_min is None else int(meta_filter_n_det_min)
     meta_filter_n_det_max = None if meta_filter_n_det_max is None else int(meta_filter_n_det_max)
     meta_filter_n_bands_max = None if meta_filter_n_bands_max is None else int(meta_filter_n_bands_max)
@@ -768,7 +760,6 @@ def build_eval_datasets(args, ckpt_args, config_dict):
             "relaxed": bool(meta_filter_relaxed),
             "relax_t_span_if_below_rows": meta_filter_relax_thresholds,
         },
-        "real_stream_profile_path": real_stream_profile_path,
         "dataset_window_metadata": {
             "positive": _read_optical_h5_window_metadata(pos_data_path),
             "negative": _read_optical_h5_window_metadata(neg_data_path),
