@@ -10,8 +10,8 @@
 
 set -euo pipefail
 
-PROFILE="${PROFILE:-test_aug}"          # test_aug | final_train
-DATASET_MODE="${DATASET_MODE:-test}"   # train | test
+PROFILE="${PROFILE:-final_train}"          # test_aug | final_train
+DATASET_MODE="${DATASET_MODE:-train}"   # train | test
 
 BUFFER_LIMIT="${BUFFER_LIMIT:-10000}"
 SEED="${SEED:-42}"
@@ -253,5 +253,6 @@ append_optional_arg --nsbh_max_neg_type2_gw "${NSBH_MAX_NEG_TYPE2_GW:-}"
 echo "PROFILE=$PROFILE DATASET_MODE=$DATASET_MODE"
 echo "Output H5: $OUTPUT_H5_PATH"
 echo "Luptitude params: FLUXCAL_ZP=$FLUXCAL_ZP PSFFLUX_ZP=$PSFFLUX_ZP LUPT_K=$LUPT_K LUPT_M5_MAG=$LUPT_M5_MAG"
+echo "Light-curve preprocessing: 2h same-band inverse-variance merge in psfFlux domain before luptitude conversion"
 "${cmd[@]}"
 validate_output_h5_schema "$OUTPUT_H5_PATH"

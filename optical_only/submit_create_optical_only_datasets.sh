@@ -11,7 +11,7 @@
 
 set -euo pipefail
 
-DATASET_MODE="${DATASET_MODE:-test}"   # train | test
+DATASET_MODE="${DATASET_MODE:-train}"   # train | test
 BUILD_POSITIVE="${BUILD_POSITIVE:-true}" # true|false
 BUILD_NEGATIVE="${BUILD_NEGATIVE:-true}" # true|false
 ENFORCE_TIME_WINDOW="${ENFORCE_TIME_WINDOW:-true}"  # true|false
@@ -193,11 +193,14 @@ echo "Build negative: ${BUILD_NEGATIVE}"
 echo "Output POS: ${OUTPUT_POS_H5}"
 echo "Output NEG: ${OUTPUT_NEG_H5}"
 echo "Lock file: ${LOCK_FILE}"
-echo "Detection rule: PHOTFLAG!=0, fallback SNR>${SNR_THRESHOLD}"
+echo "Merge policy: 2h same-band inverse-variance merge in psfFlux domain"
+echo "Detection rule: merged psfFlux SNR>${SNR_THRESHOLD}"
+echo "min_nobs stage: post-merge"
 echo "Workers: ${NUM_WORKERS}"
 echo "Flux zeropoints: FLUXCAL_ZP=${FLUXCAL_ZP}, PSFFLUX_ZP=${PSFFLUX_ZP}"
 echo "Luptitude params: LUPT_K=${LUPT_K}, LUPT_M5_MAG=${LUPT_M5_MAG}"
-echo "zero_time_mjd_base policy: uniform sample in fixed window [6100,64500]"
+echo "POS zero_time policy: first detection + fixed_offset_days"
+echo "NEG zero_time policy: synthetic first detection sampled in [61000,64500]"
 echo "Time window: enforce=${ENFORCE_TIME_WINDOW}, range=[${TIME_WINDOW_START}, ${TIME_WINDOW_END}]"
 echo "Meta features: write_meta_features=${WRITE_META_FEATURES}"
 echo "Density matching: neg_match_pos_density=${NEG_MATCH_POS_DENSITY}"

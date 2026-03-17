@@ -38,6 +38,26 @@ except ModuleNotFoundError as exc:
         parse_prefix_det_support,
     )
 
+try:
+    from lightcurve_merge import (
+        MERGE_FLUX_DOMAIN,
+        MERGE_MODE,
+        MERGE_WINDOW_HOURS,
+        merge_photometry_psfflux,
+    )
+except ModuleNotFoundError as exc:
+    if exc.name != "lightcurve_merge":
+        raise
+    this_dir = str(Path(__file__).resolve().parent)
+    if this_dir not in sys.path:
+        sys.path.insert(0, this_dir)
+    from lightcurve_merge import (
+        MERGE_FLUX_DOMAIN,
+        MERGE_MODE,
+        MERGE_WINDOW_HOURS,
+        merge_photometry_psfflux,
+    )
+
 
 def _normalize_day_windows(windows) -> List[float]:
     if windows is None:
@@ -2044,22 +2064,32 @@ def split_positive_optical_indices(
     seed: int = 42
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Split positive optical indices by parent GW event to avoid train/val leakage.
+    Split positive optical indices by parent event index to avoid train/val leakage.
+    Supports both the new optical-only field name 'parent_event_idx' and the
+    legacy field name 'parent_gw_idx'.
     """
     if not (0 < val_split < 1):
         raise ValueError("val_split must be in (0, 1).")
 
     with h5py.File(pos_h5_path, "r") as f:
-        parent_gw_idx = f["events/optical_data/parent_gw_idx"][:]
+        if "events/optical_data/parent_event_idx" in f:
+            parent_event_idx = f["events/optical_data/parent_event_idx"][:]
+        elif "events/optical_data/parent_gw_idx" in f:
+            parent_event_idx = f["events/optical_data/parent_gw_idx"][:]
+        else:
+            raise KeyError(
+                "Positive optical H5 is missing both 'events/optical_data/parent_event_idx' "
+                "and legacy 'events/optical_data/parent_gw_idx'."
+            )
 
-    unique_gw = np.unique(parent_gw_idx)
+    unique_event = np.unique(parent_event_idx)
     rng = np.random.default_rng(seed)
-    rng.shuffle(unique_gw)
+    rng.shuffle(unique_event)
 
-    n_val_gw = max(1, int(len(unique_gw) * val_split))
-    val_gw = unique_gw[:n_val_gw]
+    n_val_event = max(1, int(len(unique_event) * val_split))
+    val_event = unique_event[:n_val_event]
 
-    is_val = np.isin(parent_gw_idx, val_gw)
+    is_val = np.isin(parent_event_idx, val_event)
     val_indices = np.where(is_val)[0].astype(np.int64)
     train_indices = np.where(~is_val)[0].astype(np.int64)
     return train_indices, val_indices
@@ -2597,6 +2627,68 @@ def _transform_fluxcal_to_luptitude(
     )
 
 
+def _transform_psfflux_to_luptitude(
+    mjd: np.ndarray,
+    psfflux: np.ndarray,
+    psffluxerr: np.ndarray,
+    flt: np.ndarray,
+    psfflux_zp: float,
+    lupt_b_njy: Sequence[float],
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    lupt_b_arr = np.asarray(lupt_b_njy, dtype=np.float64)
+    if lupt_b_arr.shape != (NUM_BANDS,):
+        raise ValueError(f"lupt_b_njy must contain {NUM_BANDS} values in order u,g,r,i,z,Y.")
+
+    band_idx_list: List[int] = []
+    for band_raw in flt:
+        idx = _band_index_from_raw(band_raw)
+        band_idx_list.append(-1 if idx is None else int(idx))
+    band_idx = np.asarray(band_idx_list, dtype=np.int64)
+
+    base_valid = (
+        np.isfinite(mjd)
+        & np.isfinite(psfflux)
+        & np.isfinite(psffluxerr)
+        & (psffluxerr > 0)
+        & (band_idx >= 0)
+    )
+    if not np.any(base_valid):
+        return (
+            np.asarray([], dtype=np.float64),
+            np.asarray([], dtype=np.float64),
+            np.asarray([], dtype=np.float64),
+            np.asarray([], dtype=flt.dtype),
+        )
+
+    idx_valid = np.nonzero(base_valid)[0]
+    band_valid = band_idx[idx_valid]
+    b_valid = lupt_b_arr[band_valid]
+
+    f_psf = np.asarray(psfflux[idx_valid], dtype=np.float64)
+    sigma_psf = np.asarray(np.abs(psffluxerr[idx_valid]), dtype=np.float64)
+    m_lupt = float(psfflux_zp) - ASINH_MAG_FACTOR * (
+        np.arcsinh(f_psf / (2.0 * b_valid)) + np.log(b_valid)
+    )
+    sigma_lupt = ASINH_MAG_FACTOR * sigma_psf / np.sqrt((f_psf * f_psf) + (2.0 * b_valid) ** 2)
+
+    finite_valid = np.isfinite(m_lupt) & np.isfinite(sigma_lupt) & (sigma_lupt > 0)
+    if not np.any(finite_valid):
+        return (
+            np.asarray([], dtype=np.float64),
+            np.asarray([], dtype=np.float64),
+            np.asarray([], dtype=np.float64),
+            np.asarray([], dtype=flt.dtype),
+        )
+
+    keep = idx_valid[finite_valid]
+    return (
+        np.asarray(mjd[keep], dtype=np.float64),
+        np.asarray(m_lupt[finite_valid], dtype=np.float64),
+        np.asarray(sigma_lupt[finite_valid], dtype=np.float64),
+        np.asarray(flt[keep]),
+    )
+
+
 def _first_detection_index(
     flux: np.ndarray,
     fluxerr: np.ndarray,
@@ -2688,7 +2780,7 @@ def parse_snana_fits(
                 start_idx = ptrobs_min[i] - 1
                 end_idx = ptrobs_max[i]
                 nobs = data_head['NOBS'][i]
-                if nobs < 5:
+                if (not use_luptitude) and nobs < 5:
                     # print(f"Warning: Light curve for event {event_id} realization {i} has less than 5 observations. Skipping.")
                     continue  # Skip light curves with less than 5 observations
 
@@ -2704,12 +2796,20 @@ def parse_snana_fits(
                 lc_flt = flt_all[start_idx : end_idx]
 
                 if use_luptitude:
-                    lc_mjd, lc_flux, lc_fluxerr, lc_flt = _transform_fluxcal_to_luptitude(
+                    merged_mjd, merged_psfflux, merged_psffluxerr, merged_flt = merge_photometry_psfflux(
                         mjd=np.asarray(lc_mjd, dtype=np.float64),
                         fluxcal=np.asarray(lc_flux, dtype=np.float64),
                         fluxcalerr=np.asarray(lc_fluxerr, dtype=np.float64),
                         flt=np.asarray(lc_flt),
                         fluxcal_to_psfflux_factor=float(fluxcal_to_psfflux_factor),
+                    )
+                    if len(merged_mjd) < 5:
+                        continue
+                    lc_mjd, lc_flux, lc_fluxerr, lc_flt = _transform_psfflux_to_luptitude(
+                        mjd=merged_mjd,
+                        psfflux=merged_psfflux,
+                        psffluxerr=merged_psffluxerr,
+                        flt=np.asarray(merged_flt),
                         psfflux_zp=float(psfflux_zp),
                         lupt_b_njy=lupt_b_njy,
                     )

@@ -152,7 +152,7 @@ def _stop_cuda_timer(timer) -> float:
 def apply_time_offsets(opt_t, opt_mask, delta_days, scale_divisor):
     valid = (opt_mask.sum(dim=-1) > 0).to(dtype=opt_t.dtype)
     shift = (delta_days.to(device=opt_t.device, dtype=opt_t.dtype) / float(scale_divisor)).unsqueeze(1)
-    return opt_t - shift * valid
+    return opt_t + shift * valid
 
 
 def apply_hard_negative_time_shift(opt_t, opt_mask, delta_days, scale_divisor):
