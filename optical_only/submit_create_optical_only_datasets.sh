@@ -11,6 +11,26 @@
 
 set -euo pipefail
 
+SCRIPT_SUBDIR="optical_only"
+SCRIPT_REL_PATH="optical_only/submit_create_optical_only_datasets.sh"
+REPO_NAME="gw-kn-multimodal"
+if [[ -n "${SLURM_JOB_ID:-}" && -n "${SLURM_SUBMIT_DIR:-}" ]]; then
+    if [[ "$(basename "${SLURM_SUBMIT_DIR}")" == "${REPO_NAME}" ]]; then
+        REPO_ROOT="${SLURM_SUBMIT_DIR}"
+    else
+        REPO_ROOT="${SLURM_SUBMIT_DIR}/${REPO_NAME}"
+    fi
+else
+    LOCAL_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    REPO_ROOT="${LOCAL_SCRIPT_DIR%/${SCRIPT_SUBDIR}}"
+fi
+SCRIPT_DIR="${REPO_ROOT}/${SCRIPT_SUBDIR}"
+SCRIPT_PATH="${REPO_ROOT}/${SCRIPT_REL_PATH}"
+if [[ ! -f "${SCRIPT_PATH}" ]]; then
+    echo "Resolved script path not found: ${SCRIPT_PATH}" >&2
+    exit 1
+fi
+
 DATASET_MODE="${DATASET_MODE:-train}"   # train | test
 BUILD_POSITIVE="${BUILD_POSITIVE:-true}" # true|false
 BUILD_NEGATIVE="${BUILD_NEGATIVE:-true}" # true|false
@@ -65,12 +85,14 @@ if [[ -z "${SLURM_JOB_ID:-}" ]]; then
         exit 1
     fi
 
-    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    script_path="${script_dir}/$(basename "${BASH_SOURCE[0]}")"
+    script_path="${SCRIPT_PATH}"
 
     mkdir -p /fred/oz016/bgao_kn/logs/data
     echo "Submitting: sbatch ${script_path}"
-    sbatch "${script_path}"
+    (
+        cd "${REPO_ROOT}"
+        sbatch "${script_path}"
+    )
     exit 0
 fi
 
@@ -78,7 +100,7 @@ fi
 # Hard-coded parameters
 # ------------------------------
 PYTHON_BIN="python"
-BUILD_SCRIPT="/fred/oz016/bgao_kn/ML+GW+KN/optical_only/create_optical_only_datasets.py"
+BUILD_SCRIPT="${SCRIPT_DIR}/create_optical_only_datasets.py"
 
 case "${DATASET_MODE}" in
     train)

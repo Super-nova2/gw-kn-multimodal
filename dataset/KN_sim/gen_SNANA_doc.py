@@ -15,6 +15,9 @@ from pathlib import Path
 import re
 import pandas as pd
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+DATASET_DIR = SCRIPT_DIR.parent
+
 # function to sample sky coordinates from MOC skymap
 def r_peak(distmu, distsigma):
     """
@@ -160,12 +163,12 @@ parser.add_argument("--GW_type", type=str, default="bns", help="bns/nsbh")
 parser.add_argument("--skymap_path", type=str, default="/fred/oz016/bgao_kn/data/bns_skymap/", help="Path to skymaps")
 parser.add_argument("--sim_name", type=str, default="LSST_KN_BNS", help="Name of simulation, eg:LSST_KN_BNS/NSBH")
 parser.add_argument("--sim_ids", nargs="+", type=int, required=True, help="a list of simulation_id, at most 10")
-parser.add_argument("--GW_params", type=str, default="/fred/oz016/bgao_kn/ML+GW+KN/dataset/O5_sim_bns/injections_final.csv", help="CSV file containing GW parameters")
+parser.add_argument("--GW_params", type=str, default=str(DATASET_DIR / "O5_sim_bns" / "injections_final.csv"), help="CSV file containing GW parameters")
 parser.add_argument("--Opsim", type=str, default="/fred/oz016/bgao_kn/data/rubin_sim/baseline_v5.1/baseline_v5.1.1_10yrs.db", help="Opsim database file")
 parser.add_argument("--within", action='store_true', help="sample within credible level")
 parser.add_argument("--level", type=float, default=0.9, help="credible level to sample sky position")
 parser.add_argument("--outdir", type=str, default="./data/", help="output directory for SIMLIB")
-parser.add_argument("--template_input", type=str, default="./ML+GW+KN/dataset/KN_sim/Template_doc/SIMGEN_KN_LSST_TEMPLATE.INPUT", help="template SIMGEN INPUT file")
+parser.add_argument("--template_input", type=str, default=str(SCRIPT_DIR / "Template_doc" / "SIMGEN_KN_LSST_TEMPLATE.INPUT"), help="template SIMGEN INPUT file")
 args = parser.parse_args()
 
 # check output directory

@@ -5,13 +5,33 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=200G
-#SBATCH --gres=gpu:1
+#SBATCH --mem=220G
 #SBATCH --time=24:00:00
+#SBATCH --gres=gpu:1
 #SBATCH --partition=gpu
 #SBATCH --tmp=200G
 
 set -euo pipefail
+
+SCRIPT_SUBDIR="Model"
+SCRIPT_REL_PATH="Model/ALBEF_train.sh"
+REPO_NAME="gw-kn-multimodal"
+if [[ -n "${SLURM_JOB_ID:-}" && -n "${SLURM_SUBMIT_DIR:-}" ]]; then
+    if [[ "$(basename "${SLURM_SUBMIT_DIR}")" == "${REPO_NAME}" ]]; then
+        REPO_ROOT="${SLURM_SUBMIT_DIR}"
+    else
+        REPO_ROOT="${SLURM_SUBMIT_DIR}/${REPO_NAME}"
+    fi
+else
+    LOCAL_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    REPO_ROOT="${LOCAL_SCRIPT_DIR%/${SCRIPT_SUBDIR}}"
+fi
+SCRIPT_DIR="${REPO_ROOT}/${SCRIPT_SUBDIR}"
+SCRIPT_PATH="${REPO_ROOT}/${SCRIPT_REL_PATH}"
+if [[ ! -f "${SCRIPT_PATH}" ]]; then
+    echo "Resolved script path not found: ${SCRIPT_PATH}" >&2
+    exit 1
+fi
 
 args_file=${1:-}
 if [[ -z "${args_file}" || ! -f "${args_file}" ]]; then
@@ -28,8 +48,7 @@ if [[ -z "${SLURM_JOB_ID:-}" ]]; then
         exit 1
     fi
 
-    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    script_path="${script_dir}/$(basename "${BASH_SOURCE[0]}")"
+    script_path="${SCRIPT_PATH}"
 
     sbatch_opts=()
     if [[ -n "${JOB_NAME:-}" ]]; then
@@ -64,7 +83,10 @@ if [[ -z "${SLURM_JOB_ID:-}" ]]; then
     fi
 
     echo "Submitting job with: sbatch ${sbatch_opts[*]} ${script_path} ${args_file}"
-    sbatch "${sbatch_opts[@]}" "${script_path}" "${args_file}"
+    (
+        cd "${REPO_ROOT}"
+        sbatch "${sbatch_opts[@]}" "${script_path}" "${args_file}"
+    )
     exit 0
 fi
 
@@ -182,7 +204,7 @@ NEG_OFFSET_SEED=$(jq -r '.neg_offset_seed // empty' "$args_file")
 NEG_OFFSET_BANK_SIZE=$(jq -r '.neg_offset_bank_size // empty' "$args_file")
 TEST_DATA_PATH=$(jq -r '.test_data_path // empty' "$args_file")
 TEST_STEPS=$(jq -r '.test_steps // empty' "$args_file")
-ENABLE_OOD_MONITORING=$(jq -r '\.enable_ood_monitoring // false' "$args_file")
+ENABLE_OOD_MONITORING=$(jq -r '.enable_ood_monitoring // false' "$args_file")
 mkdir -p "$CKPT_PATH"
 
 echo "========================================"
@@ -243,7 +265,7 @@ if [ "$STAGE_TO_JOBFS" = "true" ]; then
 fi
 
 cmd=(
-    python -u /fred/oz016/bgao_kn/ML+GW+KN/Model/ALBEF_train.py
+    python -u "${SCRIPT_DIR}/ALBEF_train.py"
     --data_path "$DATA_PATH"
     --ckpt_path "$CKPT_PATH"
     --epochs "$EPOCHS"

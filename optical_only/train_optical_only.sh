@@ -13,7 +13,26 @@
 
 set -euo pipefail
 
-DEFAULT_ARGS_FILE="/fred/oz016/bgao_kn/ML+GW+KN/optical_only/args/optical_only_kn_v6.json"
+SCRIPT_SUBDIR="optical_only"
+SCRIPT_REL_PATH="optical_only/train_optical_only.sh"
+REPO_NAME="gw-kn-multimodal"
+if [[ -n "${SLURM_JOB_ID:-}" && -n "${SLURM_SUBMIT_DIR:-}" ]]; then
+    if [[ "$(basename "${SLURM_SUBMIT_DIR}")" == "${REPO_NAME}" ]]; then
+        REPO_ROOT="${SLURM_SUBMIT_DIR}"
+    else
+        REPO_ROOT="${SLURM_SUBMIT_DIR}/${REPO_NAME}"
+    fi
+else
+    LOCAL_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    REPO_ROOT="${LOCAL_SCRIPT_DIR%/${SCRIPT_SUBDIR}}"
+fi
+SCRIPT_DIR="${REPO_ROOT}/${SCRIPT_SUBDIR}"
+SCRIPT_PATH="${REPO_ROOT}/${SCRIPT_REL_PATH}"
+if [[ ! -f "${SCRIPT_PATH}" ]]; then
+    echo "Resolved script path not found: ${SCRIPT_PATH}" >&2
+    exit 1
+fi
+DEFAULT_ARGS_FILE="${SCRIPT_DIR}/args/optical_only_kn_v6.json"
 args_file=${1:-${OPTICAL_ONLY_ARGS_FILE:-${DEFAULT_ARGS_FILE}}}
 if [[ ! -f "${args_file}" ]]; then
     echo "Args file not found: ${args_file}"
@@ -40,8 +59,7 @@ if [[ -z "${SLURM_JOB_ID:-}" ]]; then
         exit 1
     fi
 
-    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    script_path="${script_dir}/$(basename "${BASH_SOURCE[0]}")"
+    script_path="${SCRIPT_PATH}"
 
     sbatch_opts=()
     if [[ -n "${JOB_NAME:-}" ]]; then
@@ -76,7 +94,10 @@ if [[ -z "${SLURM_JOB_ID:-}" ]]; then
     fi
 
     echo "Submitting job with: sbatch ${sbatch_opts[*]} ${script_path} ${args_file}"
-    sbatch "${sbatch_opts[@]}" "${script_path}" "${args_file}"
+    (
+        cd "${REPO_ROOT}"
+        sbatch "${sbatch_opts[@]}" "${script_path}" "${args_file}"
+    )
     exit 0
 fi
 
@@ -300,7 +321,7 @@ if is_truthy "$STAGE_TO_JOBFS"; then
 fi
 
 cmd=(
-    python -u /fred/oz016/bgao_kn/ML+GW+KN/optical_only/train_optical_only.py
+    python -u "${SCRIPT_DIR}/train_optical_only.py"
     --config "$args_file"
     --pos_data_path "$POS_DATA_PATH"
     --neg_data_path "$NEG_DATA_PATH"
@@ -559,7 +580,7 @@ fi
 
 BEST_CKPT="${CKPT_PATH}/optical_only/${RUN_NAME}/optical_only_best.pth"
 EVAL_OUTPUT_DIR="${CKPT_PATH}/optical_only/eval_results/${RUN_NAME}"
-EVAL_PY="/fred/oz016/bgao_kn/ML+GW+KN/optical_only/test_evaluate_optical_only.py"
+EVAL_PY="${SCRIPT_DIR}/test_evaluate_optical_only.py"
 
 if [[ ! -f "$BEST_CKPT" ]]; then
     echo "Best checkpoint not found after training: $BEST_CKPT"

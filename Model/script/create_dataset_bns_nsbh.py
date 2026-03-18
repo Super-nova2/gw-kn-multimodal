@@ -3,6 +3,7 @@ import importlib.util
 import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
 import h5py
@@ -12,8 +13,8 @@ from astropy.io import fits
 from astropy.time import Time
 from tqdm import tqdm
 
-# Load required functions/constants from data_loader.py (not a standard package due to '+' in path)
-_DATA_LOADER_PATH = "/fred/oz016/bgao_kn/ML+GW+KN/Model/data_loader.py"
+# Load required functions/constants from data_loader.py.
+_DATA_LOADER_PATH = Path(__file__).resolve().parents[1] / "data_loader.py"
 _spec = importlib.util.spec_from_file_location("data_loader", _DATA_LOADER_PATH)
 _data_loader = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_data_loader)  # type: ignore
@@ -299,7 +300,8 @@ def _iter_event_task_results(
             yield result
         return
 
-    chunksize = max(1, len(tasks) // (effective_workers * 8))
+    # chunksize = max(1, len(tasks) // (effective_workers * 8))
+    chunksize = 10
     executor_kwargs = {"max_workers": effective_workers}
     if os.name != "nt":
         try:

@@ -13,6 +13,27 @@
 
 set -euo pipefail
 
+SCRIPT_SUBDIR="Model/script"
+SCRIPT_REL_PATH="Model/script/submit_test_evaluate.sh"
+REPO_NAME="gw-kn-multimodal"
+if [[ -n "${SLURM_JOB_ID:-}" && -n "${SLURM_SUBMIT_DIR:-}" ]]; then
+    if [[ "$(basename "${SLURM_SUBMIT_DIR}")" == "${REPO_NAME}" ]]; then
+        REPO_ROOT="${SLURM_SUBMIT_DIR}"
+    else
+        REPO_ROOT="${SLURM_SUBMIT_DIR}/${REPO_NAME}"
+    fi
+else
+    LOCAL_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    REPO_ROOT="${LOCAL_SCRIPT_DIR%/${SCRIPT_SUBDIR}}"
+fi
+SCRIPT_DIR="${REPO_ROOT}/${SCRIPT_SUBDIR}"
+MODEL_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+SCRIPT_PATH="${REPO_ROOT}/${SCRIPT_REL_PATH}"
+if [[ ! -f "${SCRIPT_PATH}" ]]; then
+    echo "Resolved script path not found: ${SCRIPT_PATH}" >&2
+    exit 1
+fi
+
 extract_version_tag() {
     local path_text="$1"
     if [[ "$path_text" =~ _v([0-9]+) ]]; then
@@ -60,8 +81,7 @@ if [[ -z "${SLURM_JOB_ID:-}" ]]; then
         exit 1
     fi
 
-    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    script_path="${script_dir}/$(basename "${BASH_SOURCE[0]}")"
+    script_path="${SCRIPT_PATH}"
 
     mkdir -p logs/eval
 
@@ -98,7 +118,10 @@ if [[ -z "${SLURM_JOB_ID:-}" ]]; then
     fi
 
     echo "Submitting job with: sbatch ${sbatch_opts[*]} ${script_path} ${args_file}"
-    sbatch "${sbatch_opts[@]}" "${script_path}" "${args_file}"
+    (
+        cd "${REPO_ROOT}"
+        sbatch "${sbatch_opts[@]}" "${script_path}" "${args_file}"
+    )
     exit 0
 fi
 
@@ -221,7 +244,7 @@ if [[ "$STAGE_TO_JOBFS" == "true" ]]; then
 fi
 
 cmd=(
-    python -u /fred/oz016/bgao_kn/ML+GW+KN/Model/test_evaluate.py
+    python -u "${MODEL_DIR}/test_evaluate.py"
     --checkpoint "$CHECKPOINT"
     --test_data_path "$TEST_DATA_PATH"
     --output_dir "$OUTPUT_DIR"

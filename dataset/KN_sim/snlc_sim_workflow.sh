@@ -10,20 +10,44 @@
 # ml gsl/2.7 cfitsio/4.2.0
 set -euo pipefail
 
-args_file=$1
+SCRIPT_SUBDIR="dataset/KN_sim"
+SCRIPT_REL_PATH="dataset/KN_sim/snlc_sim_workflow.sh"
+REPO_NAME="gw-kn-multimodal"
+if [[ -n "${SLURM_JOB_ID:-}" && -n "${SLURM_SUBMIT_DIR:-}" ]]; then
+    if [[ "$(basename "${SLURM_SUBMIT_DIR}")" == "${REPO_NAME}" ]]; then
+        REPO_ROOT="${SLURM_SUBMIT_DIR}"
+    else
+        REPO_ROOT="${SLURM_SUBMIT_DIR}/${REPO_NAME}"
+    fi
+else
+    LOCAL_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    REPO_ROOT="${LOCAL_SCRIPT_DIR%/${SCRIPT_SUBDIR}}"
+fi
+SCRIPT_DIR="${REPO_ROOT}/${SCRIPT_SUBDIR}"
+SCRIPT_PATH="${REPO_ROOT}/${SCRIPT_REL_PATH}"
+if [[ ! -f "${SCRIPT_PATH}" ]]; then
+    echo "Resolved script path not found: ${SCRIPT_PATH}" >&2
+    exit 1
+fi
 
-sim_name=$(jq -r '.SIM_NAME' $args_file)
-gw_type=$(jq -r '.GW_type' $args_file)
-skymap_path=$(jq -r '.skymap_path' $args_file)
-opsim_db=$(jq -r '.OpsimDB' $args_file)
-nside=$(jq -r '.Nside' $args_file)
-data_dir=$(jq -r '.DATA_DIR' $args_file)
-input_dir=$(jq -r '.INPUT_DIR' $args_file)
-simlib_dir=$(jq -r '.SIMLIB_DIR' $args_file)
-inj_file=$(jq -r '.injections_file' $args_file)
-out_dir=$(jq -r '.OUTPUT_DIR' $args_file)
-log_dir=$(jq -r '.LOG_DIR' $args_file)
-tem_input=$(jq -r '.TEMPLATE_INPUT' $args_file)
+args_file=${1:-}
+if [[ -z "${args_file}" || ! -f "${args_file}" ]]; then
+    echo "Usage: $0 <args.json>" >&2
+    exit 1
+fi
+
+sim_name=$(jq -r '.SIM_NAME' "${args_file}")
+gw_type=$(jq -r '.GW_type' "${args_file}")
+skymap_path=$(jq -r '.skymap_path' "${args_file}")
+opsim_db=$(jq -r '.OpsimDB' "${args_file}")
+nside=$(jq -r '.Nside' "${args_file}")
+data_dir=$(jq -r '.DATA_DIR' "${args_file}")
+input_dir=$(jq -r '.INPUT_DIR' "${args_file}")
+simlib_dir=$(jq -r '.SIMLIB_DIR' "${args_file}")
+inj_file=$(jq -r '.injections_file' "${args_file}")
+out_dir=$(jq -r '.OUTPUT_DIR' "${args_file}")
+log_dir=$(jq -r '.LOG_DIR' "${args_file}")
+tem_input=$(jq -r '.TEMPLATE_INPUT' "${args_file}")
 
 # derive SIMLIB filename prefix from the OpSim database filename stem
 # (opsimsummaryv2 names SIMLIB as <db_stem><file_suffix>.SIMLIB)
@@ -61,13 +85,13 @@ echo "Task $task_id handles indices [$start, $end] / N=$N"
 echo "Processing simulation ids: ${group_ids[@]}"
 
 # gen_snana_doc=$(sbatch -J ${sim_name}_gen_snana_doc_%a --array=0-$(($NTASK - 1)) --cpus-per-task=1 --mem=8G \
-#     --output=${log_dir}%x_%A_%a.out --parsable /fred/oz016/bgao_kn/ML+GW+KN/dataset/KN_sim/gen_snana_doc.sh ${args_file} ${SIM_IDS})
+#     --output=${log_dir}%x_%A_%a.out --parsable ${SCRIPT_DIR}/gen_snana_doc.sh ${args_file} ${SIM_IDS})
 
 ###################################################################
 #-------Generating SIMLIB and INPUT files for snlc_sim.exe--------#
 ###################################################################
 
-python /fred/oz016/bgao_kn/ML+GW+KN/dataset/KN_sim/gen_SNANA_doc.py --sim_name ${sim_name} \
+python "${SCRIPT_DIR}/gen_SNANA_doc.py" --sim_name ${sim_name} \
     --GW_type ${gw_type} \
     --skymap_path ${skymap_path} \
     --sim_ids "${group_ids[@]}" \

@@ -2440,7 +2440,7 @@ def train(args):
 if __name__ == "__main__":
     """
     Example usage:
-    python ML+GW+KN/Model/ALBEF_train.py --data_path data/LSST_KN_BNS/combined_dataset.h5 \
+    python Model/ALBEF_train.py --data_path data/LSST_KN_BNS/combined_dataset.h5 \
         --epochs 2 --batch_size 32 --steps_per_epoch 10 --ckpt_path data/model/checkpoints
     """
     parser = argparse.ArgumentParser()

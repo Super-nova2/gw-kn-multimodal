@@ -3,9 +3,7 @@ from pathlib import Path
 from graphviz import Digraph
 
 
-DEFAULT_V5_BASE = (
-    "/fred/oz016/bgao_kn/ML+GW+KN/Model/framework/gw_optical_architecture_v5_clean"
-)
+DEFAULT_V5_BASE = str(Path(__file__).resolve().with_name("gw_optical_architecture_v5_clean"))
 
 
 def _normalize_output_base(filename):
