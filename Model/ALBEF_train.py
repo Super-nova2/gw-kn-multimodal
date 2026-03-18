@@ -24,6 +24,22 @@ from typing import Dict, List, Optional, Tuple
 warnings.filterwarnings("ignore", "Wswiglal-redir-stdio")
 
 
+def _close_loader_dataset_handles(loader, *, cache_in_memory: bool, label: str) -> None:
+    if loader is None or cache_in_memory:
+        return
+    dataset = getattr(loader, "dataset", None)
+    close_fn = getattr(dataset, "close", None)
+    if not callable(close_fn):
+        return
+    try:
+        closed = int(close_fn())
+    except Exception as exc:
+        print(f"[WARN] {label}: failed to close lazy dataset handles: {exc}")
+        return
+    if closed > 0:
+        print(f"{label}: closed {closed} lazy HDF5 handle(s) after evaluation.")
+
+
 DEFAULT_MTAN_LUPT_M5 = np.asarray([23.9, 25.0, 24.7, 24.0, 23.3, 22.1], dtype=np.float64)
 
 
@@ -1513,6 +1529,8 @@ def train(args):
             extra_negative_timeaware_windows_days=args._hardneg_window_days,
             extra_negative_timeaware_min_candidates=args.hardneg_min_candidates,
             extra_negative_timeaware_seed=extra_neg_timeaware_seed,
+            loader_usage="train",
+            loader_label="Train DataLoader",
         )
 
     mtan_cfg = resolve_mtan_runtime_config(args)
@@ -1665,6 +1683,8 @@ def train(args):
                 extra_negative_timeaware_windows_days=args._hardneg_window_days,
                 extra_negative_timeaware_min_candidates=args.hardneg_min_candidates,
                 extra_negative_timeaware_seed=extra_neg_timeaware_seed,
+                loader_usage="ood",
+                loader_label="OOD DataLoader",
             )
             ood_event_time_mjd_table = load_gw_event_time_mjd_table(args.test_data_path, device)
             if ood_event_time_mjd_table is None:
@@ -2240,6 +2260,11 @@ def train(args):
                 gw_event_time_mjd_table=gw_event_time_mjd_table,
                 neg_offset_policy=neg_offset_policy,
             )
+            _close_loader_dataset_handles(
+                val_loader,
+                cache_in_memory=bool(args.cache_in_memory),
+                label="Validation DataLoader",
+            )
             if val_metrics is not None:
                 print(
                     f"Val Avg Total: {val_metrics['total']:.4f} | "
@@ -2377,6 +2402,11 @@ def train(args):
                 gw_event_time_mjd_table=ood_event_time_mjd_table,
                 neg_offset_policy=neg_offset_policy,
             )
+            _close_loader_dataset_handles(
+                ood_val_loader,
+                cache_in_memory=False,
+                label="OOD DataLoader",
+            )
             if ood_metrics is not None:
                 writer.add_scalar('OOD/Epoch_Total_Loss', ood_metrics['total'], epoch)
                 writer.add_scalar('OOD/Epoch_ITC_Loss', ood_metrics['itc'], epoch)
@@ -2424,6 +2454,22 @@ def train(args):
         
         if stop_early:
             break
+
+    _close_loader_dataset_handles(
+        train_loader,
+        cache_in_memory=bool(args.cache_in_memory),
+        label="Train DataLoader",
+    )
+    _close_loader_dataset_handles(
+        val_loader,
+        cache_in_memory=bool(args.cache_in_memory),
+        label="Validation DataLoader",
+    )
+    _close_loader_dataset_handles(
+        ood_val_loader,
+        cache_in_memory=False,
+        label="OOD DataLoader",
+    )
 
     writer.close()
 

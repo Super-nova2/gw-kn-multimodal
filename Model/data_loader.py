@@ -84,6 +84,60 @@ def _geometric_level_probs(n_levels: int) -> np.ndarray:
     return weights / s
 
 
+def _resolve_noncache_loader_policy(
+    *,
+    cache_in_memory: bool,
+    usage: str,
+    num_workers: int,
+    pin_memory: bool,
+    persistent_workers: bool,
+    prefetch_factor: int,
+) -> Dict[str, object]:
+    resolved = {
+        "num_workers": int(num_workers),
+        "pin_memory": bool(pin_memory),
+        "persistent_workers": bool(persistent_workers),
+        "prefetch_factor": int(prefetch_factor),
+        "ram_reclaim_active": False,
+    }
+    if cache_in_memory:
+        return resolved
+
+    resolved["ram_reclaim_active"] = True
+    resolved["persistent_workers"] = False
+    if str(usage) in {"val", "ood"}:
+        resolved["pin_memory"] = False
+    elif resolved["num_workers"] <= 0:
+        resolved["pin_memory"] = False
+    return resolved
+
+
+def _log_loader_runtime_policy(
+    *,
+    label: str,
+    cache_in_memory: bool,
+    usage: str,
+    policy: Dict[str, object],
+) -> None:
+    if cache_in_memory:
+        print(
+            f"{label}: cache_in_memory=True, preserving existing loader policy "
+            f"(usage={usage}, num_workers={int(policy['num_workers'])}, "
+            f"pin_memory={int(bool(policy['pin_memory']))}, "
+            f"persistent_workers={int(bool(policy['persistent_workers']))}, "
+            f"prefetch_factor={int(policy['prefetch_factor'])})."
+        )
+        return
+
+    print(
+        f"{label}: cache_in_memory=False, RAM-reclaim loader policy active "
+        f"(usage={usage}, num_workers={int(policy['num_workers'])}, "
+        f"pin_memory={int(bool(policy['pin_memory']))}, "
+        f"persistent_workers={int(bool(policy['persistent_workers']))}, "
+        f"prefetch_factor={int(policy['prefetch_factor'])})."
+    )
+
+
 def build_gw_to_lc_mapping(h5_path: str):
     """
     Scans the HDF5 file to build a mapping from GW Event Index to Light Curve Indices.
@@ -309,6 +363,24 @@ class RelationalHDF5Dataset(Dataset):
                 f"min_candidates={self.extra_negative_timeaware_min_candidates}, "
                 f"valid_neg={int(self.neg_cls_time_sorted.shape[0])}/{int(self.neg_length)}"
             )
+
+    def close(self) -> int:
+        closed = 0
+        for attr_name in ("h5_file", "neg_file"):
+            handle = getattr(self, attr_name, None)
+            if handle is None:
+                continue
+            try:
+                handle.close()
+                closed += 1
+            except Exception:
+                pass
+            finally:
+                setattr(self, attr_name, None)
+        return closed
+
+    def __del__(self):
+        self.close()
 
     def _sample_uniform_neg_idx(self) -> int:
         return int(np.random.randint(0, int(self.neg_length)))
@@ -867,7 +939,7 @@ def split_gw_map(gw_to_lc_map: dict, val_split: float, seed: int):
     val_map = {gw_id: gw_to_lc_map[gw_id] for gw_id in val_ids}
     return train_map, val_map
 
-def     _build_dataloader(
+def _build_dataloader(
     dataset: Dataset,
     sampler: Sampler,
     num_workers: int,
@@ -891,6 +963,43 @@ def     _build_dataloader(
         pin_memory=pin_memory
     )
 
+
+def _build_configured_dataloader(
+    dataset: Dataset,
+    sampler: Sampler,
+    num_workers: int,
+    pin_memory: bool,
+    persistent_workers: bool,
+    prefetch_factor: int,
+    *,
+    cache_in_memory: bool,
+    usage: str,
+    label: str,
+):
+    policy = _resolve_noncache_loader_policy(
+        cache_in_memory=cache_in_memory,
+        usage=usage,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
+        prefetch_factor=prefetch_factor,
+    )
+    _log_loader_runtime_policy(
+        label=label,
+        cache_in_memory=cache_in_memory,
+        usage=usage,
+        policy=policy,
+    )
+    return _build_dataloader(
+        dataset,
+        sampler,
+        int(policy["num_workers"]),
+        bool(policy["pin_memory"]),
+        bool(policy["persistent_workers"]),
+        int(policy["prefetch_factor"]),
+    )
+
+
 def create_training_dataloader(
     h5_path: str, 
     batch_size: int = 32, 
@@ -908,6 +1017,8 @@ def create_training_dataloader(
     extra_negative_timeaware_windows_days=None,
     extra_negative_timeaware_min_candidates: int = 1,
     extra_negative_timeaware_seed: int = 42,
+    loader_usage: str = "train",
+    loader_label: str = "Train DataLoader",
 ):
     """
     Factory function to initialize the Dataset, Sampler, and DataLoader.
@@ -942,13 +1053,16 @@ def create_training_dataloader(
     # 4. Initialize DataLoader
     # IMPORTANT: batch_sampler is used, so batch_size/shuffle/sampler/drop_last 
     # arguments in DataLoader constructor must not be provided.
-    return _build_dataloader(
+    return _build_configured_dataloader(
         dataset,
         sampler,
         num_workers,
         pin_memory,
         persistent_workers,
-        prefetch_factor
+        prefetch_factor,
+        cache_in_memory=cache_in_memory,
+        usage=loader_usage,
+        label=loader_label,
     )
 
 def create_train_val_dataloaders(
@@ -1045,21 +1159,27 @@ def create_train_val_dataloaders(
         steps_per_epoch=val_steps_per_epoch
     )
 
-    train_loader = _build_dataloader(
+    train_loader = _build_configured_dataloader(
         train_dataset,
         train_sampler,
         num_workers,
         pin_memory,
         persistent_workers,
-        prefetch_factor
+        prefetch_factor,
+        cache_in_memory=cache_in_memory,
+        usage="train",
+        label="Train DataLoader",
     )
-    val_loader = _build_dataloader(
+    val_loader = _build_configured_dataloader(
         val_dataset,
         val_sampler,
         num_workers,
         pin_memory,
         persistent_workers,
-        prefetch_factor
+        prefetch_factor,
+        cache_in_memory=cache_in_memory,
+        usage="val",
+        label="Validation DataLoader",
     )
 
     return train_loader, val_loader, steps_per_epoch, len(val_sampler)
@@ -1169,21 +1289,27 @@ def create_supcon_dataloaders(
         min_lc_per_gw=min_lc_per_gw
     )
 
-    train_loader = _build_dataloader(
+    train_loader = _build_configured_dataloader(
         train_dataset,
         train_sampler,
         num_workers,
         pin_memory,
         persistent_workers,
-        prefetch_factor
+        prefetch_factor,
+        cache_in_memory=cache_in_memory,
+        usage="train",
+        label="Train DataLoader",
     )
-    val_loader = _build_dataloader(
+    val_loader = _build_configured_dataloader(
         val_dataset,
         val_sampler,
         num_workers,
         pin_memory,
         persistent_workers,
-        prefetch_factor
+        prefetch_factor,
+        cache_in_memory=cache_in_memory,
+        usage="val",
+        label="Validation DataLoader",
     )
 
     return train_loader, val_loader, steps_per_epoch, len(val_sampler)
@@ -1340,21 +1466,27 @@ def create_mixed_gw_dataloaders(
         samples_per_gw=samples_per_gw
     )
 
-    train_loader = _build_dataloader(
+    train_loader = _build_configured_dataloader(
         train_dataset,
         train_sampler,
         num_workers,
         pin_memory,
         persistent_workers,
-        prefetch_factor
+        prefetch_factor,
+        cache_in_memory=cache_in_memory,
+        usage="train",
+        label="Train DataLoader",
     )
-    val_loader = _build_dataloader(
+    val_loader = _build_configured_dataloader(
         val_dataset,
         val_sampler,
         num_workers,
         pin_memory,
         persistent_workers,
-        prefetch_factor
+        prefetch_factor,
+        cache_in_memory=cache_in_memory,
+        usage="val",
+        label="Validation DataLoader",
     )
 
     return train_loader, val_loader, steps_per_epoch, len(val_sampler)
