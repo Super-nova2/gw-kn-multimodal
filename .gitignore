@@ -18,6 +18,7 @@ eval_results/
 *.dot
 PRD/
 *.h5
+./claude
 
 outputs/
 
