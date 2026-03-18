@@ -13,6 +13,26 @@
 
 set -euo pipefail
 
+SCRIPT_SUBDIR="Model"
+SCRIPT_REL_PATH="Model/hpo_train.sh"
+REPO_NAME="gw-kn-multimodal"
+if [[ -n "${SLURM_JOB_ID:-}" && -n "${SLURM_SUBMIT_DIR:-}" ]]; then
+    if [[ "$(basename "${SLURM_SUBMIT_DIR}")" == "${REPO_NAME}" ]]; then
+        REPO_ROOT="${SLURM_SUBMIT_DIR}"
+    else
+        REPO_ROOT="${SLURM_SUBMIT_DIR}/${REPO_NAME}"
+    fi
+else
+    LOCAL_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    REPO_ROOT="${LOCAL_SCRIPT_DIR%/${SCRIPT_SUBDIR}}"
+fi
+SCRIPT_DIR="${REPO_ROOT}/${SCRIPT_SUBDIR}"
+SCRIPT_PATH="${REPO_ROOT}/${SCRIPT_REL_PATH}"
+if [[ ! -f "${SCRIPT_PATH}" ]]; then
+    echo "Resolved script path not found: ${SCRIPT_PATH}" >&2
+    exit 1
+fi
+
 args_file=${1:-}
 if [[ -z "${args_file}" || ! -f "${args_file}" ]]; then
     echo "Usage: $0 <hpo_config.json>"
@@ -29,8 +49,7 @@ if [[ -z "${SLURM_JOB_ID:-}" ]]; then
         exit 1
     fi
 
-    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    script_path="${script_dir}/$(basename "${BASH_SOURCE[0]}")"
+    script_path="${SCRIPT_PATH}"
 
     sbatch_opts=()
     if [[ -n "${JOB_NAME:-}" ]]; then
@@ -44,7 +63,10 @@ if [[ -z "${SLURM_JOB_ID:-}" ]]; then
     fi
 
     echo "Submitting job with: sbatch ${sbatch_opts[*]} ${script_path} ${args_file}"
-    sbatch "${sbatch_opts[@]}" "${script_path}" "${args_file}"
+    (
+        cd "${REPO_ROOT}"
+        sbatch "${sbatch_opts[@]}" "${script_path}" "${args_file}"
+    )
     exit 0
 fi
 
@@ -219,7 +241,7 @@ jq \
 
 # ─── Build command ─────────────────────────────────────────────────────
 cmd=(
-    python -u /fred/oz016/bgao_kn/ML+GW+KN/Model/hpo_optuna.py
+    python -u "${SCRIPT_DIR}/hpo_optuna.py"
     --config "$RUNTIME_CONFIG"
 )
 
@@ -239,7 +261,7 @@ if [ $exit_code -eq 0 ]; then
     if [[ -z "$STORAGE" || "$STORAGE" == "null" ]]; then
         STORAGE="sqlite:///$OUTPUT_DIR/optuna_study.db"
     fi
-    python -u /fred/oz016/bgao_kn/ML+GW+KN/Model/hpo_analyze.py \
+    python -u "${SCRIPT_DIR}/hpo_analyze.py" \
         --study_name "$STUDY_NAME" \
         --storage "$STORAGE" \
         --output_dir "$OUTPUT_DIR/analysis" \

@@ -5,15 +5,36 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=140G
+#SBATCH --mem=32G
 #SBATCH --time=8:00:00
 
 set -euo pipefail
 
+SCRIPT_SUBDIR="Model/script"
+SCRIPT_REL_PATH="Model/script/submit_create_dataset_bns_nsbh.sh"
+REPO_NAME="gw-kn-multimodal"
+if [[ -n "${SLURM_JOB_ID:-}" && -n "${SLURM_SUBMIT_DIR:-}" ]]; then
+    if [[ "$(basename "${SLURM_SUBMIT_DIR}")" == "${REPO_NAME}" ]]; then
+        REPO_ROOT="${SLURM_SUBMIT_DIR}"
+    else
+        REPO_ROOT="${SLURM_SUBMIT_DIR}/${REPO_NAME}"
+    fi
+else
+    LOCAL_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    REPO_ROOT="${LOCAL_SCRIPT_DIR%/${SCRIPT_SUBDIR}}"
+fi
+SCRIPT_DIR="${REPO_ROOT}/${SCRIPT_SUBDIR}"
+MODEL_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+SCRIPT_PATH="${REPO_ROOT}/${SCRIPT_REL_PATH}"
+if [[ ! -f "${SCRIPT_PATH}" ]]; then
+    echo "Resolved script path not found: ${SCRIPT_PATH}" >&2
+    exit 1
+fi
+
 PROFILE="${PROFILE:-final_train}"          # test_aug | final_train
 DATASET_MODE="${DATASET_MODE:-train}"   # train | test
 
-BUFFER_LIMIT="${BUFFER_LIMIT:-10000}"
+BUFFER_LIMIT="${BUFFER_LIMIT:-2000}"
 NUM_WORKERS="${NUM_WORKERS:-8}"
 SEED="${SEED:-42}"
 
@@ -37,13 +58,13 @@ LUPT_M5_MAG="${LUPT_M5_MAG:-23.9,25.0,24.7,24.0,23.3,22.1}"
 set_profile_defaults() {
     case "$PROFILE" in
         test_aug)
-            BNS_FULL_CATALOG_PATH="${BNS_FULL_CATALOG_PATH:-/fred/oz016/bgao_kn/ML+GW+KN/dataset/O5_sim_bns/injections_final.csv}"
+            BNS_FULL_CATALOG_PATH="${BNS_FULL_CATALOG_PATH:-${REPO_ROOT}/dataset/O5_sim_bns/injections_final.csv}"
             BNS_SKYMAP_DIR="${BNS_SKYMAP_DIR:-/fred/oz016/bgao_kn/data/skymap/bns_skymap_v0}"
             BNS_SIM_ROOT="${BNS_SIM_ROOT:-/fred/oz016/bgao_kn/SNANA/SNDATA_ROOT/SIM/LSST_KN_BNS}"
             BNS_SIM_NAME="${BNS_SIM_NAME:-LSST_KN_BNS}"
             BNS_SUCCESS_IDS_PATH="${BNS_SUCCESS_IDS_PATH:-/fred/oz016/bgao_kn/data/LSST_KN_BNS/success_sim_ids.txt}"
 
-            NSBH_FULL_CATALOG_PATH="${NSBH_FULL_CATALOG_PATH:-/fred/oz016/bgao_kn/ML+GW+KN/dataset/O5_sim_nsbh_aug/injections_full.csv}"
+            NSBH_FULL_CATALOG_PATH="${NSBH_FULL_CATALOG_PATH:-${REPO_ROOT}/dataset/O5_sim_nsbh_aug/injections_full.csv}"
             NSBH_SKYMAP_DIR="${NSBH_SKYMAP_DIR:-/fred/oz016/bgao_kn/data/skymap/nsbh_skymap}"
             NSBH_SIM_ROOT="${NSBH_SIM_ROOT:-/fred/oz016/bgao_kn/SNANA/SNDATA_ROOT/SIM/LSST_KN_NSBH_AUG}"
             NSBH_SIM_NAME="${NSBH_SIM_NAME:-LSST_KN_NSBH_AUG}"
@@ -52,14 +73,14 @@ set_profile_defaults() {
             OUTPUT_H5_PATH="${OUTPUT_H5_PATH:-/fred/oz016/bgao_kn/data/ALBEF_dataset/combined_dataset_${DATASET_MODE}.h5}"
             ;;
         final_train)
-            BNS_FULL_CATALOG_PATH="${BNS_FULL_CATALOG_PATH:-/fred/oz016/bgao_kn/ML+GW+KN/dataset/O5_sim_bns_aug/injections_final.csv}"
+            BNS_FULL_CATALOG_PATH="${BNS_FULL_CATALOG_PATH:-${REPO_ROOT}/dataset/O5_sim_bns_aug/injections_final.csv}"
             BNS_SKYMAP_DIR="${BNS_SKYMAP_DIR:-/fred/oz016/bgao_kn/data/skymap/bns_skymap}"
             # Keep overridable because BNS_AUG raw SNANA outputs may be compressed/offline.
             BNS_SIM_ROOT="${BNS_SIM_ROOT:-/fred/oz016/bgao_kn/SNANA/SNDATA_ROOT/SIM/LSST_KN_BNS_AUG}"
             BNS_SIM_NAME="${BNS_SIM_NAME:-LSST_KN_BNS_AUG}"
             BNS_SUCCESS_IDS_PATH="${BNS_SUCCESS_IDS_PATH:-/fred/oz016/bgao_kn/data/LSST_KN_BNS_AUG/success_sim_ids.txt}"
 
-            NSBH_FULL_CATALOG_PATH="${NSBH_FULL_CATALOG_PATH:-/fred/oz016/bgao_kn/ML+GW+KN/dataset/O5_sim_nsbh_train/injections_full.csv}"
+            NSBH_FULL_CATALOG_PATH="${NSBH_FULL_CATALOG_PATH:-${REPO_ROOT}/dataset/O5_sim_nsbh_train/injections_full.csv}"
             NSBH_SKYMAP_DIR="${NSBH_SKYMAP_DIR:-/fred/oz016/bgao_kn/data/skymap/nsbh_skymap_train}"
             NSBH_SIM_ROOT="${NSBH_SIM_ROOT:-/fred/oz016/bgao_kn/SNANA/SNDATA_ROOT/SIM/LSST_KN_NSBH_TRAIN}"
             NSBH_SIM_NAME="${NSBH_SIM_NAME:-LSST_KN_NSBH_TRAIN}"
@@ -151,8 +172,7 @@ if [[ -z "${SLURM_JOB_ID:-}" ]]; then
         exit 1
     fi
 
-    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    script_path="${script_dir}/$(basename "${BASH_SOURCE[0]}")"
+    script_path="${SCRIPT_PATH}"
 
     mkdir -p logs/data
 
@@ -187,7 +207,10 @@ if [[ -z "${SLURM_JOB_ID:-}" ]]; then
     fi
 
     echo "Submitting job with: sbatch ${sbatch_opts[*]} ${script_path}"
-    sbatch "${sbatch_opts[@]}" "${script_path}"
+    (
+        cd "${REPO_ROOT}"
+        sbatch "${sbatch_opts[@]}" "${script_path}"
+    )
     exit 0
 fi
 
@@ -228,7 +251,7 @@ if [[ -n "${SLURM_CPUS_PER_TASK:-}" && "$NUM_WORKERS" -gt "$SLURM_CPUS_PER_TASK"
     NUM_WORKERS="$SLURM_CPUS_PER_TASK"
 fi
 
-py_script="/fred/oz016/bgao_kn/ML+GW+KN/Model/script/create_dataset_bns_nsbh.py"
+py_script="${SCRIPT_DIR}/create_dataset_bns_nsbh.py"
 
 cmd=(
     python -u "$py_script"

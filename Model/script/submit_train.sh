@@ -11,6 +11,25 @@
 
 # ================= Configuration Area =================
 set -euo pipefail
+SCRIPT_SUBDIR="Model/script"
+SCRIPT_REL_PATH="Model/script/submit_train.sh"
+REPO_NAME="gw-kn-multimodal"
+if [[ -n "${SLURM_JOB_ID:-}" && -n "${SLURM_SUBMIT_DIR:-}" ]]; then
+    if [[ "$(basename "${SLURM_SUBMIT_DIR}")" == "${REPO_NAME}" ]]; then
+        REPO_ROOT="${SLURM_SUBMIT_DIR}"
+    else
+        REPO_ROOT="${SLURM_SUBMIT_DIR}/${REPO_NAME}"
+    fi
+else
+    LOCAL_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    REPO_ROOT="${LOCAL_SCRIPT_DIR%/${SCRIPT_SUBDIR}}"
+fi
+SCRIPT_DIR="${REPO_ROOT}/${SCRIPT_SUBDIR}"
+SCRIPT_PATH="${REPO_ROOT}/${SCRIPT_REL_PATH}"
+if [[ ! -f "${SCRIPT_PATH}" ]]; then
+    echo "Resolved script path not found: ${SCRIPT_PATH}" >&2
+    exit 1
+fi
 which python
 
 args_file=${1:-}
@@ -39,7 +58,7 @@ echo "------------------------------------------------"
 # ================= Run Command =================
 # 'python -u' disables stdout buffering, allowing real-time logging in the output file
 if [ "$Float32" = true ]; then
-    python -u /fred/oz016/bgao_kn/ML+GW+KN/Model/Contrastive_train.py \
+    python -u "${SCRIPT_DIR}/Contrastive_train.py" \
         --data_path "$DATA_PATH" \
         --ckpt_path "$CKPT_PATH" \
         --epochs $EPOCHS \
@@ -54,7 +73,7 @@ if [ "$Float32" = true ]; then
         exit $exit_code
     fi
 else
-    python -u /fred/oz016/bgao_kn/ML+GW+KN/Model/Contrastive_train.py \
+    python -u "${SCRIPT_DIR}/Contrastive_train.py" \
         --data_path "$DATA_PATH" \
         --ckpt_path "$CKPT_PATH" \
         --epochs $EPOCHS \

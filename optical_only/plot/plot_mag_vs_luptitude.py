@@ -11,6 +11,7 @@ where b = lupt_k * f_5sigma / 5, f_5sigma = 10^((psfflux_zp - m5) / 2.5).
 
 import numpy as np
 import matplotlib.pyplot as plt
+from pathlib import Path
 
 # ---------- parameters (same defaults as create_optical_only_datasets.py) ----------
 PSFFLUX_ZP = 31.4
@@ -18,6 +19,7 @@ LUPT_K = 1.0
 LUPT_M5_MAG = np.array([23.9, 25.0, 24.7, 24.0, 23.3, 22.1])  # u,g,r,i,z,Y
 BANDS = ("u", "g", "r", "i", "z", "Y")
 ASINH_MAG_FACTOR = 2.5 / np.log(10.0)
+OUTPUT_PNG = Path(__file__).resolve().parents[1] / "mag_vs_luptitude.png"
 
 # derive b for each band
 lupt_f5sigma_njy = 10.0 ** ((PSFFLUX_ZP - LUPT_M5_MAG) / 2.5)
@@ -80,8 +82,7 @@ fig.suptitle(
     fontsize=14, fontweight="bold", y=0.98,
 )
 plt.tight_layout(rect=[0, 0, 1, 0.94])
-plt.savefig("/fred/oz016/bgao_kn/ML+GW+KN/optical_only/mag_vs_luptitude.png",
-            dpi=300, bbox_inches="tight")
-# plt.savefig("/fred/oz016/bgao_kn/ML+GW+KN/optical_only/mag_vs_luptitude.pdf",
+plt.savefig(OUTPUT_PNG, dpi=300, bbox_inches="tight")
+# plt.savefig(OUTPUT_PNG.with_suffix(".pdf"),
 #             bbox_inches="tight")
 print("Saved: mag_vs_luptitude.png / .pdf")
