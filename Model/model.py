@@ -277,7 +277,7 @@ class MultiTimeAttention(nn.Module):
             bound = 1 / math.sqrt(fan_in)
             nn.init.uniform_(self.U.bias, -bound, bound)
 
-    def forward(self, query_emb, key_emb, values, mask=None, errors=None):
+    def forward(self, query_emb, key_emb, values, mask=None, errors=None, return_attn: bool = False):
         """
         Args:
             query_emb: [Batch, K, H, d_r]
@@ -360,7 +360,8 @@ class MultiTimeAttention(nn.Module):
         x_hat_flat = x_hat.permute(0, 2, 1, 3).reshape(batch_size, -1, self.H * self.D)
         
         output = self.U(x_hat_flat) # [Batch, K, J]
-        
+        if return_attn:
+            return output, attn_weights
         return output
 
 # ==============================================================================
@@ -526,7 +527,7 @@ class OpticalEncoderWithCLSNoCoord(nn.Module):
         )
         self.output_dropout = nn.Dropout(dropout)
 
-    def forward(self, t_obs, values_obs, t_ref, mask=None, errors_obs=None):
+    def forward(self, t_obs, values_obs, t_ref, mask=None, errors_obs=None, return_attn: bool = False):
         batch_size = t_obs.size(0)
 
         key_emb = self.time_embedding(t_obs)
@@ -534,11 +535,15 @@ class OpticalEncoderWithCLSNoCoord(nn.Module):
         cls_emb = self.cls_token.expand(batch_size, -1, -1, -1)
         query_emb = torch.cat([cls_emb, ref_time_emb], dim=1)
 
-        full_output = self.mtan(query_emb, key_emb, values_obs, mask, errors_obs)
+        full_output = self.mtan(query_emb, key_emb, values_obs, mask, errors_obs, return_attn=return_attn)
+        if return_attn:
+            full_output, attn_weights = full_output
         full_output = self.output_dropout(full_output)
 
         z_l = full_output[:, 0, :]
         h_l = full_output[:, 1:, :]
+        if return_attn:
+            return z_l, h_l, attn_weights
         return z_l, h_l
 
 # ==============================================================================
@@ -2136,6 +2141,15 @@ class OpticalKNClassifier(nn.Module):
             z_l = self.feature_dropout(z_l)
             h_l = self.feature_dropout(h_l)
         return z_l, h_l
+
+    def encode_optical_with_attention(self, opt_t, opt_v, opt_ref_t, opt_mask, opt_err):
+        z_l, h_l, attn_weights = self.optical_encoder(
+            opt_t, opt_v, opt_ref_t, opt_mask, errors_obs=opt_err, return_attn=True
+        )
+        if self.feature_dropout.p > 0:
+            z_l = self.feature_dropout(z_l)
+            h_l = self.feature_dropout(h_l)
+        return z_l, h_l, attn_weights
 
     def compute_joint_features(self, opt_t, opt_v, opt_ref_t, opt_mask, opt_err):
         z_l, h_l = self.encode_optical(opt_t, opt_v, opt_ref_t, opt_mask, opt_err)
