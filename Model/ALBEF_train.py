@@ -2,6 +2,7 @@ from data_loader import (
     create_training_dataloader,
     create_train_val_dataloaders,
     create_supcon_dataloaders,
+    build_effective_input_window_metadata,
     build_gw_to_lc_mapping,
 )
 from model import GWOpticalALBEFModel, normalize_fusion_mode
@@ -90,6 +91,62 @@ def parse_lupt_m5_mag_text(text: str) -> np.ndarray:
     if not np.all(np.isfinite(vals)):
         raise ValueError("mtan_lupt_m5_mag must contain finite values.")
     return vals
+
+
+def _jsonify_metadata_value(value):
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value
+
+
+def _read_optical_h5_window_metadata(path: Optional[str]) -> Dict[str, object]:
+    out: Dict[str, object] = {"path": None if path is None else str(path)}
+    if path is None:
+        return out
+    if not os.path.exists(path):
+        out["exists"] = False
+        return out
+    out["exists"] = True
+    with h5py.File(path, "r") as f:
+        for key in (
+            "observation_window_mode",
+            "pre_first_detection_points_kept",
+            "post_last_detection_points_kept",
+            "enforce_time_window",
+            "time_window_start",
+            "time_window_end",
+            "fixed_offset_days",
+        ):
+            if key in f.attrs:
+                out[key] = _jsonify_metadata_value(f.attrs[key])
+    return out
+
+
+def _collect_dataset_window_metadata(args) -> Dict[str, object]:
+    return {
+        "train_positive": _read_optical_h5_window_metadata(getattr(args, "data_path", None)),
+        "train_negative": _read_optical_h5_window_metadata(getattr(args, "neg_data_path", None)),
+        "eval_positive": _read_optical_h5_window_metadata(getattr(args, "test_data_path", None)),
+        "eval_negative": _read_optical_h5_window_metadata(getattr(args, "neg_data_path", None)),
+    }
+
+
+def _build_effective_input_window_metadata(args) -> Dict[str, object]:
+    pos_meta = getattr(args, "_dataset_window_metadata", {}).get("train_positive", {})
+    dataset_window_start = pos_meta.get("time_window_start") if isinstance(pos_meta, dict) else None
+    dataset_window_end = pos_meta.get("time_window_end") if isinstance(pos_meta, dict) else None
+    return build_effective_input_window_metadata(
+        float(args.ref_start),
+        float(args.ref_end),
+        runtime_input_window_start=float(args.ref_start),
+        runtime_input_window_end=float(args.ref_end),
+        dataset_window_start=(None if dataset_window_start is None else float(dataset_window_start)),
+        dataset_window_end=(None if dataset_window_end is None else float(dataset_window_end)),
+    )
 
 
 def resolve_mtan_runtime_config(args) -> Dict[str, object]:
@@ -1418,6 +1475,10 @@ def train(args):
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
+    args._dataset_window_metadata = _collect_dataset_window_metadata(args)
+    args._effective_input_window_metadata = _build_effective_input_window_metadata(args)
+    print(f"Dataset window metadata: {json.dumps(args._dataset_window_metadata, indent=2)}")
+    print(f"Effective input window metadata: {json.dumps(args._effective_input_window_metadata, indent=2)}")
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1474,6 +1535,8 @@ def train(args):
                 extra_negative_timeaware_windows_days=args._hardneg_window_days,
                 extra_negative_timeaware_min_candidates=args.hardneg_min_candidates,
                 extra_negative_timeaware_seed=extra_neg_timeaware_seed,
+                opt_input_window_start=args.ref_start,
+                opt_input_window_end=args.ref_end,
             )
             print(
                 f"SupCon mode: {args.samples_per_gw} samples/GW, "
@@ -1501,6 +1564,8 @@ def train(args):
                 extra_negative_timeaware_windows_days=args._hardneg_window_days,
                 extra_negative_timeaware_min_candidates=args.hardneg_min_candidates,
                 extra_negative_timeaware_seed=extra_neg_timeaware_seed,
+                opt_input_window_start=args.ref_start,
+                opt_input_window_end=args.ref_end,
             )
         print(f"Train Steps/Epoch: {steps_per_epoch} | Val Steps/Epoch: {val_steps}")
     else:
@@ -1529,6 +1594,8 @@ def train(args):
             extra_negative_timeaware_windows_days=args._hardneg_window_days,
             extra_negative_timeaware_min_candidates=args.hardneg_min_candidates,
             extra_negative_timeaware_seed=extra_neg_timeaware_seed,
+            opt_input_window_start=args.ref_start,
+            opt_input_window_end=args.ref_end,
             loader_usage="train",
             loader_label="Train DataLoader",
         )
@@ -1683,6 +1750,8 @@ def train(args):
                 extra_negative_timeaware_windows_days=args._hardneg_window_days,
                 extra_negative_timeaware_min_candidates=args.hardneg_min_candidates,
                 extra_negative_timeaware_seed=extra_neg_timeaware_seed,
+                opt_input_window_start=args.ref_start,
+                opt_input_window_end=args.ref_end,
                 loader_usage="ood",
                 loader_label="OOD DataLoader",
             )
@@ -2371,6 +2440,8 @@ def train(args):
                             'best_tracking_start_epoch': best_tracking_start_epoch,
                             'loss': val_metrics['total'],
                             'args': vars(args),
+                            'dataset_window_metadata': getattr(args, "_dataset_window_metadata", None),
+                            'effective_input_window_metadata': getattr(args, "_effective_input_window_metadata", None),
                         }, best_ckpt)
                         print(
                             f"Saved best checkpoint ({args.best_ckpt_metric}="
@@ -2445,6 +2516,8 @@ def train(args):
                 'scaler_state_dict': scaler.state_dict(),
                 'loss': avg_total,
                 'args': vars(args),
+                'dataset_window_metadata': getattr(args, "_dataset_window_metadata", None),
+                'effective_input_window_metadata': getattr(args, "_effective_input_window_metadata", None),
             }, checkpoint_path)
         
         # End-of-epoch memory cleanup
@@ -2476,10 +2549,15 @@ def train(args):
     # Write trial results JSON for HPO collection
     if best_val_metrics:
         best_val_metrics["final_epoch"] = epoch
+        best_val_metrics["dataset_window_metadata"] = getattr(args, "_dataset_window_metadata", None)
+        best_val_metrics["effective_input_window_metadata"] = getattr(args, "_effective_input_window_metadata", None)
         result_path = os.path.join(args.ckpt_path, "ALBEF", "trial_results.json")
-        os.makedirs(os.path.dirname(result_path), exist_ok=True)
-        with open(result_path, "w") as f:
-            json.dump(best_val_metrics, f, indent=2)
+        summary_dir = os.path.dirname(result_path)
+        os.makedirs(summary_dir, exist_ok=True)
+        for summary_name in ("trial_results.json", "train_summary.json", "best_checkpoint_summary.json"):
+            summary_path = os.path.join(summary_dir, summary_name)
+            with open(summary_path, "w") as f:
+                json.dump(best_val_metrics, f, indent=2)
         print(f"Trial results saved to: {result_path}")
 
 

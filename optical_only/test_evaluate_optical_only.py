@@ -33,6 +33,7 @@ from data_loader import (
     _build_prefix_manifest_for_binary_dataset,
     _filter_indices_by_meta_constraints,
     _filter_indices_by_min_detection_count,
+    build_effective_input_window_metadata,
 )
 from metrics import compute_classification_metrics
 from model import OpticalKNClassifier
@@ -448,6 +449,8 @@ def load_model(checkpoint_path, device, config_dict):
     ckpt_args = dict(ckpt_args)
     ckpt_args["_init_source_metadata"] = ckpt.get("init_source_metadata")
     ckpt_args["_dataset_window_metadata"] = ckpt.get("dataset_window_metadata")
+    ckpt_args["_effective_input_window_metadata"] = ckpt.get("effective_input_window_metadata")
+    ckpt_args["_effective_input_window_metadata"] = ckpt.get("effective_input_window_metadata")
 
     def _get(key, default):
         if key in ckpt_args and ckpt_args[key] is not None:
@@ -511,6 +514,8 @@ def build_eval_datasets(args, ckpt_args, config_dict):
     pos_data_path = choose_value(args.pos_data_path, config_dict, ckpt_args, "pos_data_path", default=None)
     neg_data_path = choose_value(args.neg_data_path, config_dict, ckpt_args, "neg_data_path", default=None)
     neg_group = choose_value(args.neg_group, config_dict, ckpt_args, "neg_group", default=None)
+    runtime_input_window_start = float(choose_value(None, config_dict, ckpt_args, "ref_start", default=-0.3))
+    runtime_input_window_end = float(choose_value(None, config_dict, ckpt_args, "ref_end", default=0.6))
     prefix_eval_enable = choose_value(
         args.prefix_eval_enable,
         config_dict,
@@ -596,6 +601,8 @@ def build_eval_datasets(args, ckpt_args, config_dict):
             neg_h5_path=neg_data_path,
             neg_group=neg_group,
             cache_in_memory=False,
+            runtime_input_window_start=runtime_input_window_start,
+            runtime_input_window_end=runtime_input_window_end,
         ).n_pos,
         dtype=np.int64,
     )
@@ -605,6 +612,8 @@ def build_eval_datasets(args, ckpt_args, config_dict):
             neg_h5_path=neg_data_path,
             neg_group=neg_group,
             cache_in_memory=False,
+            runtime_input_window_start=runtime_input_window_start,
+            runtime_input_window_end=runtime_input_window_end,
         ).n_neg,
         dtype=np.int64,
     )
@@ -631,6 +640,8 @@ def build_eval_datasets(args, ckpt_args, config_dict):
             n_det_max=meta_filter_n_det_max,
             n_bands_max=meta_filter_n_bands_max,
             t_span_max=meta_filter_t_span_max,
+            runtime_input_window_start=runtime_input_window_start,
+            runtime_input_window_end=runtime_input_window_end,
         )
         neg_indices, _ = _filter_indices_by_meta_constraints(
             neg_data_path,
@@ -640,6 +651,8 @@ def build_eval_datasets(args, ckpt_args, config_dict):
             n_det_max=meta_filter_n_det_max,
             n_bands_max=meta_filter_n_bands_max,
             t_span_max=meta_filter_t_span_max,
+            runtime_input_window_start=runtime_input_window_start,
+            runtime_input_window_end=runtime_input_window_end,
         )
         if (
             meta_filter_t_span_max is not None
@@ -656,6 +669,8 @@ def build_eval_datasets(args, ckpt_args, config_dict):
                 n_det_max=meta_filter_n_det_max,
                 n_bands_max=meta_filter_n_bands_max,
                 t_span_max=meta_filter_t_span_used,
+                runtime_input_window_start=runtime_input_window_start,
+                runtime_input_window_end=runtime_input_window_end,
             )
             neg_indices, _ = _filter_indices_by_meta_constraints(
                 neg_data_path,
@@ -665,6 +680,8 @@ def build_eval_datasets(args, ckpt_args, config_dict):
                 n_det_max=meta_filter_n_det_max,
                 n_bands_max=meta_filter_n_bands_max,
                 t_span_max=meta_filter_t_span_used,
+                runtime_input_window_start=runtime_input_window_start,
+                runtime_input_window_end=runtime_input_window_end,
             )
         print(
             "Evaluation meta filter: "
@@ -677,10 +694,14 @@ def build_eval_datasets(args, ckpt_args, config_dict):
 
     if prefix_eval_enable:
         pos_indices = _filter_indices_by_min_detection_count(
-            pos_data_path, "events/optical_data", pos_indices, prefix_min_det
+            pos_data_path, "events/optical_data", pos_indices, prefix_min_det,
+            runtime_input_window_start=runtime_input_window_start,
+            runtime_input_window_end=runtime_input_window_end,
         )
         neg_indices = _filter_indices_by_min_detection_count(
-            neg_data_path, neg_group, neg_indices, prefix_min_det
+            neg_data_path, neg_group, neg_indices, prefix_min_det,
+            runtime_input_window_start=runtime_input_window_start,
+            runtime_input_window_end=runtime_input_window_end,
         )
         if pos_indices.size == 0 or neg_indices.size == 0:
             raise ValueError("prefix_eval_enable=true left an empty class after prefix_min_det filtering.")
@@ -702,6 +723,8 @@ def build_eval_datasets(args, ckpt_args, config_dict):
         neg_indices=neg_indices,
         cache_in_memory=False,
         return_prefix_aux=prefix_eval_enable,
+        runtime_input_window_start=runtime_input_window_start,
+        runtime_input_window_end=runtime_input_window_end,
     )
 
     print(
@@ -735,6 +758,8 @@ def build_eval_datasets(args, ckpt_args, config_dict):
             neg_indices=neg_indices,
             cache_in_memory=False,
             return_prefix_aux=False,
+            runtime_input_window_start=runtime_input_window_start,
+            runtime_input_window_end=runtime_input_window_end,
         )
         print(
             "Prefix evaluation manifest: "
@@ -764,8 +789,25 @@ def build_eval_datasets(args, ckpt_args, config_dict):
             "positive": _read_optical_h5_window_metadata(pos_data_path),
             "negative": _read_optical_h5_window_metadata(neg_data_path),
         },
+        "effective_input_window_metadata": build_effective_input_window_metadata(
+            runtime_input_window_start,
+            runtime_input_window_end,
+            runtime_input_window_start=runtime_input_window_start,
+            runtime_input_window_end=runtime_input_window_end,
+            dataset_window_start=(
+                None
+                if _read_optical_h5_window_metadata(pos_data_path).get("time_window_start") is None
+                else float(_read_optical_h5_window_metadata(pos_data_path).get("time_window_start"))
+            ),
+            dataset_window_end=(
+                None
+                if _read_optical_h5_window_metadata(pos_data_path).get("time_window_end") is None
+                else float(_read_optical_h5_window_metadata(pos_data_path).get("time_window_end"))
+            ),
+        ),
         "init_source_metadata": ckpt_args.get("_init_source_metadata"),
         "checkpoint_dataset_window_metadata": ckpt_args.get("_dataset_window_metadata"),
+        "checkpoint_effective_input_window_metadata": ckpt_args.get("_effective_input_window_metadata"),
         "detspan_training": {
             "enabled": bool(choose_value(None, config_dict, ckpt_args, "detspan_train_enable", default=False)),
             "view_prob": float(choose_value(None, config_dict, ckpt_args, "detspan_view_prob", default=0.0)),

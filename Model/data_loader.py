@@ -3,6 +3,7 @@ import numpy as np
 import pandas as pd
 from astropy.io import fits
 from tqdm import tqdm
+import hashlib
 import os
 import sys
 import healpy as hp
@@ -57,6 +58,313 @@ except ModuleNotFoundError as exc:
         MERGE_WINDOW_HOURS,
         merge_photometry_psfflux,
     )
+
+
+LEGACY_FULL_WINDOW_START = -0.3
+LEGACY_FULL_WINDOW_END = 0.6
+RUNTIME_WINDOW_TOL = 1.0e-8
+
+
+def _normalize_runtime_input_window(
+    window_start: Optional[float],
+    window_end: Optional[float],
+) -> Tuple[Optional[float], Optional[float]]:
+    if window_start is None and window_end is None:
+        return None, None
+    if window_start is None or window_end is None:
+        raise ValueError("runtime input window requires both start and end or neither.")
+    start = float(window_start)
+    end = float(window_end)
+    if not np.isfinite(start) or not np.isfinite(end):
+        raise ValueError("runtime input window bounds must be finite.")
+    if end <= start:
+        raise ValueError(f"Invalid runtime input window: start={start}, end={end}")
+    return start, end
+
+
+def _float_close(a: Optional[float], b: Optional[float], tol: float = RUNTIME_WINDOW_TOL) -> bool:
+    if a is None or b is None:
+        return False
+    return abs(float(a) - float(b)) <= float(tol)
+
+
+def _read_root_time_window_attrs(h5_path: str) -> Tuple[Optional[float], Optional[float]]:
+    if h5_path is None or (not os.path.exists(h5_path)):
+        return None, None
+    with h5py.File(h5_path, "r") as f:
+        if "time_window_start" in f.attrs and "time_window_end" in f.attrs:
+            return float(f.attrs["time_window_start"]), float(f.attrs["time_window_end"])
+    return None, None
+
+
+def _runtime_input_window_is_active_for_bounds(
+    window_start: Optional[float],
+    window_end: Optional[float],
+    dataset_window_start: Optional[float],
+    dataset_window_end: Optional[float],
+) -> bool:
+    start, end = _normalize_runtime_input_window(window_start, window_end)
+    if start is None or end is None:
+        return False
+    baseline_start = LEGACY_FULL_WINDOW_START if dataset_window_start is None else float(dataset_window_start)
+    baseline_end = LEGACY_FULL_WINDOW_END if dataset_window_end is None else float(dataset_window_end)
+    return not (_float_close(start, baseline_start) and _float_close(end, baseline_end))
+
+
+def runtime_input_window_is_active_for_h5(
+    h5_path: Optional[str],
+    window_start: Optional[float],
+    window_end: Optional[float],
+) -> bool:
+    dataset_window_start, dataset_window_end = _read_root_time_window_attrs(h5_path) if h5_path else (None, None)
+    return _runtime_input_window_is_active_for_bounds(
+        window_start,
+        window_end,
+        dataset_window_start,
+        dataset_window_end,
+    )
+
+
+def build_effective_input_window_metadata(
+    ref_start: float,
+    ref_end: float,
+    *,
+    runtime_input_window_start: Optional[float] = None,
+    runtime_input_window_end: Optional[float] = None,
+    dataset_window_start: Optional[float] = None,
+    dataset_window_end: Optional[float] = None,
+) -> Dict[str, object]:
+    runtime_start, runtime_end = _normalize_runtime_input_window(
+        runtime_input_window_start,
+        runtime_input_window_end,
+    )
+    effective_start = float(ref_start if runtime_start is None else runtime_start)
+    effective_end = float(ref_end if runtime_end is None else runtime_end)
+    runtime_override_active = _runtime_input_window_is_active_for_bounds(
+        effective_start,
+        effective_end,
+        dataset_window_start,
+        dataset_window_end,
+    )
+    return {
+        "runtime_override_active": bool(runtime_override_active),
+        "effective_input_window_start_scaled": float(effective_start),
+        "effective_input_window_end_scaled": float(effective_end),
+        "effective_input_window_start_days": float(effective_start * 100.0),
+        "effective_input_window_end_days": float(effective_end * 100.0),
+        "reference_grid_start_scaled": float(ref_start),
+        "reference_grid_end_scaled": float(ref_end),
+    }
+
+
+def apply_runtime_input_window_torch(
+    opt_time: torch.Tensor,
+    opt_val: torch.Tensor,
+    opt_mask: torch.Tensor,
+    opt_err: Optional[torch.Tensor] = None,
+    slot_is_detection: Optional[torch.Tensor] = None,
+    *,
+    window_start: Optional[float] = None,
+    window_end: Optional[float] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+    start, end = _normalize_runtime_input_window(window_start, window_end)
+    if start is None or end is None:
+        return opt_time, opt_val, opt_mask, opt_err, slot_is_detection
+
+    keep_rows = (opt_time >= float(start)) & (opt_time <= float(end))
+    keep_rows_3d = keep_rows.unsqueeze(-1)
+    cropped_time = torch.where(keep_rows, opt_time, torch.zeros_like(opt_time))
+    cropped_val = torch.where(keep_rows_3d, opt_val, torch.zeros_like(opt_val))
+    cropped_mask = torch.where(keep_rows_3d, opt_mask, torch.zeros_like(opt_mask))
+    cropped_err = None if opt_err is None else torch.where(keep_rows_3d, opt_err, torch.zeros_like(opt_err))
+    cropped_det = None
+    if slot_is_detection is not None:
+        cropped_det = torch.where(keep_rows, slot_is_detection, torch.zeros_like(slot_is_detection))
+    return cropped_time, cropped_val, cropped_mask, cropped_err, cropped_det
+
+
+def apply_runtime_input_window_numpy(
+    opt_time: np.ndarray,
+    opt_val: np.ndarray,
+    opt_mask: np.ndarray,
+    opt_err: Optional[np.ndarray] = None,
+    slot_is_detection: Optional[np.ndarray] = None,
+    *,
+    window_start: Optional[float] = None,
+    window_end: Optional[float] = None,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
+    start, end = _normalize_runtime_input_window(window_start, window_end)
+    if start is None or end is None:
+        return opt_time, opt_val, opt_mask, opt_err, slot_is_detection
+
+    keep_rows = (np.asarray(opt_time, dtype=np.float32) >= float(start)) & (
+        np.asarray(opt_time, dtype=np.float32) <= float(end)
+    )
+    out_time = np.asarray(opt_time, dtype=np.float32).copy()
+    out_val = np.asarray(opt_val, dtype=np.float32).copy()
+    out_mask = np.asarray(opt_mask, dtype=np.float32).copy()
+    out_err = None if opt_err is None else np.asarray(opt_err, dtype=np.float32).copy()
+    out_det = None if slot_is_detection is None else np.asarray(slot_is_detection, dtype=np.float32).copy()
+
+    out_time[~keep_rows] = 0.0
+    out_val[~keep_rows, :] = 0.0
+    out_mask[~keep_rows, :] = 0.0
+    if out_err is not None:
+        out_err[~keep_rows, :] = 0.0
+    if out_det is not None:
+        out_det[~keep_rows] = 0.0
+    return out_time, out_val, out_mask, out_err, out_det
+
+
+def _format_runtime_window_token(value: float) -> str:
+    sign = "m" if float(value) < 0 else "p"
+    scaled = int(round(abs(float(value)) * 10000.0))
+    return f"{sign}{scaled:06d}"
+
+
+def _runtime_window_cache_path(
+    h5_path: str,
+    group: str,
+    window_start: float,
+    window_end: float,
+) -> Path:
+    source = Path(h5_path)
+    digest = hashlib.blake2b(
+        f"{Path(h5_path).resolve()}|{group}|{float(window_start):.8f}|{float(window_end):.8f}".encode("utf-8"),
+        digest_size=8,
+    ).hexdigest()
+    group_token = str(group).strip("/").replace("/", "__")
+    cache_dir = source.parent / ".runtime_window_meta"
+    filename = (
+        f"{source.stem}.{group_token}.win_{_format_runtime_window_token(window_start)}_"
+        f"{_format_runtime_window_token(window_end)}.{digest}.npz"
+    )
+    return cache_dir / filename
+
+
+def _compute_runtime_window_meta_chunk(
+    times: np.ndarray,
+    masks: np.ndarray,
+    slot_is_detection: Optional[np.ndarray],
+    *,
+    window_start: float,
+    window_end: float,
+) -> Dict[str, np.ndarray]:
+    times_np = np.asarray(times, dtype=np.float32)
+    masks_np = np.asarray(masks, dtype=np.float32)
+    row_valid = masks_np.sum(axis=-1) > 0
+    keep = row_valid & (times_np >= float(window_start)) & (times_np <= float(window_end))
+    keep_3d = keep[..., None] & (masks_np > 0)
+
+    n_obs = keep.sum(axis=1).astype(np.float32, copy=False)
+    if slot_is_detection is not None:
+        slot_det_np = np.asarray(slot_is_detection, dtype=np.float32)
+        n_det = ((slot_det_np > 0) & keep).sum(axis=1).astype(np.float32, copy=False)
+    else:
+        n_det = n_obs.astype(np.float32, copy=True)
+
+    band_hits = keep_3d.any(axis=1)
+    n_bands = band_hits.sum(axis=1).astype(np.float32, copy=False)
+    single_band_id = np.full((times_np.shape[0],), -1, dtype=np.int16)
+    single_mask = n_bands == 1
+    if np.any(single_mask):
+        single_band_id[single_mask] = np.argmax(band_hits[single_mask], axis=1).astype(np.int16, copy=False)
+
+    t_span = np.zeros((times_np.shape[0],), dtype=np.float32)
+    has_obs = n_obs > 0
+    if np.any(has_obs):
+        first_idx = np.argmax(keep, axis=1)
+        last_idx = keep.shape[1] - 1 - np.argmax(keep[:, ::-1], axis=1)
+        rows = np.flatnonzero(has_obs)
+        t_span[rows] = (
+            times_np[rows, last_idx[rows]] - times_np[rows, first_idx[rows]]
+        ).astype(np.float32, copy=False)
+
+    return {
+        "n_obs": n_obs,
+        "n_det": n_det,
+        "n_bands": n_bands,
+        "t_span": t_span,
+        "single_band_id": single_band_id,
+    }
+
+
+def _load_or_compute_runtime_window_meta_arrays(
+    h5_path: str,
+    group: str,
+    *,
+    window_start: Optional[float],
+    window_end: Optional[float],
+    chunk_size: int = 8192,
+) -> dict:
+    start, end = _normalize_runtime_input_window(window_start, window_end)
+    if start is None or end is None or (not runtime_input_window_is_active_for_h5(h5_path, start, end)):
+        with h5py.File(h5_path, "r") as f:
+            return OpticalBinaryDataset._load_or_compute_meta_arrays(f, group, chunk_size=chunk_size)
+
+    cache_path = _runtime_window_cache_path(h5_path, group, float(start), float(end))
+    if cache_path.exists():
+        with np.load(cache_path, allow_pickle=False) as npz:
+            return {
+                "n_obs": np.asarray(npz["n_obs"], dtype=np.float32).reshape(-1),
+                "n_det": np.asarray(npz["n_det"], dtype=np.float32).reshape(-1),
+                "n_bands": np.asarray(npz["n_bands"], dtype=np.float32).reshape(-1),
+                "t_span": np.asarray(npz["t_span"], dtype=np.float32).reshape(-1),
+                "single_band_id": np.asarray(npz["single_band_id"], dtype=np.int16).reshape(-1),
+            }
+
+    with h5py.File(h5_path, "r") as f:
+        if group not in f:
+            raise KeyError(f"Group '{group}' not found in {h5_path}")
+        grp = f[group]
+        n_total = int(grp["values"].shape[0])
+        ds_masks = grp["masks"]
+        ds_times = grp["times"]
+        ds_slot_is_detection = grp["slot_is_detection"] if "slot_is_detection" in grp else None
+
+        n_obs_all = np.zeros((n_total,), dtype=np.float32)
+        n_det_all = np.zeros((n_total,), dtype=np.float32)
+        n_bands_all = np.zeros((n_total,), dtype=np.float32)
+        t_span_all = np.zeros((n_total,), dtype=np.float32)
+        single_band_id_all = np.full((n_total,), -1, dtype=np.int16)
+
+        for s in range(0, n_total, int(chunk_size)):
+            e = min(s + int(chunk_size), n_total)
+            chunk = _compute_runtime_window_meta_chunk(
+                times=np.asarray(ds_times[s:e], dtype=np.float32),
+                masks=np.asarray(ds_masks[s:e], dtype=np.float32),
+                slot_is_detection=(
+                    np.asarray(ds_slot_is_detection[s:e], dtype=np.float32)
+                    if ds_slot_is_detection is not None
+                    else None
+                ),
+                window_start=float(start),
+                window_end=float(end),
+            )
+            n_obs_all[s:e] = chunk["n_obs"]
+            n_det_all[s:e] = chunk["n_det"]
+            n_bands_all[s:e] = chunk["n_bands"]
+            t_span_all[s:e] = chunk["t_span"]
+            single_band_id_all[s:e] = chunk["single_band_id"]
+
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        cache_path,
+        n_obs=n_obs_all,
+        n_det=n_det_all,
+        n_bands=n_bands_all,
+        t_span=t_span_all,
+        single_band_id=single_band_id_all,
+        window_start=np.float32(start),
+        window_end=np.float32(end),
+    )
+    return {
+        "n_obs": n_obs_all,
+        "n_det": n_det_all,
+        "n_bands": n_bands_all,
+        "t_span": t_span_all,
+        "single_band_id": single_band_id_all,
+    }
 
 
 def _normalize_day_windows(windows) -> List[float]:
@@ -185,6 +493,8 @@ class RelationalHDF5Dataset(Dataset):
         extra_negative_timeaware_windows_days=None,
         extra_negative_timeaware_min_candidates: int = 1,
         extra_negative_timeaware_seed: int = 42,
+        opt_input_window_start: Optional[float] = None,
+        opt_input_window_end: Optional[float] = None,
     ):
         super().__init__()
         self.h5_path = h5_path
@@ -218,6 +528,18 @@ class RelationalHDF5Dataset(Dataset):
         self.use_neg_gw = use_neg_gw
         self.neg_gw_indices = None
         self.n_pos_gw = None
+        self.opt_input_window_start, self.opt_input_window_end = _normalize_runtime_input_window(
+            opt_input_window_start,
+            opt_input_window_end,
+        )
+        pos_dataset_window_start, pos_dataset_window_end = _read_root_time_window_attrs(self.h5_path)
+        self.opt_input_window_active = _runtime_input_window_is_active_for_bounds(
+            self.opt_input_window_start,
+            self.opt_input_window_end,
+            pos_dataset_window_start,
+            pos_dataset_window_end,
+        )
+        self.neg_input_window_active = False
 
         # Open file temporarily to get dataset length
         with h5py.File(h5_path, 'r') as f:
@@ -278,6 +600,13 @@ class RelationalHDF5Dataset(Dataset):
                     self.data_cache["neg_gw_skymap"] = torch.from_numpy(f['events/gw_data/skymaps'][self.neg_gw_indices]).share_memory_()
         
         if self.negative_h5_path is not None:
+            neg_dataset_window_start, neg_dataset_window_end = _read_root_time_window_attrs(self.negative_h5_path)
+            self.neg_input_window_active = _runtime_input_window_is_active_for_bounds(
+                self.opt_input_window_start,
+                self.opt_input_window_end,
+                neg_dataset_window_start,
+                neg_dataset_window_end,
+            )
             with h5py.File(self.negative_h5_path, 'r') as f:
                 if self.negative_group not in f:
                     raise KeyError(f"Negative group '{self.negative_group}' not found in {self.negative_h5_path}")
@@ -535,6 +864,17 @@ class RelationalHDF5Dataset(Dataset):
                         "return_zero_time_mjd=True."
                     )
 
+        if self.opt_input_window_active:
+            opt_time, opt_val, opt_mask, opt_err, _ = apply_runtime_input_window_torch(
+                opt_time,
+                opt_val,
+                opt_mask,
+                opt_err,
+                None,
+                window_start=self.opt_input_window_start,
+                window_end=self.opt_input_window_end,
+            )
+
         is_neg_gw = False
         if (
             neg_gw_local_idx is not None
@@ -587,6 +927,17 @@ class RelationalHDF5Dataset(Dataset):
                 if self.return_zero_time_mjd:
                     neg_zero_time_mjd_base = self.neg_cache["neg_zero_time_mjd_base"][neg_idx].to(torch.float32)
                     neg_zero_time_mjd_cls_base = self.neg_cache["neg_zero_time_mjd_cls_base"][neg_idx].to(torch.float32)
+
+            if self.neg_input_window_active:
+                neg_time, neg_val, neg_mask, neg_err, _ = apply_runtime_input_window_torch(
+                    neg_time,
+                    neg_val,
+                    neg_mask,
+                    neg_err,
+                    None,
+                    window_start=self.opt_input_window_start,
+                    window_end=self.opt_input_window_end,
+                )
 
             # Return tuple: (GW_Inputs, Optical_Inputs, Metadata, Negative_Optical_Inputs)
             # gw_idx is returned for masking the contrastive loss (handling same-source negatives)
@@ -1017,6 +1368,8 @@ def create_training_dataloader(
     extra_negative_timeaware_windows_days=None,
     extra_negative_timeaware_min_candidates: int = 1,
     extra_negative_timeaware_seed: int = 42,
+    opt_input_window_start: Optional[float] = None,
+    opt_input_window_end: Optional[float] = None,
     loader_usage: str = "train",
     loader_label: str = "Train DataLoader",
 ):
@@ -1040,6 +1393,8 @@ def create_training_dataloader(
         extra_negative_timeaware_windows_days=extra_negative_timeaware_windows_days,
         extra_negative_timeaware_min_candidates=extra_negative_timeaware_min_candidates,
         extra_negative_timeaware_seed=extra_negative_timeaware_seed,
+        opt_input_window_start=opt_input_window_start,
+        opt_input_window_end=opt_input_window_end,
     )
     
     # 3. Initialize Custom Sampler
@@ -1086,6 +1441,8 @@ def create_train_val_dataloaders(
     extra_negative_timeaware_windows_days=None,
     extra_negative_timeaware_min_candidates: int = 1,
     extra_negative_timeaware_seed: int = 42,
+    opt_input_window_start: Optional[float] = None,
+    opt_input_window_end: Optional[float] = None,
 ):
     if cache_in_memory and num_workers > 0:
         print("cache_in_memory=True with num_workers>0 may increase RAM usage.")
@@ -1119,6 +1476,8 @@ def create_train_val_dataloaders(
             extra_negative_timeaware_windows_days=extra_negative_timeaware_windows_days,
             extra_negative_timeaware_min_candidates=extra_negative_timeaware_min_candidates,
             extra_negative_timeaware_seed=extra_negative_timeaware_seed,
+            opt_input_window_start=opt_input_window_start,
+            opt_input_window_end=opt_input_window_end,
         )
         train_dataset = shared_dataset
         val_dataset = shared_dataset
@@ -1134,6 +1493,8 @@ def create_train_val_dataloaders(
             extra_negative_timeaware_windows_days=extra_negative_timeaware_windows_days,
             extra_negative_timeaware_min_candidates=extra_negative_timeaware_min_candidates,
             extra_negative_timeaware_seed=extra_negative_timeaware_seed,
+            opt_input_window_start=opt_input_window_start,
+            opt_input_window_end=opt_input_window_end,
         )
         val_dataset = RelationalHDF5Dataset(
             h5_path,
@@ -1146,6 +1507,8 @@ def create_train_val_dataloaders(
             extra_negative_timeaware_windows_days=extra_negative_timeaware_windows_days,
             extra_negative_timeaware_min_candidates=extra_negative_timeaware_min_candidates,
             extra_negative_timeaware_seed=extra_negative_timeaware_seed,
+            opt_input_window_start=opt_input_window_start,
+            opt_input_window_end=opt_input_window_end,
         )
 
     train_sampler = BalancedGWBatchedSampler(
@@ -1207,6 +1570,8 @@ def create_supcon_dataloaders(
     extra_negative_timeaware_windows_days=None,
     extra_negative_timeaware_min_candidates: int = 1,
     extra_negative_timeaware_seed: int = 42,
+    opt_input_window_start: Optional[float] = None,
+    opt_input_window_end: Optional[float] = None,
 ):
     """
     Create dataloaders for Supervised Contrastive Learning.
@@ -1245,6 +1610,8 @@ def create_supcon_dataloaders(
             extra_negative_timeaware_windows_days=extra_negative_timeaware_windows_days,
             extra_negative_timeaware_min_candidates=extra_negative_timeaware_min_candidates,
             extra_negative_timeaware_seed=extra_negative_timeaware_seed,
+            opt_input_window_start=opt_input_window_start,
+            opt_input_window_end=opt_input_window_end,
         )
         train_dataset = shared_dataset
         val_dataset = shared_dataset
@@ -1260,6 +1627,8 @@ def create_supcon_dataloaders(
             extra_negative_timeaware_windows_days=extra_negative_timeaware_windows_days,
             extra_negative_timeaware_min_candidates=extra_negative_timeaware_min_candidates,
             extra_negative_timeaware_seed=extra_negative_timeaware_seed,
+            opt_input_window_start=opt_input_window_start,
+            opt_input_window_end=opt_input_window_end,
         )
         val_dataset = RelationalHDF5Dataset(
             h5_path,
@@ -1272,6 +1641,8 @@ def create_supcon_dataloaders(
             extra_negative_timeaware_windows_days=extra_negative_timeaware_windows_days,
             extra_negative_timeaware_min_candidates=extra_negative_timeaware_min_candidates,
             extra_negative_timeaware_seed=extra_negative_timeaware_seed,
+            opt_input_window_start=opt_input_window_start,
+            opt_input_window_end=opt_input_window_end,
         )
 
     train_sampler = MultiPositiveGWBatchedSampler(
@@ -1339,6 +1710,8 @@ def create_mixed_gw_dataloaders(
     extra_negative_timeaware_windows_days=None,
     extra_negative_timeaware_min_candidates: int = 1,
     extra_negative_timeaware_seed: int = 42,
+    opt_input_window_start: Optional[float] = None,
+    opt_input_window_end: Optional[float] = None,
 ):
     """
     Create dataloaders with mixed positive/negative GW sampling.
@@ -1389,6 +1762,8 @@ def create_mixed_gw_dataloaders(
             extra_negative_timeaware_windows_days=extra_negative_timeaware_windows_days,
             extra_negative_timeaware_min_candidates=extra_negative_timeaware_min_candidates,
             extra_negative_timeaware_seed=extra_negative_timeaware_seed,
+            opt_input_window_start=opt_input_window_start,
+            opt_input_window_end=opt_input_window_end,
         )
         train_dataset = shared_dataset
         val_dataset = shared_dataset
@@ -1405,6 +1780,8 @@ def create_mixed_gw_dataloaders(
             extra_negative_timeaware_windows_days=extra_negative_timeaware_windows_days,
             extra_negative_timeaware_min_candidates=extra_negative_timeaware_min_candidates,
             extra_negative_timeaware_seed=extra_negative_timeaware_seed,
+            opt_input_window_start=opt_input_window_start,
+            opt_input_window_end=opt_input_window_end,
         )
         val_dataset = RelationalHDF5Dataset(
             h5_path,
@@ -1418,6 +1795,8 @@ def create_mixed_gw_dataloaders(
             extra_negative_timeaware_windows_days=extra_negative_timeaware_windows_days,
             extra_negative_timeaware_min_candidates=extra_negative_timeaware_min_candidates,
             extra_negative_timeaware_seed=extra_negative_timeaware_seed,
+            opt_input_window_start=opt_input_window_start,
+            opt_input_window_end=opt_input_window_end,
         )
 
     # Check that negative GW data is available
@@ -1515,6 +1894,8 @@ class OpticalBinaryDataset(Dataset):
         cache_in_memory: bool = False,
         load_meta_features: bool = True,
         return_prefix_aux: bool = False,
+        runtime_input_window_start: Optional[float] = None,
+        runtime_input_window_end: Optional[float] = None,
     ):
         super().__init__()
         self.pos_h5_path = pos_h5_path
@@ -1529,6 +1910,20 @@ class OpticalBinaryDataset(Dataset):
         self._meta_loaded = False
         self._load_meta_features = bool(load_meta_features)
         self.return_prefix_aux = bool(return_prefix_aux)
+        self.runtime_input_window_start, self.runtime_input_window_end = _normalize_runtime_input_window(
+            runtime_input_window_start,
+            runtime_input_window_end,
+        )
+        self.pos_runtime_input_window_active = runtime_input_window_is_active_for_h5(
+            self.pos_h5_path,
+            self.runtime_input_window_start,
+            self.runtime_input_window_end,
+        )
+        self.neg_runtime_input_window_active = runtime_input_window_is_active_for_h5(
+            self.neg_h5_path,
+            self.runtime_input_window_start,
+            self.runtime_input_window_end,
+        )
 
         with h5py.File(self.pos_h5_path, "r") as f:
             n_pos_total = int(f["events/optical_data/values"].shape[0])
@@ -1669,10 +2064,18 @@ class OpticalBinaryDataset(Dataset):
     def _ensure_meta_loaded(self):
         if self._meta_loaded:
             return
-        with h5py.File(self.pos_h5_path, "r") as f:
-            pos_meta_full = self._load_or_compute_meta_arrays(f, "events/optical_data")
-        with h5py.File(self.neg_h5_path, "r") as f:
-            neg_meta_full = self._load_or_compute_meta_arrays(f, self.neg_group)
+        pos_meta_full = _load_or_compute_runtime_window_meta_arrays(
+            self.pos_h5_path,
+            "events/optical_data",
+            window_start=self.runtime_input_window_start,
+            window_end=self.runtime_input_window_end,
+        )
+        neg_meta_full = _load_or_compute_runtime_window_meta_arrays(
+            self.neg_h5_path,
+            self.neg_group,
+            window_start=self.runtime_input_window_start,
+            window_end=self.runtime_input_window_end,
+        )
         self.pos_meta = {
             "n_obs": np.asarray(pos_meta_full["n_obs"][self.pos_indices], dtype=np.float32),
             "n_det": np.asarray(pos_meta_full["n_det"][self.pos_indices], dtype=np.float32),
@@ -1721,6 +2124,17 @@ class OpticalBinaryDataset(Dataset):
         slot_is_detection = None
         if self.return_prefix_aux:
             slot_is_detection = np.asarray(f[f"{grp}/slot_is_detection"][real_idx], dtype=np.float32)
+        runtime_active = self.pos_runtime_input_window_active if int(label) == 1 else self.neg_runtime_input_window_active
+        if runtime_active:
+            opt_time, opt_val, opt_mask, opt_err, slot_is_detection = apply_runtime_input_window_numpy(
+                opt_time,
+                opt_val,
+                opt_mask,
+                opt_err,
+                slot_is_detection,
+                window_start=self.runtime_input_window_start,
+                window_end=self.runtime_input_window_end,
+            )
         return opt_time, opt_val, opt_mask, opt_err, slot_is_detection, float(target)
 
     def __getitem__(self, idx):
@@ -1878,6 +2292,8 @@ def _filter_indices_by_meta_constraints(
     n_det_max: Optional[int] = None,
     n_bands_max: Optional[int] = None,
     t_span_max: Optional[float] = None,
+    runtime_input_window_start: Optional[float] = None,
+    runtime_input_window_end: Optional[float] = None,
 ) -> Tuple[np.ndarray, Dict[str, object]]:
     idx = np.asarray(indices, dtype=np.int64).reshape(-1)
     summary: Dict[str, object] = {
@@ -1887,6 +2303,12 @@ def _filter_indices_by_meta_constraints(
         "n_det_max": (None if n_det_max is None else int(n_det_max)),
         "n_bands_max": (None if n_bands_max is None else int(n_bands_max)),
         "t_span_max": (None if t_span_max is None else float(t_span_max)),
+        "runtime_input_window_start": (
+            None if runtime_input_window_start is None else float(runtime_input_window_start)
+        ),
+        "runtime_input_window_end": (
+            None if runtime_input_window_end is None else float(runtime_input_window_end)
+        ),
         "applied": False,
     }
     if idx.size == 0:
@@ -1900,37 +2322,56 @@ def _filter_indices_by_meta_constraints(
         return idx, summary
 
     keep = np.ones((idx.shape[0],), dtype=bool)
-    with h5py.File(h5_path, "r") as f:
-        if group not in f:
-            raise KeyError(f"Group '{group}' not found in {h5_path}")
-        grp = f[group]
-        try:
-            det_counts, det_name = _read_group_meta_array_for_indices(
-                grp,
-                idx,
-                ("meta_n_det_snr5", "meta_n_det"),
-                np.float32,
-            )
-            n_bands, n_bands_name = _read_group_meta_array_for_indices(
-                grp,
-                idx,
-                ("meta_n_bands",),
-                np.float32,
-            )
-            t_span, t_span_name = _read_group_meta_array_for_indices(
-                grp,
-                idx,
-                ("meta_t_span",),
-                np.float32,
-            )
-        except KeyError:
-            meta = OpticalBinaryDataset._load_or_compute_meta_arrays(f, group)
-            det_counts = np.asarray(meta["n_det"][idx], dtype=np.float32).reshape(-1)
-            n_bands = np.asarray(meta["n_bands"][idx], dtype=np.float32).reshape(-1)
-            t_span = np.asarray(meta["t_span"][idx], dtype=np.float32).reshape(-1)
-            det_name = "computed_n_det"
-            n_bands_name = "computed_n_bands"
-            t_span_name = "computed_t_span"
+    runtime_active = runtime_input_window_is_active_for_h5(
+        h5_path,
+        runtime_input_window_start,
+        runtime_input_window_end,
+    )
+    if runtime_active:
+        meta = _load_or_compute_runtime_window_meta_arrays(
+            h5_path,
+            group,
+            window_start=runtime_input_window_start,
+            window_end=runtime_input_window_end,
+        )
+        det_counts = np.asarray(meta["n_det"][idx], dtype=np.float32).reshape(-1)
+        n_bands = np.asarray(meta["n_bands"][idx], dtype=np.float32).reshape(-1)
+        t_span = np.asarray(meta["t_span"][idx], dtype=np.float32).reshape(-1)
+        det_name = "runtime_window_n_det"
+        n_bands_name = "runtime_window_n_bands"
+        t_span_name = "runtime_window_t_span"
+    else:
+        with h5py.File(h5_path, "r") as f:
+            if group not in f:
+                raise KeyError(f"Group '{group}' not found in {h5_path}")
+            grp = f[group]
+            try:
+                det_counts, det_name = _read_group_meta_array_for_indices(
+                    grp,
+                    idx,
+                    ("meta_n_det_snr5", "meta_n_det"),
+                    np.float32,
+                )
+                n_bands, n_bands_name = _read_group_meta_array_for_indices(
+                    grp,
+                    idx,
+                    ("meta_n_bands",),
+                    np.float32,
+                )
+                t_span, t_span_name = _read_group_meta_array_for_indices(
+                    grp,
+                    idx,
+                    ("meta_t_span",),
+                    np.float32,
+                )
+            except KeyError:
+                meta = OpticalBinaryDataset._load_or_compute_meta_arrays(f, group)
+                det_counts = np.asarray(meta["n_det"][idx], dtype=np.float32).reshape(-1)
+                n_bands = np.asarray(meta["n_bands"][idx], dtype=np.float32).reshape(-1)
+                t_span = np.asarray(meta["t_span"][idx], dtype=np.float32).reshape(-1)
+                det_name = "computed_n_det"
+                n_bands_name = "computed_n_bands"
+                t_span_name = "computed_t_span"
 
     if n_det_min is not None:
         keep &= det_counts >= float(n_det_min)
@@ -1959,12 +2400,18 @@ def _filter_indices_by_min_detection_count(
     group: str,
     indices: np.ndarray,
     prefix_min_det: int,
+    runtime_input_window_start: Optional[float] = None,
+    runtime_input_window_end: Optional[float] = None,
 ) -> np.ndarray:
     idx = np.asarray(indices, dtype=np.int64).reshape(-1)
     if idx.size == 0:
         return idx
-    with h5py.File(h5_path, "r") as f:
-        meta = OpticalBinaryDataset._load_or_compute_meta_arrays(f, group)
+    meta = _load_or_compute_runtime_window_meta_arrays(
+        h5_path,
+        group,
+        window_start=runtime_input_window_start,
+        window_end=runtime_input_window_end,
+    )
     det_counts = np.asarray(meta["n_det"][idx], dtype=np.float32)
     keep = det_counts >= float(prefix_min_det)
     return idx[keep]
@@ -2285,6 +2732,8 @@ def create_optical_binary_dataloaders(
     meta_filter_n_bands_max: Optional[int] = None,
     meta_filter_t_span_max: Optional[float] = None,
     meta_filter_relax_t_span_if_below_rows: Optional[int] = None,
+    runtime_input_window_start: Optional[float] = None,
+    runtime_input_window_end: Optional[float] = None,
 ):
     if cache_in_memory and num_workers > 0:
         print("cache_in_memory=True with num_workers>0 may increase RAM usage.")
@@ -2303,6 +2752,10 @@ def create_optical_binary_dataloaders(
     prefix_train_enable = bool(prefix_train_enable)
     prefix_min_det = int(prefix_min_det)
     prefix_det_support = parse_prefix_det_support(prefix_eval_det_support)
+    runtime_input_window_start, runtime_input_window_end = _normalize_runtime_input_window(
+        runtime_input_window_start,
+        runtime_input_window_end,
+    )
 
     meta_filter_n_det_min = None if meta_filter_n_det_min is None else int(meta_filter_n_det_min)
     meta_filter_n_det_max = None if meta_filter_n_det_max is None else int(meta_filter_n_det_max)
@@ -2337,6 +2790,8 @@ def create_optical_binary_dataloaders(
                 n_det_max=meta_filter_n_det_max,
                 n_bands_max=meta_filter_n_bands_max,
                 t_span_max=t_span_limit,
+                runtime_input_window_start=runtime_input_window_start,
+                runtime_input_window_end=runtime_input_window_end,
             )
             neg_out, neg_summary = _filter_indices_by_meta_constraints(
                 neg_h5_path,
@@ -2346,6 +2801,8 @@ def create_optical_binary_dataloaders(
                 n_det_max=meta_filter_n_det_max,
                 n_bands_max=meta_filter_n_bands_max,
                 t_span_max=t_span_limit,
+                runtime_input_window_start=runtime_input_window_start,
+                runtime_input_window_end=runtime_input_window_end,
             )
             return pos_out, neg_out, {
                 "pos": pos_summary,
@@ -2410,16 +2867,24 @@ def create_optical_binary_dataloaders(
                 "prefix_train_enable=true requires slot_is_detection in the negative H5 dataset."
             )
         train_pos_idx = _filter_indices_by_min_detection_count(
-            pos_h5_path, pos_group, train_pos_idx, prefix_min_det
+            pos_h5_path, pos_group, train_pos_idx, prefix_min_det,
+            runtime_input_window_start=runtime_input_window_start,
+            runtime_input_window_end=runtime_input_window_end,
         )
         val_pos_idx = _filter_indices_by_min_detection_count(
-            pos_h5_path, pos_group, val_pos_idx, prefix_min_det
+            pos_h5_path, pos_group, val_pos_idx, prefix_min_det,
+            runtime_input_window_start=runtime_input_window_start,
+            runtime_input_window_end=runtime_input_window_end,
         )
         train_neg_idx = _filter_indices_by_min_detection_count(
-            neg_h5_path, neg_group, train_neg_idx, prefix_min_det
+            neg_h5_path, neg_group, train_neg_idx, prefix_min_det,
+            runtime_input_window_start=runtime_input_window_start,
+            runtime_input_window_end=runtime_input_window_end,
         )
         val_neg_idx = _filter_indices_by_min_detection_count(
-            neg_h5_path, neg_group, val_neg_idx, prefix_min_det
+            neg_h5_path, neg_group, val_neg_idx, prefix_min_det,
+            runtime_input_window_start=runtime_input_window_start,
+            runtime_input_window_end=runtime_input_window_end,
         )
         if train_pos_idx.size == 0 or train_neg_idx.size == 0:
             raise ValueError(
@@ -2459,6 +2924,8 @@ def create_optical_binary_dataloaders(
         cache_in_memory=cache_in_memory,
         load_meta_features=bool(meta_matched_sampling),
         return_prefix_aux=prefix_train_enable,
+        runtime_input_window_start=runtime_input_window_start,
+        runtime_input_window_end=runtime_input_window_end,
     )
 
     if bool(meta_matched_sampling):
@@ -2516,6 +2983,8 @@ def create_optical_binary_dataloaders(
             cache_in_memory=cache_in_memory,
             load_meta_features=False,
             return_prefix_aux=True,
+            runtime_input_window_start=runtime_input_window_start,
+            runtime_input_window_end=runtime_input_window_end,
         )
         manifest_rows = _build_prefix_manifest_for_binary_dataset(
             base_dataset=val_base_dataset,
@@ -2564,6 +3033,8 @@ def create_optical_binary_dataloaders(
         neg_indices=val_neg_idx,
         cache_in_memory=cache_in_memory,
         load_meta_features=bool(meta_matched_sampling),
+        runtime_input_window_start=runtime_input_window_start,
+        runtime_input_window_end=runtime_input_window_end,
     )
 
     if bool(meta_matched_sampling):

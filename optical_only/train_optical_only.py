@@ -37,7 +37,7 @@ MODEL_DIR = SCRIPT_DIR.parent / "Model"
 if str(MODEL_DIR) not in sys.path:
     sys.path.insert(0, str(MODEL_DIR))
 
-from data_loader import create_optical_binary_dataloaders
+from data_loader import build_effective_input_window_metadata, create_optical_binary_dataloaders
 from metrics import compute_classification_metrics
 from model import OpticalKNClassifier
 from optical_prefix import (
@@ -1406,6 +1406,7 @@ def save_checkpoint(path, model, optimizer, epoch, args, val_metrics):
             "args": vars(args),
             "init_source_metadata": getattr(args, "_init_source_metadata", None),
             "dataset_window_metadata": getattr(args, "_dataset_window_metadata", None),
+            "effective_input_window_metadata": getattr(args, "_effective_input_window_metadata", None),
         },
         path,
     )
@@ -1461,6 +1462,7 @@ def build_train_summary_payload(
         "current_epoch": int(current_epoch),
         "current_stage": str(current_stage),
         "dataset_window_metadata": getattr(args, "_dataset_window_metadata", None),
+        "effective_input_window_metadata": getattr(args, "_effective_input_window_metadata", None),
         "init_source_metadata": getattr(args, "_init_source_metadata", None),
     }
     if last_epoch_metrics:
@@ -1539,7 +1541,19 @@ def train(args):
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     args._dataset_window_metadata = _collect_dataset_window_metadata(args)
+    pos_meta = args._dataset_window_metadata.get("train_positive", {})
+    dataset_window_start = pos_meta.get("time_window_start") if isinstance(pos_meta, dict) else None
+    dataset_window_end = pos_meta.get("time_window_end") if isinstance(pos_meta, dict) else None
+    args._effective_input_window_metadata = build_effective_input_window_metadata(
+        float(args.ref_start),
+        float(args.ref_end),
+        runtime_input_window_start=float(args.ref_start),
+        runtime_input_window_end=float(args.ref_end),
+        dataset_window_start=(None if dataset_window_start is None else float(dataset_window_start)),
+        dataset_window_end=(None if dataset_window_end is None else float(dataset_window_end)),
+    )
     print(f"Dataset window metadata: {json.dumps(args._dataset_window_metadata, indent=2)}")
+    print(f"Effective input window metadata: {json.dumps(args._effective_input_window_metadata, indent=2)}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type == "cuda":
@@ -1616,6 +1630,8 @@ def train(args):
         meta_filter_n_bands_max=getattr(args, "meta_filter_n_bands_max", None),
         meta_filter_t_span_max=getattr(args, "meta_filter_t_span_max", None),
         meta_filter_relax_t_span_if_below_rows=int(relax_thresholds["train"]),
+        runtime_input_window_start=float(args.ref_start),
+        runtime_input_window_end=float(args.ref_end),
     )
     print(f"Train Steps/Epoch: {steps_per_epoch} | Val Steps/Epoch: {val_steps}")
 
