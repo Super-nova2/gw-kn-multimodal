@@ -48,6 +48,9 @@ from data_loader import (
     RelationalHDF5Dataset,
     BalancedGWBatchedSampler,
     _build_dataloader,
+    _read_root_time_window_attrs,
+    apply_runtime_input_window_torch,
+    build_effective_input_window_metadata,
 )
 from model import GWOpticalALBEFModel, normalize_fusion_mode
 from metrics import (
@@ -780,12 +783,16 @@ def build_test_dataloader(
     """
     from data_loader import build_gw_to_lc_mapping
 
+    runtime_window_start = float(choose_value(None, saved_args, "ref_start", default=-0.3))
+    runtime_window_end = float(choose_value(None, saved_args, "ref_end", default=0.6))
     dataset = RelationalHDF5Dataset(
         args.test_data_path,
         negative_h5_path=args.neg_data_path,
         negative_group=args.neg_group,
         return_zero_time_mjd=bool(return_zero_time_mjd),
         nonkn_cls_base_field=str(nonkn_cls_base_field),
+        opt_input_window_start=runtime_window_start,
+        opt_input_window_end=runtime_window_end,
     )
     gw_to_lc = build_gw_to_lc_mapping(args.test_data_path)
     n_gw = len(gw_to_lc)
@@ -830,6 +837,8 @@ def load_negative_optical_samples(
     require_zero_time_mjd_base=False,
     require_zero_time_mjd_cls_base=False,
     nonkn_cls_base_field="zero_time_mjd_cls_base",
+    runtime_input_window_start: Optional[float] = None,
+    runtime_input_window_end: Optional[float] = None,
 ):
     """Load negative optical samples (non-KN transients) from external HDF5 file.
     
@@ -886,7 +895,22 @@ def load_negative_optical_samples(
         if 'types' in grp:
             neg_data['types'] = [grp['types'][i].decode() if isinstance(grp['types'][i], bytes) 
                                  else grp['types'][i] for i in sample_indices]
-        
+
+    if runtime_input_window_start is not None and runtime_input_window_end is not None:
+        cropped_time, cropped_val, cropped_mask, cropped_err, _ = apply_runtime_input_window_torch(
+            neg_data['times'],
+            neg_data['values'],
+            neg_data['masks'],
+            neg_data['errors'],
+            None,
+            window_start=float(runtime_input_window_start),
+            window_end=float(runtime_input_window_end),
+        )
+        neg_data['times'] = cropped_time
+        neg_data['values'] = cropped_val
+        neg_data['masks'] = cropped_mask
+        neg_data['errors'] = cropped_err
+
     return neg_data
 
 
@@ -3294,6 +3318,19 @@ def main():
     # Load model
     model, model_args, saved_args = load_model(args, device)
     runtime_model_args = dict(model_args)
+    dataset_window_start, dataset_window_end = _read_root_time_window_attrs(args.test_data_path)
+    runtime_model_args["dataset_window_metadata"] = {
+        "positive": _read_root_time_window_attrs(args.test_data_path),
+        "negative": _read_root_time_window_attrs(args.neg_data_path),
+    }
+    runtime_model_args["effective_input_window_metadata"] = build_effective_input_window_metadata(
+        float(runtime_model_args.get("ref_start", -0.3)),
+        float(runtime_model_args.get("ref_end", 0.6)),
+        runtime_input_window_start=float(runtime_model_args.get("ref_start", -0.3)),
+        runtime_input_window_end=float(runtime_model_args.get("ref_end", 0.6)),
+        dataset_window_start=dataset_window_start,
+        dataset_window_end=dataset_window_end,
+    )
     credibility_modes = _parse_credibility_ablation_modes(args.credibility_ablation_modes)
     model_uses_cred = _model_requires_cred_level(model)
     nonkn_cls_base_field = str(model_args.get("nonkn_cls_base_field", "zero_time_mjd_cls_base"))
@@ -3452,6 +3489,8 @@ def main():
             "modes_requested": credibility_modes,
             "model_uses_cred_level_input": bool(model_uses_cred),
         },
+        "dataset_window_metadata": runtime_model_args.get("dataset_window_metadata"),
+        "effective_input_window_metadata": runtime_model_args.get("effective_input_window_metadata"),
     }
     print("\nComputing batch-mode retrieval metrics...")
     results["retrieval_batch"] = evaluate_retrieval_batch_mode(embeddings)
@@ -3481,6 +3520,8 @@ def main():
             require_zero_time_mjd_base=False,
             require_zero_time_mjd_cls_base=False,
             nonkn_cls_base_field=nonkn_cls_base_field,
+            runtime_input_window_start=float(runtime_model_args.get("ref_start", -0.3)),
+            runtime_input_window_end=float(runtime_model_args.get("ref_end", 0.6)),
         )
     neg_gw_indices = load_negative_gw_indices(args.test_data_path)
 
