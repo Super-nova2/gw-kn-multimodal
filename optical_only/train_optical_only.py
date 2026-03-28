@@ -730,11 +730,13 @@ def sample_universal_target_k(
 
 
 def bucketize_n_det(n_det: torch.Tensor) -> torch.Tensor:
+    # Aligned with prefix_eval_det_support 2-6 and secondary up to 12.
+    # Buckets: <=2 | 3 | 4 | 5-6 | >=7
     out = torch.zeros_like(n_det, dtype=torch.long)
-    out = torch.where(n_det == 4, torch.ones_like(out), out)
-    out = torch.where((n_det >= 5) & (n_det <= 6), torch.full_like(out, 2), out)
-    out = torch.where((n_det >= 7) & (n_det <= 12), torch.full_like(out, 3), out)
-    out = torch.where(n_det >= 13, torch.full_like(out, 4), out)
+    out = torch.where(n_det == 3, torch.ones_like(out), out)
+    out = torch.where(n_det == 4, torch.full_like(out, 2), out)
+    out = torch.where((n_det >= 5) & (n_det <= 6), torch.full_like(out, 3), out)
+    out = torch.where(n_det >= 7, torch.full_like(out, 4), out)
     return out
 
 
@@ -747,11 +749,14 @@ def bucketize_n_bands(n_bands: torch.Tensor) -> torch.Tensor:
 
 
 def bucketize_t_span(t_span: torch.Tensor) -> torch.Tensor:
+    # Aligned with event window [-10d, 20d] (normalised max ~0.3).
+    # Buckets (days): <=2d | 2-5d | 5-10d | 10-20d | >20d
+    # Normalised thresholds (÷100): 0.02, 0.05, 0.10, 0.20
     out = torch.zeros_like(t_span, dtype=torch.long)
-    out = torch.where(t_span > 0.01, torch.ones_like(out), out)
+    out = torch.where(t_span > 0.02, torch.ones_like(out), out)
     out = torch.where(t_span > 0.05, torch.full_like(out, 2), out)
-    out = torch.where(t_span > 0.2, torch.full_like(out, 3), out)
-    out = torch.where(t_span > 0.6, torch.full_like(out, 4), out)
+    out = torch.where(t_span > 0.10, torch.full_like(out, 3), out)
+    out = torch.where(t_span > 0.20, torch.full_like(out, 4), out)
     return out
 
 
@@ -2039,7 +2044,7 @@ def parse_args():
     parser.add_argument("--meta_match_fallback", type=str, default="nearest")
     parser.add_argument("--meta_bins_n_det", type=str, default="3,5,8,12,20,40,80,200")
     parser.add_argument("--meta_bins_n_bands", type=str, default="1,2,3,4,5,6")
-    parser.add_argument("--meta_bins_t_span", type=str, default="0,0.01,0.05,0.1,0.2,0.5,1.0")
+    parser.add_argument("--meta_bins_t_span", type=str, default="0,0.02,0.05,0.10,0.20,0.30")
     parser.add_argument("--meta_filter_n_det_min", type=int, default=None)
     parser.add_argument("--meta_filter_n_det_max", type=int, default=None)
     parser.add_argument("--meta_filter_n_bands_max", type=int, default=None)

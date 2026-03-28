@@ -22,6 +22,7 @@ PRD/
 /plots_scripts/
 
 outputs/
+*.pdf
 
 
 ./dataset/KN_sim/notebook/

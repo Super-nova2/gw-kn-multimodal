@@ -52,7 +52,7 @@ from data_loader import (
     apply_runtime_input_window_torch,
     build_effective_input_window_metadata,
 )
-from model import GWOpticalALBEFModel, normalize_fusion_mode
+from model import GWOpticalALBEFModel, normalize_fusion_mode, migrate_time_embed_state_dict
 from metrics import (
     compute_retrieval_metrics,
     compute_classification_metrics,
@@ -751,6 +751,7 @@ def load_model(args, device):
     # Strip _orig_mod. prefix from torch.compile'd checkpoints
     state_dict = ckpt["model_state_dict"]
     state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
+    state_dict = migrate_time_embed_state_dict(state_dict)
     try:
         model.load_state_dict(state_dict)
     except RuntimeError as exc:

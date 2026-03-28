@@ -5,7 +5,7 @@ from data_loader import (
     build_effective_input_window_metadata,
     build_gw_to_lc_mapping,
 )
-from model import GWOpticalALBEFModel, normalize_fusion_mode
+from model import GWOpticalALBEFModel, normalize_fusion_mode, migrate_time_embed_state_dict
 from tqdm import tqdm
 import torch
 import torch.nn.functional as F
@@ -1666,6 +1666,7 @@ def train(args):
         if not os.path.exists(args.resume):
             raise FileNotFoundError(f"Resume checkpoint not found: {args.resume}")
         ckpt = torch.load(args.resume, map_location=device)
+        migrate_time_embed_state_dict(ckpt["model_state_dict"])
         try:
             model.load_state_dict(ckpt["model_state_dict"], strict=True)
         except RuntimeError as exc:
