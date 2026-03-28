@@ -31,7 +31,7 @@ from data_loader import (
     split_gw_map,
     _build_dataloader,
 )
-from model import GWOpticalALBEFModel
+from model import GWOpticalALBEFModel, migrate_time_embed_state_dict
 
 
 def header(title):
@@ -338,6 +338,7 @@ def main():
             ref_time_dim=getattr(ckpt_args, "ref_dim", 64),
             use_lightweight_gw=getattr(ckpt_args, "use_lightweight_gw", False),
         ).to(device)
+        migrate_time_embed_state_dict(ckpt["model_state_dict"])
         model.load_state_dict(ckpt["model_state_dict"], strict=False)
         check_5_embedding_stats(
             model, gw_s, gw_m, opt_t, opt_v, opt_mask, opt_err, opt_coords, device

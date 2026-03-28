@@ -36,7 +36,7 @@ from data_loader import (
     build_effective_input_window_metadata,
 )
 from metrics import compute_classification_metrics
-from model import OpticalKNClassifier
+from model import OpticalKNClassifier, migrate_time_embed_state_dict
 from optical_prefix import parse_prefix_det_support
 
 
@@ -463,6 +463,7 @@ def load_model(checkpoint_path, device, config_dict):
     if not isinstance(state_dict, dict):
         raise ValueError("Checkpoint does not contain valid state_dict.")
     cleaned_state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
+    cleaned_state_dict = migrate_time_embed_state_dict(cleaned_state_dict)
     has_universal_aux = (
         bool(ckpt_args.get("universal_train_enable", False))
         or any(k.startswith("projection_head.") for k in cleaned_state_dict.keys())

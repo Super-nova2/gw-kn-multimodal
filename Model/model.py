@@ -47,33 +47,71 @@ def normalize_fusion_mode(fusion_mode=None, dual_fusion=False):
     raise ValueError(f"Unsupported fusion_mode: {fusion_mode}")
 
 # ==============================================================================
+# 0. Checkpoint migration helper
+# ==============================================================================
+def migrate_time_embed_state_dict(state_dict: dict) -> dict:
+    """Convert legacy ``*.wi`` keys to ``*.log_wi`` for checkpoint compatibility.
+
+    Old checkpoints store angular frequencies in linear space as ``wi``.
+    The current ``LearnablePeriodicEmbedding`` uses log-parameterisation
+    (``log_wi = log(wi)``).  This function detects old-format keys and
+    converts them in-place so that ``load_state_dict`` works transparently.
+    """
+    keys_to_migrate = [
+        k for k in list(state_dict.keys())
+        if k.endswith(".wi") and k.replace(".wi", ".log_wi") not in state_dict
+    ]
+    for old_key in keys_to_migrate:
+        new_key = old_key.replace(".wi", ".log_wi")
+        state_dict[new_key] = torch.log(state_dict.pop(old_key))
+    if keys_to_migrate:
+        print(f"[migrate_time_embed] converted {len(keys_to_migrate)} key(s): "
+              f"{keys_to_migrate}")
+    return state_dict
+
+
+# ==============================================================================
 # 1. Learnable Periodic Time Embedding (phi_h(t)) and Spatial Embedding Module
 # ==============================================================================
 class LearnablePeriodicEmbedding(nn.Module):
     """
     Implements the time embedding phi_h(t) described in Equation (1).
-    
+
     phi_h(t)[i] = w_0h * t + a_0h             if i = 0 (Linear term)
                 = sin(w_ih * t + a_ih)        if 0 < i < d_r (Periodic term)
     """
-    def __init__(self, num_heads, ref_dim):
+    def __init__(self, num_heads, ref_dim,
+                 period_range_days=(0.5, 100.0),
+                 time_scale_divisor=100.0):
         """
         Args:
             num_heads (H): Number of attention heads.
             ref_dim (d_r): Dimension of the reference embedding per head.
+            period_range_days: (min_days, max_days) physical period range for
+                frequency initialization.  Frequencies are log-linearly spaced
+                so that the shortest period is min_days and the longest is
+                max_days.  For kilonova light curves, (0.5, 100) covers the
+                UV flash (~hours) to the red-component tail (~months).
+            time_scale_divisor: The divisor used by the data pipeline to scale
+                time inputs (t_scaled = t_days / time_scale_divisor).  Must
+                match ``offset_scale_days_divisor`` in the training config.
         """
         super().__init__()
         self.num_heads = num_heads
         self.ref_dim = ref_dim
-        
+        self.period_range_days = tuple(period_range_days)
+        self.time_scale_divisor = float(time_scale_divisor)
+
         # Parameters for the linear term (i=0)
         # Shape: [1, 1, H, 1] for broadcasting over batch and time
-        self.w0 = nn.Parameter(torch.empty(1, 1, num_heads, 1)) 
+        self.w0 = nn.Parameter(torch.empty(1, 1, num_heads, 1))
         self.a0 = nn.Parameter(torch.empty(1, 1, num_heads, 1))
-        
+
         # Parameters for the periodic terms (0 < i < d_r)
         # We need (d_r - 1) frequencies per head
-        self.wi = nn.Parameter(torch.empty(1, 1, num_heads, ref_dim - 1))
+        # log-parameterised: store log(ω) so that high- and low-frequency
+        # components receive comparable relative gradient magnitudes.
+        self.log_wi = nn.Parameter(torch.empty(1, 1, num_heads, ref_dim - 1))
         self.ai = nn.Parameter(torch.empty(1, 1, num_heads, ref_dim - 1))
 
         self.reset_parameters()
@@ -81,35 +119,55 @@ class LearnablePeriodicEmbedding(nn.Module):
 
     def reset_parameters(self):
         """
-        Custom initialization logic.
+        Physics-informed initialization.
+
+        Frequencies are log-linearly spaced so that their periods cover
+        [period_min, period_max] in physical days.  The linear-term weight
+        is scaled so that ``w0 * t_scaled`` produces O(1) values over a
+        typical observation window, matching the [-1, 1] range of the
+        periodic components.
+
+        Previous behaviour (scale=100, ω ∈ [0.01, 1]) produced initial
+        periods of 628–62 832 days — far longer than kilonova timescales
+        (< 100 days).  The periodic components collapsed to near-constants,
+        trapping optimisation in a linear basin with vanishing ∂sin/∂ω
+        gradients.
         """
-        # 1. Linear Terms: Use Xavier Uniform for weights, Zero for bias
-        nn.init.xavier_uniform_(self.w0)
+        p_min, p_max = self.period_range_days
+        D = self.time_scale_divisor
+
+        # --- 1. Linear term (w0, a0) ---
+        # Goal: w0 * t_scaled ∈ ~[-1, 1] for t_scaled in the observation
+        # window.  Choosing w0_scale = ω_min = 2π·D/p_max so the linear
+        # term has the same magnitude as the slowest periodic component.
+        w0_scale = 2.0 * math.pi * D / p_max          # ≈ 6.28 for defaults
+        nn.init.uniform_(self.w0, -w0_scale, w0_scale)
         nn.init.zeros_(self.a0)
-        
-        # 2. Periodic Frequencies (wi): Log-Linear Initialization
-        # We want frequencies to span a range (e.g., from 1.0 to 100.0) geometrically.
-        # This is similar to the fixed positional encoding in Transformers.
-        # Generate exponents linearly spaced
-        exponents = torch.linspace(0, self.ref_dim - 2, self.ref_dim - 1)
-        
-        # Scale factor (e.g., 100.0 means frequencies range from ~1 to ~100)
-        # Formula: freq = scale ^ (i / d)
-        scale = 100.0
-        log_freqs = -math.log(scale) * (exponents / (self.ref_dim - 1))
-        freqs = torch.exp(log_freqs) # Shape: [d-1]
-        
-        # Broadcast to heads [1, 1, H, d-1]
+
+        # --- 2. Periodic frequencies (wi): physics-informed log-linear ---
+        # ω = 2π · D / period_days, so:
+        #   ω_min = 2π · D / p_max  (slowest, longest period)
+        #   ω_max = 2π · D / p_min  (fastest, shortest period)
+        omega_min = 2.0 * math.pi * D / p_max   # ≈ 6.28   for defaults
+        omega_max = 2.0 * math.pi * D / p_min   # ≈ 1256.6 for defaults
+
+        n_freq = self.ref_dim - 1
+        log_omega = torch.linspace(
+            math.log(omega_min), math.log(omega_max), n_freq,
+        )
+        freqs = torch.exp(log_omega)                   # [n_freq]
+
+        # Broadcast to heads [1, 1, H, n_freq]
         freq_init = freqs.view(1, 1, 1, -1).repeat(1, 1, self.num_heads, 1)
-        
-        # Add small random noise so heads are not identical
+
+        # Add small random noise (±5 %) so heads are not identical
         freq_noise = torch.randn_like(freq_init) * 0.05
         freq_init = freq_init * torch.exp(freq_noise)
-        
+
         with torch.no_grad():
-            self.wi.copy_(freq_init)
-        
-        # 3. Periodic Phases (ai): Uniform distribution over [0, 2pi]
+            self.log_wi.copy_(torch.log(freq_init))
+
+        # --- 3. Periodic phases (ai): Uniform [0, 2π] ---
         nn.init.uniform_(self.ai, 0, 2 * math.pi)
 
     def forward(self, t):
@@ -129,8 +187,9 @@ class LearnablePeriodicEmbedding(nn.Module):
         
         # 2. Compute Periodic Terms (i > 0): sin(w_ih * t + a_ih)
         # Output: [Batch, Seq_Len, H, d_r - 1]
-        # Note: t_expanded broadcasts against self.wi [1, 1, H, d_r-1]
-        periodic_term = torch.sin(self.wi * t_expanded + self.ai)
+        # Recover linear frequencies from log-parameterisation
+        wi = torch.exp(self.log_wi)
+        periodic_term = torch.sin(wi * t_expanded + self.ai)
         
         # 3. Concatenate along the last dimension to form d_r
         # Output: [Batch, Seq_Len, H, d_r]
@@ -391,21 +450,26 @@ class OpticalEncoderWithCLS(nn.Module):
         mtan_lupt_psfflux_zp: float = 31.4,
         mtan_lupt_k: float = 1.0,
         mtan_lupt_m5_mag=(23.9, 25.0, 24.7, 24.0, 23.3, 22.1),
+        mtan_period_range_days=(0.5, 100.0),
+        mtan_time_scale_divisor: float = 100.0,
     ):
         super().__init__()
         self.num_heads = num_heads
         self.ref_dim = ref_dim
-        
+
         # 1. Time Embedding Layer (phi) [cite: 5, 6]
-        self.time_embedding = LearnablePeriodicEmbedding(num_heads, ref_dim)
+        self.time_embedding = LearnablePeriodicEmbedding(
+            num_heads, ref_dim,
+            period_range_days=mtan_period_range_days,
+            time_scale_divisor=mtan_time_scale_divisor,
+        )
         
         # 2. Learnable CLS Token Parameter
         # This replaces phi(t) for the first token. 
         # Dimensions must match the embedded time: [1, 1, H, d_r]
         self.cls_token = nn.Parameter(torch.empty(1, 1, num_heads, ref_dim))
-        nn.init.normal_(self.cls_token, mean=0.0, std=0.02) # BERT initialization
-        # self.cls_token.requires_grad = True
-        
+        nn.init.normal_(self.cls_token, mean=0.0, std=0.10)
+
         # 3. mTAN Core Module [cite: 3, 4]
         self.mtan = MultiTimeAttention(
             input_dim,
@@ -505,11 +569,17 @@ class OpticalEncoderWithCLSNoCoord(nn.Module):
         mtan_lupt_psfflux_zp: float = 31.4,
         mtan_lupt_k: float = 1.0,
         mtan_lupt_m5_mag=(23.9, 25.0, 24.7, 24.0, 23.3, 22.1),
+        mtan_period_range_days=(0.5, 100.0),
+        mtan_time_scale_divisor: float = 100.0,
     ):
         super().__init__()
-        self.time_embedding = LearnablePeriodicEmbedding(num_heads, ref_dim)
+        self.time_embedding = LearnablePeriodicEmbedding(
+            num_heads, ref_dim,
+            period_range_days=mtan_period_range_days,
+            time_scale_divisor=mtan_time_scale_divisor,
+        )
         self.cls_token = nn.Parameter(torch.empty(1, 1, num_heads, ref_dim))
-        nn.init.normal_(self.cls_token, mean=0.0, std=0.02)
+        nn.init.normal_(self.cls_token, mean=0.0, std=0.10)
         self.mtan = MultiTimeAttention(
             input_dim,
             num_heads,
@@ -1006,6 +1076,8 @@ class PhysicalDualOpticalEncoder(nn.Module):
         mtan_lupt_psfflux_zp: float = 31.4,
         mtan_lupt_k: float = 1.0,
         mtan_lupt_m5_mag=(23.9, 25.0, 24.7, 24.0, 23.3, 22.1),
+        mtan_period_range_days=(0.5, 100.0),
+        mtan_time_scale_divisor: float = 100.0,
     ):
         super().__init__()
         self.curve_encoder = OpticalLightCurveEncoder(
@@ -1023,6 +1095,8 @@ class PhysicalDualOpticalEncoder(nn.Module):
             mtan_lupt_psfflux_zp=mtan_lupt_psfflux_zp,
             mtan_lupt_k=mtan_lupt_k,
             mtan_lupt_m5_mag=mtan_lupt_m5_mag,
+            mtan_period_range_days=mtan_period_range_days,
+            mtan_time_scale_divisor=mtan_time_scale_divisor,
         )
         self.coord_encoder = OpticalCoordEncoder(output_dim=enc_dim)
         self.contrastive_head = OptContrastiveFuseProj(
@@ -1442,6 +1516,8 @@ class GWOpticalALBEFModel(nn.Module):
         mtan_lupt_psfflux_zp=31.4,
         mtan_lupt_k=1.0,
         mtan_lupt_m5_mag=(23.9, 25.0, 24.7, 24.0, 23.3, 22.1),
+        mtan_period_range_days=(0.5, 100.0),
+        mtan_time_scale_divisor=100.0,
     ):
         super().__init__()
         self.fusion_mode = normalize_fusion_mode(fusion_mode, dual_fusion=dual_fusion)
@@ -1476,6 +1552,8 @@ class GWOpticalALBEFModel(nn.Module):
                 mtan_lupt_psfflux_zp=mtan_lupt_psfflux_zp,
                 mtan_lupt_k=mtan_lupt_k,
                 mtan_lupt_m5_mag=mtan_lupt_m5_mag,
+                mtan_period_range_days=mtan_period_range_days,
+                mtan_time_scale_divisor=mtan_time_scale_divisor,
             )
             self.gw_proj = None
             self.opt_proj = None
@@ -1511,6 +1589,8 @@ class GWOpticalALBEFModel(nn.Module):
                 mtan_lupt_psfflux_zp=mtan_lupt_psfflux_zp,
                 mtan_lupt_k=mtan_lupt_k,
                 mtan_lupt_m5_mag=mtan_lupt_m5_mag,
+                mtan_period_range_days=mtan_period_range_days,
+                mtan_time_scale_divisor=mtan_time_scale_divisor,
             )
             self.gw_proj = ProjectionHead(enc_dim, enc_dim, proj_dim, dropout=proj_dropout)
             self.opt_proj = ProjectionHead(enc_dim, enc_dim, proj_dim, dropout=proj_dropout)
@@ -2057,6 +2137,8 @@ class OpticalKNClassifier(nn.Module):
         n_bands_bucket_classes=4,
         t_span_bucket_classes=5,
         grl_lambda=1.0,
+        mtan_period_range_days=(0.5, 100.0),
+        mtan_time_scale_divisor: float = 100.0,
     ):
         super().__init__()
         self.feature_dropout = nn.Dropout(feature_dropout)
@@ -2070,6 +2152,8 @@ class OpticalKNClassifier(nn.Module):
             ref_dim=ref_time_dim,
             k_dim=k_dim,
             dropout=opt_dropout,
+            mtan_period_range_days=mtan_period_range_days,
+            mtan_time_scale_divisor=mtan_time_scale_divisor,
         )
 
         hidden = head_hidden_dim if head_hidden_dim is not None else enc_dim
@@ -2223,6 +2307,9 @@ class OpticalKNClassifier(nn.Module):
             if not optical_state:
                 raise KeyError("No optical_encoder.curve_encoder.* keys found in provided state_dict.")
             source_mode = "curve_encoder_only"
+
+        # Migrate legacy wi → log_wi keys from old checkpoints
+        optical_state = migrate_time_embed_state_dict(optical_state)
 
         target_state = self.optical_encoder.state_dict()
         matched_keys = []
