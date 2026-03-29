@@ -1,0 +1,102 @@
+// GW-Optical ALBEF architecture (v5 clean, v4 style)
+digraph G {
+	label="GW-Optical ALBEF Architecture (Clean v5)" labelloc=t rankdir=LR
+	graph [bgcolor="#FFFFFF" dpi=220 fontname=Helvetica fontsize=18 nodesep=0.45 pad=0.15 ranksep=0.75 splines=spline]
+	node [color="#475569" fontname=Helvetica fontsize=11 penwidth=1.2 shape=box style="rounded,filled"]
+	edge [arrowsize=0.75 color="#64748B" penwidth=1.2]
+	subgraph cluster_inputs {
+		color="#CBD5E1" label="1) Inputs" style="rounded,dashed"
+		gw_scalars [label="GW scalars
+(mass, spin, distance)" fillcolor="#F8FAFC"]
+		gw_skymap [label="GW skymap sequence
+(7 x 19200)" fillcolor="#F8FAFC"]
+		opt_lc [label="Optical light curves" fillcolor="#F8FAFC"]
+		opt_coord [label="Optical coordinates
+(RA, Dec)" fillcolor="#F8FAFC"]
+		ref_time [label="Reference time grid" fillcolor="#F8FAFC"]
+		cls_tok [label="Learnable CLS token" fillcolor="#F8FAFC"]
+	}
+	subgraph cluster_encoders {
+		color="#93C5FD" label="2) Decoupled Encoders" style="rounded,dashed"
+		gw_scalar_enc [label="GW scalar encoder" color="#60A5FA" fillcolor="#DBEAFE"]
+		gw_skymap_enc [label="GW skymap encoder
+(1D ResNet / lightweight)" color="#60A5FA" fillcolor="#DBEAFE"]
+		gw_pool [label="Global average pool" color="#60A5FA" fillcolor="#DBEAFE"]
+		curve_enc [label="Optical light-curve encoder
+(mTAN / Transformer)" color="#22C55E" fillcolor="#DCFCE7"]
+		coord_enc [label="Optical coordinate encoder" color="#22C55E" fillcolor="#DCFCE7"]
+		g_scalar [label="g_scalar
+GW scalar vector" color="#FB923C" fillcolor="#FFF7ED" shape=ellipse]
+		H_gw [label="H_gw
+GW token sequence" color="#FB923C" fillcolor="#FFF7ED" shape=ellipse]
+		g_sky [label="g_sky
+Pooled skymap vector" color="#FB923C" fillcolor="#FFF7ED" shape=ellipse]
+		z_curve [label="z_curve
+Light-curve global vector" color="#FB923C" fillcolor="#FFF7ED" shape=ellipse]
+		H_l [label="H_l
+Optical token sequence" color="#FB923C" fillcolor="#FFF7ED" shape=ellipse]
+		coord_feat [label="coord_feat
+Coordinate vector" color="#FB923C" fillcolor="#FFF7ED" shape=ellipse]
+	}
+	subgraph cluster_align {
+		color="#A5B4FC" label="3) Alignment Branch (Contrastive)" style="rounded,dashed"
+		gw_proj [label="GW fusion + projection" color="#6366F1" fillcolor="#E0E7FF"]
+		opt_proj [label="Optical fusion + projection" color="#6366F1" fillcolor="#E0E7FF"]
+		feat_g [label="feat_g
+Normalized embedding" color="#FB923C" fillcolor="#FFF7ED" shape=ellipse]
+		feat_o [label="feat_o
+Normalized embedding" color="#FB923C" fillcolor="#FFF7ED" shape=ellipse]
+		pair_sim [label="sim_itc_pair
+Optional scalar" color="#FB923C" fillcolor="#FFF7ED" shape=ellipse]
+		loss_itc [label=L_itc color="#EF4444" fillcolor="#FEE2E2" fontcolor="#991B1B" shape=diamond style=filled]
+	}
+	subgraph cluster_fusion {
+		color="#FCA5A5" label="4) Fusion + Classification" style="rounded,dashed"
+		cross_g2o [label="Cross-attention
+(g_scalar -> H_l)" color="#F59E0B" fillcolor="#FEF3C7"]
+		cross_o2g [label="Cross-attention
+(coord_feat -> H_gw)" color="#F59E0B" fillcolor="#FEF3C7"]
+		cred [label="Credible level estimator
+(skymap + RA/Dec)" color="#F59E0B" fillcolor="#FEF3C7"]
+		f_opt [label=f_param2opt color="#FB923C" fillcolor="#FFF7ED" shape=ellipse]
+		f_gw [label=f_coord2gw color="#FB923C" fillcolor="#FFF7ED" shape=ellipse]
+		merge [label="Feature concat" color="#F59E0B" fillcolor="#FEF3C7"]
+		clf [label="Classifier MLP" color="#F59E0B" fillcolor="#FEF3C7"]
+		loss_cls [label=L_cls color="#EF4444" fillcolor="#FEE2E2" fontcolor="#991B1B" shape=diamond style=filled]
+	}
+	gw_scalars -> gw_scalar_enc
+	gw_skymap -> gw_skymap_enc
+	opt_lc -> curve_enc
+	ref_time -> curve_enc
+	cls_tok -> curve_enc
+	opt_coord -> coord_enc
+	gw_scalar_enc -> g_scalar
+	gw_skymap_enc -> H_gw
+	H_gw -> gw_pool
+	gw_pool -> g_sky
+	curve_enc -> z_curve
+	curve_enc -> H_l
+	coord_enc -> coord_feat
+	g_scalar -> gw_proj
+	g_sky -> gw_proj
+	gw_proj -> feat_g
+	z_curve -> opt_proj
+	coord_feat -> opt_proj
+	opt_proj -> feat_o
+	feat_g -> loss_itc
+	feat_o -> loss_itc
+	feat_g -> pair_sim
+	feat_o -> pair_sim
+	g_scalar -> cross_g2o
+	H_l -> cross_g2o
+	coord_feat -> cross_o2g
+	H_gw -> cross_o2g
+	cross_g2o -> f_opt
+	cross_o2g -> f_gw
+	f_opt -> merge
+	f_gw -> merge
+	pair_sim -> merge [label=optional style=dashed]
+	cred -> merge [label=optional style=dashed]
+	merge -> clf
+	clf -> loss_cls
+}

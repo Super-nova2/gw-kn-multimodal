@@ -1,0 +1,16 @@
+{
+    "SIM_NAME": "LSST_KN_NSBH_TRAIN",
+    "GW_type": "nsbh",
+    "skymap_path": "<BASE_DIR>/data/skymap/nsbh_skymap_train/",
+    "OpsimDB": "<BASE_DIR>/data/rubin_sim/baseline_v5.1/baseline_v5.1.1_10yrs.db",
+    "Nside": 256,
+    "SNANA_DIR": "<BASE_DIR>/SNANA/SNANA",
+    "SNDATA_ROOT": "<BASE_DIR>/SNANA/SNDATA_ROOT",
+    "DATA_DIR": "<BASE_DIR>/data/LSST_KN_NSBH_TRAIN/",
+    "INPUT_DIR": "<BASE_DIR>/data/LSST_KN_NSBH_TRAIN/SIM_INPUT/",
+    "SIMLIB_DIR": "<BASE_DIR>/data/LSST_KN_NSBH_TRAIN/SIMLIB/",
+    "OUTPUT_DIR": "<BASE_DIR>/SNANA/SNDATA_ROOT/SIM/",
+    "injections_file": "<BASE_DIR>/ML+GW+KN/dataset/O5_sim_nsbh_train/injections_final.csv",
+    "LOG_DIR": "<BASE_DIR>/logs/",
+    "TEMPLATE_INPUT": "<BASE_DIR>/ML+GW+KN/dataset/KN_sim/Template_doc/SIMGEN_KN_NSBH_LSST_TEMPLATE.INPUT"
+}

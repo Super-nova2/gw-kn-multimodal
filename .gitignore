@@ -1,37 +1,39 @@
-snana_out.ipynb
-gen_SIMLIB.ipynb
-*.json
-*.pth
-*.pyc
+# Python
 __pycache__/
+*.pyc
+*.pyo
+*.egg-info/
 
-*.csv
-*.dat
-notebook/
-docs/
+# Model checkpoints & large data
+*.pth
+*.h5
+*.hdf5
+*.xml.gz
+*.SIMLIB
 
-hpo_results/
+# Training outputs
+outputs/
 logs/
 eval_results/
-*.png
-*.svg
-*.dot
+hpo_results/
+
+# Notebook checkpoints
+.ipynb_checkpoints/
+
+# IDE & local config
+.claude/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+
+# User-local config overrides
+*.local.json
+
+# Generated exports
+*.html
+
+# Deprecated / internal
 PRD/
-*.h5
-./claude
-/plots_scripts/
-
-outputs/
-*.pdf
-
-
-./dataset/KN_sim/notebook/
-dataset/O5_sim_bns/*.ipynb
-基于 ALBEF (Align Before Fuse) 架构将稀疏光学数据与引力波数据结合的完整技术实施方案.md
-optical_only/snana_first_detection_delay_bns_nsbh.ipynb
-Model/args/shortcut/README.md
-Model/script/check_eval_consistency.py
-Model/script/generate_shortcut_eval_args.py
-Model/script/shortcut_eval_gate.py
-Model/script/submit_shortcut_eval_matrix.sh
-Model/framework/gw_optical_architecture_v5_clean
+docs/superpowers/

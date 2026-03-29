@@ -59,34 +59,34 @@ set_profile_defaults() {
     case "$PROFILE" in
         test_aug)
             BNS_FULL_CATALOG_PATH="${BNS_FULL_CATALOG_PATH:-${REPO_ROOT}/dataset/O5_sim_bns/injections_final.csv}"
-            BNS_SKYMAP_DIR="${BNS_SKYMAP_DIR:-/fred/oz016/bgao_kn/data/skymap/bns_skymap_v0}"
-            BNS_SIM_ROOT="${BNS_SIM_ROOT:-/fred/oz016/bgao_kn/SNANA/SNDATA_ROOT/SIM/LSST_KN_BNS}"
+            BNS_SKYMAP_DIR="${BNS_SKYMAP_DIR:-<BASE_DIR>/data/skymap/bns_skymap_v0}"
+            BNS_SIM_ROOT="${BNS_SIM_ROOT:-<BASE_DIR>/SNANA/SNDATA_ROOT/SIM/LSST_KN_BNS}"
             BNS_SIM_NAME="${BNS_SIM_NAME:-LSST_KN_BNS}"
-            BNS_SUCCESS_IDS_PATH="${BNS_SUCCESS_IDS_PATH:-/fred/oz016/bgao_kn/data/LSST_KN_BNS/success_sim_ids.txt}"
+            BNS_SUCCESS_IDS_PATH="${BNS_SUCCESS_IDS_PATH:-<BASE_DIR>/data/LSST_KN_BNS/success_sim_ids.txt}"
 
             NSBH_FULL_CATALOG_PATH="${NSBH_FULL_CATALOG_PATH:-${REPO_ROOT}/dataset/O5_sim_nsbh_aug/injections_full.csv}"
-            NSBH_SKYMAP_DIR="${NSBH_SKYMAP_DIR:-/fred/oz016/bgao_kn/data/skymap/nsbh_skymap}"
-            NSBH_SIM_ROOT="${NSBH_SIM_ROOT:-/fred/oz016/bgao_kn/SNANA/SNDATA_ROOT/SIM/LSST_KN_NSBH_AUG}"
+            NSBH_SKYMAP_DIR="${NSBH_SKYMAP_DIR:-<BASE_DIR>/data/skymap/nsbh_skymap}"
+            NSBH_SIM_ROOT="${NSBH_SIM_ROOT:-<BASE_DIR>/SNANA/SNDATA_ROOT/SIM/LSST_KN_NSBH_AUG}"
             NSBH_SIM_NAME="${NSBH_SIM_NAME:-LSST_KN_NSBH_AUG}"
-            NSBH_SUCCESS_IDS_PATH="${NSBH_SUCCESS_IDS_PATH:-/fred/oz016/bgao_kn/data/LSST_KN_NSBH_AUG/success_sim_ids.txt}"
+            NSBH_SUCCESS_IDS_PATH="${NSBH_SUCCESS_IDS_PATH:-<BASE_DIR>/data/LSST_KN_NSBH_AUG/success_sim_ids.txt}"
 
-            OUTPUT_H5_PATH="${OUTPUT_H5_PATH:-/fred/oz016/bgao_kn/data/ALBEF_dataset/combined_dataset_${DATASET_MODE}.h5}"
+            OUTPUT_H5_PATH="${OUTPUT_H5_PATH:-<BASE_DIR>/data/ALBEF_dataset/combined_dataset_${DATASET_MODE}.h5}"
             ;;
         final_train)
             BNS_FULL_CATALOG_PATH="${BNS_FULL_CATALOG_PATH:-${REPO_ROOT}/dataset/O5_sim_bns_aug/injections_final.csv}"
-            BNS_SKYMAP_DIR="${BNS_SKYMAP_DIR:-/fred/oz016/bgao_kn/data/skymap/bns_skymap}"
+            BNS_SKYMAP_DIR="${BNS_SKYMAP_DIR:-<BASE_DIR>/data/skymap/bns_skymap}"
             # Keep overridable because BNS_AUG raw SNANA outputs may be compressed/offline.
-            BNS_SIM_ROOT="${BNS_SIM_ROOT:-/fred/oz016/bgao_kn/SNANA/SNDATA_ROOT/SIM/LSST_KN_BNS_AUG}"
+            BNS_SIM_ROOT="${BNS_SIM_ROOT:-<BASE_DIR>/SNANA/SNDATA_ROOT/SIM/LSST_KN_BNS_AUG}"
             BNS_SIM_NAME="${BNS_SIM_NAME:-LSST_KN_BNS_AUG}"
-            BNS_SUCCESS_IDS_PATH="${BNS_SUCCESS_IDS_PATH:-/fred/oz016/bgao_kn/data/LSST_KN_BNS_AUG/success_sim_ids.txt}"
+            BNS_SUCCESS_IDS_PATH="${BNS_SUCCESS_IDS_PATH:-<BASE_DIR>/data/LSST_KN_BNS_AUG/success_sim_ids.txt}"
 
             NSBH_FULL_CATALOG_PATH="${NSBH_FULL_CATALOG_PATH:-${REPO_ROOT}/dataset/O5_sim_nsbh_train/injections_full.csv}"
-            NSBH_SKYMAP_DIR="${NSBH_SKYMAP_DIR:-/fred/oz016/bgao_kn/data/skymap/nsbh_skymap_train}"
-            NSBH_SIM_ROOT="${NSBH_SIM_ROOT:-/fred/oz016/bgao_kn/SNANA/SNDATA_ROOT/SIM/LSST_KN_NSBH_TRAIN}"
+            NSBH_SKYMAP_DIR="${NSBH_SKYMAP_DIR:-<BASE_DIR>/data/skymap/nsbh_skymap_train}"
+            NSBH_SIM_ROOT="${NSBH_SIM_ROOT:-<BASE_DIR>/SNANA/SNDATA_ROOT/SIM/LSST_KN_NSBH_TRAIN}"
             NSBH_SIM_NAME="${NSBH_SIM_NAME:-LSST_KN_NSBH_TRAIN}"
-            NSBH_SUCCESS_IDS_PATH="${NSBH_SUCCESS_IDS_PATH:-/fred/oz016/bgao_kn/data/LSST_KN_NSBH_TRAIN/success_sim_ids.txt}"
+            NSBH_SUCCESS_IDS_PATH="${NSBH_SUCCESS_IDS_PATH:-<BASE_DIR>/data/LSST_KN_NSBH_TRAIN/success_sim_ids.txt}"
 
-            OUTPUT_H5_PATH="${OUTPUT_H5_PATH:-/fred/oz016/bgao_kn/data/ALBEF_dataset/combined_dataset_${DATASET_MODE}.h5}"
+            OUTPUT_H5_PATH="${OUTPUT_H5_PATH:-<BASE_DIR>/data/ALBEF_dataset/combined_dataset_${DATASET_MODE}.h5}"
             ;;
         *)
             echo "Unsupported PROFILE='$PROFILE'. Use PROFILE=test_aug or PROFILE=final_train."

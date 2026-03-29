@@ -45,36 +45,26 @@ gw-kn-multimodal/
 
 ## 依赖与运行环境
 
-仓库没有单独维护 `requirements.txt`，当前代码实际依赖主要包括：
+Python 依赖见 `requirements.txt`，可通过以下命令安装：
 
-- Python 3.10+
-- PyTorch
-- h5py
-- numpy
-- pandas
-- astropy
-- healpy
-- ligo.skymap
-- tqdm
-- matplotlib
-- optuna
-- tensorboard
-- graphviz
-- jq
-- Slurm
-- SNANA
-- opsimsummaryv2
+```bash
+pip install -r requirements.txt
+```
+
+主要依赖：Python 3.10+、PyTorch、h5py、numpy、pandas、astropy、healpy、ligo.skymap、tqdm、matplotlib、optuna、tensorboard、graphviz。
+
+额外系统依赖：jq、Slurm（HPC 环境）、SNANA + opsimsummaryv2（仅数据生成流程需要）。
 
 建议在 HPC/Slurm 环境中运行。现有 `.sh` 入口脚本默认就是按 Slurm 提交和资源申请来写的。
 
 ## 数据与路径约定
 
-当前示例配置默认使用 `/fred/oz016/bgao_kn/data/...` 下的数据与输出目录，例如：
+配置文件中的路径使用 `<BASE_DIR>` 占位符。在运行前，请将所有 `<BASE_DIR>` 替换为你的实际根目录。示例数据目录结构：
 
-- 多模态训练 HDF5：`/fred/oz016/bgao_kn/data/ALBEF_dataset/`
-- optical-only 训练 HDF5：`/fred/oz016/bgao_kn/data/Optical_Only_dataset/`
-- checkpoint：`/fred/oz016/bgao_kn/data/model/`
-- skymap / SNANA 数据：`/fred/oz016/bgao_kn/data/` 和 `/fred/oz016/bgao_kn/SNANA/`
+- 多模态训练 HDF5：`<BASE_DIR>/data/ALBEF_dataset/`
+- optical-only 训练 HDF5：`<BASE_DIR>/data/Optical_Only_dataset/`
+- checkpoint：`<BASE_DIR>/data/model/`
+- skymap / SNANA 数据：`<BASE_DIR>/data/` 和 `<BASE_DIR>/SNANA/`
 
 如果你在别的机器或目录运行，需要优先修改：
 
@@ -89,7 +79,7 @@ gw-kn-multimodal/
 这个流程会把 BNS / NSBH 的 GW 参数、skymap 和光学光变整理到同一个 HDF5 中。
 
 ```bash
-cd /fred/oz016/bgao_kn/gw-kn-multimodal
+cd <BASE_DIR>/gw-kn-multimodal
 
 PROFILE=final_train DATASET_MODE=train \
 bash Model/script/submit_create_dataset_bns_nsbh.sh
@@ -112,7 +102,7 @@ bash Model/script/submit_create_dataset_bns_nsbh.sh
 推荐直接用现成 JSON 配置提交：
 
 ```bash
-cd /fred/oz016/bgao_kn/gw-kn-multimodal
+cd <BASE_DIR>/gw-kn-multimodal
 
 bash Model/ALBEF_train.sh Model/args/ALBEF_BNS_NSBH.json
 ```
@@ -129,7 +119,7 @@ bash Model/ALBEF_train.sh Model/args/ALBEF_BNS_NSBH.json
 ### 3. 评估多模态模型
 
 ```bash
-cd /fred/oz016/bgao_kn/gw-kn-multimodal
+cd <BASE_DIR>/gw-kn-multimodal
 
 bash Model/script/submit_test_evaluate.sh /path/to/eval_args.json
 ```
@@ -146,7 +136,7 @@ bash Model/script/submit_test_evaluate.sh /path/to/eval_args.json
 这个流程会把光变序列做 first-detection 对齐、2 小时同波段合并、luptitude 变换，并输出 optical-only HDF5。
 
 ```bash
-cd /fred/oz016/bgao_kn/gw-kn-multimodal
+cd <BASE_DIR>/gw-kn-multimodal
 
 DATASET_MODE=train \
 BUILD_POSITIVE=true \
@@ -162,7 +152,7 @@ bash optical_only/submit_create_optical_only_datasets.sh
 ### 5. 训练 optical-only 基线
 
 ```bash
-cd /fred/oz016/bgao_kn/gw-kn-multimodal
+cd <BASE_DIR>/gw-kn-multimodal
 
 bash optical_only/train_optical_only.sh optical_only/args/optical_only_kn_v14.json
 ```
@@ -199,6 +189,30 @@ bash optical_only/train_optical_only.sh optical_only/args/optical_only_kn_v14.js
 
 ## 建议起步顺序
 
-1. 先确认 `/fred/oz016/bgao_kn/data/` 下的 HDF5、skymap、SNANA 数据是否齐全。
-2. 再检查 `Model/args/ALBEF_BNS_NSBH.json` 或 `optical_only/args/optical_only_kn_v14.json`。
-3. 先跑数据构建，再跑训练，再跑评估。
+1. 安装依赖：`pip install -r requirements.txt`
+2. 将配置文件中的 `<BASE_DIR>` 替换为你的实际根目录。
+3. 确认 `<BASE_DIR>/data/` 下的 HDF5、skymap、SNANA 数据是否齐全。
+4. 再检查 `Model/args/ALBEF_BNS_NSBH.json` 或 `optical_only/args/optical_only_kn_v14.json`。
+5. 先跑数据构建，再跑训练，再跑评估。
+
+## 数据获取
+
+本仓库不包含训练数据和大型模拟文件。数据集需通过以下方式获取：
+
+- **GW 模拟事件**：使用 `dataset/KN_sim/` 下的脚本配合 SNANA/OpSim 生成。
+- **训练 HDF5**：使用 `Model/script/create_dataset_bns_nsbh.py` 和 `optical_only/create_optical_only_datasets.py` 从模拟数据构建。
+- 如需预构建数据集，请联系作者。
+
+## Citation
+
+如果你使用了本仓库的代码，请引用我们的论文：
+
+```
+[Paper in preparation]
+```
+
+详见 `CITATION.cff`。
+
+## License
+
+本项目采用 MIT 许可证，详见 [LICENSE](LICENSE)。

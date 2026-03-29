@@ -3,7 +3,7 @@ SIM_KEYS:
   GENFILTERS:         ugrizY
   KCOR_FILE:    $SNDATA_ROOT/kcor/LSST/baseline_1.9/kcor_LSST.fits
   SIMLIB_FILE:  $KN_DIR/data/rubin_sim/baseline/baseline_v5.0.1_10yrs.db
-  SIMSED_PATH_BINARY: /fred/oz016/bgao_kn/SNANA/SNDATA_ROOT/models/SIMSED/BINARY
+  SIMSED_PATH_BINARY: <BASE_DIR>/SNANA/SNDATA_ROOT/models/SIMSED/BINARY
 
 # provide models
 SIMSED_MODELS:    # model                                                   zmin  zmax

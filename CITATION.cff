@@ -1,0 +1,6 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite our paper."
+title: "gw-kn-multimodal"
+type: software
+authors:
+  - name: "[Paper in preparation]"

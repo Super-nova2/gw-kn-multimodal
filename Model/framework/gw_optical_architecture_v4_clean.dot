@@ -1,0 +1,120 @@
+// GW-Optical ALBEF architecture (v4 clean, minimal)
+// Render:
+//   dot -Tpng -Gdpi=220 gw_optical_architecture_v4_clean.dot -o gw_optical_architecture_v4_clean.png
+//   dot -Tsvg gw_optical_architecture_v4_clean.dot -o gw_optical_architecture_v4_clean.svg
+
+digraph G {
+  rankdir=LR;
+  labelloc=t;
+  label="GW-Optical ALBEF Architecture (Clean v4)";
+
+  graph [
+    fontname="Helvetica",
+    fontsize=18,
+    bgcolor="#FFFFFF",
+    pad=0.15,
+    nodesep=0.45,
+    ranksep=0.75,
+    splines=spline
+  ];
+
+  node [
+    shape=box,
+    style="rounded,filled",
+    fontname="Helvetica",
+    fontsize=11,
+    color="#475569",
+    penwidth=1.2
+  ];
+
+  edge [
+    color="#64748B",
+    penwidth=1.2,
+    arrowsize=0.75
+  ];
+
+  // ==================== Inputs ====================
+  subgraph cluster_inputs {
+    label="1) Inputs";
+    color="#CBD5E1";
+    style="rounded,dashed";
+
+    gw_scalars [label="GW scalars\n(mass, spin, ...)", fillcolor="#F8FAFC"];
+    gw_skymap  [label="GW skymap sequence\n(HEALPix / MOC)", fillcolor="#F8FAFC"];
+    opt_lc     [label="Optical light curves", fillcolor="#F8FAFC"];
+    opt_coord  [label="Optical coordinates\n(RA, Dec)", fillcolor="#F8FAFC"];
+    ref_time   [label="Reference time points", fillcolor="#F8FAFC"];
+    cls_tok    [label="Learnable CLS token", fillcolor="#F8FAFC"];
+  }
+
+  // ==================== Encoders ====================
+  subgraph cluster_encoders {
+    label="2) Encoders";
+    color="#93C5FD";
+    style="rounded,dashed";
+
+    gw_enc  [label="GW dual-stream encoder\nMLP (scalars) + ResNet1D (skymap)", fillcolor="#DBEAFE", color="#60A5FA"];
+    opt_enc [label="Optical temporal encoder\nmTAN/Transformer + spatial embed + CLS", fillcolor="#DCFCE7", color="#22C55E"];
+
+    gw_g  [label="g\nGW global vector", shape=ellipse, fillcolor="#FFF7ED", color="#FB923C"];
+    gw_H  [label="H_gw\nGW spatial sequence", shape=ellipse, fillcolor="#FFF7ED", color="#FB923C"];
+    opt_z [label="z_l\nOptical CLS vector", shape=ellipse, fillcolor="#FFF7ED", color="#FB923C"];
+    opt_H [label="H_l\nOptical temporal matrix", shape=ellipse, fillcolor="#FFF7ED", color="#FB923C"];
+  }
+
+  // ==================== Alignment ====================
+  subgraph cluster_align {
+    label="3) Alignment Branch (Contrastive)";
+    color="#A5B4FC";
+    style="rounded,dashed";
+
+    proj    [label="Projection heads", fillcolor="#E0E7FF", color="#6366F1"];
+    loss_itc [label="L_itc", shape=diamond, style=filled, fillcolor="#FEE2E2", color="#EF4444", fontcolor="#991B1B"];
+  }
+
+  // ==================== Fusion ====================
+  subgraph cluster_fusion {
+    label="4) Fusion + Classification";
+    color="#FCA5A5";
+    style="rounded,dashed";
+
+    dual_attn [label="Dual cross-attention\n(GW ↔ Optical)", fillcolor="#FEF3C7", color="#F59E0B"];
+    cred      [label="Credible level estimator\n(skymap + RA/Dec)", fillcolor="#FEF3C7", color="#F59E0B"];
+    merge     [label="Feature concat", fillcolor="#FEF3C7", color="#F59E0B"];
+    clf       [label="Classifier MLP", fillcolor="#FEF3C7", color="#F59E0B"];
+    loss_cls  [label="L_cls", shape=diamond, style=filled, fillcolor="#FEE2E2", color="#EF4444", fontcolor="#991B1B"];
+  }
+
+  // Inputs -> Encoders
+  gw_scalars -> gw_enc;
+  gw_skymap  -> gw_enc;
+
+  opt_lc    -> opt_enc;
+  opt_coord -> opt_enc;
+  ref_time  -> opt_enc;
+  cls_tok   -> opt_enc;
+
+  // Encoders -> Representations
+  gw_enc  -> gw_g;
+  gw_enc  -> gw_H;
+  opt_enc -> opt_z;
+  opt_enc -> opt_H;
+
+  // Alignment branch
+  gw_g  -> proj;
+  opt_z -> proj;
+  proj  -> loss_itc;
+
+  // Fusion branch
+  gw_g  -> dual_attn;
+  gw_H  -> dual_attn;
+  opt_z -> dual_attn;
+  opt_H -> dual_attn;
+  dual_attn -> merge;
+
+  gw_skymap -> cred;
+  opt_coord -> cred;
+  cred -> merge;
+
+  merge -> clf -> loss_cls;
+}

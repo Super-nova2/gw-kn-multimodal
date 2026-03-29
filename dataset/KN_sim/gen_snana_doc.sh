@@ -4,7 +4,7 @@
 #SBATCH --cpus-per-task=1
 #SBATCH --array=0-1
 #SBATCH --mem=8G
-#SBATCH --output=/fred/oz016/bgao_kn/logs/%x_%j.out
+#SBATCH --output=<BASE_DIR>/logs/%x_%j.out
 
 # ml gcc/11.3/0 python/3.10.4
 # ml gsl/2.7 cfitsio/4.2.0

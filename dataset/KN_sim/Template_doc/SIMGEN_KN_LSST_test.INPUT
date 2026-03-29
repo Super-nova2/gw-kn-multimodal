@@ -70,7 +70,7 @@ NEWMJD_DIF: 0.0003   # min MJD dif to count NEW MJD(26s, per exposure)
 
 # convert SED into binary 
 SIMSED_USE_BINARY:  1   # speed up the initialization of SED files
-SIMSED_PATH_BINARY: /fred/oz016/bgao_kn/SNANA/SNDATA_ROOT/models/SIMSED/BINARY
+SIMSED_PATH_BINARY: <BASE_DIR>/SNANA/SNDATA_ROOT/models/SIMSED/BINARY
 
 FORMAT_MASK:  32  # 2=TEXT  32=FITS
 

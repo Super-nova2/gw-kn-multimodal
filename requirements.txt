@@ -1,0 +1,12 @@
+torch>=2.0.0
+h5py
+numpy
+pandas
+astropy
+healpy
+ligo.skymap
+tqdm
+matplotlib
+optuna
+tensorboard
+graphviz
