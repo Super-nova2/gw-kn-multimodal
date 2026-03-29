@@ -129,9 +129,6 @@ def parse_args():
     p.add_argument("--meta_filter_n_bands_max", type=int, default=None)
     p.add_argument("--meta_filter_t_span_max", type=float, default=None)
     p.add_argument("--meta_filter_relax_t_span_if_below_rows", type=str, default=None)
-    p.add_argument("--ood_reject_enable", action="store_true", default=None)
-    p.add_argument("--ood_uncertainty_metric", type=str, default=None)
-    p.add_argument("--ood_uncertainty_threshold", type=float, default=None)
     p.add_argument("--regime_eval_enable", action="store_true", default=None)
 
     p.add_argument("--time_offset_enable", action="store_true", default=None)
