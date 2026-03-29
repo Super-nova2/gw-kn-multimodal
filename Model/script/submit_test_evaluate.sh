@@ -154,8 +154,6 @@ NONKN_CLS_BASE_FIELD=$(jq -r '.nonkn_cls_base_field // empty' "$args_file")
 REPORT_DT_BINS_STATE=$(jq -r 'if has("report_dt_bins") then (.report_dt_bins | tostring) else "unset" end' "$args_file")
 DT_BIN_EDGES=$(jq -r '.dt_bin_edges // empty' "$args_file")
 REPORT_DT_MACRO_STATE=$(jq -r 'if has("report_dt_macro") then (.report_dt_macro | tostring) else "unset" end' "$args_file")
-CREDIBILITY_ABLATION_MODES=$(jq -r '.credibility_ablation_modes // empty' "$args_file")
-
 if [[ -z "$CHECKPOINT" ]]; then
     echo "Required field missing in args: checkpoint"
     exit 1
@@ -304,9 +302,6 @@ if [[ -n "$NEG_OFFSET_SCALE_DAYS_DIVISOR" && "$NEG_OFFSET_SCALE_DAYS_DIVISOR" !=
 fi
 if [[ -n "$NONKN_CLS_BASE_FIELD" && "$NONKN_CLS_BASE_FIELD" != "null" ]]; then
     cmd+=(--nonkn_cls_base_field "$NONKN_CLS_BASE_FIELD")
-fi
-if [[ -n "$CREDIBILITY_ABLATION_MODES" && "$CREDIBILITY_ABLATION_MODES" != "null" ]]; then
-    cmd+=(--credibility_ablation_modes "$CREDIBILITY_ABLATION_MODES")
 fi
 if [[ "$REPORT_DT_BINS_STATE" == "true" ]]; then
     cmd+=(--report_dt_bins)

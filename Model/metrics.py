@@ -173,6 +173,13 @@ def compute_classification_metrics(all_probs, all_labels, all_sources=None,
     results["tn"] = tn
     results["fn"] = fn
 
+    # --- Derived confusion-matrix metrics ---
+    results["accuracy"] = (tp + tn) / max(tp + fp + tn + fn, 1)
+    results["precision"] = tp / max(tp + fp, 1)
+    results["recall"] = tp / max(tp + fn, 1)
+    prec, rec = results["precision"], results["recall"]
+    results["f1"] = 2.0 * prec * rec / max(prec + rec, 1e-12)
+
     # --- Per-source accuracy ---
     if all_sources is not None:
         for src in set(all_sources):

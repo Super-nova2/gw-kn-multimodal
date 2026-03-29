@@ -613,99 +613,6 @@ def apply_time_offsets(opt_t, opt_mask, delta_days, scale_divisor):
     return opt_t + shift * valid
 
 
-def augment_optical_data(
-    opt_t,
-    opt_v,
-    opt_mask,
-    opt_err,
-    training=True,
-    time_jitter=0.0,
-    flux_noise=0.0,
-    obs_dropout=0.0,
-    band_dropout=0.0,
-    single_band_keep_prob=1.0,
-    target_ndet_jitter=0.0,
-):
-    if not training:
-        return opt_t, opt_v, opt_mask, opt_err
-
-    if time_jitter > 0:
-        time_mask = (opt_mask.sum(dim=-1) > 0).float()
-        opt_t = opt_t + torch.randn_like(opt_t) * time_jitter * time_mask
-
-    if flux_noise > 0:
-        if opt_err is not None:
-            noise = torch.randn_like(opt_v) * (opt_err * flux_noise)
-        else:
-            noise = torch.randn_like(opt_v) * flux_noise
-        opt_v = opt_v + noise * opt_mask
-
-    if obs_dropout > 0:
-        drop_mask = (torch.rand_like(opt_mask) < obs_dropout) & (opt_mask > 0)
-        if drop_mask.any():
-            opt_mask = opt_mask.masked_fill(drop_mask, 0)
-            opt_v = opt_v.masked_fill(drop_mask, 0.0)
-            if opt_err is not None:
-                opt_err = opt_err.masked_fill(drop_mask, 0.0)
-
-    if band_dropout > 0:
-        band_mask = torch.rand(opt_v.size(0), opt_v.size(2), device=opt_v.device) < band_dropout
-        if band_mask.any():
-            band_mask = band_mask[:, None, :]
-            opt_mask = opt_mask.masked_fill(band_mask, 0)
-            opt_v = opt_v.masked_fill(band_mask, 0.0)
-            if opt_err is not None:
-                opt_err = opt_err.masked_fill(band_mask, 0.0)
-
-    if target_ndet_jitter > 0:
-        jitter = float(target_ndet_jitter)
-        valid = opt_mask > 0
-        for i in range(opt_mask.size(0)):
-            idx = torch.nonzero(valid[i], as_tuple=False)
-            n_obs = int(idx.size(0))
-            if n_obs <= 1:
-                continue
-            frac = 1.0 + float(torch.empty((1,), device=opt_mask.device).uniform_(-jitter, jitter).item())
-            target = int(round(n_obs * frac))
-            target = max(1, min(n_obs, target))
-            if target >= n_obs:
-                continue
-            perm = torch.randperm(n_obs, device=opt_mask.device)
-            keep = idx[perm[:target]]
-            keep_mask = torch.zeros_like(valid[i], dtype=torch.bool)
-            keep_mask[keep[:, 0], keep[:, 1]] = True
-            drop = valid[i] & (~keep_mask)
-            if drop.any():
-                opt_mask[i] = opt_mask[i].masked_fill(drop, 0)
-                opt_v[i] = opt_v[i].masked_fill(drop, 0.0)
-                if opt_err is not None:
-                    opt_err[i] = opt_err[i].masked_fill(drop, 0.0)
-
-    if single_band_keep_prob < 1.0:
-        keep_prob = float(single_band_keep_prob)
-        band_presence = opt_mask.sum(dim=1) > 0
-        n_bands = band_presence.sum(dim=1)
-        single_ids = torch.where(n_bands == 1)[0]
-        for i in single_ids.tolist():
-            if float(torch.rand((1,), device=opt_mask.device).item()) <= keep_prob:
-                continue
-            valid = opt_mask[i] > 0
-            n_valid = int(valid.sum().item())
-            if n_valid <= 1:
-                continue
-            drop = (torch.rand_like(opt_mask[i]) < 0.5) & valid
-            if int((valid & (~drop)).sum().item()) <= 0:
-                idx = torch.nonzero(valid, as_tuple=False)
-                keep_one = idx[torch.randint(0, idx.size(0), (1,), device=opt_mask.device)[0]]
-                drop[keep_one[0], keep_one[1]] = False
-            if drop.any():
-                opt_mask[i] = opt_mask[i].masked_fill(drop, 0)
-                opt_v[i] = opt_v[i].masked_fill(drop, 0.0)
-                if opt_err is not None:
-                    opt_err[i] = opt_err[i].masked_fill(drop, 0.0)
-
-    return opt_t, opt_v, opt_mask, opt_err
-
 
 
 def sample_universal_target_k(
@@ -1170,7 +1077,7 @@ def run_eval(model, loader, device, args, criterion, amp_dtype, offset_policy):
         "op_meets_target_recall": bool(op["meets_target_recall"]),
         "offset_eval_count": int(len(offset_policy.eval_offsets_days)),
         "task_mode": "prefix_right_censored"
-        if (bool(getattr(args, "prefix_train_enable", False)) or bool(getattr(args, "universal_train_enable", False)))
+        if bool(getattr(args, "universal_train_enable", False))
         else "full_window",
     }
     for k, v in shortcut_metrics.items():
@@ -1233,47 +1140,6 @@ def train_one_epoch(
                 raise ValueError("universal_train_enable=true requires slot_is_detection in training batches.")
             if not getattr(model, "universal_aux_enable", False):
                 raise ValueError("universal_train_enable=true requires model.universal_aux_enable=True.")
-        elif bool(getattr(args, "prefix_train_enable", False)):
-            if slot_is_detection is None:
-                raise ValueError("prefix_train_enable=true requires slot_is_detection in training batches.")
-            target_k = prefix_policy.sample_target_k(slot_is_detection)
-            opt_t, opt_v, opt_mask, opt_err, slot_is_detection, _ = apply_prefix_right_censoring_torch(
-                opt_t=opt_t,
-                opt_v=opt_v,
-                opt_mask=opt_mask,
-                opt_err=opt_err,
-                slot_is_detection=slot_is_detection,
-                target_k=target_k,
-                min_det=int(args.prefix_min_det),
-            )
-
-            opt_t, opt_v, opt_mask, opt_err = augment_optical_data(
-                opt_t,
-                opt_v,
-                opt_mask,
-                opt_err,
-                training=True,
-                time_jitter=args.opt_aug_time_jitter,
-                flux_noise=args.opt_aug_noise,
-                obs_dropout=args.opt_aug_dropout,
-                band_dropout=args.opt_aug_band_dropout,
-                single_band_keep_prob=args.single_band_keep_prob,
-                target_ndet_jitter=0.0,
-            )
-        else:
-            opt_t, opt_v, opt_mask, opt_err = augment_optical_data(
-                opt_t,
-                opt_v,
-                opt_mask,
-                opt_err,
-                training=True,
-                time_jitter=args.opt_aug_time_jitter,
-                flux_noise=args.opt_aug_noise,
-                obs_dropout=args.opt_aug_dropout,
-                band_dropout=args.opt_aug_band_dropout,
-                single_band_keep_prob=args.single_band_keep_prob,
-                target_ndet_jitter=args.target_ndet_jitter,
-            )
 
         batch_size = opt_t.size(0)
         if (
@@ -1462,7 +1328,7 @@ def build_train_summary_payload(
             ),
         },
         "task_mode": "prefix_right_censored"
-        if (bool(args.prefix_train_enable) or bool(getattr(args, "universal_train_enable", False)))
+        if bool(getattr(args, "universal_train_enable", False))
         else "full_window",
         "current_epoch": int(current_epoch),
         "current_stage": str(current_stage),
@@ -1576,9 +1442,6 @@ def train(args):
     print(f"Time offset policy: {json.dumps(offset_policy.describe(), indent=2)}")
     prefix_policy = PrefixTrainPolicy(args)
     print(f"Prefix train policy: {json.dumps(prefix_policy.describe(), indent=2)}")
-    if bool(args.prefix_train_enable) and float(args.target_ndet_jitter) > 0:
-        print("prefix_train_enable=true: target_ndet_jitter will be ignored in favor of causal right-censoring.")
-
     meta_bins_n_det = parse_bin_edges(
         getattr(args, "meta_bins_n_det", None),
         default="3,5,8,12,20,40,80,200",
@@ -1626,7 +1489,7 @@ def train(args):
         meta_bins_n_det=meta_bins_n_det,
         meta_bins_n_bands=meta_bins_n_bands,
         meta_bins_t_span=meta_bins_t_span,
-        prefix_train_enable=(bool(args.prefix_train_enable) or bool(getattr(args, "universal_train_enable", False))),
+        prefix_train_enable=bool(getattr(args, "universal_train_enable", False)),
         prefix_min_det=int(args.prefix_min_det),
         prefix_eval_det_support=str(args.prefix_eval_det_support),
         prefix_eval_include_terminal=True,
@@ -1681,17 +1544,13 @@ def train(args):
 
     criterion = nn.BCEWithLogitsLoss()
 
-    if bool(getattr(args, "universal_train_enable", False)):
-        stage_plan = [
-            ("stage1_head_only", int(getattr(args, "universal_stage1_epochs", 2)), True, "single"),
-            ("stage2_finetune", int(getattr(args, "universal_stage2_epochs", 6)), False, "dual"),
-            ("stage3_finetune_adv", int(getattr(args, "universal_stage3_epochs", 6)), False, "dual_adv"),
-        ]
-    else:
-        stage_plan = [
-            ("stage1_head_only", int(args.epochs_stage1), True, None),
-            ("stage2_finetune", int(args.epochs_stage2), False, None),
-        ]
+    if not bool(getattr(args, "universal_train_enable", False)):
+        raise ValueError("universal_train_enable must be true. Non-universal training mode has been removed.")
+    stage_plan = [
+        ("stage1_head_only", int(getattr(args, "universal_stage1_epochs", 2)), True, "single"),
+        ("stage2_finetune", int(getattr(args, "universal_stage2_epochs", 6)), False, "dual"),
+        ("stage3_finetune_adv", int(getattr(args, "universal_stage3_epochs", 6)), False, "dual_adv"),
+    ]
 
     best_score = float("-inf")
     best_metrics = {}
@@ -1922,7 +1781,7 @@ def train(args):
         "time_offset": offset_policy.describe(),
         "prefix_task": prefix_policy.describe(),
         "task_mode": "prefix_right_censored"
-        if (bool(args.prefix_train_enable) or bool(getattr(args, "universal_train_enable", False)))
+        if bool(getattr(args, "universal_train_enable", False))
         else "full_window",
         "dataset_window_metadata": getattr(args, "_dataset_window_metadata", None),
         "init_source_metadata": getattr(args, "_init_source_metadata", None),
@@ -1985,8 +1844,6 @@ def parse_args():
     parser.add_argument("--ckpt_path", type=str, default=None)
     parser.add_argument("--pretrained_albef_ckpt", type=str, default=None)
 
-    parser.add_argument("--epochs_stage1", type=int, default=5)
-    parser.add_argument("--epochs_stage2", type=int, default=20)
     parser.add_argument("--batch_size", type=int, default=512)
     parser.add_argument("--val_batch_size", type=int, default=512)
     parser.add_argument("--steps_per_epoch", type=int, default=None)
@@ -2012,13 +1869,6 @@ def parse_args():
     parser.add_argument("--head_dropout", type=float, default=0.2)
     parser.add_argument("--arch_version", type=str, default="optical_only_nocoord_v1")
 
-    parser.add_argument("--opt_aug_noise", type=float, default=0.0)
-    parser.add_argument("--opt_aug_time_jitter", type=float, default=0.0)
-    parser.add_argument("--opt_aug_dropout", type=float, default=0.35)
-    parser.add_argument("--opt_aug_band_dropout", type=float, default=0.30)
-    parser.add_argument("--single_band_keep_prob", type=float, default=0.35)
-    parser.add_argument("--target_ndet_jitter", type=float, default=0.0)
-    parser.add_argument("--prefix_train_enable", action="store_true")
     parser.add_argument("--prefix_min_det", type=int, default=2)
     parser.add_argument("--prefix_train_sampling", type=str, default="bucket_uniform_terminal_mixture")
     parser.add_argument("--prefix_terminal_mix_prob", type=float, default=0.2)
@@ -2083,9 +1933,6 @@ def parse_args():
     parser.add_argument("--offset_scale_days_divisor", type=float, default=100.0)
     parser.add_argument("--offset_seed", type=int, default=None)
     parser.add_argument("--offset_bank_size", type=int, default=1000000)
-    parser.add_argument("--ood_reject_enable", action="store_true")
-    parser.add_argument("--ood_uncertainty_metric", type=str, default="logit_std")
-    parser.add_argument("--ood_uncertainty_threshold", type=float, default=0.75)
     parser.add_argument("--regime_eval_enable", action="store_true")
 
     pre_args, _ = parser.parse_known_args()
@@ -2102,10 +1949,6 @@ def parse_args():
     args = parser.parse_args()
     if args.offset_seed is None:
         args.offset_seed = int(args.seed)
-    if not (0.0 <= float(args.single_band_keep_prob) <= 1.0):
-        raise ValueError("--single_band_keep_prob must be in [0, 1].")
-    if float(args.target_ndet_jitter) < 0:
-        raise ValueError("--target_ndet_jitter must be >= 0.")
     if int(args.recycle_dataloader_workers_every_n_epochs) < 0:
         raise ValueError("--recycle_dataloader_workers_every_n_epochs must be >= 0.")
     if int(args.step_memory_cleanup_interval) < 0:

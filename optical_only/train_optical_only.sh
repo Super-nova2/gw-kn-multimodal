@@ -110,8 +110,6 @@ CKPT_PATH=$(jq -r '.ckpt_path' "$args_file")
 PRETRAINED_ALBEF_CKPT=$(jq -r '.pretrained_albef_ckpt // empty' "$args_file")
 STAGE_TO_JOBFS=$(jq -r '.stage_to_jobfs // false' "$args_file")
 
-EPOCHS_STAGE1=$(jq -r '.epochs_stage1 // empty' "$args_file")
-EPOCHS_STAGE2=$(jq -r '.epochs_stage2 // empty' "$args_file")
 BATCH_SIZE=$(jq -r '.batch_size // empty' "$args_file")
 VAL_BATCH_SIZE=$(jq -r '.val_batch_size // empty' "$args_file")
 STEPS_PER_EPOCH=$(jq -r '.steps_per_epoch // empty' "$args_file")
@@ -136,11 +134,6 @@ FEATURE_DROPOUT=$(jq -r '.feature_dropout // empty' "$args_file")
 HEAD_HIDDEN_DIM=$(jq -r '.head_hidden_dim // empty' "$args_file")
 HEAD_DROPOUT=$(jq -r '.head_dropout // empty' "$args_file")
 ARCH_VERSION=$(jq -r '.arch_version // empty' "$args_file")
-
-OPT_AUG_NOISE=$(jq -r '.opt_aug_noise // empty' "$args_file")
-OPT_AUG_TIME_JITTER=$(jq -r '.opt_aug_time_jitter // empty' "$args_file")
-OPT_AUG_DROPOUT=$(jq -r '.opt_aug_dropout // empty' "$args_file")
-OPT_AUG_BAND_DROPOUT=$(jq -r '.opt_aug_band_dropout // empty' "$args_file")
 
 TARGET_RECALL=$(jq -r '.target_recall // empty' "$args_file")
 EARLY_STOP_PATIENCE=$(jq -r '.early_stop_patience // empty' "$args_file")
@@ -183,11 +176,8 @@ META_FILTER_N_DET_MAX=$(jq -r '.meta_filter_n_det_max // empty' "$args_file")
 META_FILTER_N_BANDS_MAX=$(jq -r '.meta_filter_n_bands_max // empty' "$args_file")
 META_FILTER_T_SPAN_MAX=$(jq -r '.meta_filter_t_span_max // empty' "$args_file")
 META_FILTER_RELAX_T_SPAN_IF_BELOW_ROWS=$(jq -r '.meta_filter_relax_t_span_if_below_rows // empty' "$args_file")
-SINGLE_BAND_KEEP_PROB=$(jq -r '.single_band_keep_prob // empty' "$args_file")
-TARGET_NDET_JITTER=$(jq -r '.target_ndet_jitter // empty' "$args_file")
 SHORTCUT_AUDIT_ENABLE=$(jq -r '.shortcut_audit_enable // empty' "$args_file")
 SHORTCUT_AUDIT_VAL_SAMPLES=$(jq -r '.shortcut_audit_val_samples // empty' "$args_file")
-PREFIX_TRAIN_ENABLE=$(jq -r '.prefix_train_enable // false' "$args_file")
 PREFIX_MIN_DET=$(jq -r '.prefix_min_det // empty' "$args_file")
 PREFIX_TRAIN_SAMPLING=$(jq -r '.prefix_train_sampling // empty' "$args_file")
 PREFIX_TERMINAL_MIX_PROB=$(jq -r '.prefix_terminal_mix_prob // empty' "$args_file")
@@ -210,9 +200,6 @@ ADV_DET_WEIGHT=$(jq -r '.adv_det_weight // empty' "$args_file")
 ADV_BAND_WEIGHT=$(jq -r '.adv_band_weight // empty' "$args_file")
 ADV_SPAN_WEIGHT=$(jq -r '.adv_span_weight // empty' "$args_file")
 GRL_LAMBDA=$(jq -r '.grl_lambda // empty' "$args_file")
-OOD_REJECT_ENABLE=$(jq -r '.ood_reject_enable // false' "$args_file")
-OOD_UNCERTAINTY_METRIC=$(jq -r '.ood_uncertainty_metric // empty' "$args_file")
-OOD_UNCERTAINTY_THRESHOLD=$(jq -r '.ood_uncertainty_threshold // empty' "$args_file")
 REGIME_EVAL_ENABLE=$(jq -r '.regime_eval_enable // false' "$args_file")
 
 OPTICAL_V2_EVAL_POS_DEFAULT="/fred/oz016/bgao_kn/data/Optical_Only_dataset/combined_dataset_test.h5"
@@ -277,13 +264,6 @@ echo "Train NEG data: $NEG_DATA_PATH"
 if [[ -n "$NEG_GROUP" && "$NEG_GROUP" != "null" ]]; then
     echo "Train NEG group: $NEG_GROUP"
 fi
-echo "Prefix train enable: ${PREFIX_TRAIN_ENABLE}"
-if is_truthy "$PREFIX_TRAIN_ENABLE"; then
-    echo "Prefix min detections: ${PREFIX_MIN_DET:-<default>}"
-    echo "Prefix train sampling: ${PREFIX_TRAIN_SAMPLING:-<default>}"
-    echo "Prefix terminal mix prob: ${PREFIX_TERMINAL_MIX_PROB:-<default>}"
-    echo "Prefix eval det support: ${PREFIX_EVAL_DET_SUPPORT:-<default>}"
-fi
 echo "Eval POS data (resolved): $EVAL_POS_DATA_PATH"
 echo "Eval NEG data (resolved): $EVAL_NEG_DATA_PATH"
 echo "Eval NEG group (resolved): $EVAL_NEG_GROUP"
@@ -335,12 +315,6 @@ if [[ -n "$PRETRAINED_ALBEF_CKPT" && "$PRETRAINED_ALBEF_CKPT" != "null" ]]; then
     cmd+=(--pretrained_albef_ckpt "$PRETRAINED_ALBEF_CKPT")
 fi
 
-if [[ -n "$EPOCHS_STAGE1" && "$EPOCHS_STAGE1" != "null" ]]; then
-    cmd+=(--epochs_stage1 "$EPOCHS_STAGE1")
-fi
-if [[ -n "$EPOCHS_STAGE2" && "$EPOCHS_STAGE2" != "null" ]]; then
-    cmd+=(--epochs_stage2 "$EPOCHS_STAGE2")
-fi
 if [[ -n "$BATCH_SIZE" && "$BATCH_SIZE" != "null" ]]; then
     cmd+=(--batch_size "$BATCH_SIZE")
 fi
@@ -406,19 +380,6 @@ if [[ -n "$HEAD_DROPOUT" && "$HEAD_DROPOUT" != "null" ]]; then
 fi
 if [[ -n "$ARCH_VERSION" && "$ARCH_VERSION" != "null" ]]; then
     cmd+=(--arch_version "$ARCH_VERSION")
-fi
-
-if [[ -n "$OPT_AUG_NOISE" && "$OPT_AUG_NOISE" != "null" ]]; then
-    cmd+=(--opt_aug_noise "$OPT_AUG_NOISE")
-fi
-if [[ -n "$OPT_AUG_TIME_JITTER" && "$OPT_AUG_TIME_JITTER" != "null" ]]; then
-    cmd+=(--opt_aug_time_jitter "$OPT_AUG_TIME_JITTER")
-fi
-if [[ -n "$OPT_AUG_DROPOUT" && "$OPT_AUG_DROPOUT" != "null" ]]; then
-    cmd+=(--opt_aug_dropout "$OPT_AUG_DROPOUT")
-fi
-if [[ -n "$OPT_AUG_BAND_DROPOUT" && "$OPT_AUG_BAND_DROPOUT" != "null" ]]; then
-    cmd+=(--opt_aug_band_dropout "$OPT_AUG_BAND_DROPOUT")
 fi
 
 if [[ -n "$TARGET_RECALL" && "$TARGET_RECALL" != "null" ]]; then
@@ -487,9 +448,6 @@ if [[ -n "$OFFSET_SEED" && "$OFFSET_SEED" != "null" ]]; then
 fi
 if [[ -n "$OFFSET_BANK_SIZE" && "$OFFSET_BANK_SIZE" != "null" ]]; then
     cmd+=(--offset_bank_size "$OFFSET_BANK_SIZE")
-fi
-if is_truthy "$PREFIX_TRAIN_ENABLE"; then
-    cmd+=(--prefix_train_enable)
 fi
 if [[ -n "$PREFIX_MIN_DET" && "$PREFIX_MIN_DET" != "null" ]]; then
     cmd+=(--prefix_min_det "$PREFIX_MIN_DET")
@@ -565,7 +523,7 @@ if [[ -n "$META_FILTER_RELAX_T_SPAN_IF_BELOW_ROWS" && "$META_FILTER_RELAX_T_SPAN
 fi
 
 echo "Training Command: ${cmd[*]}"
-echo "Optical controls (from config): meta_matched_sampling=${META_MATCHED_SAMPLING:-<default>}, meta_match_fallback=${META_MATCH_FALLBACK:-<default>}, meta_filter_n_det=[${META_FILTER_N_DET_MIN:-<default>},${META_FILTER_N_DET_MAX:-<default>}], meta_filter_n_bands_max=${META_FILTER_N_BANDS_MAX:-<default>}, meta_filter_t_span_max=${META_FILTER_T_SPAN_MAX:-<default>}, meta_filter_relax=${META_FILTER_RELAX_T_SPAN_IF_BELOW_ROWS:-<default>}, universal_train_enable=${UNIVERSAL_TRAIN_ENABLE:-<default>}, universal_epochs=${UNIVERSAL_STAGE1_EPOCHS:-<default>}/${UNIVERSAL_STAGE2_EPOCHS:-<default>}/${UNIVERSAL_STAGE3_EPOCHS:-<default>}, view_keep_prob=${VIEW_KEEP_PROB_MIN:-<default>}..${VIEW_KEEP_PROB_MAX:-<default>}, view_band_dropout_max=${VIEW_BAND_DROPOUT_MAX:-<default>}, cons_weights=${CONSISTENCY_EMBED_WEIGHT:-<default>}/${CONSISTENCY_PROB_WEIGHT:-<default>}, adv_weights=${ADV_DET_WEIGHT:-<default>}/${ADV_BAND_WEIGHT:-<default>}/${ADV_SPAN_WEIGHT:-<default>}, grl_lambda=${GRL_LAMBDA:-<default>}, single_band_keep_prob=${SINGLE_BAND_KEEP_PROB:-<default>}, target_ndet_jitter=${TARGET_NDET_JITTER:-<default>}, shortcut_audit_enable=${SHORTCUT_AUDIT_ENABLE:-<default>}, shortcut_audit_val_samples=${SHORTCUT_AUDIT_VAL_SAMPLES:-<default>}, prefix_train_enable=${PREFIX_TRAIN_ENABLE:-<default>}, prefix_min_det=${PREFIX_MIN_DET:-<default>}, prefix_train_sampling=${PREFIX_TRAIN_SAMPLING:-<default>}, prefix_mix_weights=${PREFIX_BUCKET_UNIFORM_MIX_WEIGHT:-<default>}:${PREFIX_TERMINAL_MIX_WEIGHT:-<default>}"
+echo "Optical controls (from config): meta_matched_sampling=${META_MATCHED_SAMPLING:-<default>}, meta_match_fallback=${META_MATCH_FALLBACK:-<default>}, meta_filter_n_det=[${META_FILTER_N_DET_MIN:-<default>},${META_FILTER_N_DET_MAX:-<default>}], meta_filter_n_bands_max=${META_FILTER_N_BANDS_MAX:-<default>}, meta_filter_t_span_max=${META_FILTER_T_SPAN_MAX:-<default>}, meta_filter_relax=${META_FILTER_RELAX_T_SPAN_IF_BELOW_ROWS:-<default>}, universal_train_enable=${UNIVERSAL_TRAIN_ENABLE:-<default>}, universal_epochs=${UNIVERSAL_STAGE1_EPOCHS:-<default>}/${UNIVERSAL_STAGE2_EPOCHS:-<default>}/${UNIVERSAL_STAGE3_EPOCHS:-<default>}, view_keep_prob=${VIEW_KEEP_PROB_MIN:-<default>}..${VIEW_KEEP_PROB_MAX:-<default>}, view_band_dropout_max=${VIEW_BAND_DROPOUT_MAX:-<default>}, cons_weights=${CONSISTENCY_EMBED_WEIGHT:-<default>}/${CONSISTENCY_PROB_WEIGHT:-<default>}, adv_weights=${ADV_DET_WEIGHT:-<default>}/${ADV_BAND_WEIGHT:-<default>}/${ADV_SPAN_WEIGHT:-<default>}, grl_lambda=${GRL_LAMBDA:-<default>}, shortcut_audit_enable=${SHORTCUT_AUDIT_ENABLE:-<default>}, shortcut_audit_val_samples=${SHORTCUT_AUDIT_VAL_SAMPLES:-<default>}, prefix_min_det=${PREFIX_MIN_DET:-<default>}, prefix_train_sampling=${PREFIX_TRAIN_SAMPLING:-<default>}, prefix_mix_weights=${PREFIX_BUCKET_UNIFORM_MIX_WEIGHT:-<default>}:${PREFIX_TERMINAL_MIX_WEIGHT:-<default>}"
 set +e
 "${cmd[@]}"
 train_exit_code=$?
@@ -675,9 +633,6 @@ fi
 if [[ -n "$OFFSET_SCALE_DAYS_DIVISOR" && "$OFFSET_SCALE_DAYS_DIVISOR" != "null" ]]; then
     eval_cmd+=(--offset_scale_days_divisor "$OFFSET_SCALE_DAYS_DIVISOR")
 fi
-if [[ -z "$PREFIX_EVAL_ENABLE" || "$PREFIX_EVAL_ENABLE" == "null" ]]; then
-    PREFIX_EVAL_ENABLE="$PREFIX_TRAIN_ENABLE"
-fi
 if is_truthy "$PREFIX_EVAL_ENABLE"; then
     eval_cmd+=(--prefix_eval_enable)
 fi
@@ -704,15 +659,6 @@ if [[ -n "$META_FILTER_T_SPAN_MAX" && "$META_FILTER_T_SPAN_MAX" != "null" ]]; th
 fi
 if [[ -n "$META_FILTER_RELAX_T_SPAN_IF_BELOW_ROWS" && "$META_FILTER_RELAX_T_SPAN_IF_BELOW_ROWS" != "null" ]]; then
     eval_cmd+=(--meta_filter_relax_t_span_if_below_rows "$META_FILTER_RELAX_T_SPAN_IF_BELOW_ROWS")
-fi
-if is_truthy "$OOD_REJECT_ENABLE"; then
-    eval_cmd+=(--ood_reject_enable)
-fi
-if [[ -n "$OOD_UNCERTAINTY_METRIC" && "$OOD_UNCERTAINTY_METRIC" != "null" ]]; then
-    eval_cmd+=(--ood_uncertainty_metric "$OOD_UNCERTAINTY_METRIC")
-fi
-if [[ -n "$OOD_UNCERTAINTY_THRESHOLD" && "$OOD_UNCERTAINTY_THRESHOLD" != "null" ]]; then
-    eval_cmd+=(--ood_uncertainty_threshold "$OOD_UNCERTAINTY_THRESHOLD")
 fi
 if is_truthy "$REGIME_EVAL_ENABLE"; then
     eval_cmd+=(--regime_eval_enable)

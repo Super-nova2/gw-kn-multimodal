@@ -34,7 +34,6 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import h5py
-from matplotlib.pyplot import hist
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -107,16 +106,6 @@ def parse_args():
     )
     p.add_argument("--no_plots", action="store_true",
                    help="Skip generating plots (useful on headless machines)")
-    p.add_argument(
-        "--credibility_ablation_modes",
-        type=str,
-        default="baseline,cred_zero,cred_mean,cred_shuffle,cred_coord_shuffle,cred_score_only",
-        help=(
-            "Comma-separated credibility ablation modes. "
-            "Supported: baseline, cred_zero, cred_mean, cred_shuffle, "
-            "cred_coord_shuffle, cred_score_only."
-        ),
-    )
     p.add_argument("--neg_time_offset_enable", action="store_true", default=None,
                    help="Enable time offsets for external non-KN optical negatives in evaluation.")
     p.add_argument("--neg_offset_dist_npz", type=str, default=None,
@@ -245,12 +234,6 @@ def apply_time_offsets(opt_t, opt_mask, delta_days, scale_divisor):
     return opt_t + shift * valid
 
 
-def apply_hard_negative_time_shift(opt_t, opt_mask, delta_days, scale_divisor):
-    valid = (opt_mask.sum(dim=-1) > 0).to(dtype=opt_t.dtype)
-    shift = (delta_days.to(device=opt_t.device, dtype=opt_t.dtype) / float(scale_divisor)).unsqueeze(1)
-    return opt_t + shift * valid
-
-
 def compute_time_delta_days(opt_zero_time_mjd, gw_anchor_time_mjd):
     dt = opt_zero_time_mjd.to(torch.float32) - gw_anchor_time_mjd.to(torch.float32)
     dt = torch.where(torch.isfinite(dt), dt, torch.zeros_like(dt))
@@ -299,7 +282,7 @@ def encode_hard_negative_with_time_shift(
         shifted_opt_t = opt_t
     else:
         delta_days = compute_time_delta_days(candidate_gw_time_mjd, anchor_gw_time_mjd)
-        shifted_opt_t = apply_hard_negative_time_shift(opt_t, opt_mask, delta_days, scale_divisor)
+        shifted_opt_t = apply_time_offsets(opt_t, opt_mask, delta_days, scale_divisor)
     z_l_hard, h_l_hard = model.encode_optical(
         opt_coords, shifted_opt_t, opt_v, opt_ref_t, opt_mask, opt_err
     )
@@ -621,38 +604,6 @@ def _model_requires_cred_level(model):
     if hasattr(base, "uses_cred_level_input"):
         return bool(base.uses_cred_level_input())
     return bool(getattr(base, "dual_fusion", False))
-
-
-def _parse_credibility_ablation_modes(text):
-    valid = {
-        "baseline",
-        "cred_zero",
-        "cred_mean",
-        "cred_shuffle",
-        "cred_coord_shuffle",
-        "cred_score_only",
-    }
-    modes = []
-    for part in str(text).split(","):
-        mode = part.strip().lower()
-        if not mode:
-            continue
-        if mode not in valid:
-            raise ValueError(f"Unsupported credibility ablation mode: {mode}")
-        if mode not in modes:
-            modes.append(mode)
-    if not modes:
-        return ["baseline"]
-    if "baseline" not in modes:
-        modes.insert(0, "baseline")
-    return modes
-
-
-def _permute_batch_tensor(tensor, rng):
-    if tensor is None or tensor.size(0) <= 1:
-        return tensor
-    perm = torch.randperm(tensor.size(0), generator=rng)
-    return tensor.index_select(0, perm.to(tensor.device))
 
 
 def load_model(args, device):
@@ -1354,8 +1305,6 @@ def extract_triplet_logits(model, loader, device, model_args, neg_optical_data,
                            neg_gw_indices,
                            gw_source_types=None,
                            shuffle_gw=False, shuffle_seed=42,
-                           credibility_mode: str = "baseline",
-                           credibility_mean_value: Optional[float] = None,
                            amp_dtype=torch.float32, amp_enabled=False,
                            neg_offset_policy: Optional[EvalNegativeTimeOffsetPolicy] = None,
                            gw_event_time_mjd_table=None,
@@ -1414,34 +1363,12 @@ def extract_triplet_logits(model, loader, device, model_args, neg_optical_data,
     ref_start = model_args["ref_start"]
     ref_end = model_args["ref_end"]
     need_cred = _model_requires_cred_level(model)
-    cred_mode = str(credibility_mode).strip().lower()
-    cred_shuffle_rng = torch.Generator(device='cpu')
-    cred_shuffle_rng.manual_seed(int(shuffle_seed) + 1003)
-    
+
     # RNG for GW shuffling
     if shuffle_gw:
         shuffle_rng = torch.Generator(device='cpu')
         shuffle_rng.manual_seed(shuffle_seed)
 
-    def _coords_for_cred(coords):
-        if not need_cred:
-            return coords
-        if cred_mode == "cred_coord_shuffle":
-            return _permute_batch_tensor(coords, cred_shuffle_rng)
-        return coords
-
-    def _adjust_cred(cred):
-        if cred is None:
-            return None
-        if cred_mode == "cred_zero":
-            return torch.zeros_like(cred)
-        if cred_mode == "cred_mean":
-            fill = 0.0 if credibility_mean_value is None else float(credibility_mean_value)
-            return torch.full_like(cred, fill)
-        if cred_mode == "cred_shuffle":
-            return _permute_batch_tensor(cred, cred_shuffle_rng)
-        return cred
-    
     # Pre-process negative optical data if available
     has_neg_optical = neg_optical_data is not None
     has_neg_gw = neg_gw_indices is not None and len(neg_gw_indices) > 0
@@ -1552,7 +1479,7 @@ def extract_triplet_logits(model, loader, device, model_args, neg_optical_data,
 
                 if need_cred:
                     from ALBEF_train import compute_credible_level
-                    _cred = _adjust_cred(compute_credible_level(gw_m, _coords_for_cred(opt_coords)))
+                    _cred = compute_credible_level(gw_m, opt_coords)
                 else:
                     _cred = None
 
@@ -1626,7 +1553,7 @@ def extract_triplet_logits(model, loader, device, model_args, neg_optical_data,
                     scale_divisor=float(model_args.get("neg_offset_scale_days_divisor", 100.0)),
                 )
                 _cred_hard = (
-                    _adjust_cred(compute_credible_level(gw_m, _coords_for_cred(coords_hard)))
+                    compute_credible_level(gw_m, coords_hard)
                     if need_cred else None
                 )
                 if batch_event_time_mjd_anchor is not None:
@@ -1661,7 +1588,7 @@ def extract_triplet_logits(model, loader, device, model_args, neg_optical_data,
                         gw_s_neg, gw_m_neg, opt_coords, opt_t, opt_v, ref_time, opt_mask, opt_err
                     )
                     _cred_gw_neg = (
-                        _adjust_cred(compute_credible_level(gw_m_neg, _coords_for_cred(opt_coords)))
+                        compute_credible_level(gw_m_neg, opt_coords)
                         if need_cred else None
                     )
                     dt_gw_neg = None
@@ -1702,7 +1629,7 @@ def extract_triplet_logits(model, loader, device, model_args, neg_optical_data,
                     ref_time_neg = build_ref_time(batch_size, n_ref, ref_start, ref_end,
                                                   device, neg_t_batch.dtype)
                     _cred_neg = (
-                        _adjust_cred(compute_credible_level(gw_m, _coords_for_cred(neg_c_batch)))
+                        compute_credible_level(gw_m, neg_c_batch)
                         if need_cred else None
                     )
                     if neg_offset_policy is not None and neg_offset_policy.enabled:
@@ -1762,7 +1689,6 @@ def extract_triplet_logits(model, loader, device, model_args, neg_optical_data,
         "cred_positive": torch.cat(cred_positive) if cred_positive else None,
         "cred_hard_neg": torch.cat(cred_hard_neg) if cred_hard_neg else None,
         "cred_gw_neg": torch.cat(cred_gw_neg) if cred_gw_neg else None,
-        "credibility_mode": cred_mode,
         "source_positive": source_positive,
         "source_optical_neg": source_optical_neg,
         "source_gw_neg": source_gw_neg,
@@ -1783,82 +1709,11 @@ def extract_triplet_logits(model, loader, device, model_args, neg_optical_data,
         result["logits_optical_neg"] = optical_logits
         result["cred_optical_neg"] = torch.cat(cred_optical_neg) if cred_optical_neg else None
         result["optical_neg_types"] = optical_neg_types
-        # Backward-compatible aliases
-        result["logits_easy_neg"] = optical_logits
-        result["easy_neg_types"] = optical_neg_types
     else:
         result["logits_optical_neg"] = None
         result["cred_optical_neg"] = None
         result["optical_neg_types"] = []
-        result["logits_easy_neg"] = None
-        result["easy_neg_types"] = []
 
-    return result
-
-
-def sample_semi_hard_negatives_for_optical(sim_o2g, gw_indices, allowed_mask=None):
-    """
-    Sample semi-hard negative GW indices for each optical sample.
-    
-    For each optical sample i, find the GW j that:
-    1. Is NOT from the same GW event as optical i
-    2. Has similarity < positive similarity (sim with correct GW)
-    3. Has the highest similarity among all such negatives
-    
-    This implements semi-hard negative mining: selecting the hardest negative
-    that is still easier than the positive, which provides informative gradients.
-    
-    Reference: model.py sample_semi_hard_negatives
-    
-    Args:
-        sim_o2g: Similarity matrix [batch_opt, batch_gw], Optical-to-GW similarities
-        gw_indices: GW event indices for each sample [batch]
-        allowed_mask: Optional boolean mask [batch, batch] of allowed negatives
-        
-    Returns:
-        semi_hard_idx: Indices of semi-hard negative GW for each optical sample [batch]
-    """
-    # In eval we run under autocast, so sim_o2g may be fp16 on CUDA.
-    # Use fp32 here to safely apply large mask values (e.g. -1e9).
-    sim = sim_o2g.detach().float()
-    batch_size = sim.size(0)
-    device = sim.device
-    
-    # Create same-event mask: gw_indices[i] == gw_indices[j]
-    same_event = gw_indices.unsqueeze(0) == gw_indices.unsqueeze(1)  # [batch, batch]
-    
-    # Get positive similarity for each sample (diagonal of same-event pairs)
-    # For test set with unique GW per sample, this is the diagonal
-    pos_sim = sim.diagonal()  # [batch] - similarity with correct GW
-    
-    # Mask out same-event pairs from negative candidates
-    neg_sim = sim.masked_fill(same_event, -1e9)
-    if allowed_mask is not None:
-        neg_sim = neg_sim.masked_fill(~allowed_mask, -1e9)
-    
-    # For each optical, find negatives with sim < pos_sim
-    # Then select the one with maximum similarity (semi-hard)
-    result = torch.zeros(batch_size, dtype=torch.long, device=device)
-    
-    for i in range(batch_size):
-        # Find negatives below positive similarity
-        below_mask = (neg_sim[i] < pos_sim[i]) & (neg_sim[i] > -1e8)
-        below_idx = below_mask.nonzero(as_tuple=False).squeeze(-1)
-        
-        if below_idx.numel() > 0:
-            # Select the negative with highest similarity (closest to positive)
-            best_local = neg_sim[i, below_idx].argmax()
-            result[i] = below_idx[best_local]
-        else:
-            # Fallback: all negatives exceed pos_sim, pick random negative
-            neg_idx = (~same_event[i]).nonzero(as_tuple=False).squeeze(-1)
-            if neg_idx.numel() > 0:
-                pick = torch.randint(0, neg_idx.numel(), (1,), device=device)
-                result[i] = neg_idx[pick]
-            else:
-                # Edge case: no negatives available (shouldn't happen)
-                result[i] = (i + 1) % batch_size
-    
     return result
 
 
@@ -2010,7 +1865,7 @@ def _score_gallery_candidates_with_logits(model, query_cache, candidate_indices,
             cand_gw_time = gw_event_time_mjd_table[cand_gw_idx_chunk]
             query_gw_time = gw_event_time_mjd_table[query_gw_idx_chunk]
             delta_days = compute_time_delta_days(cand_gw_time, query_gw_time)
-            shifted_opt_t = apply_hard_negative_time_shift(
+            shifted_opt_t = apply_time_offsets(
                 opt_t_chunk, opt_mask_chunk, delta_days, scale_divisor
             )
             ref_time_chunk = build_ref_time(
@@ -2057,13 +1912,17 @@ def evaluate_retrieval_gallery_mode(model, embeddings, gallery_sizes, test_data_
                                     device, n_trials=10, seed=42,
                                     model_args=None,
                                     gw_event_time_mjd_table=None,
-                                    amp_dtype=torch.float32, amp_enabled=False):
+                                    amp_dtype=torch.float32, amp_enabled=False,
+                                    gw_source_types=None):
     """
     Gallery retrieval with classification branch logits.
 
     For each GW query event, build candidate pool of size N
     (1 correct optical + N-1 distractors), score each pair by fusion-head
     positive probability, then compute Recall@K and MRR.
+
+    If gw_source_types is provided, also returns per-source metrics under
+    the "by_source" key of the result dict.
     """
     gw_indices = embeddings["gw_indices"]
     unique_gw = torch.unique(gw_indices).cpu().tolist()
@@ -2083,6 +1942,14 @@ def evaluate_retrieval_gallery_mode(model, embeddings, gallery_sizes, test_data_
     ref_end = float(model_args.get("ref_end", 0.6))
     scale_divisor = float(model_args.get("neg_offset_scale_days_divisor", 100.0))
 
+    # Build per-GW source label map for per-source accumulation
+    gw_source_map: Dict[int, str] = {}
+    if gw_source_types is not None:
+        for gw_id in unique_gw:
+            gw_source_map[int(gw_id)] = _lookup_source_type(int(gw_id), gw_source_types)
+        source_labels = sorted(set(gw_source_map.values()))
+        print(f"Gallery retrieval: tracking per-source metrics for {source_labels}")
+
     print("Building GW query cache for logits-based gallery retrieval...")
     gw_query_cache = _build_gallery_query_cache(
         model, unique_gw, test_data_path, device,
@@ -2090,6 +1957,9 @@ def evaluate_retrieval_gallery_mode(model, embeddings, gallery_sizes, test_data_
     )
 
     results = {}
+    # per_source_accum[source][N] = {"recalls": {1:[], 5:[], 10:[]}, "mrrs": []}
+    per_source_accum: Dict[str, Dict[int, Dict]] = {}
+
     for N in gallery_sizes:
         recalls = {1: [], 5: [], 10: []}
         mrrs = []
@@ -2136,20 +2006,39 @@ def evaluate_retrieval_gallery_mode(model, embeddings, gallery_sizes, test_data_
                     recalls[k].append(1.0 if correct_rank < k else 0.0)
                 mrrs.append(1.0 / (correct_rank + 1))
 
+                # Per-source accumulation
+                if gw_source_map:
+                    src = gw_source_map.get(int(gw_id), "unknown")
+                    if src not in per_source_accum:
+                        per_source_accum[src] = {}
+                    if N not in per_source_accum[src]:
+                        per_source_accum[src][N] = {
+                            "recalls": {1: [], 5: [], 10: []},
+                            "mrrs": [],
+                        }
+                    src_acc = per_source_accum[src][N]
+                    for k in src_acc["recalls"]:
+                        src_acc["recalls"][k].append(1.0 if correct_rank < k else 0.0)
+                    src_acc["mrrs"].append(1.0 / (correct_rank + 1))
+
         for k in recalls:
             key = f"gallery_{N}_recall_at_{k}"
             results[key] = float(np.mean(recalls[k])) if recalls[k] else 0.0
         results[f"gallery_{N}_mrr"] = float(np.mean(mrrs)) if mrrs else 0.0
 
+    # Collapse per-source accumulators into flat metric dicts
+    if per_source_accum:
+        by_source: Dict[str, Dict] = {}
+        for src, size_acc in per_source_accum.items():
+            src_metrics: Dict[str, float] = {}
+            for N, acc in size_acc.items():
+                for k, vals in acc["recalls"].items():
+                    src_metrics[f"gallery_{N}_recall_at_{k}"] = float(np.mean(vals)) if vals else 0.0
+                src_metrics[f"gallery_{N}_mrr"] = float(np.mean(acc["mrrs"])) if acc["mrrs"] else 0.0
+            by_source[src] = src_metrics
+        results["by_source"] = by_source
+
     return results
-
-
-def evaluate_classification(embeddings):
-    """Global classification metrics from fusion head (pos + rolled neg pairs)."""
-    logits = embeddings["logits"]
-    labels = embeddings["labels"]
-    probs = torch.softmax(logits.float(), dim=1)[:, 1]
-    return compute_classification_metrics(probs, labels)
 
 
 def evaluate_classification_triplet(triplet_logits, report_dt_bins=False, dt_bin_edges=None, report_dt_macro=False):
@@ -2186,10 +2075,7 @@ def evaluate_classification_triplet(triplet_logits, report_dt_bins=False, dt_bin
         dt_pos = triplet_logits.get("dt_positive_days")
         _append_dt_or_nan(dt_pos, len(probs_pos))
 
-    # Optical negatives (GW, nonKN), with backward-compatible fallback
     optical_logits = triplet_logits.get("logits_optical_neg")
-    if optical_logits is None:
-        optical_logits = triplet_logits.get("logits_easy_neg")
     if optical_logits is not None:
         probs_optical = torch.softmax(optical_logits.float(), dim=1)[:, 1]
         all_probs.append(probs_optical)
@@ -2269,8 +2155,6 @@ def _metric_delta(current_metrics, baseline_metrics, keys=("auroc", "auprc", "f1
 
 def summarize_triplet_prob_distributions(triplet_logits):
     optical_logits = triplet_logits.get("logits_optical_neg")
-    if optical_logits is None:
-        optical_logits = triplet_logits.get("logits_easy_neg")
     return {
         "positive": _summarize_score_tensor(
             torch.softmax(triplet_logits["logits_positive"].float(), dim=1)[:, 1]
@@ -2284,38 +2168,6 @@ def summarize_triplet_prob_distributions(triplet_logits):
         "hard_negative": _summarize_score_tensor(
             torch.softmax(triplet_logits["logits_hard_neg"].float(), dim=1)[:, 1]
         ) if triplet_logits.get("logits_hard_neg") is not None else None,
-    }
-
-
-def evaluate_credibility_score_triplet(triplet_logits):
-    all_scores = []
-    all_labels = []
-    summaries = {}
-
-    def _add(cred_key, label, summary_key):
-        cred = triplet_logits.get(cred_key)
-        if cred is None:
-            return
-        score = 1.0 - cred.float().reshape(-1).clamp(0.0, 1.0)
-        all_scores.append(score)
-        all_labels.append(torch.full((score.numel(),), label, dtype=torch.long))
-        summaries[summary_key] = _summarize_score_tensor(score)
-
-    _add("cred_positive", 1, "positive")
-    _add("cred_optical_neg", 0, "optical_negative")
-    _add("cred_gw_neg", 0, "gw_negative")
-    _add("cred_hard_neg", 0, "hard_negative")
-
-    if not all_scores:
-        return {}
-
-    scores = torch.cat(all_scores)
-    labels = torch.cat(all_labels)
-    metrics = compute_classification_metrics(scores, labels)
-    metrics["score_transform"] = "1 - cred_level"
-    return {
-        "metrics": metrics,
-        "score_summary": summaries,
     }
 
 
@@ -2393,8 +2245,6 @@ def evaluate_classification_triplet_by_source(triplet_logits):
     )
 
     optical_logits = triplet_logits.get("logits_optical_neg")
-    if optical_logits is None:
-        optical_logits = triplet_logits.get("logits_easy_neg")
     add_pair_type(
         optical_logits,
         triplet_logits.get("source_optical_neg"),
@@ -2490,7 +2340,7 @@ def evaluate_embeddings(embeddings):
     )
 
 
-def generate_plots(embeddings, results, output_dir):
+def generate_plots(embeddings, results, output_dir, triplet_logits=None):
     """Generate evaluation plots."""
     try:
         import matplotlib
@@ -2502,11 +2352,32 @@ def generate_plots(embeddings, results, output_dir):
 
     os.makedirs(output_dir, exist_ok=True)
 
-    # --- 1. ROC Curve ---
-    logits = embeddings["logits"]
-    labels = embeddings["labels"]
-    probs = torch.softmax(logits.float(), dim=1)[:, 1].numpy()
-    labels_np = labels.numpy()
+    # --- Build probs/labels for ROC/PR/calibration ---
+    # Prefer triplet logits (consistent with results["classification"]);
+    # fall back to roll-by-1 embeddings if triplet_logits unavailable.
+    if triplet_logits is not None:
+        all_probs, all_labels = [], []
+        pos = triplet_logits.get("logits_positive")
+        if pos is not None:
+            all_probs.append(torch.softmax(pos.float(), dim=1)[:, 1])
+            all_labels.append(torch.ones(pos.size(0), dtype=torch.long))
+        for key in ("logits_optical_neg", "logits_gw_neg", "logits_hard_neg"):
+            neg = triplet_logits.get(key)
+            if neg is not None:
+                all_probs.append(torch.softmax(neg.float(), dim=1)[:, 1])
+                all_labels.append(torch.zeros(neg.size(0), dtype=torch.long))
+        if all_probs:
+            probs = torch.cat(all_probs).numpy()
+            labels_np = torch.cat(all_labels).numpy()
+        else:
+            probs = np.array([], dtype=np.float32)
+            labels_np = np.array([], dtype=np.int64)
+    else:
+        logits = embeddings["logits"]
+        labels = embeddings["labels"]
+        probs = torch.softmax(logits.float(), dim=1)[:, 1].numpy()
+        labels_np = labels.numpy()
+
     finite_cls = np.isfinite(probs) & np.isfinite(labels_np)
     n_bad_cls = int((~finite_cls).sum())
     if n_bad_cls > 0:
@@ -2533,7 +2404,7 @@ def generate_plots(embeddings, results, output_dir):
         ax.plot(fpr, tpr, lw=2)
         ax.plot([0, 1], [0, 1], "k--", lw=1)
         auroc = results.get("classification", {}).get("auroc", 0)
-        ax.set_title(f"ROC Curve (AUROC={auroc:.4f})")
+        ax.set_title(f"ROC Curve (AUROC={auroc:.3f})")
         ax.set_xlabel("False Positive Rate")
         ax.set_ylabel("True Positive Rate")
         fig.savefig(os.path.join(output_dir, "roc_curve.png"), dpi=150,
@@ -2550,7 +2421,7 @@ def generate_plots(embeddings, results, output_dir):
         fig, ax = plt.subplots(figsize=(6, 6))
         ax.plot(recall, precision, lw=2)
         auprc = results.get("classification", {}).get("auprc", 0)
-        ax.set_title(f"Precision-Recall Curve (AUPRC={auprc:.4f})")
+        ax.set_title(f"Precision-Recall Curve (AUPRC={auprc:.3f})")
         ax.set_xlabel("Recall")
         ax.set_ylabel("Precision")
         fig.savefig(os.path.join(output_dir, "pr_curve.png"), dpi=150,
@@ -2784,8 +2655,6 @@ def generate_logits_distribution_plot(triplet_logits, output_dir):
     if triplet_logits.get("logits_positive") is not None:
         probs_pos = torch.softmax(triplet_logits["logits_positive"].float(), dim=1)[:, 1].numpy()
     optical_logits = triplet_logits.get("logits_optical_neg")
-    if optical_logits is None:
-        optical_logits = triplet_logits.get("logits_easy_neg")
     if optical_logits is not None:
         probs_optical = torch.softmax(optical_logits.float(), dim=1)[:, 1].numpy()
     if triplet_logits.get("logits_gw_neg") is not None:
@@ -2919,8 +2788,6 @@ def generate_gw_shuffle_comparison_plot(triplet_logits_normal, triplet_logits_sh
 
     def get_optical_neg_probs(logits_dict):
         optical_logits = logits_dict.get("logits_optical_neg")
-        if optical_logits is None:
-            optical_logits = logits_dict.get("logits_easy_neg")
         if optical_logits is None:
             return None
         return torch.softmax(optical_logits.float(), dim=1)[:, 1].numpy()
@@ -3056,56 +2923,6 @@ def generate_gw_shuffle_comparison_plot(triplet_logits_normal, triplet_logits_sh
     print(f"GW-shuffle comparison plots saved to {output_dir}/")
 
 
-def generate_credibility_ablation_plot(results, output_dir):
-    cred_ablation = results.get("ablation", {}).get("credibility", {})
-    modes = cred_ablation.get("modes", {})
-    if not modes:
-        return
-    metric_modes = []
-    auroc_vals = []
-    auprc_vals = []
-    f1_vals = []
-    for mode, entry in modes.items():
-        if mode == "cred_score_only":
-            metrics = entry.get("metrics", {})
-        else:
-            metrics = entry.get("classification", {})
-        if not metrics:
-            continue
-        metric_modes.append(mode)
-        auroc_vals.append(float(metrics.get("auroc", 0.0)))
-        auprc_vals.append(float(metrics.get("auprc", 0.0)))
-        f1_vals.append(float(metrics.get("f1_optimal", 0.0)))
-
-    if not metric_modes:
-        return
-
-    try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-    except ImportError:
-        print("matplotlib not available, skipping credibility ablation plot")
-        return
-
-    os.makedirs(output_dir, exist_ok=True)
-    x = np.arange(len(metric_modes))
-    width = 0.25
-    fig, ax = plt.subplots(figsize=(max(8, len(metric_modes) * 1.4), 5))
-    ax.bar(x - width, auroc_vals, width=width, label="AUROC")
-    ax.bar(x, auprc_vals, width=width, label="AUPRC")
-    ax.bar(x + width, f1_vals, width=width, label="F1")
-    ax.set_xticks(x)
-    ax.set_xticklabels(metric_modes, rotation=25, ha="right")
-    ax.set_ylim(0.0, 1.0)
-    ax.set_title("Credibility Ablation Metrics")
-    ax.grid(True, axis="y", alpha=0.25, linestyle="--")
-    ax.legend()
-    fig.tight_layout()
-    fig.savefig(os.path.join(output_dir, "credibility_ablation_metrics.png"), dpi=200, bbox_inches="tight")
-    plt.close(fig)
-
-
 def save_results(results, output_dir):
     """Save results as JSON."""
     os.makedirs(output_dir, exist_ok=True)
@@ -3229,42 +3046,13 @@ def print_summary(results):
                 f"(bins_used={dt_macro.get('bins_used',0)}/{dt_macro.get('bins_total',0)})"
             )
 
-    cls_shuffle = results.get("classification_gw_shuffle", {})
+    cls_shuffle = results.get("ablation", {}).get("gw_shuffle", {}).get("classification", {})
     if cls_shuffle:
         print("\n--- Classification (GW-Shuffle) ---")
         print(f"  AUROC={cls_shuffle.get('auroc', 0):.4f}  "
               f"AUPRC={cls_shuffle.get('auprc', 0):.4f}  "
               f"F1={cls_shuffle.get('f1_optimal', 0):.4f} (t={cls_shuffle.get('f1_threshold', 0):.2f})  "
               f"ECE={cls_shuffle.get('ece', 0):.4f}")
-
-    cred_ablation = results.get("ablation", {}).get("credibility", {})
-    if cred_ablation:
-        print("\n--- Credibility Ablation ---")
-        print(
-            f"  enabled={int(bool(cred_ablation.get('enabled', False)))} "
-            f"modes={cred_ablation.get('modes_requested', [])}"
-        )
-        for mode, entry in cred_ablation.get("modes", {}).items():
-            if mode == "baseline":
-                continue
-            if mode == "cred_score_only":
-                metrics = entry.get("metrics", {})
-                if metrics:
-                    print(
-                        f"  {mode}: AUROC={metrics.get('auroc',0):.4f} "
-                        f"AUPRC={metrics.get('auprc',0):.4f} "
-                        f"F1={metrics.get('f1_optimal',0):.4f}"
-                    )
-                continue
-            metrics = entry.get("classification", {})
-            delta = entry.get("delta_vs_baseline", {})
-            if metrics:
-                print(
-                    f"  {mode}: AUROC={metrics.get('auroc',0):.4f} "
-                    f"AUPRC={metrics.get('auprc',0):.4f} "
-                    f"ΔAUROC={delta.get('delta_auroc',0.0):+.4f} "
-                    f"ΔAUPRC={delta.get('delta_auprc',0.0):+.4f}"
-                )
 
     cls_by_src = results.get("classification_by_source", {})
     if cls_by_src:
@@ -3332,8 +3120,6 @@ def main():
         dataset_window_start=dataset_window_start,
         dataset_window_end=dataset_window_end,
     )
-    credibility_modes = _parse_credibility_ablation_modes(args.credibility_ablation_modes)
-    model_uses_cred = _model_requires_cred_level(model)
     nonkn_cls_base_field = str(model_args.get("nonkn_cls_base_field", "zero_time_mjd_cls_base"))
     neg_time_offset_enable = bool(
         choose_value(
@@ -3486,10 +3272,6 @@ def main():
             "windows_days": [float(v) for v in hardneg_windows_days],
             "min_candidates": int(hardneg_min_candidates),
         },
-        "credibility_ablation": {
-            "modes_requested": credibility_modes,
-            "model_uses_cred_level_input": bool(model_uses_cred),
-        },
         "dataset_window_metadata": runtime_model_args.get("dataset_window_metadata"),
         "effective_input_window_metadata": runtime_model_args.get("effective_input_window_metadata"),
     }
@@ -3497,16 +3279,18 @@ def main():
     results["retrieval_batch"] = evaluate_retrieval_batch_mode(embeddings)
 
     print("Computing gallery-mode retrieval metrics...")
-    results["retrieval_gallery"] = evaluate_retrieval_gallery_mode(
+    _gallery_result = evaluate_retrieval_gallery_mode(
         model, embeddings, gallery_sizes, args.test_data_path,
         device=device, n_trials=args.gallery_trials,
         model_args=runtime_model_args,
         gw_event_time_mjd_table=gw_event_time_mjd_table,
-        amp_dtype=amp_dtype, amp_enabled=amp_enabled
+        amp_dtype=amp_dtype, amp_enabled=amp_enabled,
+        gw_source_types=gw_source_types,
     )
-
-    print("Computing classification metrics (roll-by-1, preliminary)...")
-    results["classification"] = evaluate_classification(embeddings)
+    _gallery_by_source = _gallery_result.pop("by_source", {})
+    results["retrieval_gallery"] = _gallery_result
+    if _gallery_by_source:
+        results["retrieval_gallery_by_source"] = _gallery_by_source
 
     print("Computing embedding quality metrics...")
     results["embedding"] = evaluate_embeddings(embeddings)
@@ -3526,7 +3310,7 @@ def main():
         )
     neg_gw_indices = load_negative_gw_indices(args.test_data_path)
 
-    def _extract_triplets_with_retry(*, shuffle_gw=False, credibility_mode="baseline", credibility_mean_value=None):
+    def _extract_triplets_with_retry(*, shuffle_gw=False):
         loader_local, _ = build_test_dataloader(
             args, saved_args, return_zero_time_mjd=False,
             nonkn_cls_base_field=nonkn_cls_base_field,
@@ -3536,8 +3320,6 @@ def main():
                 model, loader_local, device, runtime_model_args, neg_optical_data, neg_gw_indices,
                 gw_source_types=gw_source_types,
                 shuffle_gw=shuffle_gw, shuffle_seed=42,
-                credibility_mode=credibility_mode,
-                credibility_mean_value=credibility_mean_value,
                 amp_dtype=amp_dtype, amp_enabled=amp_enabled,
                 neg_offset_policy=neg_offset_policy,
                 gw_event_time_mjd_table=gw_event_time_mjd_table,
@@ -3560,8 +3342,6 @@ def main():
                 model, loader_local, device, runtime_model_args, neg_optical_data, neg_gw_indices,
                 gw_source_types=gw_source_types,
                 shuffle_gw=shuffle_gw, shuffle_seed=42,
-                credibility_mode=credibility_mode,
-                credibility_mean_value=credibility_mean_value,
                 amp_dtype=amp_dtype, amp_enabled=amp_enabled,
                 neg_offset_policy=neg_offset_policy,
                 gw_event_time_mjd_table=gw_event_time_mjd_table,
@@ -3573,40 +3353,11 @@ def main():
             )
 
     # Extract triplet logits for distribution analysis
-    triplet_logits = None
-    triplet_logits_shuffle = None
-    credibility_ablation_triplets = {}
-    credibility_mean_value = None
-    if neg_optical_data is not None or len(neg_gw_indices) > 0 or True:  # Always extract for hard negatives
-        print("\nExtracting triplet logits for distribution analysis...")
-        triplet_logits = _extract_triplets_with_retry(shuffle_gw=False, credibility_mode="baseline")
+    print("\nExtracting triplet logits for distribution analysis...")
+    triplet_logits = _extract_triplets_with_retry(shuffle_gw=False)
 
-        print("\nExtracting triplet logits with GW-SHUFFLE (ablation test)...")
-        triplet_logits_shuffle = _extract_triplets_with_retry(shuffle_gw=True, credibility_mode="baseline")
-
-        if model_uses_cred:
-            cred_values = []
-            for key in ("cred_positive", "cred_optical_neg", "cred_gw_neg", "cred_hard_neg"):
-                tensor = triplet_logits.get(key)
-                if tensor is not None and tensor.numel() > 0:
-                    cred_values.append(tensor.reshape(-1))
-            if cred_values:
-                credibility_mean_value = float(torch.cat(cred_values).float().mean().item())
-
-            for mode in credibility_modes:
-                if mode in {"baseline", "cred_score_only"}:
-                    continue
-                print(f"\nExtracting triplet logits with credibility ablation: {mode}...")
-                credibility_ablation_triplets[mode] = _extract_triplets_with_retry(
-                    shuffle_gw=False,
-                    credibility_mode=mode,
-                    credibility_mean_value=credibility_mean_value,
-                )
-        elif any(mode != "baseline" for mode in credibility_modes):
-            print(
-                "Skipping credibility-input ablations because the current model "
-                "does not consume cred_level in its classifier path."
-            )
+    print("\nExtracting triplet logits with GW-SHUFFLE (ablation test)...")
+    triplet_logits_shuffle = _extract_triplets_with_retry(shuffle_gw=True)
 
     # Recompute classification from triplet logits (pos + optical_neg + gw_neg + semi_hard_neg)
     if triplet_logits is not None:
@@ -3642,24 +3393,6 @@ def main():
         if triplet_cls_by_source:
             results["classification_by_source"] = triplet_cls_by_source
         results.setdefault("ablation", {})
-        results["ablation"]["credibility"] = {
-            "enabled": bool(model_uses_cred),
-            "mean_fill_value": credibility_mean_value,
-            "modes_requested": credibility_modes,
-            "modes": {
-                "baseline": {
-                    "classification": triplet_cls,
-                    "distribution_summary": summarize_triplet_prob_distributions(triplet_logits),
-                }
-            },
-        }
-        if "cred_score_only" in credibility_modes:
-            cred_only = evaluate_credibility_score_triplet(triplet_logits)
-            if cred_only:
-                cred_only["delta_vs_baseline"] = _metric_delta(
-                    cred_only.get("metrics", {}), triplet_cls or {}
-                )
-            results["ablation"]["credibility"]["modes"]["cred_score_only"] = cred_only
         if triplet_logits_shuffle is not None:
             shuffle_cls = evaluate_classification_triplet(
                 triplet_logits_shuffle,
@@ -3667,30 +3400,13 @@ def main():
                 dt_bin_edges=dt_bin_edges,
                 report_dt_macro=report_dt_macro,
             )
-            if shuffle_cls:
-                results["classification_gw_shuffle"] = shuffle_cls
             shuffle_src = evaluate_classification_triplet_by_source(triplet_logits_shuffle)
-            if shuffle_src:
-                results["classification_by_source_gw_shuffle"] = shuffle_src
             results["ablation"]["gw_shuffle"] = {
                 "classification": shuffle_cls,
+                "classification_by_source": shuffle_src if shuffle_src else {},
                 "distribution_summary": summarize_triplet_prob_distributions(triplet_logits_shuffle),
                 "delta_vs_baseline": _metric_delta(shuffle_cls or {}, triplet_cls or {}),
             }
-
-        if model_uses_cred:
-            for mode, logits_dict in credibility_ablation_triplets.items():
-                cls_mode = evaluate_classification_triplet(
-                    logits_dict,
-                    report_dt_bins=report_dt_bins,
-                    dt_bin_edges=dt_bin_edges,
-                    report_dt_macro=report_dt_macro,
-                )
-                results["ablation"]["credibility"]["modes"][mode] = {
-                    "classification": cls_mode,
-                    "distribution_summary": summarize_triplet_prob_distributions(logits_dict),
-                    "delta_vs_baseline": _metric_delta(cls_mode or {}, triplet_cls or {}),
-                }
 
     # Save and display
     save_results(results, args.output_dir)
@@ -3698,7 +3414,7 @@ def main():
 
     if not args.no_plots:
         print("\nGenerating plots...")
-        generate_plots(embeddings, results, args.output_dir)
+        generate_plots(embeddings, results, args.output_dir, triplet_logits=triplet_logits)
         
         # Generate triplet logits distribution plot
         if triplet_logits is not None:
@@ -3711,9 +3427,6 @@ def main():
             generate_gw_shuffle_comparison_plot(
                 triplet_logits, triplet_logits_shuffle, args.output_dir
             )
-        if results.get("ablation", {}).get("credibility", {}).get("modes"):
-            print("\nGenerating credibility ablation plots...")
-            generate_credibility_ablation_plot(results, args.output_dir)
 
 
 if __name__ == "__main__":
