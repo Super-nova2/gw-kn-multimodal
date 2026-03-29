@@ -45,38 +45,28 @@ gw-kn-multimodal/
 
 ## Dependencies
 
-The repository does not maintain a `requirements.txt`. The main runtime dependencies are:
+Python dependencies are listed in `requirements.txt`. Install with:
 
-- Python 3.10+
-- PyTorch
-- h5py
-- numpy
-- pandas
-- astropy
-- healpy
-- ligo.skymap
-- tqdm
-- matplotlib
-- optuna
-- tensorboard
-- graphviz
-- jq
-- Slurm
-- SNANA
-- opsimsummaryv2
+```bash
+pip install -r requirements.txt
+```
+
+Main dependencies: Python 3.10+, PyTorch, h5py, numpy, pandas, astropy, healpy, ligo.skymap, tqdm, matplotlib, optuna, tensorboard, graphviz.
+
+Additional system dependencies: jq, Slurm (HPC environment), SNANA + opsimsummaryv2 (data generation only).
 
 Running on an HPC / Slurm environment is recommended. All `.sh` entry scripts are written for Slurm job submission and resource allocation.
 
 ## Data & Path Conventions
 
-The example configurations use paths under `/fred/oz016/bgao_kn/data/`. **These are cluster-specific and must be updated before running on any other system.** Key directories:
+Configuration files use `<BASE_DIR>` as a placeholder. Replace all occurrences of `<BASE_DIR>` with your actual root directory before running. Key directories:
 
 | Purpose | Example path |
 |---------|-------------|
-| Multimodal HDF5 | `/fred/oz016/bgao_kn/data/ALBEF_dataset/` |
-| optical-only HDF5 | `/fred/oz016/bgao_kn/data/Optical_Only_dataset/` |
-| Checkpoints | `/fred/oz016/bgao_kn/data/model/` |
-| Skymap / SNANA data | `/fred/oz016/bgao_kn/data/` and `/fred/oz016/bgao_kn/SNANA/` |
+| Multimodal HDF5 | `<BASE_DIR>/data/ALBEF_dataset/` |
+| optical-only HDF5 | `<BASE_DIR>/data/Optical_Only_dataset/` |
+| Checkpoints | `<BASE_DIR>/data/model/` |
+| Skymap / SNANA data | `<BASE_DIR>/data/` and `<BASE_DIR>/SNANA/` |
 
 To run on a different machine, update:
 
@@ -203,14 +193,30 @@ Copy an existing JSON and edit the following fields:
 
 ## Recommended Starting Order
 
-1. Confirm that HDF5, skymap, and SNANA data files under your data directory are present.
-2. Check `Model/args/ALBEF_BNS_NSBH.json` or `optical_only/args/optical_only_kn_v14.json`.
-3. Run dataset construction → training → evaluation in order.
+1. Install dependencies: `pip install -r requirements.txt`
+2. Replace `<BASE_DIR>` in configuration files with your actual root directory.
+3. Confirm that HDF5, skymap, and SNANA data files under your data directory are present.
+4. Check `Model/args/ALBEF_BNS_NSBH.json` or `optical_only/args/optical_only_kn_v14.json`.
+5. Run dataset construction -> training -> evaluation in order.
+
+## Data
+
+This repository does not include training data or large simulation files. Datasets can be obtained by:
+
+- **GW simulated events**: Generate using scripts under `dataset/KN_sim/` with SNANA/OpSim.
+- **Training HDF5**: Build from simulation data using `Model/script/create_dataset_bns_nsbh.py` and `optical_only/create_optical_only_datasets.py`.
+- For pre-built datasets, please contact the authors.
 
 ## Citation
 
-Paper in preparation. Citation information will be added upon publication.
+If you use this code, please cite our paper:
+
+```
+[Paper in preparation]
+```
+
+See `CITATION.cff` for details.
 
 ## License
 
-TBD — see `LICENSE` file.
+This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.

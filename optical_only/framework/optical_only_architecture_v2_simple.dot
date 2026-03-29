@@ -1,0 +1,64 @@
+// Optical-only KN model architecture (high-level, simplified).
+// Source: ML+GW+KN/Model/model.py (OpticalKNClassifier + OpticalEncoderWithCLSNoCoord)
+// Render:
+//   dot -Tpng -Gdpi=240 optical_only_architecture_v2_simple.dot -o optical_only_architecture_v2_simple.png
+//   dot -Tsvg optical_only_architecture_v2_simple.dot -o optical_only_architecture_v2_simple.svg
+
+digraph OpticalOnlySimple {
+  rankdir=LR;
+  labelloc=t;
+  label="Optical-Only KN Classifier (Simplified Architecture)";
+
+  graph [
+    bgcolor="#F8FAFC",
+    fontname="Helvetica",
+    fontsize=18,
+    pad=0.35,
+    nodesep=0.50,
+    ranksep=0.65,
+    splines=ortho
+  ];
+
+  node [
+    shape=box,
+    style="rounded,filled",
+    fontname="Helvetica",
+    fontsize=11,
+    color="#475569",
+    penwidth=1.0
+  ];
+
+  edge [
+    color="#64748B",
+    penwidth=1.2,
+    arrowsize=0.7
+  ];
+
+  inputs [label="Optical Inputs\nopt_t [B,L], opt_v [B,L,6],\nopt_mask [B,L,6], opt_err [B,L,6]", fillcolor="#E2E8F0"];
+  reftime [label="Reference Time Grid\nN_ref anchors (default: 64)\nrange: [-0.3, 0.6]", fillcolor="#E0F2FE", color="#0284C7"];
+  offset [label="Optional Time Offset\nopt_t <- opt_t - delta/100", fillcolor="#FEF3C7", color="#D97706"];
+
+  encoder [label="Optical Encoder (NoCoord)\nLearnable periodic time embedding\n+ CLS token\n+ Multi-Time Attention\n(mask + error-aware)", fillcolor="#DCFCE7", color="#16A34A"];
+
+  branch_cls [label="CLS feature z_l\n[B, J]", fillcolor="#DCFCE7", color="#16A34A"];
+  branch_temp [label="Temporal features H_l\n[B, N_ref, J]", fillcolor="#DCFCE7", color="#16A34A"];
+
+  pool [label="Temporal Mean Pooling\nh_pool = mean(H_l, dim=1)\n[B, J]", fillcolor="#EDE9FE", color="#7C3AED"];
+  concat [label="Feature Fusion\nconcat(z_l, h_pool)\n[B, 2J]", fillcolor="#EDE9FE", color="#7C3AED"];
+  head [label="Classifier Head (MLP)\nLinear(2J->hidden) -> ReLU\n-> Dropout -> Linear(hidden->1)", fillcolor="#FCE7F3", color="#DB2777"];
+  out [label="Output Logit / KN Score\nsigmoid(logit) -> P(KN)", shape=ellipse, fillcolor="#FEE2E2", color="#DC2626"];
+
+  note [label="Typical optical-only setup:\ninput_dim=6, heads=4,\nref_dim=64, k_dim=64,\nenc_dim=J, two-stage training", shape=note, fillcolor="#FFFFFF", color="#94A3B8", fontsize=10];
+
+  inputs -> offset;
+  offset -> encoder;
+  reftime -> encoder;
+
+  encoder -> branch_cls;
+  encoder -> branch_temp;
+  branch_temp -> pool;
+  branch_cls -> concat;
+  pool -> concat;
+  concat -> head -> out;
+  out -> note [style=dotted, arrowhead=none, color="#94A3B8"];
+}

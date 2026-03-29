@@ -1,7 +1,7 @@
 #!/bin/bash
 
 #SBATCH --job-name=FD_DELAY_SNR
-#SBATCH --output=/fred/oz016/bgao_kn/logs/optical_only/%x_%j.out
+#SBATCH --output=<BASE_DIR>/logs/optical_only/%x_%j.out
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
@@ -31,11 +31,11 @@ if [[ ! -f "${PYTHON_SCRIPT}" ]]; then
     exit 1
 fi
 
-mkdir -p /fred/oz016/bgao_kn/logs/optical_only
+mkdir -p <BASE_DIR>/logs/optical_only
 PYTHON_BIN="${PYTHON_BIN:-python}"
 export MPLBACKEND=Agg
 
-cd /fred/oz016/bgao_kn
+cd "${BASE_DIR:-.}"
 which "${PYTHON_BIN}"
 "${PYTHON_BIN}" --version
 

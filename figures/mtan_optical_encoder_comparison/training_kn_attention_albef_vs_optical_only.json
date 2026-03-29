@@ -1,0 +1,25 @@
+{
+  "sample_index": 7450970,
+  "time_window_days": [
+    -10.0,
+    20.0
+  ],
+  "offset_days": [
+    0.45980000495910645,
+    0.8677951157093043,
+    1.2941502332687378,
+    1.9087496995925903,
+    3.1061999797821045
+  ],
+  "models": {
+    "ALBEF": {
+      "checkpoint": "<BASE_DIR>/data/model/checkpoints_bns_nsbh/bns_nsbh_v8/ALBEF/albef_best.pth",
+      "epoch": 17
+    },
+    "Optical-only": {
+      "checkpoint": "<BASE_DIR>/data/model/checkpoints_optical/optical_only/optical_only_kn_v16/optical_only_best.pth",
+      "epoch": 11
+    }
+  },
+  "output_png": "<BASE_DIR>/gw-kn-multimodal/figures/mtan_optical_encoder_comparison/training_kn_attention_albef_vs_optical_only.png"
+}

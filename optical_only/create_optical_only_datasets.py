@@ -1885,13 +1885,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--bns_sim_root",
         type=str,
-        default="/fred/oz016/bgao_kn/SNANA/SNDATA_ROOT/SIM/LSST_KN_BNS_AUG",
+        default="<BASE_DIR>/SNANA/SNDATA_ROOT/SIM/LSST_KN_BNS_AUG",
     )
     p.add_argument("--bns_sim_name", type=str, default="LSST_KN_BNS_AUG")
     p.add_argument(
         "--nsbh_sim_root",
         type=str,
-        default="/fred/oz016/bgao_kn/SNANA/SNDATA_ROOT/SIM/LSST_KN_NSBH_TRAIN",
+        default="<BASE_DIR>/SNANA/SNDATA_ROOT/SIM/LSST_KN_NSBH_TRAIN",
     )
     p.add_argument("--nsbh_sim_name", type=str, default="LSST_KN_NSBH_TRAIN")
 
