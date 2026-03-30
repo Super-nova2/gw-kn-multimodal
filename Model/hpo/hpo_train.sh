@@ -13,8 +13,8 @@
 
 set -euo pipefail
 
-SCRIPT_SUBDIR="Model"
-SCRIPT_REL_PATH="Model/hpo_train.sh"
+SCRIPT_SUBDIR="Model/hpo"
+SCRIPT_REL_PATH="Model/hpo/hpo_train.sh"
 REPO_NAME="gw-kn-multimodal"
 if [[ -n "${SLURM_JOB_ID:-}" && -n "${SLURM_SUBMIT_DIR:-}" ]]; then
     if [[ "$(basename "${SLURM_SUBMIT_DIR}")" == "${REPO_NAME}" ]]; then

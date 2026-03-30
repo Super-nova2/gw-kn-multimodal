@@ -3,8 +3,8 @@
 Config-driven Optuna hyperparameter optimization for ALBEF GW-Optical training.
 
 Usage:
-    python hpo_optuna.py --config args/hpo_v1.json
-    python hpo_optuna.py --config args/hpo_v1.json --dry_run
+    python Model/hpo/hpo_optuna.py --config Model/args/hpo_v1.json
+    python Model/hpo/hpo_optuna.py --config Model/args/hpo_v1.json --dry_run
 """
 
 import argparse
@@ -22,8 +22,9 @@ from optuna.samplers import TPESampler
 
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-TRAIN_SCRIPT = os.path.join(SCRIPT_DIR, "ALBEF_train.py")
-DEFAULT_BASE_TRAIN_CONFIG = os.path.join(SCRIPT_DIR, "args", "ALBEF_BNS_NSBH.json")
+MODEL_DIR = os.path.dirname(SCRIPT_DIR)
+TRAIN_SCRIPT = os.path.join(MODEL_DIR, "ALBEF_train.py")
+DEFAULT_BASE_TRAIN_CONFIG = os.path.join(MODEL_DIR, "args", "ALBEF_BNS_NSBH.json")
 
 ALBEF_BOOL_KEYS = {
     "cache_in_memory",
