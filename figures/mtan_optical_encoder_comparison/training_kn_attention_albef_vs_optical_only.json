@@ -13,13 +13,13 @@
   ],
   "models": {
     "ALBEF": {
-      "checkpoint": "<BASE_DIR>/data/model/checkpoints_bns_nsbh/bns_nsbh_v8/ALBEF/albef_best.pth",
+      "checkpoint": "/fred/oz016/bgao_kn/data/model/checkpoints_bns_nsbh/bns_nsbh_v8/ALBEF/albef_best.pth",
       "epoch": 17
     },
     "Optical-only": {
-      "checkpoint": "<BASE_DIR>/data/model/checkpoints_optical/optical_only/optical_only_kn_v16/optical_only_best.pth",
+      "checkpoint": "/fred/oz016/bgao_kn/data/model/checkpoints_optical/optical_only/optical_only_kn_v16/optical_only_best.pth",
       "epoch": 11
     }
   },
-  "output_png": "<BASE_DIR>/gw-kn-multimodal/figures/mtan_optical_encoder_comparison/training_kn_attention_albef_vs_optical_only.png"
+  "output_png": "/fred/oz016/bgao_kn/gw-kn-multimodal/figures/mtan_optical_encoder_comparison/training_kn_attention_albef_vs_optical_only.png"
 }
