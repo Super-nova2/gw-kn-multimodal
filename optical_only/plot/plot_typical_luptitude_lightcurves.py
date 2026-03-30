@@ -13,6 +13,7 @@ This script selects "typical" positive and negative samples by:
 3. plotting the closest samples to the class center.
 """
 
+import os
 from __future__ import annotations
 
 import argparse
@@ -41,8 +42,9 @@ BAND_COLORS: Dict[str, str] = {
 }
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_POS_H5 = Path("<BASE_DIR>/data/Optical_Only_dataset/combined_dataset_test.h5")
-DEFAULT_NEG_H5 = Path("<BASE_DIR>/data/Optical_Only_dataset/Tutorial_negative_dataset.h5")
+_BASE = Path(os.environ.get('BASE_DIR', '/fred/oz016/bgao_kn'))
+DEFAULT_POS_H5 = _BASE / 'data' / 'Optical_Only_dataset' / 'combined_dataset_test.h5'
+DEFAULT_NEG_H5 = _BASE / 'data' / 'Optical_Only_dataset' / 'Tutorial_negative_dataset.h5'
 DEFAULT_NEG_GROUP = "Tutorial/optical_data"
 DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "outputs" / "typical_test_lightcurves"
 ASINH_MAG_FACTOR = 2.5 / np.log(10.0)

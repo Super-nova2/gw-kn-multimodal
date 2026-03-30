@@ -11,6 +11,8 @@
 
 set -euo pipefail
 
+BASE_DIR="${BASE_DIR:-/fred/oz016/bgao_kn}"
+
 SCRIPT_SUBDIR="optical_only"
 SCRIPT_REL_PATH="optical_only/submit_create_optical_only_datasets.sh"
 REPO_NAME="gw-kn-multimodal"
@@ -87,7 +89,7 @@ if [[ -z "${SLURM_JOB_ID:-}" ]]; then
 
     script_path="${SCRIPT_PATH}"
 
-    mkdir -p <BASE_DIR>/logs/data
+    mkdir -p ${BASE_DIR}/logs/data
     echo "Submitting: sbatch ${script_path}"
     (
         cd "${REPO_ROOT}"
@@ -104,39 +106,39 @@ BUILD_SCRIPT="${SCRIPT_DIR}/create_optical_only_datasets.py"
 
 case "${DATASET_MODE}" in
     train)
-        BNS_SIM_ROOT="<BASE_DIR>/SNANA/SNDATA_ROOT/SIM/LSST_KN_BNS_AUG"
+        BNS_SIM_ROOT="${BASE_DIR}/SNANA/SNDATA_ROOT/SIM/LSST_KN_BNS_AUG"
         BNS_SIM_NAME="LSST_KN_BNS_AUG"
 
-        NSBH_SIM_ROOT="<BASE_DIR>/SNANA/SNDATA_ROOT/SIM/LSST_KN_NSBH_TRAIN"
+        NSBH_SIM_ROOT="${BASE_DIR}/SNANA/SNDATA_ROOT/SIM/LSST_KN_NSBH_TRAIN"
         NSBH_SIM_NAME="LSST_KN_NSBH_TRAIN"
 
-        NEG_SIM_ROOT="<BASE_DIR>/data/ELASTICC2_TRAIN_02"
+        NEG_SIM_ROOT="${BASE_DIR}/data/ELASTICC2_TRAIN_02"
         NEG_GROUP="ELASTICC2/optical_data"
 
         if [[ "${PREFIX_TASK_ENABLE}" == "true" ]]; then
-            OUTPUT_POS_H5_DEFAULT="<BASE_DIR>/data/Optical_Only_dataset/combined_dataset_train_${DATASET_TAG_SLUG}.h5"
-            OUTPUT_NEG_H5_DEFAULT="<BASE_DIR>/data/Optical_Only_dataset/ELASTICC2_negative_dataset_${DATASET_TAG_SLUG}.h5"
+            OUTPUT_POS_H5_DEFAULT="${BASE_DIR}/data/Optical_Only_dataset/combined_dataset_train_${DATASET_TAG_SLUG}.h5"
+            OUTPUT_NEG_H5_DEFAULT="${BASE_DIR}/data/Optical_Only_dataset/ELASTICC2_negative_dataset_${DATASET_TAG_SLUG}.h5"
         else
-            OUTPUT_POS_H5_DEFAULT="<BASE_DIR>/data/Optical_Only_dataset/combined_dataset_train.h5"
-            OUTPUT_NEG_H5_DEFAULT="<BASE_DIR>/data/Optical_Only_dataset/ELASTICC2_negative_dataset.h5"
+            OUTPUT_POS_H5_DEFAULT="${BASE_DIR}/data/Optical_Only_dataset/combined_dataset_train.h5"
+            OUTPUT_NEG_H5_DEFAULT="${BASE_DIR}/data/Optical_Only_dataset/ELASTICC2_negative_dataset.h5"
         fi
         ;;
     test)
-        BNS_SIM_ROOT="<BASE_DIR>/SNANA/SNDATA_ROOT/SIM/LSST_KN_BNS"
+        BNS_SIM_ROOT="${BASE_DIR}/SNANA/SNDATA_ROOT/SIM/LSST_KN_BNS"
         BNS_SIM_NAME="LSST_KN_BNS"
 
-        NSBH_SIM_ROOT="<BASE_DIR>/SNANA/SNDATA_ROOT/SIM/LSST_KN_NSBH_AUG"
+        NSBH_SIM_ROOT="${BASE_DIR}/SNANA/SNDATA_ROOT/SIM/LSST_KN_NSBH_AUG"
         NSBH_SIM_NAME="LSST_KN_NSBH_AUG"
 
-        NEG_SIM_ROOT="<BASE_DIR>/data/Tutorial_LSST_sims_2025"
+        NEG_SIM_ROOT="${BASE_DIR}/data/Tutorial_LSST_sims_2025"
         NEG_GROUP="Tutorial/optical_data"
 
         if [[ "${PREFIX_TASK_ENABLE}" == "true" ]]; then
-            OUTPUT_POS_H5_DEFAULT="<BASE_DIR>/data/Optical_Only_dataset/combined_dataset_test_${DATASET_TAG_SLUG}.h5"
-            OUTPUT_NEG_H5_DEFAULT="<BASE_DIR>/data/Optical_Only_dataset/Tutorial_negative_dataset_${DATASET_TAG_SLUG}.h5"
+            OUTPUT_POS_H5_DEFAULT="${BASE_DIR}/data/Optical_Only_dataset/combined_dataset_test_${DATASET_TAG_SLUG}.h5"
+            OUTPUT_NEG_H5_DEFAULT="${BASE_DIR}/data/Optical_Only_dataset/Tutorial_negative_dataset_${DATASET_TAG_SLUG}.h5"
         else
-            OUTPUT_POS_H5_DEFAULT="<BASE_DIR>/data/Optical_Only_dataset/combined_dataset_test.h5"
-            OUTPUT_NEG_H5_DEFAULT="<BASE_DIR>/data/Optical_Only_dataset/Tutorial_negative_dataset.h5"
+            OUTPUT_POS_H5_DEFAULT="${BASE_DIR}/data/Optical_Only_dataset/combined_dataset_test.h5"
+            OUTPUT_NEG_H5_DEFAULT="${BASE_DIR}/data/Optical_Only_dataset/Tutorial_negative_dataset.h5"
         fi
         ;;
     *)
@@ -192,7 +194,7 @@ if [[ "${BUILD_NEGATIVE}" == "true" ]]; then
 fi
 
 # Prevent concurrent jobs from writing the same dataset outputs.
-LOCK_FILE="<BASE_DIR>/data/Optical_Only_dataset/.build_optical_only_${DATASET_MODE}${LOCK_TAG}.lock"
+LOCK_FILE="${BASE_DIR}/data/Optical_Only_dataset/.build_optical_only_${DATASET_MODE}${LOCK_TAG}.lock"
 exec 200>"${LOCK_FILE}"
 if ! flock -n 200; then
     echo "Another build job is already running for DATASET_MODE=${DATASET_MODE}."

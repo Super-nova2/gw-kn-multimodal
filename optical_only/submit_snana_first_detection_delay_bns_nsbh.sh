@@ -1,7 +1,7 @@
 #!/bin/bash
 
 #SBATCH --job-name=FD_DELAY_SNR
-#SBATCH --output=<BASE_DIR>/logs/optical_only/%x_%j.out
+#SBATCH --output=${BASE_DIR}/logs/optical_only/%x_%j.out
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
@@ -10,6 +10,8 @@
 #SBATCH --partition=cpu
 
 set -euo pipefail
+
+BASE_DIR="${BASE_DIR:-/fred/oz016/bgao_kn}"
 
 SCRIPT_SUBDIR="optical_only"
 SCRIPT_REL_PATH="optical_only/submit_snana_first_detection_delay_bns_nsbh.sh"
@@ -31,7 +33,7 @@ if [[ ! -f "${PYTHON_SCRIPT}" ]]; then
     exit 1
 fi
 
-mkdir -p <BASE_DIR>/logs/optical_only
+mkdir -p ${BASE_DIR}/logs/optical_only
 PYTHON_BIN="${PYTHON_BIN:-python}"
 export MPLBACKEND=Agg
 

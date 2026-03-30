@@ -10,8 +10,8 @@ from astropy.io import fits
 from astropy.time import Time
 from tqdm import tqdm
 
-# Load required functions/constants from data_loader.py (not a standard package due to '+' in path)
-_DATA_LOADER_PATH = "<BASE_DIR>/ML+GW+KN/Model/data_loader.py"
+# Load required functions/constants from data_loader.py in parent Model/ directory
+_DATA_LOADER_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data_loader.py")
 _spec = importlib.util.spec_from_file_location("data_loader", _DATA_LOADER_PATH)
 _data_loader = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_data_loader)  # type: ignore

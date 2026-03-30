@@ -10,6 +10,8 @@
 
 set -euo pipefail
 
+BASE_DIR="${BASE_DIR:-/fred/oz016/bgao_kn}"
+
 PROFILE="${PROFILE:-nsbh_train}"           # bns_aug | nsbh_aug | nsbh_train
 SOURCE_TYPE="${SOURCE_TYPE:-nsbh}"
 
@@ -28,30 +30,30 @@ set_profile_defaults() {
     case "$PROFILE" in
         bns_aug)
             SOURCE_TYPE="${SOURCE_TYPE:-bns}"
-            FULL_CATALOG_PATH="${FULL_CATALOG_PATH:-<BASE_DIR>/gw-kn-multimodal/dataset/O5_sim_bns_aug/injections_final.csv}"
-            SUCCESS_IDS_PATH="${SUCCESS_IDS_PATH:-<BASE_DIR>/data/LSST_KN_BNS_AUG/success_sim_ids.txt}"
-            SKYMAP_DIR="${SKYMAP_DIR:-<BASE_DIR>/data/skymap/bns_skymap}"
-            SIM_ROOT="${SIM_ROOT:-<BASE_DIR>/SNANA/SNDATA_ROOT/SIM/LSST_KN_BNS_AUG}"
+            FULL_CATALOG_PATH="${FULL_CATALOG_PATH:-${BASE_DIR}/gw-kn-multimodal/dataset/O5_sim_bns_aug/injections_final.csv}"
+            SUCCESS_IDS_PATH="${SUCCESS_IDS_PATH:-${BASE_DIR}/data/LSST_KN_BNS_AUG/success_sim_ids.txt}"
+            SKYMAP_DIR="${SKYMAP_DIR:-${BASE_DIR}/data/skymap/bns_skymap}"
+            SIM_ROOT="${SIM_ROOT:-${BASE_DIR}/SNANA/SNDATA_ROOT/SIM/LSST_KN_BNS_AUG}"
             SIM_NAME="${SIM_NAME:-LSST_KN_BNS_AUG}"
-            OUTPUT_H5_PATH="${OUTPUT_H5_PATH:-<BASE_DIR>/data/LSST_KN_BNS_AUG/combined_dataset_with_neg_gw.h5}"
+            OUTPUT_H5_PATH="${OUTPUT_H5_PATH:-${BASE_DIR}/data/LSST_KN_BNS_AUG/combined_dataset_with_neg_gw.h5}"
             ;;
         nsbh_aug)
             SOURCE_TYPE="${SOURCE_TYPE:-nsbh}"
-            FULL_CATALOG_PATH="${FULL_CATALOG_PATH:-<BASE_DIR>/gw-kn-multimodal/dataset/O5_sim_nsbh_aug/injections_full.csv}"
-            SUCCESS_IDS_PATH="${SUCCESS_IDS_PATH:-<BASE_DIR>/data/LSST_KN_NSBH_AUG/success_sim_ids.txt}"
-            SKYMAP_DIR="${SKYMAP_DIR:-<BASE_DIR>/data/skymap/nsbh_skymap}"
-            SIM_ROOT="${SIM_ROOT:-<BASE_DIR>/SNANA/SNDATA_ROOT/SIM/LSST_KN_NSBH_AUG}"
+            FULL_CATALOG_PATH="${FULL_CATALOG_PATH:-${BASE_DIR}/gw-kn-multimodal/dataset/O5_sim_nsbh_aug/injections_full.csv}"
+            SUCCESS_IDS_PATH="${SUCCESS_IDS_PATH:-${BASE_DIR}/data/LSST_KN_NSBH_AUG/success_sim_ids.txt}"
+            SKYMAP_DIR="${SKYMAP_DIR:-${BASE_DIR}/data/skymap/nsbh_skymap}"
+            SIM_ROOT="${SIM_ROOT:-${BASE_DIR}/SNANA/SNDATA_ROOT/SIM/LSST_KN_NSBH_AUG}"
             SIM_NAME="${SIM_NAME:-LSST_KN_NSBH_AUG}"
-            OUTPUT_H5_PATH="${OUTPUT_H5_PATH:-<BASE_DIR>/data/LSST_KN_NSBH_AUG/combined_dataset_with_neg_gw.h5}"
+            OUTPUT_H5_PATH="${OUTPUT_H5_PATH:-${BASE_DIR}/data/LSST_KN_NSBH_AUG/combined_dataset_with_neg_gw.h5}"
             ;;
         nsbh_train)
             SOURCE_TYPE="${SOURCE_TYPE:-nsbh}"
-            FULL_CATALOG_PATH="${FULL_CATALOG_PATH:-<BASE_DIR>/gw-kn-multimodal/dataset/O5_sim_nsbh_train/injections_full.csv}"
-            SUCCESS_IDS_PATH="${SUCCESS_IDS_PATH:-<BASE_DIR>/data/LSST_KN_NSBH_TRAIN/success_sim_ids.txt}"
-            SKYMAP_DIR="${SKYMAP_DIR:-<BASE_DIR>/data/skymap/nsbh_skymap_train}"
-            SIM_ROOT="${SIM_ROOT:-<BASE_DIR>/SNANA/SNDATA_ROOT/SIM/LSST_KN_NSBH_TRAIN}"
+            FULL_CATALOG_PATH="${FULL_CATALOG_PATH:-${BASE_DIR}/gw-kn-multimodal/dataset/O5_sim_nsbh_train/injections_full.csv}"
+            SUCCESS_IDS_PATH="${SUCCESS_IDS_PATH:-${BASE_DIR}/data/LSST_KN_NSBH_TRAIN/success_sim_ids.txt}"
+            SKYMAP_DIR="${SKYMAP_DIR:-${BASE_DIR}/data/skymap/nsbh_skymap_train}"
+            SIM_ROOT="${SIM_ROOT:-${BASE_DIR}/SNANA/SNDATA_ROOT/SIM/LSST_KN_NSBH_TRAIN}"
             SIM_NAME="${SIM_NAME:-LSST_KN_NSBH_TRAIN}"
-            OUTPUT_H5_PATH="${OUTPUT_H5_PATH:-<BASE_DIR>/data/LSST_KN_NSBH_TRAIN/combined_dataset_with_neg_gw.h5}"
+            OUTPUT_H5_PATH="${OUTPUT_H5_PATH:-${BASE_DIR}/data/LSST_KN_NSBH_TRAIN/combined_dataset_with_neg_gw.h5}"
             ;;
         *)
             echo "Unsupported PROFILE='$PROFILE'. Use PROFILE=bns_aug, PROFILE=nsbh_aug, or PROFILE=nsbh_train."
@@ -193,7 +195,7 @@ fi
 
 mkdir -p "$(dirname "$OUTPUT_H5_PATH")"
 
-py_script="<BASE_DIR>/gw-kn-multimodal/Model/notebook/create_dataset.py"
+py_script="${BASE_DIR}/gw-kn-multimodal/Model/notebook/create_dataset.py"
 
 cmd=(
     python -u "$py_script"

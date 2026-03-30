@@ -18,13 +18,14 @@ import pandas as pd
 from astropy.io import fits
 from tqdm.auto import tqdm
 
-PROJECT_DIR = Path('<BASE_DIR>/gw-kn-multimodal/optical_only')
-MODEL_DIR = Path('<BASE_DIR>/gw-kn-multimodal/Model')
+_BASE = Path(os.environ.get('BASE_DIR', '/fred/oz016/bgao_kn'))
+PROJECT_DIR = _BASE / 'gw-kn-multimodal' / 'optical_only'
+MODEL_DIR = _BASE / 'gw-kn-multimodal' / 'Model'
 DEFAULT_OUTPUT_BASE_DIR = PROJECT_DIR / 'outputs' / 'snana_first_detection_delay_bns_nsbh'
-DEFAULT_CANONICAL_OFFSET_NPZ = Path('<BASE_DIR>/data/Optical_Only_dataset/delta_days_distribution.npz')
-DEFAULT_BNS_SIM_ROOT = Path('<BASE_DIR>/SNANA/SNDATA_ROOT/SIM/LSST_KN_BNS_AUG')
+DEFAULT_CANONICAL_OFFSET_NPZ = _BASE / 'data' / 'Optical_Only_dataset' / 'delta_days_distribution.npz'
+DEFAULT_BNS_SIM_ROOT = _BASE / 'SNANA' / 'SNDATA_ROOT' / 'SIM' / 'LSST_KN_BNS_AUG'
 DEFAULT_BNS_PREFIX = 'LSST_KN_BNS_AUG'
-DEFAULT_NSBH_SIM_ROOT = Path('<BASE_DIR>/SNANA/SNDATA_ROOT/SIM/LSST_KN_NSBH_TRAIN')
+DEFAULT_NSBH_SIM_ROOT = _BASE / 'SNANA' / 'SNDATA_ROOT' / 'SIM' / 'LSST_KN_NSBH_TRAIN'
 DEFAULT_NSBH_PREFIX = 'LSST_KN_NSBH_TRAIN'
 DEFAULT_SNR_THRESHOLD = 5.0
 DEFAULT_FLUXCAL_ZP = 27.5
