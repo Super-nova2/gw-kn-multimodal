@@ -13,9 +13,9 @@ This script selects "typical" positive and negative samples by:
 3. plotting the closest samples to the class center.
 """
 
-import os
 from __future__ import annotations
 
+import os
 import argparse
 import csv
 from dataclasses import dataclass
