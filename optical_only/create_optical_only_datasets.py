@@ -32,6 +32,8 @@ import numpy as np
 from astropy.io import fits
 from tqdm import tqdm
 
+_BASE_DIR = os.environ.get('BASE_DIR', '/fred/oz016/bgao_kn')
+
 _MERGE_HELPER_PATH = Path(__file__).resolve().parents[1] / "Model" / "lightcurve_merge.py"
 _merge_spec = importlib.util.spec_from_file_location("lightcurve_merge", _MERGE_HELPER_PATH)
 if _merge_spec is None or _merge_spec.loader is None:
@@ -1885,13 +1887,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--bns_sim_root",
         type=str,
-        default="<BASE_DIR>/SNANA/SNDATA_ROOT/SIM/LSST_KN_BNS_AUG",
+        default=f"{_BASE_DIR}/SNANA/SNDATA_ROOT/SIM/LSST_KN_BNS_AUG",
     )
     p.add_argument("--bns_sim_name", type=str, default="LSST_KN_BNS_AUG")
     p.add_argument(
         "--nsbh_sim_root",
         type=str,
-        default="<BASE_DIR>/SNANA/SNDATA_ROOT/SIM/LSST_KN_NSBH_TRAIN",
+        default=f"{_BASE_DIR}/SNANA/SNDATA_ROOT/SIM/LSST_KN_NSBH_TRAIN",
     )
     p.add_argument("--nsbh_sim_name", type=str, default="LSST_KN_NSBH_TRAIN")
 

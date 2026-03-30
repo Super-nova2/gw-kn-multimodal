@@ -18,9 +18,9 @@ New Features:
 
 Usage:
     python test_evaluate.py \\
-        --checkpoint <BASE_DIR>/data/model/checkpoints/supcon_v2/ALBEF/albef_best.pth \\
-        --test_data_path <BASE_DIR>/data/LSST_KN_BNS/combined_dataset_with_neg_gw.h5 \\
-        --neg_data_path <BASE_DIR>/data/ELASTICC2_TRAIN/negative_dataset.h5 \\
+        --checkpoint ${BASE_DIR}/data/model/checkpoints/supcon_v2/ALBEF/albef_best.pth \\
+        --test_data_path ${BASE_DIR}/data/LSST_KN_BNS/combined_dataset_with_neg_gw.h5 \\
+        --neg_data_path ${BASE_DIR}/data/ELASTICC2_TRAIN/negative_dataset.h5 \\
         --neg_group ELASTICC2_TRAIN/optical_data \\
         --output_dir eval_results
 """
@@ -59,6 +59,9 @@ from metrics import (
 )
 
 
+_BASE_DIR = os.environ.get('BASE_DIR', '/fred/oz016/bgao_kn')
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="Evaluate GW-KN ALBEF model")
 
@@ -67,10 +70,10 @@ def parse_args():
 
     # Data source
     p.add_argument("--test_data_path", type=str,
-                   default="<BASE_DIR>/data/LSST_KN_BNS/combined_dataset_with_neg_gw.h5",
+                   default=f"{_BASE_DIR}/data/LSST_KN_BNS/combined_dataset_with_neg_gw.h5",
                    help="Independent test HDF5 file")
     p.add_argument("--neg_data_path", type=str,
-                   default="<BASE_DIR>/data/ELASTICC2_TRAIN/negative_dataset.h5",
+                   default=f"{_BASE_DIR}/data/ELASTICC2_TRAIN/negative_dataset.h5",
                    help="Path to negative (non-KN transient) HDF5 file")
     p.add_argument("--neg_group", type=str, default="ELASTICC2_TRAIN/optical_data",
                    help="HDF5 group path for negative optical data")
@@ -3430,5 +3433,5 @@ def main():
 
 
 if __name__ == "__main__":
-    "python test_evaluate.py --checkpoint <BASE_DIR>/data/model/checkpoints/supcon_v1/ALBEF/albef_best.pth --test_data_path <BASE_DIR>/data/LSST_KN_BNS/combined_dataset_with_neg_gw.h5 --output_dir eval_results"
+    "python test_evaluate.py --checkpoint ${BASE_DIR}/data/model/checkpoints/supcon_v1/ALBEF/albef_best.pth --test_data_path ${BASE_DIR}/data/LSST_KN_BNS/combined_dataset_with_neg_gw.h5 --output_dir eval_results"
     main()

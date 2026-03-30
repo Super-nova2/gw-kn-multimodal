@@ -13,6 +13,8 @@
 
 set -euo pipefail
 
+BASE_DIR="${BASE_DIR:-/fred/oz016/bgao_kn}"
+
 SCRIPT_SUBDIR="optical_only"
 SCRIPT_REL_PATH="optical_only/train_optical_only.sh"
 REPO_NAME="gw-kn-multimodal"
@@ -202,8 +204,8 @@ ADV_SPAN_WEIGHT=$(jq -r '.adv_span_weight // empty' "$args_file")
 GRL_LAMBDA=$(jq -r '.grl_lambda // empty' "$args_file")
 REGIME_EVAL_ENABLE=$(jq -r '.regime_eval_enable // false' "$args_file")
 
-OPTICAL_V2_EVAL_POS_DEFAULT="<BASE_DIR>/data/Optical_Only_dataset/combined_dataset_test.h5"
-OPTICAL_V2_EVAL_NEG_DEFAULT="<BASE_DIR>/data/Optical_Only_dataset/Tutorial_negative_dataset.h5"
+OPTICAL_V2_EVAL_POS_DEFAULT="${BASE_DIR}/data/Optical_Only_dataset/combined_dataset_test.h5"
+OPTICAL_V2_EVAL_NEG_DEFAULT="${BASE_DIR}/data/Optical_Only_dataset/Tutorial_negative_dataset.h5"
 OPTICAL_V2_EVAL_GROUP_DEFAULT="Tutorial/optical_data"
 
 if [[ -z "$EVAL_POS_DATA_PATH" || "$EVAL_POS_DATA_PATH" == "null" ]]; then

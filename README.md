@@ -59,18 +59,41 @@ pip install -r requirements.txt
 
 ## 数据与路径约定
 
-配置文件中的路径使用 `<BASE_DIR>` 占位符。在运行前，请将所有 `<BASE_DIR>` 替换为你的实际根目录。示例数据目录结构：
+### 环境变量 `BASE_DIR`
 
-- 多模态训练 HDF5：`<BASE_DIR>/data/ALBEF_dataset/`
-- optical-only 训练 HDF5：`<BASE_DIR>/data/Optical_Only_dataset/`
-- checkpoint：`<BASE_DIR>/data/model/`
-- skymap / SNANA 数据：`<BASE_DIR>/data/` 和 `<BASE_DIR>/SNANA/`
+所有 shell 脚本和 Python 源代码通过环境变量 `BASE_DIR` 确定数据根目录。如果未设置，默认值为 `/fred/oz016/bgao_kn`。
 
-如果你在别的机器或目录运行，需要优先修改：
+```bash
+export BASE_DIR=/your/data/root
+```
 
-- `Model/args/*.json`
-- `optical_only/args/*.json`
-- 通过环境变量覆盖的提交脚本参数
+### JSON 配置文件（`.json.example` 模板）
+
+配置文件采用模板模式：
+
+- `*.json.example` 是跟踪在 Git 中的模板文件，路径使用 `<BASE_DIR>` 占位符
+- `*.json` 是实际运行时使用的配置文件（已被 `.gitignore` 忽略）
+
+首次使用时，复制模板并替换占位符：
+
+```bash
+# 复制并替换路径
+cd Model/args
+for f in *.json.example; do
+    sed 's|<BASE_DIR>|'"$BASE_DIR"'|g' "$f" > "${f%.example}"
+done
+
+# optical_only/args/ 和 dataset/KN_sim/ 下同理
+```
+
+### 数据目录结构
+
+| 用途 | 路径 |
+|------|------|
+| 多模态训练 HDF5 | `$BASE_DIR/data/ALBEF_dataset/` |
+| optical-only 训练 HDF5 | `$BASE_DIR/data/Optical_Only_dataset/` |
+| 模型 checkpoint | `$BASE_DIR/data/model/` |
+| skymap / SNANA 数据 | `$BASE_DIR/data/` 和 `$BASE_DIR/SNANA/` |
 
 ## 常用工作流
 
@@ -183,17 +206,17 @@ bash optical_only/train_optical_only.sh optical_only/args/optical_only_kn_v14.js
 ## 注意事项
 
 - 很多脚本默认依赖 Slurm；本地直接运行时也会优先尝试 `sbatch` 自提交。
-- 现有示例配置大量使用绝对路径，迁移环境前要先检查 JSON。
+- 迁移环境前需重新从 `.json.example` 模板生成配置文件。
 - `dataset/KN_sim/` 下的脚本依赖外部 SNANA、OpSim 数据和数据库文件。
 - 部分 notebook 与实验文档保留了研究期的路径习惯，跑之前建议先核对。
 
 ## 建议起步顺序
 
 1. 安装依赖：`pip install -r requirements.txt`
-2. 将配置文件中的 `<BASE_DIR>` 替换为你的实际根目录。
-3. 确认 `<BASE_DIR>/data/` 下的 HDF5、skymap、SNANA 数据是否齐全。
-4. 再检查 `Model/args/ALBEF_BNS_NSBH.json` 或 `optical_only/args/optical_only_kn_v14.json`。
-5. 先跑数据构建，再跑训练，再跑评估。
+2. 设置环境变量：`export BASE_DIR=/your/data/root`
+3. 从 `.json.example` 模板生成本地配置文件（见上方说明）
+4. 确认 `$BASE_DIR/data/` 下的 HDF5、skymap、SNANA 数据是否齐全
+5. 先跑数据构建，再跑训练，再跑评估
 
 ## 数据获取
 

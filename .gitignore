@@ -28,8 +28,9 @@ hpo_results/
 # OS
 .DS_Store
 
-# User-local config overrides
-*.local.json
+# User-local JSON configs (track .json.example templates only)
+*.json
+!*.json.example
 
 # Generated exports
 *.html

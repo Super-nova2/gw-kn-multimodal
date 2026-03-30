@@ -59,20 +59,40 @@ Running on an HPC / Slurm environment is recommended. All `.sh` entry scripts ar
 
 ## Data & Path Conventions
 
-Configuration files use `<BASE_DIR>` as a placeholder. Replace all occurrences of `<BASE_DIR>` with your actual root directory before running. Key directories:
+### Environment Variable `BASE_DIR`
 
-| Purpose | Example path |
-|---------|-------------|
-| Multimodal HDF5 | `<BASE_DIR>/data/ALBEF_dataset/` |
-| optical-only HDF5 | `<BASE_DIR>/data/Optical_Only_dataset/` |
-| Checkpoints | `<BASE_DIR>/data/model/` |
-| Skymap / SNANA data | `<BASE_DIR>/data/` and `<BASE_DIR>/SNANA/` |
+All shell scripts and Python source code resolve data paths through the `BASE_DIR` environment variable. If unset, it defaults to `/fred/oz016/bgao_kn`.
 
-To run on a different machine, update:
+```bash
+export BASE_DIR=/your/data/root
+```
 
-- `Model/args/*.json`
-- `optical_only/args/*.json`
-- Environment variables passed to submission scripts
+### JSON Configuration (`.json.example` Templates)
+
+Configuration files use a template pattern:
+
+- `*.json.example` files are tracked in Git and use `<BASE_DIR>` as a path placeholder
+- `*.json` files are the actual runtime configs (gitignored)
+
+On first use, copy templates and substitute your path:
+
+```bash
+cd Model/args
+for f in *.json.example; do
+    sed 's|<BASE_DIR>|'"$BASE_DIR"'|g' "$f" > "${f%.example}"
+done
+
+# Repeat for optical_only/args/ and dataset/KN_sim/
+```
+
+### Data Directory Layout
+
+| Purpose | Path |
+|---------|------|
+| Multimodal HDF5 | `$BASE_DIR/data/ALBEF_dataset/` |
+| optical-only HDF5 | `$BASE_DIR/data/Optical_Only_dataset/` |
+| Checkpoints | `$BASE_DIR/data/model/` |
+| Skymap / SNANA data | `$BASE_DIR/data/` and `$BASE_DIR/SNANA/` |
 
 ## Workflows
 
@@ -187,17 +207,17 @@ Copy an existing JSON and edit the following fields:
 ## Notes
 
 - Most scripts assume a Slurm environment; on local machines they will attempt `sbatch` self-submission.
-- Example configurations use absolute paths — always check JSON files before transferring to a new environment.
+- When transferring to a new environment, regenerate config files from `.json.example` templates.
 - Scripts under `dataset/KN_sim/` depend on external SNANA, OpSim data and database files.
 - Some notebooks and experiment documents retain cluster-specific paths from earlier development; verify paths before running.
 
 ## Recommended Starting Order
 
 1. Install dependencies: `pip install -r requirements.txt`
-2. Replace `<BASE_DIR>` in configuration files with your actual root directory.
-3. Confirm that HDF5, skymap, and SNANA data files under your data directory are present.
-4. Check `Model/args/ALBEF_BNS_NSBH.json` or `optical_only/args/optical_only_kn_v14.json`.
-5. Run dataset construction -> training -> evaluation in order.
+2. Set the environment variable: `export BASE_DIR=/your/data/root`
+3. Generate local config files from `.json.example` templates (see above)
+4. Confirm that HDF5, skymap, and SNANA data files under `$BASE_DIR/data/` are present
+5. Run dataset construction -> training -> evaluation in order
 
 ## Data
 
