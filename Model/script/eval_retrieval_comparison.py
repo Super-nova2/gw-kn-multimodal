@@ -23,6 +23,7 @@ import random
 import re
 import sys
 from collections import OrderedDict
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
@@ -1071,6 +1072,92 @@ def build_neg_offset_policy(cfg: Dict[str, Any], seed: int) -> EvalNegativeTimeO
     )
 
 
+def build_simple_inbatch_negative_indices(gw_indices: torch.Tensor) -> torch.Tensor:
+    """Deterministic roll-and-skip negative pairing for ablation comparison."""
+    gw_indices = gw_indices.to(torch.long)
+    batch_size = int(gw_indices.numel())
+    device = gw_indices.device
+    base = torch.arange(batch_size, device=device, dtype=torch.long)
+    if batch_size <= 1:
+        return base
+
+    result = torch.roll(base, shifts=1, dims=0)
+    unresolved = gw_indices[result] == gw_indices
+    shift = 2
+    while unresolved.any() and shift < batch_size:
+        candidate = torch.roll(base, shifts=shift, dims=0)
+        valid = gw_indices[candidate] != gw_indices
+        update_mask = unresolved & valid
+        result = torch.where(update_mask, candidate, result)
+        unresolved = unresolved & (~valid)
+        shift += 1
+
+    if unresolved.any():
+        unresolved_rows = torch.nonzero(unresolved, as_tuple=False).squeeze(-1)
+        for row in unresolved_rows.tolist():
+            candidates = torch.nonzero(gw_indices != gw_indices[row], as_tuple=False).squeeze(-1)
+            if candidates.numel() > 0:
+                result[row] = candidates[0]
+            else:
+                result[row] = row
+    return result
+
+
+def sample_simple_inbatch_hard_negatives_with_time(
+    sim_g2o,
+    gw_indices,
+    batch_event_time_mjd,
+    window_days,
+    min_candidates,
+    semi_hard,
+    semi_hard_margin,
+    fallback_mode,
+    active_rows=None,
+):
+    del sim_g2o, batch_event_time_mjd, window_days, min_candidates, semi_hard, semi_hard_margin, fallback_mode
+    full_idx = build_simple_inbatch_negative_indices(gw_indices)
+    if active_rows is not None:
+        active_rows = active_rows.to(device=gw_indices.device, dtype=torch.long)
+        return full_idx[active_rows], [0], 0
+    return full_idx, [0], 0
+
+
+@contextmanager
+def temporary_simple_hard_negative_sampling(model):
+    import ALBEF_train
+
+    patch_targets = [model]
+    core_model = getattr(model, "_orig_mod", None)
+    if core_model is not None:
+        patch_targets.append(core_model)
+
+    original_time_sampler = ALBEF_train.sample_inbatch_hard_negatives_with_time
+    original_methods = []
+
+    def _simple_sampler(sim_g2o, gw_indices=None, margin=0.2):
+        del sim_g2o, margin
+        if gw_indices is None:
+            raise ValueError("simple hard-negative sampler requires gw_indices")
+        return build_simple_inbatch_negative_indices(gw_indices)
+
+    ALBEF_train.sample_inbatch_hard_negatives_with_time = sample_simple_inbatch_hard_negatives_with_time
+    for target in patch_targets:
+        original_methods.append((target, getattr(target, "sample_semi_hard_negatives", None), getattr(target, "sample_hard_negatives", None)))
+        if hasattr(target, "sample_semi_hard_negatives"):
+            target.sample_semi_hard_negatives = _simple_sampler
+        if hasattr(target, "sample_hard_negatives"):
+            target.sample_hard_negatives = _simple_sampler
+    try:
+        yield
+    finally:
+        ALBEF_train.sample_inbatch_hard_negatives_with_time = original_time_sampler
+        for target, original_semi, original_hard in original_methods:
+            if original_semi is not None:
+                target.sample_semi_hard_negatives = original_semi
+            if original_hard is not None:
+                target.sample_hard_negatives = original_hard
+
+
 def evaluate_multimodal_classification(
     model,
     runtime_model_args: Dict[str, Any],
@@ -1104,6 +1191,7 @@ def evaluate_multimodal_classification(
     hardneg_semi_hard = _as_bool(saved_args.get("semi_hard", True), default=True)
     hardneg_semi_hard_margin = float(saved_args.get("semi_hard_margin", 0.2))
     hardneg_fallback_mode = str(saved_args.get("hardneg_fallback_mode", "inbatch_semihard"))
+    hard_negative_strategy = str(shared_cfg.get("hard_negative_strategy", "simple")).strip().lower()
 
     try_num_workers = int(num_workers)
     while True:
@@ -1123,26 +1211,49 @@ def evaluate_multimodal_classification(
                 return_zero_time_mjd=False,
             )
             neg_offset_policy = build_neg_offset_policy(shared_cfg, seed)
-            triplet_logits = extract_triplet_logits(
-                model,
-                loader,
-                device,
-                runtime_model_args,
-                neg_optical_data,
-                neg_gw_indices,
-                gw_source_types=gw_source_types,
-                shuffle_gw=False,
-                shuffle_seed=int(seed),
-                amp_dtype=amp_dtype,
-                amp_enabled=amp_enabled,
-                neg_offset_policy=neg_offset_policy,
-                gw_event_time_mjd_table=gw_event_time_mjd_table,
-                hardneg_windows_days=hardneg_windows_days,
-                hardneg_min_candidates=hardneg_min_candidates,
-                hardneg_semi_hard=hardneg_semi_hard,
-                hardneg_semi_hard_margin=hardneg_semi_hard_margin,
-                hardneg_fallback_mode=hardneg_fallback_mode,
-            )
+            if hard_negative_strategy == "simple":
+                with temporary_simple_hard_negative_sampling(model):
+                    triplet_logits = extract_triplet_logits(
+                        model,
+                        loader,
+                        device,
+                        runtime_model_args,
+                        neg_optical_data,
+                        neg_gw_indices,
+                        gw_source_types=gw_source_types,
+                        shuffle_gw=False,
+                        shuffle_seed=int(seed),
+                        amp_dtype=amp_dtype,
+                        amp_enabled=amp_enabled,
+                        neg_offset_policy=neg_offset_policy,
+                        gw_event_time_mjd_table=gw_event_time_mjd_table,
+                        hardneg_windows_days=hardneg_windows_days,
+                        hardneg_min_candidates=hardneg_min_candidates,
+                        hardneg_semi_hard=hardneg_semi_hard,
+                        hardneg_semi_hard_margin=hardneg_semi_hard_margin,
+                        hardneg_fallback_mode=hardneg_fallback_mode,
+                    )
+            else:
+                triplet_logits = extract_triplet_logits(
+                    model,
+                    loader,
+                    device,
+                    runtime_model_args,
+                    neg_optical_data,
+                    neg_gw_indices,
+                    gw_source_types=gw_source_types,
+                    shuffle_gw=False,
+                    shuffle_seed=int(seed),
+                    amp_dtype=amp_dtype,
+                    amp_enabled=amp_enabled,
+                    neg_offset_policy=neg_offset_policy,
+                    gw_event_time_mjd_table=gw_event_time_mjd_table,
+                    hardneg_windows_days=hardneg_windows_days,
+                    hardneg_min_candidates=hardneg_min_candidates,
+                    hardneg_semi_hard=hardneg_semi_hard,
+                    hardneg_semi_hard_margin=hardneg_semi_hard_margin,
+                    hardneg_fallback_mode=hardneg_fallback_mode,
+                )
             cls_metrics = evaluate_classification_triplet(
                 triplet_logits,
                 report_dt_bins=bool(report_dt_bins),
@@ -1204,6 +1315,7 @@ def normalize_shared_config(cfg: Dict[str, Any], cfg_path: Path) -> Dict[str, An
         "report_dt_bins": _as_bool(cfg.get("report_dt_bins", False)),
         "dt_bin_edges": str(cfg.get("dt_bin_edges", DEFAULT_DT_BIN_EDGES)),
         "report_dt_macro": _as_bool(cfg.get("report_dt_macro", False)),
+        "hard_negative_strategy": str(cfg.get("hard_negative_strategy", "simple")),
     }
     if normalized["test_data_path"] is None:
         raise ValueError("Comparison config is missing test_data_path")
@@ -1549,6 +1661,7 @@ def main():
             "report_dt_bins": cfg["report_dt_bins"],
             "dt_bin_edges": dt_bin_edges if dt_bin_edges is not None else None,
             "report_dt_macro": cfg["report_dt_macro"],
+            "hard_negative_strategy": cfg["hard_negative_strategy"],
             "models": [
                 {
                     "name": spec["name"],
