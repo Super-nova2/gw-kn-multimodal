@@ -240,6 +240,42 @@ def apply_hard_negative_time_shift(opt_t, opt_mask, delta_days, scale_divisor):
     return opt_t + shift * valid
 
 
+def prepare_retrieval_extra_negative_inputs(
+    model,
+    *,
+    neg_coords,
+    neg_t,
+    neg_v,
+    neg_mask,
+    neg_err,
+    opt_ref_t,
+    neg_offset_policy=None,
+    training=True,
+    neg_zero_time_mjd_base=None,
+):
+    batch_size = int(neg_t.size(0))
+    delta_days = torch.zeros((batch_size,), device=neg_t.device, dtype=torch.float32)
+    neg_t_for_retrieval = neg_t
+    if neg_offset_policy is not None and neg_offset_policy.enabled:
+        if training:
+            delta_np = neg_offset_policy.sample_train_offsets(batch_size)
+            delta_days = torch.from_numpy(delta_np).to(device=neg_t.device, dtype=torch.float32)
+        else:
+            eval_offsets = list(getattr(neg_offset_policy, "eval_offsets_days", []) or [0.0])
+            selected_offset = float(eval_offsets[len(eval_offsets) // 2])
+            delta_days = torch.full((batch_size,), selected_offset, device=neg_t.device, dtype=torch.float32)
+        neg_t_for_retrieval = apply_time_offsets(
+            neg_t, neg_mask, delta_days, neg_offset_policy.scale_divisor
+        )
+    neg_event_time_mjd = None
+    if neg_zero_time_mjd_base is not None:
+        neg_event_time_mjd = neg_zero_time_mjd_base.to(device=neg_t.device, dtype=torch.float32) + delta_days
+    z_l_neg, _ = model.encode_optical(
+        neg_coords, neg_t_for_retrieval, neg_v, opt_ref_t, neg_mask, neg_err
+    )
+    return z_l_neg, neg_event_time_mjd
+
+
 def compute_time_delta_days(opt_zero_time_mjd, gw_anchor_time_mjd):
     dt = opt_zero_time_mjd.to(torch.float32) - gw_anchor_time_mjd.to(torch.float32)
     dt = torch.where(torch.isfinite(dt), dt, torch.zeros_like(dt))
@@ -992,6 +1028,10 @@ def compute_cls_weight(args, epoch):
     progress = (epoch - args.cls_start_epoch + 1) / float(args.cls_ramp_epochs)
     return args.cls_weight * min(1.0, progress)
 
+def is_cls_branch_enabled(args):
+    return float(getattr(args, "cls_weight", 0.0)) > 0.0
+
+
 def compute_itc_weight(args, epoch):
     if args.itc_decay_epochs <= 0 or args.itc_decay_ratio <= 0:
         return args.itc_weight
@@ -1010,8 +1050,29 @@ def compute_hard_neg_ratio(args, epoch):
     return min(1.0, progress)
 
 
+def compute_curriculum_full_epoch(start_epoch, ramp_epochs):
+    start_epoch = max(0, int(start_epoch))
+    ramp_epochs = int(ramp_epochs)
+    if ramp_epochs <= 0:
+        return start_epoch
+    return start_epoch + ramp_epochs - 1
+
+
+def hard_neg_full_activation_reachable(args):
+    total_epochs = max(1, int(getattr(args, "epochs", 1)))
+    hard_neg_full_epoch = compute_curriculum_full_epoch(
+        getattr(args, "hard_neg_start_epoch", 0),
+        getattr(args, "hard_neg_ramp_epochs", 0),
+    )
+    return hard_neg_full_epoch < total_epochs
+
+
 def is_best_ckpt_selection_eligible(args, epoch, hard_neg_ratio=None):
-    """Gate best-checkpoint selection until hard negatives are fully enabled."""
+    """Gate best-checkpoint selection until hard negatives are fully enabled when reachable."""
+    if not is_cls_branch_enabled(args):
+        return True
+    if not hard_neg_full_activation_reachable(args):
+        return True
     ratio = compute_hard_neg_ratio(args, epoch) if hard_neg_ratio is None else float(hard_neg_ratio)
     return ratio >= (1.0 - 1e-8)
 
@@ -1051,20 +1112,27 @@ def clamp_temperature(model, args):
 
 def compute_ckpt_selection_score(val_metrics, metric_name):
     """Compute best-checkpoint selection score from in-domain validation metrics."""
-    cls_m = val_metrics.get('classification', {})
+    cls_m = val_metrics.get("classification", {})
+    ret_m = val_metrics.get("retrieval", {})
 
     if metric_name == "auprc":
-        return float(cls_m.get('auprc', 0.0))
+        return float(cls_m.get("auprc", 0.0))
     if metric_name == "auroc":
-        return float(cls_m.get('auroc', 0.0))
+        return float(cls_m.get("auroc", 0.0))
     if metric_name == "f1_optimal":
-        return float(cls_m.get('f1_optimal', 0.0))
+        return float(cls_m.get("f1_optimal", 0.0))
     if metric_name == "acc_total":
-        return float(cls_m.get('acc_total', 0.0))
+        return float(cls_m.get("acc_total", 0.0))
     if metric_name == "cls_composite_auprc_auroc":
-        auprc = float(cls_m.get('auprc', 0.0))
-        auroc = float(cls_m.get('auroc', 0.0))
+        auprc = float(cls_m.get("auprc", 0.0))
+        auroc = float(cls_m.get("auroc", 0.0))
         return 0.5 * auprc + 0.5 * auroc
+    if metric_name == "g2o_recall_at_1":
+        return float(ret_m.get("g2o_recall_at_1", 0.0))
+    if metric_name == "g2o_recall_at_5":
+        return float(ret_m.get("g2o_recall_at_5", 0.0))
+    if metric_name == "g2o_mrr":
+        return float(ret_m.get("g2o_mrr", 0.0))
 
     raise ValueError(f"Unsupported best_ckpt_metric: {metric_name}")
 
@@ -1084,6 +1152,7 @@ def evaluate(
 
     model.eval()
     has_negatives = args.neg_data_path is not None
+    cls_branch_enabled = is_cls_branch_enabled(args)
     ref_time_cache = None
     cls_weight = compute_cls_weight(args, epoch)
     itc_weight = compute_itc_weight(args, epoch)
@@ -1119,6 +1188,8 @@ def evaluate(
 
     with torch.no_grad():
         for batch_data in val_loader:
+            _neg_zero_time_mjd_base = None
+            _neg_zero_time_mjd_cls_base = None
             if has_negatives:
                 if len(batch_data) >= 16:
                     (
@@ -1178,150 +1249,181 @@ def evaluate(
                 g, z_l, h_l, H_gw = model.encode(
                     gw_s, gw_m, opt_coords, opt_t, opt_v, opt_ref_t, opt_mask, opt_err
                 )
+                extra_neg_z_itc = None
+                extra_neg_event_time_mjd = None
+                if has_negatives and not cls_branch_enabled:
+                    neg_zero_time_mjd_for_itc = _neg_zero_time_mjd_cls_base
+                    if neg_zero_time_mjd_for_itc is None:
+                        neg_zero_time_mjd_for_itc = _neg_zero_time_mjd_base
+                    extra_neg_z_itc, extra_neg_event_time_mjd = prepare_retrieval_extra_negative_inputs(
+                        model,
+                        neg_coords=neg_coords,
+                        neg_t=neg_t,
+                        neg_v=neg_v,
+                        neg_mask=neg_mask,
+                        neg_err=neg_err,
+                        opt_ref_t=opt_ref_t,
+                        neg_offset_policy=neg_offset_policy,
+                        training=False,
+                        neg_zero_time_mjd_base=neg_zero_time_mjd_for_itc,
+                    )
                 if args.itc_loss_type == "supcon":
                     itc_loss, sim_g2o = model.compute_supcon_loss(
                         g, z_l, gw_indices, margin=args.supcon_margin,
                         gw_event_time_mjd=batch_event_time_mjd,
                         opt_event_time_mjd=batch_event_time_mjd,
+                        extra_neg_z=extra_neg_z_itc,
+                        extra_neg_opt_event_time_mjd=extra_neg_event_time_mjd,
                     )
                 else:
                     itc_loss, sim_g2o = model.compute_itc_loss(
                         g, z_l, gw_indices, mask=args.mask_itc,
                         gw_event_time_mjd=batch_event_time_mjd,
                         opt_event_time_mjd=batch_event_time_mjd,
+                        extra_neg_z=extra_neg_z_itc,
+                        extra_neg_opt_event_time_mjd=extra_neg_event_time_mjd,
                     )
 
                 # Extract L2-normalized projected features for embedding metrics
                 feat_g, feat_o = model.get_contrastive_embeddings(g, z_l)
-
-                # Compute per-pair credible level for dual fusion
-                cred_level = compute_credible_level(gw_m, opt_coords) if need_cred_level else None
-                logits_pos = model.fusion_logits(
-                    g, h_l, z_l=z_l, H_gw=H_gw, cred_level=cred_level,
-                    gw_s=gw_s, gw_m=gw_m, opt_coords=opt_coords,
-                )
                 labels_pos = torch.ones(batch_size, device=device, dtype=torch.long)
                 labels_neg = torch.zeros(batch_size, device=device, dtype=torch.long)
-                pos_loss = model.cls_criterion(logits_pos, labels_pos)
 
-                easy_idx = sample_easy_negatives(batch_size, device)
-                choose_hard_mask = None
-                if easy_idx is None:
-                    neg_idx = None
-                elif hard_neg_ratio <= 0:
-                    neg_idx = easy_idx
-                    choose_hard_mask = torch.zeros(batch_size, device=device, dtype=torch.bool)
-                else:
-                    if batch_event_time_mjd is not None:
-                        hard_idx, lvl_hits, fallback_cnt = sample_inbatch_hard_negatives_with_time(
-                            sim_g2o=sim_g2o,
-                            gw_indices=gw_indices,
-                            batch_event_time_mjd=batch_event_time_mjd,
-                            window_days=hard_window_days,
-                            min_candidates=args.hardneg_min_candidates,
-                            semi_hard=args.semi_hard,
-                            semi_hard_margin=args.semi_hard_margin,
-                            fallback_mode=args.hardneg_fallback_mode,
-                        )
-                        hard_total += batch_size
-                        hard_fallback_total += int(fallback_cnt)
-                        for li, hv in enumerate(lvl_hits):
-                            hard_window_hits[li] += int(hv)
-                    elif args.semi_hard:
-                        hard_idx = model.sample_semi_hard_negatives(sim_g2o, gw_indices, margin=args.semi_hard_margin)
-                    else:
-                        hard_idx = model.sample_hard_negatives(sim_g2o, gw_indices)
-                    if hard_neg_ratio >= 1:
-                        neg_idx = hard_idx
-                        choose_hard_mask = torch.ones(batch_size, device=device, dtype=torch.bool)
-                    else:
-                        choose_hard = torch.rand(batch_size, device=device) < hard_neg_ratio
-                        neg_idx = torch.where(choose_hard, hard_idx, easy_idx)
-                        choose_hard_mask = choose_hard
-
-                if neg_idx is None:
-                    hard_loss = torch.zeros((), device=device)
-                    logits_hard = logits_pos.detach()
-                else:
-                    h_l_hard = h_l[neg_idx].clone()
-                    z_l_hard = z_l[neg_idx].clone()
-                    coords_hard = opt_coords[neg_idx].clone()
-                    dt_hard = torch.zeros((batch_size,), device=device, dtype=torch.float32)
-                    if choose_hard_mask is None:
-                        choose_hard_mask = torch.ones(batch_size, device=device, dtype=torch.bool)
-                    if choose_hard_mask.any():
-                        hard_rows = torch.nonzero(choose_hard_mask, as_tuple=False).squeeze(-1)
-                        hard_opt_idx = neg_idx[hard_rows]
-                        coords_hard_rows = opt_coords[hard_opt_idx]
-                        candidate_gw_time_hard = (
-                            batch_event_time_mjd[hard_opt_idx] if batch_event_time_mjd is not None else None
-                        )
-                        anchor_gw_time_hard = (
-                            batch_event_time_mjd[hard_rows] if batch_event_time_mjd is not None else None
-                        )
-                        z_hard_rows, h_hard_rows, dt_hard_rows = encode_hard_negative_with_time_shift(
-                            model,
-                            opt_coords=coords_hard_rows,
-                            opt_t=opt_t[hard_opt_idx],
-                            opt_v=opt_v[hard_opt_idx],
-                            opt_mask=opt_mask[hard_opt_idx],
-                            opt_err=opt_err[hard_opt_idx],
-                            opt_ref_t=opt_ref_t[hard_rows],
-                            candidate_zero_time_mjd=candidate_gw_time_hard,
-                            anchor_gw_time_mjd=anchor_gw_time_hard,
-                            scale_divisor=args.neg_offset_scale_days_divisor,
-                        )
-                        h_l_hard[hard_rows] = h_hard_rows
-                        z_l_hard[hard_rows] = z_hard_rows
-                        coords_hard[hard_rows] = coords_hard_rows
-                        dt_hard[hard_rows] = dt_hard_rows
-                    cred_level_hard = compute_credible_level(gw_m, coords_hard) if need_cred_level else None
-                    if batch_event_time_mjd is not None and choose_hard_mask.any():
-                        _accumulate_time_delta_stats(dt_stats, "hard", dt_hard[choose_hard_mask])
-                    logits_hard = model.fusion_logits(
-                        g, h_l_hard, z_l=z_l_hard, H_gw=H_gw, cred_level=cred_level_hard,
-                        gw_s=gw_s, gw_m=gw_m, opt_coords=coords_hard,
+                if cls_branch_enabled:
+                    # Compute per-pair credible level for dual fusion
+                    cred_level = compute_credible_level(gw_m, opt_coords) if need_cred_level else None
+                    logits_pos = model.fusion_logits(
+                        g, h_l, z_l=z_l, H_gw=H_gw, cred_level=cred_level,
+                        gw_s=gw_s, gw_m=gw_m, opt_coords=opt_coords,
                     )
-                    hard_loss = model.cls_criterion(logits_hard, labels_neg)
+                    pos_loss = model.cls_criterion(logits_pos, labels_pos)
 
-                if has_negatives:
-                    if neg_offset_policy is not None and neg_offset_policy.enabled:
-                        logits_neg_sum = None
-                        cred_level_neg = compute_credible_level(gw_m, neg_coords) if need_cred_level else None
-                        for off_days in neg_offset_policy.eval_offsets_days:
-                            delta_days = torch.full(
-                                (batch_size,), float(off_days), device=device, dtype=torch.float32
+                    easy_idx = sample_easy_negatives(batch_size, device)
+                    choose_hard_mask = None
+                    if easy_idx is None:
+                        neg_idx = None
+                    elif hard_neg_ratio <= 0:
+                        neg_idx = easy_idx
+                        choose_hard_mask = torch.zeros(batch_size, device=device, dtype=torch.bool)
+                    else:
+                        if batch_event_time_mjd is not None:
+                            hard_idx, lvl_hits, fallback_cnt = sample_inbatch_hard_negatives_with_time(
+                                sim_g2o=sim_g2o,
+                                gw_indices=gw_indices,
+                                batch_event_time_mjd=batch_event_time_mjd,
+                                window_days=hard_window_days,
+                                min_candidates=args.hardneg_min_candidates,
+                                semi_hard=args.semi_hard,
+                                semi_hard_margin=args.semi_hard_margin,
+                                fallback_mode=args.hardneg_fallback_mode,
                             )
-                            shifted_neg_t = apply_time_offsets(
-                                neg_t, neg_mask, delta_days, neg_offset_policy.scale_divisor
+                            hard_total += batch_size
+                            hard_fallback_total += int(fallback_cnt)
+                            for li, hv in enumerate(lvl_hits):
+                                hard_window_hits[li] += int(hv)
+                        elif args.semi_hard:
+                            hard_idx = model.sample_semi_hard_negatives(sim_g2o, gw_indices, margin=args.semi_hard_margin)
+                        else:
+                            hard_idx = model.sample_hard_negatives(sim_g2o, gw_indices)
+                        if hard_neg_ratio >= 1:
+                            neg_idx = hard_idx
+                            choose_hard_mask = torch.ones(batch_size, device=device, dtype=torch.bool)
+                        else:
+                            choose_hard = torch.rand(batch_size, device=device) < hard_neg_ratio
+                            neg_idx = torch.where(choose_hard, hard_idx, easy_idx)
+                            choose_hard_mask = choose_hard
+
+                    if neg_idx is None:
+                        hard_loss = torch.zeros((), device=device)
+                        logits_hard = torch.zeros((batch_size, 2), device=device, dtype=g.dtype)
+                    else:
+                        h_l_hard = h_l[neg_idx].clone()
+                        z_l_hard = z_l[neg_idx].clone()
+                        coords_hard = opt_coords[neg_idx].clone()
+                        dt_hard = torch.zeros((batch_size,), device=device, dtype=torch.float32)
+                        if choose_hard_mask is None:
+                            choose_hard_mask = torch.ones(batch_size, device=device, dtype=torch.bool)
+                        if choose_hard_mask.any():
+                            hard_rows = torch.nonzero(choose_hard_mask, as_tuple=False).squeeze(-1)
+                            hard_opt_idx = neg_idx[hard_rows]
+                            coords_hard_rows = opt_coords[hard_opt_idx]
+                            candidate_gw_time_hard = (
+                                batch_event_time_mjd[hard_opt_idx] if batch_event_time_mjd is not None else None
                             )
-                            z_l_neg_i, h_l_neg_i = model.encode_optical(
-                                neg_coords, shifted_neg_t, neg_v, opt_ref_t, neg_mask, neg_err
+                            anchor_gw_time_hard = (
+                                batch_event_time_mjd[hard_rows] if batch_event_time_mjd is not None else None
                             )
-                            logits_neg_i = model.fusion_logits(
-                                g, h_l_neg_i, z_l=z_l_neg_i, H_gw=H_gw, cred_level=cred_level_neg,
+                            z_hard_rows, h_hard_rows, dt_hard_rows = encode_hard_negative_with_time_shift(
+                                model,
+                                opt_coords=coords_hard_rows,
+                                opt_t=opt_t[hard_opt_idx],
+                                opt_v=opt_v[hard_opt_idx],
+                                opt_mask=opt_mask[hard_opt_idx],
+                                opt_err=opt_err[hard_opt_idx],
+                                opt_ref_t=opt_ref_t[hard_rows],
+                                candidate_zero_time_mjd=candidate_gw_time_hard,
+                                anchor_gw_time_mjd=anchor_gw_time_hard,
+                                scale_divisor=args.neg_offset_scale_days_divisor,
+                            )
+                            h_l_hard[hard_rows] = h_hard_rows
+                            z_l_hard[hard_rows] = z_hard_rows
+                            coords_hard[hard_rows] = coords_hard_rows
+                            dt_hard[hard_rows] = dt_hard_rows
+                        cred_level_hard = compute_credible_level(gw_m, coords_hard) if need_cred_level else None
+                        if batch_event_time_mjd is not None and choose_hard_mask.any():
+                            _accumulate_time_delta_stats(dt_stats, "hard", dt_hard[choose_hard_mask])
+                        logits_hard = model.fusion_logits(
+                            g, h_l_hard, z_l=z_l_hard, H_gw=H_gw, cred_level=cred_level_hard,
+                            gw_s=gw_s, gw_m=gw_m, opt_coords=coords_hard,
+                        )
+                        hard_loss = model.cls_criterion(logits_hard, labels_neg)
+
+                    if has_negatives:
+                        if neg_offset_policy is not None and neg_offset_policy.enabled:
+                            logits_neg_sum = None
+                            cred_level_neg = compute_credible_level(gw_m, neg_coords) if need_cred_level else None
+                            for off_days in neg_offset_policy.eval_offsets_days:
+                                delta_days = torch.full(
+                                    (batch_size,), float(off_days), device=device, dtype=torch.float32
+                                )
+                                shifted_neg_t = apply_time_offsets(
+                                    neg_t, neg_mask, delta_days, neg_offset_policy.scale_divisor
+                                )
+                                z_l_neg_i, h_l_neg_i = model.encode_optical(
+                                    neg_coords, shifted_neg_t, neg_v, opt_ref_t, neg_mask, neg_err
+                                )
+                                logits_neg_i = model.fusion_logits(
+                                    g, h_l_neg_i, z_l=z_l_neg_i, H_gw=H_gw, cred_level=cred_level_neg,
+                                    gw_s=gw_s, gw_m=gw_m, opt_coords=neg_coords,
+                                )
+                                logits_neg_sum = logits_neg_i if logits_neg_sum is None else logits_neg_sum + logits_neg_i
+                            logits_neg = logits_neg_sum / float(max(1, len(neg_offset_policy.eval_offsets_days)))
+                        else:
+                            z_l_neg, h_l_neg = model.encode_optical(
+                                neg_coords, neg_t, neg_v, opt_ref_t, neg_mask, neg_err
+                            )
+                            cred_level_neg = compute_credible_level(gw_m, neg_coords) if need_cred_level else None
+                            logits_neg = model.fusion_logits(
+                                g, h_l_neg, z_l=z_l_neg, H_gw=H_gw, cred_level=cred_level_neg,
                                 gw_s=gw_s, gw_m=gw_m, opt_coords=neg_coords,
                             )
-                            logits_neg_sum = logits_neg_i if logits_neg_sum is None else logits_neg_sum + logits_neg_i
-                        logits_neg = logits_neg_sum / float(max(1, len(neg_offset_policy.eval_offsets_days)))
+                        neg_loss = model.cls_criterion(logits_neg, labels_neg)
                     else:
-                        z_l_neg, h_l_neg = model.encode_optical(
-                            neg_coords, neg_t, neg_v, opt_ref_t, neg_mask, neg_err
-                        )
-                        cred_level_neg = compute_credible_level(gw_m, neg_coords) if need_cred_level else None
-                        logits_neg = model.fusion_logits(
-                            g, h_l_neg, z_l=z_l_neg, H_gw=H_gw, cred_level=cred_level_neg,
-                            gw_s=gw_s, gw_m=gw_m, opt_coords=neg_coords,
-                        )
-                    neg_loss = model.cls_criterion(logits_neg, labels_neg)
+                        neg_loss = None
+
+                    cls_loss = compute_weighted_cls_loss(
+                        pos_loss, hard_loss, neg_loss, has_negatives, args
+                    )
+                    total_loss = itc_weight * itc_loss + cls_weight * cls_loss
                 else:
-                    neg_loss = None
-
-                cls_loss = compute_weighted_cls_loss(
-                    pos_loss, hard_loss, neg_loss, has_negatives, args
-                )
-
-                total_loss = itc_weight * itc_loss + cls_weight * cls_loss
+                    logits_pos = torch.zeros((batch_size, 2), device=device, dtype=g.dtype)
+                    logits_hard = torch.zeros((batch_size, 2), device=device, dtype=g.dtype)
+                    logits_neg = torch.zeros((batch_size, 2), device=device, dtype=g.dtype) if has_negatives else None
+                    pos_loss = torch.zeros((), device=device)
+                    hard_loss = torch.zeros((), device=device)
+                    neg_loss = torch.zeros((), device=device) if has_negatives else None
+                    cls_loss = torch.zeros((), device=device)
+                    total_loss = itc_weight * itc_loss
 
             val_total += total_loss.item()
             val_itc += itc_loss.item()
@@ -1340,14 +1442,20 @@ def evaluate(
             pred_gw = gw_indices[itc_preds]
             itc_acc = (anchor_gw == pred_gw).float().mean().item()
 
-            pos_acc = (logits_pos.argmax(dim=1) == labels_pos).float().mean().item()
-            hard_acc = (logits_hard.argmax(dim=1) == labels_neg).float().mean().item()
-            neg_acc = 0.0
-            if has_negatives:
-                neg_acc = (logits_neg.argmax(dim=1) == labels_neg).float().mean().item()
-                total_acc = (pos_acc + hard_acc + neg_acc) / 3.0
+            if cls_branch_enabled:
+                pos_acc = (logits_pos.argmax(dim=1) == labels_pos).float().mean().item()
+                hard_acc = (logits_hard.argmax(dim=1) == labels_neg).float().mean().item()
+                neg_acc = 0.0
+                if has_negatives:
+                    neg_acc = (logits_neg.argmax(dim=1) == labels_neg).float().mean().item()
+                    total_acc = (pos_acc + hard_acc + neg_acc) / 3.0
+                else:
+                    total_acc = (pos_acc + hard_acc) / 2.0
             else:
-                total_acc = (pos_acc + hard_acc) / 2.0
+                pos_acc = 0.0
+                hard_acc = 0.0
+                neg_acc = 0.0
+                total_acc = 0.0
 
             val_itc_acc += itc_acc
             val_pos_acc += pos_acc
@@ -1357,21 +1465,22 @@ def evaluate(
             val_batches += 1
 
             # --- Accumulate for global classification + embedding metrics ---
-            pos_probs = torch.softmax(logits_pos.detach().float(), dim=1)[:, 1]
-            all_cls_probs.append(pos_probs.cpu())
-            all_cls_labels.append(labels_pos.cpu())
-            all_cls_sources.extend(['pos'] * batch_size)
+            if cls_branch_enabled:
+                pos_probs = torch.softmax(logits_pos.detach().float(), dim=1)[:, 1]
+                all_cls_probs.append(pos_probs.cpu())
+                all_cls_labels.append(labels_pos.cpu())
+                all_cls_sources.extend(['pos'] * batch_size)
 
-            hard_probs = torch.softmax(logits_hard.detach().float(), dim=1)[:, 1]
-            all_cls_probs.append(hard_probs.cpu())
-            all_cls_labels.append(labels_neg[:batch_size].cpu())
-            all_cls_sources.extend(['hard'] * batch_size)
-
-            if has_negatives:
-                neg_probs_val = torch.softmax(logits_neg.detach().float(), dim=1)[:, 1]
-                all_cls_probs.append(neg_probs_val.cpu())
+                hard_probs = torch.softmax(logits_hard.detach().float(), dim=1)[:, 1]
+                all_cls_probs.append(hard_probs.cpu())
                 all_cls_labels.append(labels_neg[:batch_size].cpu())
-                all_cls_sources.extend(['neg'] * batch_size)
+                all_cls_sources.extend(['hard'] * batch_size)
+
+                if has_negatives:
+                    neg_probs_val = torch.softmax(logits_neg.detach().float(), dim=1)[:, 1]
+                    all_cls_probs.append(neg_probs_val.cpu())
+                    all_cls_labels.append(labels_neg[:batch_size].cpu())
+                    all_cls_sources.extend(['neg'] * batch_size)
 
             all_feat_g.append(feat_g.detach().cpu())
             all_feat_o.append(feat_o.detach().cpu())
@@ -1395,11 +1504,14 @@ def evaluate(
             retrieval[key] = sum(d[key] for d in retrieval_metrics_accum) / len(retrieval_metrics_accum)
 
     # Global classification metrics
-    cls_metrics = compute_classification_metrics(
-        torch.cat(all_cls_probs),
-        torch.cat(all_cls_labels),
-        all_sources=all_cls_sources
-    )
+    if all_cls_probs:
+        cls_metrics = compute_classification_metrics(
+            torch.cat(all_cls_probs),
+            torch.cat(all_cls_labels),
+            all_sources=all_cls_sources
+        )
+    else:
+        cls_metrics = {}
 
     # Global embedding metrics
     emb_metrics = compute_embedding_metrics(
@@ -1642,6 +1754,8 @@ def train(args):
         mtan_lupt_m5_mag=tuple(mtan_cfg["mtan_lupt_m5_mag"]),
     ).to(device)
 
+    cls_branch_enabled = is_cls_branch_enabled(args)
+
     if args.use_lightweight_gw:
         print("Using lightweight GW encoder (~100K params) to prevent overfitting.")
     print(f"Using fusion_mode={args.fusion_mode}.")
@@ -1654,6 +1768,10 @@ def train(args):
             f"(use_similarity_as_cls_input={int(bool(args.use_similarity_as_cls_input))}, "
             f"use_cred_level_feature={int(bool(args.use_cred_level_feature))})."
         )
+    elif args.fusion_mode == "concat_proj":
+        print("Ablation mode: no cross-attention, classifier on [proj_gw; proj_opt].")
+    if not cls_branch_enabled:
+        print("Retrieval-only mode enabled: fusion/classification branch disabled; extra negatives go into contrastive loss.")
 
     if hasattr(torch, 'compile'):
         model = torch.compile(model)
@@ -1803,10 +1921,21 @@ def train(args):
             best_val_score = None
             best_epoch_idx = None
             epochs_no_improve = 0
-            print(
-                "Best-checkpoint selection activated "
-                f"at epoch {epoch+1} (hard_neg_ratio={hard_neg_ratio:.3f})."
-            )
+            if not cls_branch_enabled:
+                print(
+                    "Best-checkpoint selection activated "
+                    f"at epoch {epoch+1} (retrieval-only / fusion branch disabled)."
+                )
+            elif hard_neg_full_activation_reachable(args):
+                print(
+                    "Best-checkpoint selection activated "
+                    f"at epoch {epoch+1} (hard_neg_ratio={hard_neg_ratio:.3f})."
+                )
+            else:
+                print(
+                    "Best-checkpoint selection activated "
+                    f"at epoch {epoch+1} (hard negatives disabled or unreachable in this run)."
+                )
 
         pbar = tqdm(
             train_loader,
@@ -1816,6 +1945,8 @@ def train(args):
         )
         
         for batch_idx, batch_data in enumerate(pbar):
+            _neg_zero_time_mjd_base = None
+            _neg_zero_time_mjd_cls_base = None
             if has_negatives:
                 if len(batch_data) >= 16:
                     (
@@ -1912,250 +2043,284 @@ def train(args):
                 g, z_l, h_l, H_gw = model.encode(
                     gw_s, gw_m, opt_coords, opt_t, opt_v, opt_ref_t, opt_mask, opt_err
                 )
+                extra_neg_z_itc = None
+                extra_neg_event_time_mjd = None
+                if has_negatives and not cls_branch_enabled:
+                    neg_zero_time_mjd_for_itc = _neg_zero_time_mjd_cls_base
+                    if neg_zero_time_mjd_for_itc is None:
+                        neg_zero_time_mjd_for_itc = _neg_zero_time_mjd_base
+                    extra_neg_z_itc, extra_neg_event_time_mjd = prepare_retrieval_extra_negative_inputs(
+                        model,
+                        neg_coords=neg_coords,
+                        neg_t=neg_t,
+                        neg_v=neg_v,
+                        neg_mask=neg_mask,
+                        neg_err=neg_err,
+                        opt_ref_t=opt_ref_t,
+                        neg_offset_policy=neg_offset_policy,
+                        training=True,
+                        neg_zero_time_mjd_base=neg_zero_time_mjd_for_itc,
+                    )
                 if args.itc_loss_type == "supcon":
                     itc_loss, sim_g2o = model.compute_supcon_loss(
                         g, z_l, gw_indices, margin=args.supcon_margin,
                         gw_event_time_mjd=batch_event_time_mjd,
                         opt_event_time_mjd=batch_event_time_mjd,
+                        extra_neg_z=extra_neg_z_itc,
+                        extra_neg_opt_event_time_mjd=extra_neg_event_time_mjd,
                     )
                 else:
                     itc_loss, sim_g2o = model.compute_itc_loss(
                         g, z_l, gw_indices, mask=args.mask_itc,
                         gw_event_time_mjd=batch_event_time_mjd,
                         opt_event_time_mjd=batch_event_time_mjd,
+                        extra_neg_z=extra_neg_z_itc,
+                        extra_neg_opt_event_time_mjd=extra_neg_event_time_mjd,
                     )
 
-                # Compute per-pair credible level for dual fusion
-                cred_level = compute_credible_level(gw_m, opt_coords) if need_cred_level else None
-                logits_pos = model.fusion_logits(
-                    g, h_l, z_l=z_l, H_gw=H_gw, cred_level=cred_level,
-                    gw_s=gw_s, gw_m=gw_m, opt_coords=opt_coords,
-                )
                 feat_g_hard, feat_o_hard = model.get_contrastive_embeddings(g, z_l)
                 labels_pos = torch.ones(batch_size, device=device, dtype=torch.long)
                 labels_neg = torch.zeros(batch_size, device=device, dtype=torch.long)
-                pos_loss = model.cls_criterion(logits_pos, labels_pos)
 
-                hard_branch_cpu_start = time.perf_counter() if should_perf_log else None
-                easy_idx = sample_easy_negatives(batch_size, device)
-                choose_hard_mask = None
-                inbatch_hard_idx = None
-                active_rows = None
-                if easy_idx is None:
-                    neg_idx = None
-                else:
-                    neg_idx = easy_idx.clone()
-                    inbatch_hard_idx = easy_idx.clone()
-                    if hard_neg_ratio >= 1:
-                        choose_hard_mask = torch.ones(batch_size, device=device, dtype=torch.bool)
-                    elif hard_neg_ratio <= 0:
-                        choose_hard_mask = torch.zeros(batch_size, device=device, dtype=torch.bool)
+                if cls_branch_enabled:
+                    # Compute per-pair credible level for dual fusion
+                    cred_level = compute_credible_level(gw_m, opt_coords) if need_cred_level else None
+                    logits_pos = model.fusion_logits(
+                        g, h_l, z_l=z_l, H_gw=H_gw, cred_level=cred_level,
+                        gw_s=gw_s, gw_m=gw_m, opt_coords=opt_coords,
+                    )
+                    pos_loss = model.cls_criterion(logits_pos, labels_pos)
+
+                    hard_branch_cpu_start = time.perf_counter() if should_perf_log else None
+                    easy_idx = sample_easy_negatives(batch_size, device)
+                    choose_hard_mask = None
+                    inbatch_hard_idx = None
+                    active_rows = None
+                    if easy_idx is None:
+                        neg_idx = None
                     else:
-                        choose_hard_mask = torch.rand(batch_size, device=device) < hard_neg_ratio
+                        neg_idx = easy_idx.clone()
+                        inbatch_hard_idx = easy_idx.clone()
+                        if hard_neg_ratio >= 1:
+                            choose_hard_mask = torch.ones(batch_size, device=device, dtype=torch.bool)
+                        elif hard_neg_ratio <= 0:
+                            choose_hard_mask = torch.zeros(batch_size, device=device, dtype=torch.bool)
+                        else:
+                            choose_hard_mask = torch.rand(batch_size, device=device) < hard_neg_ratio
 
-                    if choose_hard_mask.any():
-                        active_rows = torch.nonzero(choose_hard_mask, as_tuple=False).squeeze(-1)
-                        inbatch_start = time.perf_counter() if should_perf_log else None
-                        if batch_event_time_mjd is not None:
-                            hard_active_idx, _, _ = sample_inbatch_hard_negatives_with_time(
-                                sim_g2o=sim_g2o,
+                        if choose_hard_mask.any():
+                            active_rows = torch.nonzero(choose_hard_mask, as_tuple=False).squeeze(-1)
+                            inbatch_start = time.perf_counter() if should_perf_log else None
+                            if batch_event_time_mjd is not None:
+                                hard_active_idx, _, _ = sample_inbatch_hard_negatives_with_time(
+                                    sim_g2o=sim_g2o,
+                                    gw_indices=gw_indices,
+                                    batch_event_time_mjd=batch_event_time_mjd,
+                                    window_days=args._hardneg_window_days,
+                                    min_candidates=args.hardneg_min_candidates,
+                                    semi_hard=args.semi_hard,
+                                    semi_hard_margin=args.semi_hard_margin,
+                                    fallback_mode=args.hardneg_fallback_mode,
+                                    active_rows=active_rows,
+                                )
+                            elif args.semi_hard:
+                                full_hard_idx = model.sample_semi_hard_negatives(
+                                    sim_g2o, gw_indices, margin=args.semi_hard_margin
+                                )
+                                hard_active_idx = full_hard_idx[active_rows]
+                            else:
+                                full_hard_idx = model.sample_hard_negatives(sim_g2o, gw_indices)
+                                hard_active_idx = full_hard_idx[active_rows]
+                            inbatch_hard_idx[active_rows] = hard_active_idx
+                            neg_idx[active_rows] = hard_active_idx
+                            if should_perf_log and inbatch_start is not None:
+                                inbatch_hard_mine_ms = (time.perf_counter() - inbatch_start) * 1000.0
+
+                    if neg_idx is None:
+                        hard_loss = torch.zeros((), device=device)
+                        logits_hard = torch.zeros((batch_size, 2), device=device, dtype=g.dtype)
+                        dt_hard = None
+                    else:
+                        h_l_hard = h_l[neg_idx].clone()
+                        z_l_hard = z_l[neg_idx].clone()
+                        coords_hard = opt_coords[neg_idx].clone()
+                        dt_hard = torch.zeros((batch_size,), device=device, dtype=torch.float32)
+                        if choose_hard_mask is None:
+                            choose_hard_mask = torch.ones(batch_size, device=device, dtype=torch.bool)
+                        if choose_hard_mask.any():
+                            hard_rows = torch.nonzero(choose_hard_mask, as_tuple=False).squeeze(-1)
+                            hard_opt_idx = neg_idx[hard_rows]
+                            coords_hard_rows = opt_coords[hard_opt_idx]
+                            candidate_gw_time_hard = (
+                                batch_event_time_mjd[hard_opt_idx] if batch_event_time_mjd is not None else None
+                            )
+                            anchor_gw_time_hard = (
+                                batch_event_time_mjd[hard_rows] if batch_event_time_mjd is not None else None
+                            )
+                            z_hard_rows, h_hard_rows, dt_hard_rows = encode_hard_negative_with_time_shift(
+                                model,
+                                opt_coords=coords_hard_rows,
+                                opt_t=opt_t[hard_opt_idx],
+                                opt_v=opt_v[hard_opt_idx],
+                                opt_mask=opt_mask[hard_opt_idx],
+                                opt_err=opt_err[hard_opt_idx],
+                                opt_ref_t=opt_ref_t[hard_rows],
+                                candidate_zero_time_mjd=candidate_gw_time_hard,
+                                anchor_gw_time_mjd=anchor_gw_time_hard,
+                                scale_divisor=args.neg_offset_scale_days_divisor,
+                            )
+                            h_l_hard[hard_rows] = h_hard_rows
+                            z_l_hard[hard_rows] = z_hard_rows
+                            coords_hard[hard_rows] = coords_hard_rows
+                            dt_hard[hard_rows] = dt_hard_rows
+
+                        # B5 memory-bank mining: replace selected hard rows with cross-batch candidates.
+                        if (
+                            args.hardneg_memory_bank_enable
+                            and hard_neg_ratio > 0
+                            and choose_hard_mask is not None
+                            and choose_hard_mask.any()
+                            and batch_event_time_mjd is not None
+                            and (global_step % args.hardneg_memory_interval == 0)
+                        ):
+                            mem_rows = active_rows
+                            if mem_rows is None:
+                                mem_rows = torch.nonzero(choose_hard_mask, as_tuple=False).squeeze(-1)
+                            if mem_rows.numel() > int(args.hardneg_memory_max_rows):
+                                perm = torch.randperm(mem_rows.numel(), device=device)[: int(args.hardneg_memory_max_rows)]
+                                mem_rows = mem_rows[perm]
+
+                            temperature = model.log_temp.exp().clamp(min=model.temp_min, max=model.temp_max)
+                            if should_perf_log and device.type == "cuda":
+                                mem_timer = _start_cuda_timer(True)
+                            else:
+                                mem_timer = None
+                                mem_cpu_start = time.perf_counter() if should_perf_log else None
+                            mem_idx, _, mem_fallback, mem_attempted = hardneg_memory.mine(
+                                feat_g=feat_g_hard,
                                 gw_indices=gw_indices,
                                 batch_event_time_mjd=batch_event_time_mjd,
+                                temperature=temperature,
                                 window_days=args._hardneg_window_days,
                                 min_candidates=args.hardneg_min_candidates,
-                                semi_hard=args.semi_hard,
-                                semi_hard_margin=args.semi_hard_margin,
-                                fallback_mode=args.hardneg_fallback_mode,
-                                active_rows=active_rows,
-                            )
-                        elif args.semi_hard:
-                            full_hard_idx = model.sample_semi_hard_negatives(
-                                sim_g2o, gw_indices, margin=args.semi_hard_margin
-                            )
-                            hard_active_idx = full_hard_idx[active_rows]
-                        else:
-                            full_hard_idx = model.sample_hard_negatives(sim_g2o, gw_indices)
-                            hard_active_idx = full_hard_idx[active_rows]
-                        inbatch_hard_idx[active_rows] = hard_active_idx
-                        neg_idx[active_rows] = hard_active_idx
-                        if should_perf_log and inbatch_start is not None:
-                            inbatch_hard_mine_ms = (time.perf_counter() - inbatch_start) * 1000.0
-
-                if neg_idx is None:
-                    hard_loss = torch.zeros((), device=device)
-                    logits_hard = logits_pos.detach()
-                    dt_hard = None
-                else:
-                    h_l_hard = h_l[neg_idx].clone()
-                    z_l_hard = z_l[neg_idx].clone()
-                    coords_hard = opt_coords[neg_idx].clone()
-                    dt_hard = torch.zeros((batch_size,), device=device, dtype=torch.float32)
-                    if choose_hard_mask is None:
-                        choose_hard_mask = torch.ones(batch_size, device=device, dtype=torch.bool)
-                    if choose_hard_mask.any():
-                        hard_rows = torch.nonzero(choose_hard_mask, as_tuple=False).squeeze(-1)
-                        hard_opt_idx = neg_idx[hard_rows]
-                        coords_hard_rows = opt_coords[hard_opt_idx]
-                        candidate_gw_time_hard = (
-                            batch_event_time_mjd[hard_opt_idx] if batch_event_time_mjd is not None else None
-                        )
-                        anchor_gw_time_hard = (
-                            batch_event_time_mjd[hard_rows] if batch_event_time_mjd is not None else None
-                        )
-                        z_hard_rows, h_hard_rows, dt_hard_rows = encode_hard_negative_with_time_shift(
-                            model,
-                            opt_coords=coords_hard_rows,
-                            opt_t=opt_t[hard_opt_idx],
-                            opt_v=opt_v[hard_opt_idx],
-                            opt_mask=opt_mask[hard_opt_idx],
-                            opt_err=opt_err[hard_opt_idx],
-                            opt_ref_t=opt_ref_t[hard_rows],
-                            candidate_zero_time_mjd=candidate_gw_time_hard,
-                            anchor_gw_time_mjd=anchor_gw_time_hard,
-                            scale_divisor=args.neg_offset_scale_days_divisor,
-                        )
-                        h_l_hard[hard_rows] = h_hard_rows
-                        z_l_hard[hard_rows] = z_hard_rows
-                        coords_hard[hard_rows] = coords_hard_rows
-                        dt_hard[hard_rows] = dt_hard_rows
-
-                    # B5 memory-bank mining: replace selected hard rows with cross-batch candidates.
-                    if (
-                        args.hardneg_memory_bank_enable
-                        and hard_neg_ratio > 0
-                        and choose_hard_mask is not None
-                        and choose_hard_mask.any()
-                        and batch_event_time_mjd is not None
-                        and (global_step % args.hardneg_memory_interval == 0)
-                    ):
-                        mem_rows = active_rows
-                        if mem_rows is None:
-                            mem_rows = torch.nonzero(choose_hard_mask, as_tuple=False).squeeze(-1)
-                        if mem_rows.numel() > int(args.hardneg_memory_max_rows):
-                            perm = torch.randperm(mem_rows.numel(), device=device)[: int(args.hardneg_memory_max_rows)]
-                            mem_rows = mem_rows[perm]
-
-                        temperature = model.log_temp.exp().clamp(min=model.temp_min, max=model.temp_max)
-                        if should_perf_log and device.type == "cuda":
-                            mem_timer = _start_cuda_timer(True)
-                        else:
-                            mem_timer = None
-                            mem_cpu_start = time.perf_counter() if should_perf_log else None
-                        mem_idx, _, mem_fallback, mem_attempted = hardneg_memory.mine(
-                            feat_g=feat_g_hard,
-                            gw_indices=gw_indices,
-                            batch_event_time_mjd=batch_event_time_mjd,
-                            temperature=temperature,
-                            window_days=args._hardneg_window_days,
-                            min_candidates=args.hardneg_min_candidates,
-                            global_step=global_step,
-                            active_rows=mem_rows,
-                        )
-                        if should_perf_log:
-                            if mem_timer is not None:
-                                memory_hard_mine_ms = _stop_cuda_timer(mem_timer)
-                            elif mem_cpu_start is not None:
-                                memory_hard_mine_ms = (time.perf_counter() - mem_cpu_start) * 1000.0
-                        hardneg_mem_attempted_epoch += int(mem_attempted)
-                        hardneg_mem_fallback_epoch += int(mem_fallback)
-                        use_mem_mask = mem_idx >= 0
-                        if use_mem_mask.any():
-                            if should_perf_log and device.type == "cuda":
-                                fetch_timer = _start_cuda_timer(True)
-                            else:
-                                fetch_timer = None
-                                fetch_cpu_start = time.perf_counter() if should_perf_log else None
-                            fetched = hardneg_memory.fetch(
-                                mem_idx[use_mem_mask],
-                                device=device,
-                                h_l_dtype=h_l.dtype,
-                                z_l_dtype=z_l.dtype,
-                                opt_dtype=opt_t.dtype,
+                                global_step=global_step,
+                                active_rows=mem_rows,
                             )
                             if should_perf_log:
-                                if fetch_timer is not None:
-                                    memory_fetch_ms = _stop_cuda_timer(fetch_timer)
-                                elif fetch_cpu_start is not None:
-                                    memory_fetch_ms = (time.perf_counter() - fetch_cpu_start) * 1000.0
-                            if fetched is not None:
-                                use_rows = mem_rows[use_mem_mask]
-                                (
-                                    _h_sel,
-                                    _z_sel,
-                                    c_sel,
-                                    t_sel,
-                                    _gw_idx_sel,
-                                    opt_t_sel,
-                                    opt_v_sel,
-                                    opt_mask_sel,
-                                    opt_err_sel,
-                                ) = fetched
-                                z_sel_re, h_sel_re, dt_sel = encode_hard_negative_with_time_shift(
-                                    model,
-                                    opt_coords=c_sel,
-                                    opt_t=opt_t_sel,
-                                    opt_v=opt_v_sel,
-                                    opt_mask=opt_mask_sel,
-                                    opt_err=opt_err_sel,
-                                    opt_ref_t=opt_ref_t[use_rows],
-                                    candidate_zero_time_mjd=t_sel,
-                                    anchor_gw_time_mjd=batch_event_time_mjd[use_rows],
-                                    scale_divisor=args.neg_offset_scale_days_divisor,
+                                if mem_timer is not None:
+                                    memory_hard_mine_ms = _stop_cuda_timer(mem_timer)
+                                elif mem_cpu_start is not None:
+                                    memory_hard_mine_ms = (time.perf_counter() - mem_cpu_start) * 1000.0
+                            hardneg_mem_attempted_epoch += int(mem_attempted)
+                            hardneg_mem_fallback_epoch += int(mem_fallback)
+                            use_mem_mask = mem_idx >= 0
+                            if use_mem_mask.any():
+                                if should_perf_log and device.type == "cuda":
+                                    fetch_timer = _start_cuda_timer(True)
+                                else:
+                                    fetch_timer = None
+                                    fetch_cpu_start = time.perf_counter() if should_perf_log else None
+                                fetched = hardneg_memory.fetch(
+                                    mem_idx[use_mem_mask],
+                                    device=device,
+                                    h_l_dtype=h_l.dtype,
+                                    z_l_dtype=z_l.dtype,
+                                    opt_dtype=opt_t.dtype,
                                 )
-                                h_l_hard[use_rows] = h_sel_re
-                                z_l_hard[use_rows] = z_sel_re
-                                coords_hard[use_rows] = c_sel
-                                dt_hard[use_rows] = dt_sel
-                                hardneg_mem_selected_epoch += int(use_rows.numel())
+                                if should_perf_log:
+                                    if fetch_timer is not None:
+                                        memory_fetch_ms = _stop_cuda_timer(fetch_timer)
+                                    elif fetch_cpu_start is not None:
+                                        memory_fetch_ms = (time.perf_counter() - fetch_cpu_start) * 1000.0
+                                if fetched is not None:
+                                    use_rows = mem_rows[use_mem_mask]
+                                    (
+                                        _h_sel,
+                                        _z_sel,
+                                        c_sel,
+                                        t_sel,
+                                        _gw_idx_sel,
+                                        opt_t_sel,
+                                        opt_v_sel,
+                                        opt_mask_sel,
+                                        opt_err_sel,
+                                    ) = fetched
+                                    z_sel_re, h_sel_re, dt_sel = encode_hard_negative_with_time_shift(
+                                        model,
+                                        opt_coords=c_sel,
+                                        opt_t=opt_t_sel,
+                                        opt_v=opt_v_sel,
+                                        opt_mask=opt_mask_sel,
+                                        opt_err=opt_err_sel,
+                                        opt_ref_t=opt_ref_t[use_rows],
+                                        candidate_zero_time_mjd=t_sel,
+                                        anchor_gw_time_mjd=batch_event_time_mjd[use_rows],
+                                        scale_divisor=args.neg_offset_scale_days_divisor,
+                                    )
+                                    h_l_hard[use_rows] = h_sel_re
+                                    z_l_hard[use_rows] = z_sel_re
+                                    coords_hard[use_rows] = c_sel
+                                    dt_hard[use_rows] = dt_sel
+                                    hardneg_mem_selected_epoch += int(use_rows.numel())
 
-                    cred_level_hard = compute_credible_level(gw_m, coords_hard) if need_cred_level else None
-                    logits_hard = model.fusion_logits(
-                        g, h_l_hard, z_l=z_l_hard, H_gw=H_gw, cred_level=cred_level_hard,
-                        gw_s=gw_s, gw_m=gw_m, opt_coords=coords_hard,
-                    )
-                    hard_loss = model.cls_criterion(logits_hard, labels_neg)
-                    if choose_hard_mask is not None:
-                        hard_count = int(choose_hard_mask.sum().item())
-                        hardneg_total_epoch += hard_count
-                        if dt_hard is not None and batch_event_time_mjd is not None and hard_count > 0:
-                            abs_dt = dt_hard[choose_hard_mask].abs()
-                            assigned = torch.zeros_like(abs_dt, dtype=torch.bool)
-                            for li, wnd in enumerate(args._hardneg_window_days):
-                                hit = (~assigned) & (abs_dt <= float(wnd))
-                                cnt = int(hit.sum().item())
-                                hardneg_level_hits_epoch[li] += cnt
-                                assigned |= hit
-                            hardneg_fallback_epoch += int((~assigned).sum().item())
-                if should_perf_log and hard_branch_cpu_start is not None:
-                    hard_branch_total_ms = (time.perf_counter() - hard_branch_cpu_start) * 1000.0
-
-                if has_negatives:
-                    neg_t_for_cls = neg_t
-                    delta_days = torch.zeros((batch_size,), device=device, dtype=torch.float32)
-                    if neg_offset_policy.enabled:
-                        delta_np = neg_offset_policy.sample_train_offsets(batch_size)
-                        delta_days = torch.from_numpy(delta_np).to(device=device, dtype=torch.float32)
-                        neg_t_for_cls = apply_time_offsets(
-                            neg_t, neg_mask, delta_days, neg_offset_policy.scale_divisor
+                        cred_level_hard = compute_credible_level(gw_m, coords_hard) if need_cred_level else None
+                        logits_hard = model.fusion_logits(
+                            g, h_l_hard, z_l=z_l_hard, H_gw=H_gw, cred_level=cred_level_hard,
+                            gw_s=gw_s, gw_m=gw_m, opt_coords=coords_hard,
                         )
-                    z_l_neg, h_l_neg = model.encode_optical(
-                        neg_coords, neg_t_for_cls, neg_v, opt_ref_t, neg_mask, neg_err
+                        hard_loss = model.cls_criterion(logits_hard, labels_neg)
+                        if choose_hard_mask is not None:
+                            hard_count = int(choose_hard_mask.sum().item())
+                            hardneg_total_epoch += hard_count
+                            if dt_hard is not None and batch_event_time_mjd is not None and hard_count > 0:
+                                abs_dt = dt_hard[choose_hard_mask].abs()
+                                assigned = torch.zeros_like(abs_dt, dtype=torch.bool)
+                                for li, wnd in enumerate(args._hardneg_window_days):
+                                    hit = (~assigned) & (abs_dt <= float(wnd))
+                                    cnt = int(hit.sum().item())
+                                    hardneg_level_hits_epoch[li] += cnt
+                                    assigned |= hit
+                                hardneg_fallback_epoch += int((~assigned).sum().item())
+                    if should_perf_log and hard_branch_cpu_start is not None:
+                        hard_branch_total_ms = (time.perf_counter() - hard_branch_cpu_start) * 1000.0
+
+                    if has_negatives:
+                        neg_t_for_cls = neg_t
+                        delta_days = torch.zeros((batch_size,), device=device, dtype=torch.float32)
+                        if neg_offset_policy.enabled:
+                            delta_np = neg_offset_policy.sample_train_offsets(batch_size)
+                            delta_days = torch.from_numpy(delta_np).to(device=device, dtype=torch.float32)
+                            neg_t_for_cls = apply_time_offsets(
+                                neg_t, neg_mask, delta_days, neg_offset_policy.scale_divisor
+                            )
+                        z_l_neg, h_l_neg = model.encode_optical(
+                            neg_coords, neg_t_for_cls, neg_v, opt_ref_t, neg_mask, neg_err
+                        )
+                        cred_level_neg = compute_credible_level(gw_m, neg_coords) if need_cred_level else None
+                        logits_neg = model.fusion_logits(
+                            g, h_l_neg, z_l=z_l_neg, H_gw=H_gw, cred_level=cred_level_neg,
+                            gw_s=gw_s, gw_m=gw_m, opt_coords=neg_coords,
+                        )
+                        neg_loss = model.cls_criterion(logits_neg, labels_neg)
+                    else:
+                        neg_loss = None
+
+                    cls_loss = compute_weighted_cls_loss(
+                        pos_loss, hard_loss, neg_loss, has_negatives, args
                     )
-                    cred_level_neg = compute_credible_level(gw_m, neg_coords) if need_cred_level else None
-                    logits_neg = model.fusion_logits(
-                        g, h_l_neg, z_l=z_l_neg, H_gw=H_gw, cred_level=cred_level_neg,
-                        gw_s=gw_s, gw_m=gw_m, opt_coords=neg_coords,
-                    )
-                    neg_loss = model.cls_criterion(logits_neg, labels_neg)
+
+                    # 分阶段训练：cls_start_epoch之前只训练ITC
+                    total_loss = itc_weight * itc_loss + cls_weight * cls_loss
                 else:
-                    neg_loss = None
-
-                cls_loss = compute_weighted_cls_loss(
-                    pos_loss, hard_loss, neg_loss, has_negatives, args
-                )
-
-                # 分阶段训练：cls_start_epoch之前只训练ITC
-                total_loss = itc_weight * itc_loss + cls_weight * cls_loss
+                    logits_pos = torch.zeros((batch_size, 2), device=device, dtype=g.dtype)
+                    logits_hard = torch.zeros((batch_size, 2), device=device, dtype=g.dtype)
+                    logits_neg = torch.zeros((batch_size, 2), device=device, dtype=g.dtype) if has_negatives else None
+                    pos_loss = torch.zeros((), device=device)
+                    hard_loss = torch.zeros((), device=device)
+                    neg_loss = torch.zeros((), device=device) if has_negatives else None
+                    cls_loss = torch.zeros((), device=device)
+                    dt_hard = None
+                    total_loss = itc_weight * itc_loss
 
             scaler.scale(total_loss).backward()
             if args.grad_clip_norm > 0:
@@ -2186,14 +2351,19 @@ def train(args):
                 pred_gw = gw_indices[itc_preds]
                 itc_acc = (gw_indices == pred_gw).float().mean().item()
 
-                pos_acc = (logits_pos.argmax(dim=1) == labels_pos).float().mean().item()
-                hard_acc = (logits_hard.argmax(dim=1) == labels_neg).float().mean().item()
-                neg_acc = None
-                if has_negatives:
-                    neg_acc = (logits_neg.argmax(dim=1) == labels_neg).float().mean().item()
+                if cls_branch_enabled:
+                    pos_acc = (logits_pos.argmax(dim=1) == labels_pos).float().mean().item()
+                    hard_acc = (logits_hard.argmax(dim=1) == labels_neg).float().mean().item()
+                    neg_acc = None
+                    if has_negatives:
+                        neg_acc = (logits_neg.argmax(dim=1) == labels_neg).float().mean().item()
+                else:
+                    pos_acc = 0.0
+                    hard_acc = 0.0
+                    neg_acc = 0.0 if has_negatives else None
                 current_temp = model.log_temp.exp().item()
 
-            if batch_event_time_mjd is not None:
+            if cls_branch_enabled and batch_event_time_mjd is not None:
                 hardneg_memory.update(
                     feat_o=feat_o_hard,
                     h_l=h_l,
@@ -2622,8 +2792,8 @@ if __name__ == "__main__":
     parser.add_argument("--early_stop_min_delta", type=float, default=1e-4,
                         help="Minimum improvement required on best_ckpt_metric to reset early stopping.")
     parser.add_argument("--best_ckpt_metric", type=str, default="auprc",
-                        choices=["auprc", "auroc", "f1_optimal", "acc_total", "cls_composite_auprc_auroc"],
-                        help="In-domain validation classification metric used for selecting best checkpoint.")
+                        choices=["auprc", "auroc", "f1_optimal", "acc_total", "cls_composite_auprc_auroc", "g2o_recall_at_1", "g2o_recall_at_5", "g2o_mrr"],
+                        help="In-domain validation metric used for selecting best checkpoint. Supports classification and retrieval metrics.")
     parser.add_argument("--n_ref", type=int, default=64)
     parser.add_argument("--ref_start", type=float, default=-0.3)
     parser.add_argument("--ref_end", type=float, default=0.6)
@@ -2732,7 +2902,7 @@ if __name__ == "__main__":
     parser.add_argument("--dual_fusion", action='store_true',
                         help="Use dual cross-attention fusion (optical→GW + GW→optical) with per-pair credible level")
     parser.add_argument("--fusion_mode", type=str, default=None,
-                        help="Fusion mode: legacy_g2o | legacy_dual | physical_dual_hgw. If unset, inferred from --dual_fusion.")
+                        help="Fusion mode: legacy_g2o | legacy_dual | physical_dual_hgw | concat_proj. If unset, inferred from --dual_fusion.")
     parser.add_argument("--use_similarity_as_cls_input", action=argparse.BooleanOptionalAction, default=False,
                         help="Append pair ITC similarity to classifier input in physical_dual_hgw mode.")
     parser.add_argument("--use_cred_level_feature", action=argparse.BooleanOptionalAction, default=False,

@@ -826,12 +826,21 @@ def load_negative_optical_samples(
                 f"Evaluation requires '{neg_group}/{nonkn_cls_base_field}' in {neg_data_path}"
             )
         
-        # Randomly sample indices
-        n_samples = min(n_samples, total_samples)
-        sample_indices = rng.choice(total_samples, size=n_samples, replace=False)
-        sample_indices = np.sort(sample_indices)  # Sort for efficient HDF5 access
-        
-        print(f"Loading {n_samples} negative optical samples from {neg_data_path}")
+        # Randomly sample indices, unless n_samples<=0 / None requests the full negative pool.
+        if n_samples is None:
+            n_samples = total_samples
+        else:
+            n_samples = int(n_samples)
+            if n_samples <= 0:
+                n_samples = total_samples
+        if n_samples >= total_samples:
+            sample_indices = np.arange(total_samples, dtype=np.int64)
+            n_samples = total_samples
+            print(f"Loading all {n_samples} negative optical samples from {neg_data_path}")
+        else:
+            sample_indices = rng.choice(total_samples, size=n_samples, replace=False)
+            sample_indices = np.sort(sample_indices)  # Sort for efficient HDF5 access
+            print(f"Loading {n_samples} negative optical samples from {neg_data_path}")
         
         # Load data
         neg_data = {
