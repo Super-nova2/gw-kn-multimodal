@@ -42,7 +42,7 @@ def normalize_fusion_mode(fusion_mode=None, dual_fusion=False):
     mode = str(fusion_mode).strip().lower()
     if mode in {"", "none", "null"}:
         return "legacy_dual" if bool(dual_fusion) else "legacy_g2o"
-    if mode in {"legacy_g2o", "legacy_dual", "physical_dual_hgw"}:
+    if mode in {"legacy_g2o", "legacy_dual", "physical_dual_hgw", "concat_proj"}:
         return mode
     raise ValueError(f"Unsupported fusion_mode: {fusion_mode}")
 
@@ -1475,6 +1475,28 @@ class CrossAttentionFusion(nn.Module):
         return logits, combined, aux
 
 
+class ConcatProjectionFusion(nn.Module):
+    """Concatenate contrastive projections as a simple fusion baseline
+    (no cross-attention). Used for ablation: w/o cross-attention."""
+
+    def __init__(self, proj_dim=256, hidden_dim=256, dropout=0.2):
+        super().__init__()
+        self.classifier = nn.Sequential(
+            nn.Linear(proj_dim * 2, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 2),
+        )
+
+    def forward(self, proj_gw, proj_opt, **kwargs):
+        combined = torch.cat([proj_gw, proj_opt], dim=-1)  # [B, proj_dim*2]
+        logits = self.classifier(combined)                   # [B, 2]
+        return logits, combined, {}
+
+    def uses_cred_level_input(self):
+        return False
+
+
 class GWOpticalALBEFModel(nn.Module):
     """
     Joint model for alignment (contrastive) and fusion (classification).
@@ -1525,7 +1547,7 @@ class GWOpticalALBEFModel(nn.Module):
         self.use_cred_level_feature = bool(use_cred_level_feature)
         self.use_similarity_as_cls_input = bool(use_similarity_as_cls_input)
 
-        if self.fusion_mode == "physical_dual_hgw":
+        if self.fusion_mode in {"physical_dual_hgw", "concat_proj"}:
             self.gw_encoder = PhysicalDualGWEncoder(
                 scalar_input_dim=gw_scalar_dim,
                 skymap_channels=gw_skymap_channels,
@@ -1605,18 +1627,25 @@ class GWOpticalALBEFModel(nn.Module):
         self.time_compat_max_penalty = float(time_compat_max_penalty)
         self.itc_criterion = nn.CrossEntropyLoss(label_smoothing=itc_label_smoothing)
 
-        self.fusion = CrossAttentionFusion(
-            gw_dim=enc_dim,
-            opt_dim=enc_dim,
-            coord_dim=enc_dim,
-            attn_dim=fusion_attn_dim,
-            hidden_dim=fusion_hidden_dim,
-            dropout=fusion_dropout,
-            dual=self.dual_fusion,
-            fusion_mode=self.fusion_mode,
-            use_cred_level_feature=use_cred_level_feature,
-            use_similarity_as_cls_input=use_similarity_as_cls_input,
-        )
+        if self.fusion_mode == "concat_proj":
+            self.fusion = ConcatProjectionFusion(
+                proj_dim=proj_dim,
+                hidden_dim=proj_dim,
+                dropout=fusion_dropout,
+            )
+        else:
+            self.fusion = CrossAttentionFusion(
+                gw_dim=enc_dim,
+                opt_dim=enc_dim,
+                coord_dim=enc_dim,
+                attn_dim=fusion_attn_dim,
+                hidden_dim=fusion_hidden_dim,
+                dropout=fusion_dropout,
+                dual=self.dual_fusion,
+                fusion_mode=self.fusion_mode,
+                use_cred_level_feature=use_cred_level_feature,
+                use_similarity_as_cls_input=use_similarity_as_cls_input,
+            )
         self.cls_criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
 
     def encode(self, gw_s, gw_m, opt_coords, opt_t, opt_v, opt_ref_t, opt_mask, opt_err):
@@ -1644,7 +1673,7 @@ class GWOpticalALBEFModel(nn.Module):
         return bool(self.fusion.uses_cred_level_input())
 
     def encode_coord_query(self, opt_coords):
-        if self.fusion_mode == "physical_dual_hgw":
+        if self.fusion_mode in {"physical_dual_hgw", "concat_proj"}:
             coord_feat = self.optical_encoder.encode_coord_only(opt_coords)
         else:
             coord_feat = self.optical_encoder.encode_coordinates(opt_coords, return_xyz=False)
@@ -1661,12 +1690,12 @@ class GWOpticalALBEFModel(nn.Module):
         return g_param
 
     def project_gw_features(self, g):
-        if self.fusion_mode == "physical_dual_hgw":
+        if self.fusion_mode in {"physical_dual_hgw", "concat_proj"}:
             return F.normalize(g, p=2, dim=1, eps=1e-8)
         return F.normalize(self.gw_proj(g), p=2, dim=1, eps=1e-8)
 
     def project_optical_features(self, z_l):
-        if self.fusion_mode == "physical_dual_hgw":
+        if self.fusion_mode in {"physical_dual_hgw", "concat_proj"}:
             return F.normalize(z_l, p=2, dim=1, eps=1e-8)
         return F.normalize(self.opt_proj(z_l), p=2, dim=1, eps=1e-8)
 
@@ -1711,8 +1740,13 @@ class GWOpticalALBEFModel(nn.Module):
         mask=False,
         gw_event_time_mjd=None,
         opt_event_time_mjd=None,
+        extra_neg_z=None,
+        extra_neg_opt_event_time_mjd=None,
     ):
         feat_g, feat_o = self.get_contrastive_embeddings(g, z_l)
+        feat_o_extra = None
+        if extra_neg_z is not None and extra_neg_z.numel() > 0:
+            feat_o_extra = self.project_optical_features(extra_neg_z)
 
         temperature = torch.clamp(self.log_temp.exp(), min=self.temp_min, max=self.temp_max)
         sim_g2o = torch.matmul(feat_g, feat_o.T) / temperature
@@ -1723,23 +1757,43 @@ class GWOpticalALBEFModel(nn.Module):
             sim_g2o = sim_g2o + time_bias
             sim_o2g = sim_o2g + time_bias.T
 
+        sim_g2o_for_loss = sim_g2o
+        if feat_o_extra is not None:
+            sim_g2o_extra = torch.matmul(feat_g, feat_o_extra.T) / temperature
+            extra_time_bias = self._build_time_compat_bias(
+                gw_event_time_mjd,
+                extra_neg_opt_event_time_mjd,
+            )
+            if extra_time_bias is not None:
+                extra_time_bias = extra_time_bias.to(device=sim_g2o_extra.device, dtype=sim_g2o_extra.dtype)
+                sim_g2o_extra = sim_g2o_extra + extra_time_bias
+            sim_g2o_for_loss = torch.cat([sim_g2o, sim_g2o_extra], dim=1)
+
         if mask and gw_indices is not None:
             labels_mask = (gw_indices.unsqueeze(0) == gw_indices.unsqueeze(1)).float()
             batch_size = feat_g.size(0)
             target = labels_mask / labels_mask.sum(dim=1, keepdim=True).clamp_min(1.0)
+            if feat_o_extra is not None:
+                target = torch.cat(
+                    [
+                        target,
+                        torch.zeros(batch_size, feat_o_extra.size(0), device=target.device, dtype=target.dtype),
+                    ],
+                    dim=1,
+                )
             if self.itc_label_smoothing > 0:
                 smooth = self.itc_label_smoothing
-                target = target * (1.0 - smooth) + smooth / float(batch_size)
+                target = target * (1.0 - smooth) + smooth / float(target.size(1))
 
-            log_prob_g2o = F.log_softmax(sim_g2o, dim=1)
+            log_prob_g2o = F.log_softmax(sim_g2o_for_loss, dim=1)
             log_prob_o2g = F.log_softmax(sim_o2g, dim=1)
             loss_g = -(target * log_prob_g2o).sum(dim=1).mean()
-            loss_o = -(target * log_prob_o2g).sum(dim=1).mean()
+            loss_o = -(labels_mask / labels_mask.sum(dim=1, keepdim=True).clamp_min(1.0) * log_prob_o2g).sum(dim=1).mean()
             total_loss = (loss_g + loss_o) / 2.0
         else:
             batch_size = feat_g.size(0)
             labels = torch.arange(batch_size, device=feat_g.device)
-            loss_g = self.itc_criterion(sim_g2o, labels)
+            loss_g = self.itc_criterion(sim_g2o_for_loss, labels)
             loss_o = self.itc_criterion(sim_o2g, labels)
             total_loss = (loss_g + loss_o) / 2
 
@@ -1753,6 +1807,8 @@ class GWOpticalALBEFModel(nn.Module):
         margin=0.0,
         gw_event_time_mjd=None,
         opt_event_time_mjd=None,
+        extra_neg_z=None,
+        extra_neg_opt_event_time_mjd=None,
     ):
         """
         Supervised Contrastive Loss for many-to-many GW-optical matching.
@@ -1766,33 +1822,47 @@ class GWOpticalALBEFModel(nn.Module):
 
         Uses the model's learned/scheduled temperature (self.log_temp) so that
         temperature scheduling and learned temperature mode work consistently.
-
-        Args:
-            g: GW embeddings [batch, dim]
-            z_l: Optical embeddings [batch, dim]
-            gw_indices: GW event indices for each sample
-            margin: Margin to enforce between positive and negative similarities.
-                    When margin > 0, negatives are penalized by subtracting margin
-                    from their similarity, pushing positives to be more similar
-                    than negatives by at least this margin.
         """
         feat_g, feat_o = self.get_contrastive_embeddings(g, z_l)
+        feat_o_extra = None
+        extra_count = 0
+        if extra_neg_z is not None and extra_neg_z.numel() > 0:
+            feat_o_extra = self.project_optical_features(extra_neg_z)
+            extra_count = int(feat_o_extra.size(0))
 
         batch_size = feat_g.size(0)
         device = feat_g.device
 
         temperature = torch.clamp(self.log_temp.exp(), min=self.temp_min, max=self.temp_max)
 
-        features = torch.cat([feat_g, feat_o], dim=0)
-        labels = torch.cat([gw_indices, gw_indices], dim=0)
+        features = [feat_g, feat_o]
+        labels = [gw_indices, gw_indices]
+        if feat_o_extra is not None:
+            label_offset = int(gw_indices.max().item()) + 1 if gw_indices.numel() > 0 else 0
+            extra_labels = torch.arange(extra_count, device=device, dtype=gw_indices.dtype) + label_offset
+            features.append(feat_o_extra)
+            labels.append(extra_labels)
+
+        features = torch.cat(features, dim=0)
+        labels = torch.cat(labels, dim=0)
+        total_count = int(features.size(0))
 
         sim_matrix = torch.matmul(features, features.T) / temperature
         time_bias = self._build_time_compat_bias(gw_event_time_mjd, opt_event_time_mjd)
         if time_bias is not None:
             time_bias = time_bias.to(device=sim_matrix.device, dtype=sim_matrix.dtype)
-            # Only apply to cross-modal blocks (GW->Optical and Optical->GW)
-            sim_matrix[:batch_size, batch_size:] = sim_matrix[:batch_size, batch_size:] + time_bias
-            sim_matrix[batch_size:, :batch_size] = sim_matrix[batch_size:, :batch_size] + time_bias.T
+            sim_matrix[:batch_size, batch_size:2 * batch_size] = sim_matrix[:batch_size, batch_size:2 * batch_size] + time_bias
+            sim_matrix[batch_size:2 * batch_size, :batch_size] = sim_matrix[batch_size:2 * batch_size, :batch_size] + time_bias.T
+        if feat_o_extra is not None:
+            extra_time_bias = self._build_time_compat_bias(
+                gw_event_time_mjd,
+                extra_neg_opt_event_time_mjd,
+            )
+            if extra_time_bias is not None:
+                extra_time_bias = extra_time_bias.to(device=sim_matrix.device, dtype=sim_matrix.dtype)
+                extra_start = 2 * batch_size
+                sim_matrix[:batch_size, extra_start:extra_start + extra_count] = sim_matrix[:batch_size, extra_start:extra_start + extra_count] + extra_time_bias
+                sim_matrix[extra_start:extra_start + extra_count, :batch_size] = sim_matrix[extra_start:extra_start + extra_count, :batch_size] + extra_time_bias.T
 
         labels_eq = labels.unsqueeze(0) == labels.unsqueeze(1)
         mask_pos = labels_eq.clone()
@@ -1802,10 +1872,8 @@ class GWOpticalALBEFModel(nn.Module):
         mask_pos = mask_pos.float()
         mask_neg = 1.0 - labels_eq.float()
 
-        mask_self = torch.eye(2 * batch_size, device=device, dtype=torch.bool)
+        mask_self = torch.eye(total_count, device=device, dtype=torch.bool)
 
-        # Apply margin: subtract margin from negative similarities
-        # This encourages positives to be more similar than negatives by margin
         if margin > 0:
             margin_matrix = margin * mask_neg / temperature
             sim_matrix = sim_matrix - margin_matrix
@@ -1822,10 +1890,7 @@ class GWOpticalALBEFModel(nn.Module):
         num_positives = mask_pos.sum(dim=1).clamp_min(1)
         mean_log_prob_pos = (mask_pos * log_prob).sum(dim=1) / num_positives
 
-        # Only average over anchors that have at least one positive
         has_pos = mask_pos.sum(dim=1) > 0
-        pos_rate = has_pos.float().mean().item()
-        # print(f"Supervised Contrastive Loss - Positive Rate: {pos_rate*100:.2f}%")
         if has_pos.any():
             loss = -mean_log_prob_pos[has_pos].mean()
         else:
@@ -1848,6 +1913,12 @@ class GWOpticalALBEFModel(nn.Module):
         gw_m=None,
         opt_coords=None,
     ):
+        if self.fusion_mode == "concat_proj":
+            # Use L2-normalized contrastive projections as classifier input
+            feat_g, feat_o = self.get_contrastive_embeddings(g_feat, z_l)
+            logits, _, _ = self.fusion(feat_g, feat_o)
+            return logits
+
         fusion_kwargs = {
             "z_l": z_l,
             "H_gw": H_gw,
