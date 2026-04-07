@@ -1,0 +1,88 @@
+[project]
+name = "bgao-kn"
+version = "0.1.0"
+description = "Kilonova research environment — GW multi-messenger astronomy"
+requires-python = ">=3.10,<3.11"
+
+dependencies = [
+    # === Scientific computing ===
+    "numpy>=1.26,<2.0",
+    "scipy>=1.15",
+    "matplotlib>=3.10",
+    "pandas>=2.3",
+    "scikit-learn>=1.7",
+    "h5py>=3.15",
+    "healpy>=1.18",
+    "dask>=2025.11",
+
+    # === Astronomy ===
+    "astropy>=6.1",
+    "astroplan>=0.10",
+    "astropy-healpix>=1.1",
+    "reproject>=0.14",
+    "corner>=2.2",
+    "george>=0.4",
+    "ptemcee>=1.0",
+
+    # === Gravitational wave ===
+    "lalsuite>=7.26",
+    "ligo-skymap>=2.3",
+    "ligo-gracedb>=2.14",
+    "python-ligo-lw>=1.8",
+    "igwn-ligolw>=2.1",
+    "lscsoft-glue>=4.1",
+
+    # === Machine learning ===
+    "torch>=2.9",
+    "torchvision>=0.24",
+    "optuna>=4.7",
+    "tensorboard>=2.20",
+    "torch-tb-profiler>=0.4",
+
+    # === Fink / Survey ===
+    "fink-client @ git+https://github.com/astrolabsoftware/fink-client.git@44e78aea6b8035aa61d2e193217f4625b54bd56d",
+    "fink-filters>=7.26",
+    "ztfquery>=1.28",
+    "ztffields>=0.6",
+
+    # === Data / IO ===
+    "pyarrow>=22.0",
+    "fastavro>=1.9",
+    "zarr>=2.18",
+    "geopandas>=1.1",
+    "confluent-kafka>=2.13",
+
+    # === Jupyter ===
+    "jupyterlab>=4.5",
+    "notebook>=7.5",
+    "ipykernel>=6.29",
+    "nbconvert>=7.17",
+    "nbstripout>=0.9",
+
+    # === Visualization ===
+    "plotly>=6.5",
+    "graphviz>=0.21",
+
+    # === Utilities ===
+    "tqdm>=4.67",
+    "coverage>=7.13",
+    "coveralls>=4.0",
+    "requests>=2.32",
+    "httpx>=0.28",
+    "cryptography>=46.0",
+    "git-filter-repo>=2.47",
+    "tabulate>=0.9",
+    "colorlog>=6.10",
+]
+
+[tool.uv]
+index-strategy = "unsafe-best-match"
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu126" }
+torchvision = { index = "pytorch-cu126" }

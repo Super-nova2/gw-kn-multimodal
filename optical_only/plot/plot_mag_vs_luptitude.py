@@ -38,50 +38,43 @@ band_colors = {
     "Y": "#333333",
 }
 
-fig, axes = plt.subplots(2, 3, figsize=(16, 10), sharex=False, sharey=False)
-axes = axes.ravel()
+fig, ax = plt.subplots(figsize=(10, 7))
 
+# Classical magnitude (only valid for f > 0)
+flux_pos = flux[flux > 0]
+mag = PSFFLUX_ZP - 2.5 * np.log10(flux_pos)
+
+# Luptitude (valid for any flux)
 for idx, (band, b_val) in enumerate(zip(BANDS, lupt_b_njy)):
-    ax = axes[idx]
+    color = band_colors[band]
 
-    # Classical magnitude (only valid for f > 0)
-    flux_pos = flux[flux > 0]
-    mag = PSFFLUX_ZP - 2.5 * np.log10(flux_pos)
-
-    # Luptitude (valid for any flux)
     lupt = PSFFLUX_ZP - ASINH_MAG_FACTOR * (
         np.arcsinh(flux / (2.0 * b_val)) + np.log(b_val)
     )
-
-    ax.plot(flux, lupt, color=band_colors[band], lw=2.0, label="Luptitude")
-    ax.plot(flux_pos, mag, color="gray", lw=1.5, ls="--", label="Magnitude")
+    ax.plot(flux, lupt, color=color, lw=2.0, label=f"LSST-{band}")
 
     # mark zero-flux level
     lupt_at_zero = PSFFLUX_ZP - ASINH_MAG_FACTOR * (
         np.arcsinh(0.0) + np.log(b_val)
     )
-    ax.axvline(0, color="k", lw=0.5, ls=":")
-    ax.axhline(lupt_at_zero, color=band_colors[band], lw=0.5, ls=":", alpha=0.6)
+    ax.axhline(lupt_at_zero, color=color, lw=0.4, ls=":", alpha=0.5)
 
-    # mark 5-sigma flux
-    ax.axvline(lupt_f5sigma_njy[idx], color=band_colors[band], lw=0.7, ls="-.",
-               alpha=0.5, label=f"$f_{{5\\sigma}}$={lupt_f5sigma_njy[idx]:.0f} nJy")
+ax.plot(flux_pos, mag, color="gray", lw=1.5, ls="--", label="Classical mag")
 
-    ax.set_title(f"LSST-{band}  ($m_5$={LUPT_M5_MAG[idx]}, $b$={b_val:.1f} nJy)",
-                 fontsize=12, fontweight="bold")
-    ax.set_xlabel("Flux (nJy)", fontsize=11)
-    ax.set_ylabel("Mag / Luptitude (AB)", fontsize=11)
-    ax.legend(fontsize=9, loc="lower right")
-    ax.invert_yaxis()
-    ax.set_xlim(-1000, 10000)
-    ax.grid(True, alpha=0.3)
+ax.axvline(0, color="k", lw=0.5, ls=":")
 
-fig.suptitle(
+ax.set_xlabel("Flux (nJy)", fontsize=12)
+ax.set_ylabel("Mag / Luptitude (AB)", fontsize=12)
+ax.set_title(
     "Magnitude vs Luptitude as a function of flux\n"
     f"(psfflux_zp={PSFFLUX_ZP}, lupt_k={LUPT_K})",
-    fontsize=14, fontweight="bold", y=0.98,
+    fontsize=14, fontweight="bold",
 )
-plt.tight_layout(rect=[0, 0, 1, 0.94])
+ax.legend(fontsize=16, loc="lower right")
+ax.invert_yaxis()
+ax.set_xlim(-1000, 10000)
+ax.grid(True, alpha=0.3)
+plt.tight_layout()
 plt.savefig(OUTPUT_PNG, dpi=300, bbox_inches="tight")
 # plt.savefig(OUTPUT_PNG.with_suffix(".pdf"),
 #             bbox_inches="tight")
