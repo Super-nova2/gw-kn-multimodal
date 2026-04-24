@@ -17,6 +17,7 @@ per-model retrieval metrics, and multimodal triplet-classification metrics.
 
 import argparse
 import gc
+import h5py
 import json
 import os
 import random
@@ -26,7 +27,7 @@ from collections import OrderedDict
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import numpy as np
 import torch
@@ -46,6 +47,16 @@ from data_loader import (  # noqa: E402
     build_gw_to_lc_mapping,
 )
 from model import OpticalKNClassifier, migrate_time_embed_state_dict  # noqa: E402
+from retrieval_gallery import (  # noqa: E402
+    aggregate_gallery_outcomes,
+    build_comparison_model_specs,
+    build_curve_rows,
+    build_prefixed_gallery_specs,
+    build_time_sky_candidate_sequences,
+    plot_retrieval_coverage,
+    plot_retrieval_curves,
+    score_all_galleries_skymap,
+)
 from test_evaluate import (  # noqa: E402
     _autocast_context,
     _build_gallery_query_cache,
@@ -207,32 +218,7 @@ def _resolve_checkpoint_path(checkpoint_path: str, model_type: str) -> str:
 
 
 def _build_model_specs(cfg: Dict[str, Any], cfg_dir: Path) -> List[Dict[str, Any]]:
-    model_specs: List[Dict[str, Any]] = []
-    valid_scoring = {"optical", "logits", "contrastive", "auto"}
-    for raw_spec in cfg.get("models", []):
-        spec = dict(raw_spec)
-        spec["name"] = str(spec["name"])
-        spec["type"] = str(spec["type"])
-        spec["checkpoint"] = _resolve_path(cfg_dir, spec.get("checkpoint"))
-        if spec["checkpoint"] is None:
-            raise ValueError(f"models[{spec['name']}] is missing checkpoint")
-        spec["config"] = _resolve_path(cfg_dir, spec.get("config"))
-        if spec["type"] == "multimodal" and spec["config"] is None:
-            raise ValueError(f"Multimodal model '{spec['name']}' requires a config path")
-        spec["resolved_checkpoint"] = _resolve_checkpoint_path(spec["checkpoint"], spec["type"])
-        spec["resolved_config"] = spec.get("config")
-        # Resolve scoring mode with sensible defaults
-        if "scoring" not in spec:
-            spec["scoring"] = "optical" if spec["type"] == "optical" else "auto"
-        if spec["scoring"] not in valid_scoring:
-            raise ValueError(
-                f"models[{spec['name']}] has invalid scoring '{spec['scoring']}', "
-                f"must be one of {valid_scoring}"
-            )
-        model_specs.append(spec)
-    if not model_specs:
-        raise ValueError("Comparison config must define a non-empty models array")
-    return model_specs
+    return build_comparison_model_specs(cfg, cfg_dir)
 
 
 def load_optical_model(checkpoint_path: str, device: torch.device) -> Tuple[OpticalKNClassifier, Dict[str, Any]]:
@@ -426,6 +412,81 @@ def build_cached_batches(
             try_num_workers = 0
 
 
+def load_test_positive_index_map(test_data_path: str) -> Tuple[Dict[int, np.ndarray], List[int]]:
+    with h5py.File(test_data_path, "r") as f:
+        if "events/optical_data/parent_gw_idx" not in f:
+            raise KeyError(f"Missing required field 'events/optical_data/parent_gw_idx' in {test_data_path}")
+        parent_gw_idx = np.asarray(f["events/optical_data/parent_gw_idx"][:], dtype=np.int64)
+
+    gw_positive_indices: Dict[int, List[int]] = {}
+    for opt_idx, gw_id in enumerate(parent_gw_idx.tolist()):
+        gw_positive_indices.setdefault(int(gw_id), []).append(int(opt_idx))
+
+    final_map = {
+        int(gw_id): np.asarray(indices, dtype=np.int64)
+        for gw_id, indices in gw_positive_indices.items()
+    }
+    return final_map, sorted(final_map.keys())
+
+
+def load_selected_positive_bank(
+    test_data_path: str,
+    selected_optical_indices: np.ndarray,
+) -> Tuple[Dict[str, torch.Tensor], Dict[int, int]]:
+    selected = np.unique(np.asarray(selected_optical_indices, dtype=np.int64).reshape(-1))
+    if selected.size == 0:
+        raise ValueError("selected_optical_indices must be non-empty to build a positive query bank.")
+
+    with h5py.File(test_data_path, "r") as f:
+        if "events/optical_data" not in f:
+            raise KeyError(f"Missing required group 'events/optical_data' in {test_data_path}")
+        opt = f["events/optical_data"]
+        required_fields = ["times", "values", "masks", "errors", "coordinates", "parent_gw_idx"]
+        for field in required_fields:
+            if field not in opt:
+                raise KeyError(f"Missing required field 'events/optical_data/{field}' in {test_data_path}")
+
+        opt_t_raw = torch.from_numpy(np.asarray(opt["times"][selected], dtype=np.float32))
+        opt_v_raw = torch.from_numpy(np.asarray(opt["values"][selected], dtype=np.float32))
+        opt_mask_raw = torch.from_numpy(np.asarray(opt["masks"][selected], dtype=np.float32))
+        opt_err_raw = torch.from_numpy(np.asarray(opt["errors"][selected], dtype=np.float32))
+        opt_coords = torch.from_numpy(np.asarray(opt["coordinates"][selected], dtype=np.float32))
+        gw_indices = torch.from_numpy(np.asarray(opt["parent_gw_idx"][selected], dtype=np.int64))
+
+    bank: Dict[str, torch.Tensor] = {
+        "times": opt_t_raw,
+        "values": opt_v_raw,
+        "masks": opt_mask_raw,
+        "errors": opt_err_raw,
+        "coordinates": opt_coords,
+        "gw_indices": gw_indices,
+        "source_optical_indices": torch.from_numpy(selected.astype(np.int64, copy=False)),
+        "opt_t_raw": opt_t_raw,
+        "opt_v_raw": opt_v_raw,
+        "opt_mask_raw": opt_mask_raw,
+        "opt_err_raw": opt_err_raw,
+        "opt_coords": opt_coords,
+    }
+    remap = {int(source_idx): int(compact_idx) for compact_idx, source_idx in enumerate(selected.tolist())}
+    return bank, remap
+
+
+def remap_gallery_positive_indices(
+    galleries: Mapping[Tuple[int, int, int], Mapping[str, Any]],
+    positive_index_remap: Mapping[int, int],
+) -> Dict[Tuple[int, int, int], Dict[str, Any]]:
+    remapped: Dict[Tuple[int, int, int], Dict[str, Any]] = {}
+    for key, gallery_spec in galleries.items():
+        source_positive_index = int(gallery_spec["positive_index"])
+        if source_positive_index not in positive_index_remap:
+            raise KeyError(f"Gallery positive index {source_positive_index} missing from compact positive-bank remap.")
+        updated_spec = dict(gallery_spec)
+        updated_spec["source_positive_index"] = source_positive_index
+        updated_spec["positive_index"] = int(positive_index_remap[source_positive_index])
+        remapped[key] = updated_spec
+    return remapped
+
+
 @torch.no_grad()
 def extract_gallery_embeddings(
     model,
@@ -491,8 +552,81 @@ def extract_gallery_embeddings(
     }
 
 
+@torch.no_grad()
+def extract_optical_candidate_embeddings(
+    model,
+    optical_data,
+    device,
+    *,
+    n_ref: int,
+    ref_start: float,
+    ref_end: float,
+    chunk_size: int = 1024,
+    amp_dtype: torch.dtype = torch.float32,
+    amp_enabled: bool = False,
+    desc: str = "  Extracting optical candidate embeddings",
+):
+    """Extract optical embeddings for a preloaded optical candidate bank."""
+    core_model = model._orig_mod if hasattr(model, "_orig_mod") else model
+    all_h_l = []
+    all_z_l = []
+    all_opt_coords = []
+    all_opt_t = []
+    all_opt_v = []
+    all_opt_mask = []
+    all_opt_err = []
+
+    total = int(optical_data["times"].shape[0])
+    for start in tqdm(range(0, total, int(chunk_size)), desc=desc):
+        end = min(start + int(chunk_size), total)
+        chunk_idx = torch.arange(start, end, dtype=torch.long)
+        opt_coords = optical_data["coordinates"].index_select(0, chunk_idx).to(device)
+        opt_t = optical_data["times"].index_select(0, chunk_idx).to(device)
+        opt_v = optical_data["values"].index_select(0, chunk_idx).to(device)
+        opt_mask = optical_data["masks"].index_select(0, chunk_idx).to(device)
+        opt_err = optical_data["errors"].index_select(0, chunk_idx).to(device)
+        ref_time = build_ref_time(opt_t.size(0), n_ref, ref_start, ref_end, device, opt_t.dtype)
+        with _autocast_context(device, amp_dtype, enabled=amp_enabled):
+            z_l, h_l = core_model.encode_optical(
+                opt_coords, opt_t, opt_v, ref_time, opt_mask, opt_err
+            )
+
+        all_h_l.append(h_l.float().cpu())
+        all_z_l.append(z_l.float().cpu())
+        all_opt_coords.append(opt_coords.float().cpu())
+        all_opt_t.append(opt_t.float().cpu())
+        all_opt_v.append(opt_v.float().cpu())
+        all_opt_mask.append(opt_mask.float().cpu())
+        all_opt_err.append(opt_err.float().cpu())
+
+    result = {
+        "h_l_cls": torch.cat(all_h_l),
+        "z_l_cls": torch.cat(all_z_l),
+        "opt_coords": torch.cat(all_opt_coords),
+        "opt_t_raw": torch.cat(all_opt_t),
+        "opt_v_raw": torch.cat(all_opt_v),
+        "opt_mask_raw": torch.cat(all_opt_mask),
+        "opt_err_raw": torch.cat(all_opt_err),
+    }
+    if "gw_indices" in optical_data:
+        gw_indices = optical_data["gw_indices"]
+        result["gw_indices"] = (
+            gw_indices.detach().cpu().to(torch.long)
+            if isinstance(gw_indices, torch.Tensor)
+            else torch.as_tensor(gw_indices, dtype=torch.long)
+        )
+    if "source_optical_indices" in optical_data:
+        source_indices = optical_data["source_optical_indices"]
+        result["source_optical_indices"] = (
+            source_indices.detach().cpu().to(torch.long)
+            if isinstance(source_indices, torch.Tensor)
+            else torch.as_tensor(source_indices, dtype=torch.long)
+        )
+    return result
+
+
 def precompute_tutorial_galleries(
-    gw_indices: torch.Tensor,
+    gw_positive_indices: Mapping[int, Any],
     n_tutorial_negatives: int,
     gallery_sizes,
     n_trials,
@@ -500,23 +634,27 @@ def precompute_tutorial_galleries(
 ):
     """Build galleries with one matched KN and tutorial non-KN distractors."""
     rng = np.random.default_rng(int(seed))
-    unique_gw = sorted(torch.unique(gw_indices).cpu().tolist())
+    unique_gw = sorted(int(gw_id) for gw_id in gw_positive_indices.keys())
     galleries: Dict[Tuple[int, int, int], Dict[str, Any]] = {}
     neg_pool = np.arange(int(n_tutorial_negatives), dtype=np.int64)
 
     for gallery_size in gallery_sizes:
         for trial in range(int(n_trials)):
             for gw_id in unique_gw:
-                gw_mask = gw_indices == gw_id
-                if int(gw_mask.sum().item()) == 0:
-                    continue
-
-                gw_idxs = torch.where(gw_mask)[0]
-                correct_idx = int(gw_idxs[rng.integers(len(gw_idxs))].item())
+                gw_idxs = np.asarray(gw_positive_indices.get(int(gw_id), []), dtype=np.int64).reshape(-1)
+                if gw_idxs.size == 0:
+                    raise ValueError(f"GW event {gw_id} has no positive optical samples available for gallery construction.")
+                correct_idx = int(gw_idxs[rng.integers(gw_idxs.size)])
                 if int(gallery_size) <= 1:
                     galleries[(int(gallery_size), int(trial), int(gw_id))] = {
                         "positive_index": correct_idx,
                         "negative_indices": np.empty((0,), dtype=np.int64),
+                        "negative_credible_levels": np.empty((0,), dtype=np.float32),
+                        "negative_abs_dt_days": np.empty((0,), dtype=np.float32),
+                        "requested_gallery_size": int(gallery_size),
+                        "actual_gallery_size": 1,
+                        "coverage_met": True,
+                        "is_undersized": False,
                     }
                     continue
 
@@ -527,9 +665,29 @@ def precompute_tutorial_galleries(
                 galleries[(int(gallery_size), int(trial), int(gw_id))] = {
                     "positive_index": correct_idx,
                     "negative_indices": np.asarray(distract_idxs, dtype=np.int64),
+                    "negative_credible_levels": np.full((n_distract,), np.nan, dtype=np.float32),
+                    "negative_abs_dt_days": np.full((n_distract,), np.nan, dtype=np.float32),
+                    "requested_gallery_size": int(gallery_size),
+                    "actual_gallery_size": 1 + int(n_distract),
+                    "coverage_met": True,
+                    "is_undersized": False,
                 }
 
     return galleries, unique_gw
+
+
+def enrich_gallery_outcomes(ranks: Mapping[Tuple[int, int, int], int], galleries: Mapping[Tuple[int, int, int], Mapping[str, Any]]) -> Dict[Tuple[int, int, int], Dict[str, Any]]:
+    outcomes: Dict[Tuple[int, int, int], Dict[str, Any]] = {}
+    for key, rank in ranks.items():
+        gallery_spec = galleries[key]
+        outcomes[key] = {
+            "rank": int(rank),
+            "requested_gallery_size": int(gallery_spec.get("requested_gallery_size", key[0])),
+            "actual_gallery_size": int(gallery_spec.get("actual_gallery_size", key[0])),
+            "coverage_met": bool(gallery_spec.get("coverage_met", True)),
+            "is_undersized": bool(gallery_spec.get("is_undersized", False)),
+        }
+    return outcomes
 
 
 @torch.no_grad()
@@ -1052,10 +1210,13 @@ def build_table_rows(all_results, gallery_sizes, model_names):
     return rows
 
 
-def build_gw_source_map(gw_source_types, shared_gw_indices):
+def build_gw_source_map(gw_source_types, gw_ids):
     if gw_source_types is None:
         return {}
-    unique_gw = sorted(torch.unique(shared_gw_indices).cpu().tolist())
+    if isinstance(gw_ids, torch.Tensor):
+        unique_gw = sorted(torch.unique(gw_ids.detach().cpu().to(torch.long)).tolist())
+    else:
+        unique_gw = sorted({int(gw_id) for gw_id in gw_ids})
     return {int(gw_id): _lookup_source_type(int(gw_id), gw_source_types) for gw_id in unique_gw}
 
 
@@ -1296,8 +1457,12 @@ def normalize_shared_config(cfg: Dict[str, Any], cfg_path: Path) -> Dict[str, An
         "batch_size": int(cfg.get("batch_size", 512)),
         "test_steps": None if cfg.get("test_steps") is None else int(cfg.get("test_steps")),
         "num_workers": int(cfg.get("num_workers", 2)),
-        "gallery_sizes": _parse_gallery_sizes(cfg.get("gallery_sizes", "100,500")),
+        "gallery_sizes": _parse_gallery_sizes(cfg.get("gallery_sizes", "10,100,500,1000,2000,5000")),
         "gallery_trials": int(cfg.get("gallery_trials", 1)),
+        "gallery_candidate_mode": str(cfg.get("gallery_candidate_mode", "time_sky_hard")).strip().lower(),
+        "gallery_candidate_time_window_days": float(cfg.get("gallery_candidate_time_window_days", 50.0)),
+        "gallery_candidate_credible_level_max": float(cfg.get("gallery_candidate_credible_level_max", 0.9)),
+        "gallery_include_undersized": _as_bool(cfg.get("gallery_include_undersized", True), default=True),
         "n_neg_samples": _parse_n_neg_samples(cfg.get("n_neg_samples", -1), default=-1),
         "amp_dtype": str(cfg.get("amp_dtype", "auto")),
         "no_latex": _as_bool(cfg.get("no_latex", False)),
@@ -1311,7 +1476,7 @@ def normalize_shared_config(cfg: Dict[str, Any], cfg_path: Path) -> Dict[str, An
         "neg_offset_eval_quantiles": str(cfg.get("neg_offset_eval_quantiles", "0.1,0.3,0.5,0.7,0.9")),
         "neg_offset_scale_days_divisor": float(cfg.get("neg_offset_scale_days_divisor", 100.0)),
         "neg_offset_bank_size": int(cfg.get("neg_offset_bank_size", 1000000)),
-        "nonkn_cls_base_field": str(cfg.get("nonkn_cls_base_field", "zero_time_mjd_base")),
+        "nonkn_cls_base_field": str(cfg.get("nonkn_cls_base_field", "zero_time_mjd_cls_base")),
         "report_dt_bins": _as_bool(cfg.get("report_dt_bins", False)),
         "dt_bin_edges": str(cfg.get("dt_bin_edges", DEFAULT_DT_BIN_EDGES)),
         "report_dt_macro": _as_bool(cfg.get("report_dt_macro", False)),
@@ -1392,32 +1557,105 @@ def main():
     cfg["used_num_workers"] = int(used_num_workers)
 
     gw_indices_parts = []
-    raw_opt_parts = {"opt_t_raw": [], "opt_v_raw": [], "opt_mask_raw": [], "opt_err_raw": []}
     for batch_data in cached_batches:
         gw_indices_parts.append(batch_data[7].long().cpu())
-        raw_opt_parts["opt_t_raw"].append(batch_data[2].float().cpu())
-        raw_opt_parts["opt_v_raw"].append(batch_data[3].float().cpu())
-        raw_opt_parts["opt_mask_raw"].append(batch_data[4].float().cpu())
-        raw_opt_parts["opt_err_raw"].append(batch_data[5].float().cpu())
     shared_gw_indices = torch.cat(gw_indices_parts)
-    shared_raw_opt = {key: torch.cat(values) for key, values in raw_opt_parts.items()}
-    gw_source_map = build_gw_source_map(gw_source_types, shared_gw_indices)
+    unique_sampled_gw = sorted(torch.unique(shared_gw_indices).cpu().tolist())
+    sampled_positive_counts = np.asarray(
+        [int((shared_gw_indices == int(gw_id)).sum().item()) for gw_id in unique_sampled_gw],
+        dtype=np.int64,
+    )
+    sampled_positive_summary = {
+        "n_unique_gw": int(len(unique_sampled_gw)),
+        "n_sampled_positives": int(shared_gw_indices.numel()),
+        "sampled_positives_per_gw": {
+            "min": int(sampled_positive_counts.min()) if sampled_positive_counts.size else 0,
+            "median": float(np.median(sampled_positive_counts)) if sampled_positive_counts.size else 0.0,
+            "mean": float(np.mean(sampled_positive_counts)) if sampled_positive_counts.size else 0.0,
+            "max": int(sampled_positive_counts.max()) if sampled_positive_counts.size else 0,
+        },
+    }
+    gw_positive_indices, all_test_gw_ids = load_test_positive_index_map(cfg["test_data_path"])
+    full_test_positive_counts = np.asarray(
+        [int(np.asarray(gw_positive_indices[int(gw_id)]).size) for gw_id in all_test_gw_ids],
+        dtype=np.int64,
+    )
+    gallery_positive_summary = {
+        "n_unique_gw": int(len(all_test_gw_ids)),
+        "n_total_positives": int(sum(int(count) for count in full_test_positive_counts.tolist())),
+        "positives_per_gw": {
+            "min": int(full_test_positive_counts.min()) if full_test_positive_counts.size else 0,
+            "median": float(np.median(full_test_positive_counts)) if full_test_positive_counts.size else 0.0,
+            "mean": float(np.mean(full_test_positive_counts)) if full_test_positive_counts.size else 0.0,
+            "max": int(full_test_positive_counts.max()) if full_test_positive_counts.size else 0,
+        },
+    }
+    gw_source_map = build_gw_source_map(gw_source_types, all_test_gw_ids)
 
     print(f"\n{'=' * 60}")
     print("Phase 2: Pre-generate shared galleries")
     print("=" * 60)
-    galleries, unique_gw = precompute_tutorial_galleries(
-        shared_gw_indices,
-        int(neg_optical_data["times"].shape[0]),
-        gallery_sizes,
-        n_trials,
-        seed,
+    gallery_candidate_mode = str(cfg["gallery_candidate_mode"]).strip().lower()
+    gallery_gw_skymaps: Dict[int, torch.Tensor] = {}
+    if gallery_candidate_mode == "time_sky_hard":
+        candidate_sequences, gallery_gw_skymaps, _gallery_gw_times = build_time_sky_candidate_sequences(
+            test_data_path=cfg["test_data_path"],
+            unique_gw_ids=all_test_gw_ids,
+            neg_optical_data=neg_optical_data,
+            n_trials=n_trials,
+            seed=seed,
+            time_window_days=cfg["gallery_candidate_time_window_days"],
+            credible_level_max=cfg["gallery_candidate_credible_level_max"],
+            zero_time_field=cfg["nonkn_cls_base_field"],
+        )
+        galleries, unique_gw = build_prefixed_gallery_specs(
+            gw_positive_indices=gw_positive_indices,
+            candidate_sequences=candidate_sequences,
+            gallery_sizes=gallery_sizes,
+            n_trials=n_trials,
+            seed=seed,
+            include_undersized=bool(cfg["gallery_include_undersized"]),
+        )
+        print(
+            "  Built hard-filtered galleries with "
+            f"time_window=±{cfg['gallery_candidate_time_window_days']:.1f} days, "
+            f"credible<= {cfg['gallery_candidate_credible_level_max']:.3f}, "
+            f"include_undersized={bool(cfg['gallery_include_undersized'])}"
+        )
+    elif gallery_candidate_mode == "tutorial_random":
+        galleries, unique_gw = precompute_tutorial_galleries(
+            gw_positive_indices,
+            int(neg_optical_data["times"].shape[0]),
+            gallery_sizes,
+            n_trials,
+            seed,
+        )
+    else:
+        raise ValueError(
+            f"Unsupported gallery_candidate_mode='{gallery_candidate_mode}'. "
+            "Expected one of {'time_sky_hard', 'tutorial_random'}."
+        )
+    if not galleries:
+        raise ValueError("Gallery construction produced no instances.")
+    selected_positive_indices = np.unique(
+        np.asarray([int(spec["positive_index"]) for spec in galleries.values()], dtype=np.int64)
+    )
+    positive_query_bank, positive_index_remap = load_selected_positive_bank(
+        cfg["test_data_path"],
+        selected_positive_indices,
+    )
+    galleries = remap_gallery_positive_indices(galleries, positive_index_remap)
+    print(
+        "  Selected "
+        f"{int(positive_query_bank['opt_t_raw'].shape[0])} positive optical queries "
+        "from the full test set"
     )
     print(f"  Built {len(galleries)} gallery instances for {len(unique_gw)} GW events")
 
     dt_bin_edges = parse_dt_bin_edges(cfg["dt_bin_edges"]) if cfg["report_dt_bins"] else None
     model_results: OrderedDict[str, Dict[str, Any]] = OrderedDict()
     retrieval_rows: OrderedDict[str, Dict[str, float]] = OrderedDict()
+    curve_rows: List[Dict[str, Any]] = []
     model_names: List[str] = []
 
     for idx, model_spec in enumerate(model_specs, start=1):
@@ -1427,7 +1665,7 @@ def main():
         print(f"\n{'=' * 60}")
         print(f"Phase 3.{idx}: {name} ({model_type})")
         print("=" * 60)
-        print(f"  Resolved checkpoint: {model_spec['resolved_checkpoint']}")
+        print(f"  Resolved checkpoint: {model_spec['resolved_checkpoint'] or 'N/A'}")
         if model_spec.get("resolved_config"):
             print(f"  Config: {model_spec['resolved_config']}")
 
@@ -1440,7 +1678,7 @@ def main():
             ]
             ranks = score_all_galleries_optical(
                 model,
-                shared_raw_opt,
+                positive_query_bank,
                 neg_optical_data,
                 galleries,
                 device=device,
@@ -1450,11 +1688,12 @@ def main():
                 amp_dtype=amp_dtype,
                 amp_enabled=amp_enabled,
             )
-            retrieval_metrics, retrieval_by_source = aggregate_metrics(
-                ranks,
-                gallery_sizes,
-                n_trials,
-                unique_gw,
+            outcomes = enrich_gallery_outcomes(ranks, galleries)
+            retrieval_metrics, retrieval_by_source, coverage_stats = aggregate_gallery_outcomes(
+                outcomes=outcomes,
+                gallery_sizes=gallery_sizes,
+                n_trials=n_trials,
+                unique_gw=unique_gw,
                 gw_source_map=gw_source_map if gw_source_map else None,
             )
             model_results[name] = {
@@ -1466,11 +1705,12 @@ def main():
                 "comparison_window": list(comparison_window),
                 "retrieval": retrieval_metrics,
                 "retrieval_by_source": retrieval_by_source,
+                "coverage": {key: float(val.get("coverage", 0.0)) for key, val in coverage_stats.items()},
+                "effective_gallery_size_stats": coverage_stats,
                 "classification_supported": False,
                 "classification": None,
                 "classification_by_source": {},
             }
-            retrieval_rows[name] = retrieval_metrics
             del model
         elif model_type == "multimodal":
             model, runtime_model_args, saved_args = load_multimodal_bundle(
@@ -1482,15 +1722,16 @@ def main():
                 comparison_window=comparison_window,
                 nonkn_cls_base_field=cfg["nonkn_cls_base_field"],
             )
-            embeddings = extract_gallery_embeddings(
+            embeddings = extract_optical_candidate_embeddings(
                 model,
-                cached_batches,
+                positive_query_bank,
                 device,
                 n_ref=int(runtime_model_args.get("n_ref", 64)),
                 ref_start=float(runtime_model_args["ref_start"]),
                 ref_end=float(runtime_model_args["ref_end"]),
                 amp_dtype=amp_dtype,
                 amp_enabled=amp_enabled,
+                desc="  Extracting positive query embeddings",
             )
             negative_embeddings = extract_negative_gallery_embeddings(
                 model,
@@ -1532,11 +1773,12 @@ def main():
                     amp_dtype=amp_dtype,
                     amp_enabled=amp_enabled,
                 )
-            retrieval_metrics, retrieval_by_source = aggregate_metrics(
-                ranks,
-                gallery_sizes,
-                n_trials,
-                unique_gw,
+            outcomes = enrich_gallery_outcomes(ranks, galleries)
+            retrieval_metrics, retrieval_by_source, coverage_stats = aggregate_gallery_outcomes(
+                outcomes=outcomes,
+                gallery_sizes=gallery_sizes,
+                n_trials=n_trials,
+                unique_gw=unique_gw,
                 gw_source_map=gw_source_map if gw_source_map else None,
             )
 
@@ -1586,22 +1828,69 @@ def main():
                 "comparison_window": list(comparison_window),
                 "retrieval": retrieval_metrics,
                 "retrieval_by_source": retrieval_by_source,
+                "coverage": {key: float(val.get("coverage", 0.0)) for key, val in coverage_stats.items()},
+                "effective_gallery_size_stats": coverage_stats,
                 "classification_supported": classification_supported,
                 "classification": classification_metrics,
                 "classification_by_source": classification_by_source,
                 "effective_input_window_metadata": runtime_model_args.get("effective_input_window_metadata"),
             }
-            retrieval_rows[name] = retrieval_metrics
             del negative_embeddings, embeddings, model
+        elif model_type == "skymap":
+            if gallery_candidate_mode != "time_sky_hard":
+                raise ValueError("skymap-only model requires gallery_candidate_mode='time_sky_hard'")
+            outcomes = score_all_galleries_skymap(
+                positive_bank={"opt_coords": positive_query_bank["opt_coords"]},
+                galleries=galleries,
+                gw_skymaps=gallery_gw_skymaps,
+            )
+            retrieval_metrics, retrieval_by_source, coverage_stats = aggregate_gallery_outcomes(
+                outcomes=outcomes,
+                gallery_sizes=gallery_sizes,
+                n_trials=n_trials,
+                unique_gw=unique_gw,
+                gw_source_map=gw_source_map if gw_source_map else None,
+            )
+            model_results[name] = {
+                "type": model_type,
+                "scoring": "skymap",
+                "resolved_checkpoint": None,
+                "resolved_config": None,
+                "original_model_window": None,
+                "comparison_window": list(comparison_window),
+                "retrieval": retrieval_metrics,
+                "retrieval_by_source": retrieval_by_source,
+                "coverage": {key: float(val.get("coverage", 0.0)) for key, val in coverage_stats.items()},
+                "effective_gallery_size_stats": coverage_stats,
+                "classification_supported": False,
+                "classification": None,
+                "classification_by_source": {},
+            }
         else:
             raise ValueError(f"Unknown model type: {model_type}")
 
+        retrieval_rows[name] = model_results[name]["retrieval"]
+        model_curve_rows = build_curve_rows(
+            method_name=name,
+            gallery_sizes=gallery_sizes,
+            retrieval_metrics=model_results[name]["retrieval"],
+            coverage_stats=model_results[name]["effective_gallery_size_stats"],
+        )
+        model_results[name]["curve_rows"] = model_curve_rows
+        curve_rows.extend(model_curve_rows)
+
         for gallery_size in gallery_sizes:
+            coverage_info = model_results[name]["effective_gallery_size_stats"].get(f"gallery_{gallery_size}", {})
             r1 = model_results[name]["retrieval"].get(f"gallery_{gallery_size}_recall_at_1", 0.0)
             r5 = model_results[name]["retrieval"].get(f"gallery_{gallery_size}_recall_at_5", 0.0)
             r10 = model_results[name]["retrieval"].get(f"gallery_{gallery_size}_recall_at_10", 0.0)
             mrr = model_results[name]["retrieval"].get(f"gallery_{gallery_size}_mrr", 0.0)
-            print(f"  gallery={gallery_size}  R@1={r1:.4f}  R@5={r5:.4f}  R@10={r10:.4f}  MRR={mrr:.4f}")
+            print(
+                f"  gallery={gallery_size}  R@1={r1:.4f}  R@5={r5:.4f}  "
+                f"R@10={r10:.4f}  MRR={mrr:.4f}  "
+                f"coverage={coverage_info.get('coverage', 0.0):.3f}  "
+                f"effN={coverage_info.get('effective_gallery_size_mean', 0.0):.1f}"
+            )
         if model_results[name]["classification_supported"] and model_results[name]["classification"]:
             cls = model_results[name]["classification"]
             print(
@@ -1622,13 +1911,18 @@ def main():
 
     output_dir = Path(cfg["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
+    plot_retrieval_curves(curve_rows, output_dir)
+    plot_retrieval_coverage(curve_rows, output_dir)
     output = {
         "table": {
             "gallery_sizes": gallery_sizes,
             "metric_labels": TABLE_METRIC_LABELS,
             "rows": build_table_rows(retrieval_rows, gallery_sizes, model_names),
         },
+        "curve_rows": curve_rows,
         "models": dict(model_results),
+        "sampled_positive_summary": sampled_positive_summary,
+        "gallery_positive_summary": gallery_positive_summary,
         "config": {
             "input_config": cfg["input_config"],
             "test_data_path": cfg["test_data_path"],
@@ -1649,6 +1943,10 @@ def main():
             "used_num_workers": cfg.get("used_num_workers", cfg["num_workers"]),
             "gallery_sizes": gallery_sizes,
             "gallery_trials": n_trials,
+            "gallery_candidate_mode": cfg["gallery_candidate_mode"],
+            "gallery_candidate_time_window_days": cfg["gallery_candidate_time_window_days"],
+            "gallery_candidate_credible_level_max": cfg["gallery_candidate_credible_level_max"],
+            "gallery_include_undersized": cfg["gallery_include_undersized"],
             "comparison_window": list(comparison_window),
             "n_neg_samples": cfg["n_neg_samples"],
             "neg_time_offset_enable": cfg["neg_time_offset_enable"],
@@ -1662,6 +1960,12 @@ def main():
             "dt_bin_edges": dt_bin_edges if dt_bin_edges is not None else None,
             "report_dt_macro": cfg["report_dt_macro"],
             "hard_negative_strategy": cfg["hard_negative_strategy"],
+            "n_unique_gw": gallery_positive_summary["n_unique_gw"],
+            "n_gallery_positives": gallery_positive_summary["n_total_positives"],
+            "gallery_positives_per_gw": gallery_positive_summary["positives_per_gw"],
+            "n_sampled_positives": sampled_positive_summary["n_sampled_positives"],
+            "n_sampled_positive_gw": sampled_positive_summary["n_unique_gw"],
+            "sampled_positives_per_gw": sampled_positive_summary["sampled_positives_per_gw"],
             "models": [
                 {
                     "name": spec["name"],
