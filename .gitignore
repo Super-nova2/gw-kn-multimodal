@@ -38,3 +38,7 @@ hpo_results/
 # Deprecated / internal
 PRD/
 docs/superpowers/
+
+# test 
+tests/
+optical_only/submit_create_elasticc_test_negative_h5.sh

@@ -5,10 +5,11 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=32G
+#SBATCH --mem=96G
 #SBATCH --gres=gpu:1
-#SBATCH --time=4:00:00
+#SBATCH --time=8:00:00
 #SBATCH --partition=gpu
+#SBATCH --tmp=100G
 
 set -euo pipefail
 
@@ -34,6 +35,7 @@ MODEL_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 SCRIPT_PATH="${REPO_ROOT}/${SCRIPT_REL_PATH}"
 EVAL_SCRIPT="${MODEL_DIR}/script/eval_retrieval_comparison.py"
 DEFAULT_CONFIG_PATH="${REPO_ROOT}/${DEFAULT_CONFIG_REL}"
+DEFAULT_OUTPUT_DIR="${MODEL_DIR}/eval_results/ablation_comparison"
 WORKSPACE_ROOT="${WORKSPACE_ROOT:-${WORKSPACE_ROOT_DEFAULT}}"
 LOG_DIR="${WORKSPACE_ROOT}/logs/eval"
 DEFAULT_OUTPUT_LOG="${LOG_DIR}/%x_%j.out"
@@ -108,14 +110,52 @@ fi
 
 which python
 
+if ! command -v jq >/dev/null 2>&1; then
+    echo "jq not found; required to parse retrieval comparison config." >&2
+    exit 1
+fi
+
+TEST_DATA_PATH=$(jq -r '.test_data_path // empty' "$config_file")
+NEG_DATA_PATH=$(jq -r '.neg_data_path // empty' "$config_file")
+NEG_GROUP=$(jq -r '.neg_group // empty' "$config_file")
+OUTPUT_DIR=$(jq -r '.output_dir // empty' "$config_file")
+DEVICE=$(jq -r '.device // "cuda"' "$config_file")
+AMP_DTYPE=$(jq -r '.amp_dtype // empty' "$config_file")
+GALLERY_SIZES=$(jq -r '.gallery_sizes // empty' "$config_file")
+GALLERY_TRIALS=$(jq -r '.gallery_trials // empty' "$config_file")
+GALLERY_CANDIDATE_MODE=$(jq -r '.gallery_candidate_mode // "time_sky_hard"' "$config_file")
+GALLERY_CANDIDATE_TIME_WINDOW_DAYS=$(jq -r '.gallery_candidate_time_window_days // empty' "$config_file")
+GALLERY_CANDIDATE_CREDIBLE_LEVEL_MAX=$(jq -r '.gallery_candidate_credible_level_max // empty' "$config_file")
+GALLERY_INCLUDE_UNDERSIZED=$(jq -r '.gallery_include_undersized // "true"' "$config_file")
+MODEL_NAMES=$(jq -r '[.models[].name] | join(", ")' "$config_file")
+MODEL_COUNT=$(jq -r '.models | length' "$config_file")
+
+if [[ -z "$TEST_DATA_PATH" || "$TEST_DATA_PATH" == "null" ]]; then
+    echo "Required field missing in config: test_data_path" >&2
+    exit 1
+fi
+if [[ ! -f "$TEST_DATA_PATH" ]]; then
+    echo "Test dataset not found: $TEST_DATA_PATH" >&2
+    exit 1
+fi
+if [[ -n "$NEG_DATA_PATH" && "$NEG_DATA_PATH" != "null" && ! -f "$NEG_DATA_PATH" ]]; then
+    echo "Negative dataset not found: $NEG_DATA_PATH" >&2
+    exit 1
+fi
+if [[ -z "$OUTPUT_DIR" || "$OUTPUT_DIR" == "null" ]]; then
+    OUTPUT_DIR="${DEFAULT_OUTPUT_DIR}"
+fi
+mkdir -p "${OUTPUT_DIR}"
+
 echo "========================================"
 echo "SLURM Job Information"
 echo "========================================"
 echo "Job ID: ${SLURM_JOB_ID}"
-echo "Job Name: ${SLURM_JOB_NAME}"
+echo "Job Name: ${SLURM_JOB_NAME:-unknown}"
 echo "Node: ${SLURMD_NODENAME:-unknown}"
 echo "Partition: ${SLURM_JOB_PARTITION:-unknown}"
 echo "CPUs: ${SLURM_CPUS_PER_TASK:-unknown}"
+echo "Memory: ${SLURM_MEM_PER_NODE:-unknown}MB"
 echo "GPUs: ${CUDA_VISIBLE_DEVICES:-unknown}"
 echo "Start time: $(date)"
 echo "========================================"
@@ -124,6 +164,27 @@ echo
 echo "Workspace root: ${WORKSPACE_ROOT}"
 echo "Log dir: ${LOG_DIR}"
 echo "Config: ${config_file}"
+echo "Test data: ${TEST_DATA_PATH}"
+echo "Negative data: ${NEG_DATA_PATH:-none}"
+echo "Negative group: ${NEG_GROUP:-none}"
+echo "Output dir: ${OUTPUT_DIR}"
+echo "Device: ${DEVICE}"
+echo "AMP dtype: ${AMP_DTYPE:-auto}"
+echo "Models (${MODEL_COUNT}): ${MODEL_NAMES}"
+echo "Gallery sizes: ${GALLERY_SIZES:-default}"
+echo "Gallery trials: ${GALLERY_TRIALS:-default}"
+echo "Gallery candidate mode: ${GALLERY_CANDIDATE_MODE}"
+if [[ -n "${GALLERY_CANDIDATE_TIME_WINDOW_DAYS}" && "${GALLERY_CANDIDATE_TIME_WINDOW_DAYS}" != "null" ]]; then
+    echo "Candidate time window: +/-${GALLERY_CANDIDATE_TIME_WINDOW_DAYS} days"
+fi
+if [[ -n "${GALLERY_CANDIDATE_CREDIBLE_LEVEL_MAX}" && "${GALLERY_CANDIDATE_CREDIBLE_LEVEL_MAX}" != "null" ]]; then
+    echo "Candidate credible max: ${GALLERY_CANDIDATE_CREDIBLE_LEVEL_MAX}"
+fi
+echo "Include undersized galleries: ${GALLERY_INCLUDE_UNDERSIZED}"
+echo "Expected outputs:"
+echo "  ${OUTPUT_DIR}/ablation_comparison.json"
+echo "  ${OUTPUT_DIR}/retrieval_curves.png"
+echo "  ${OUTPUT_DIR}/retrieval_coverage.png"
 echo "Command: python -u ${EVAL_SCRIPT} --config ${config_file}"
 
 cd "${REPO_ROOT}"
