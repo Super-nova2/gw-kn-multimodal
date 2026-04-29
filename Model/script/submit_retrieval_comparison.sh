@@ -5,9 +5,9 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=96G
+#SBATCH --mem=160G
 #SBATCH --gres=gpu:1
-#SBATCH --time=8:00:00
+#SBATCH --time=16:00:00
 #SBATCH --partition=gpu
 #SBATCH --tmp=100G
 
@@ -127,6 +127,8 @@ GALLERY_CANDIDATE_MODE=$(jq -r '.gallery_candidate_mode // "time_sky_hard"' "$co
 GALLERY_CANDIDATE_TIME_WINDOW_DAYS=$(jq -r '.gallery_candidate_time_window_days // empty' "$config_file")
 GALLERY_CANDIDATE_CREDIBLE_LEVEL_MAX=$(jq -r '.gallery_candidate_credible_level_max // empty' "$config_file")
 GALLERY_INCLUDE_UNDERSIZED=$(jq -r '.gallery_include_undersized // "true"' "$config_file")
+STAGE_TO_JOBFS=$(jq -r '.stage_to_jobfs // false' "$config_file")
+TUTORIAL_NEG_DATA_PATH=$(jq -r '.tutorial_neg_data_path // empty' "$config_file")
 MODEL_NAMES=$(jq -r '[.models[].name] | join(", ")' "$config_file")
 MODEL_COUNT=$(jq -r '.models | length' "$config_file")
 
@@ -185,6 +187,31 @@ echo "Expected outputs:"
 echo "  ${OUTPUT_DIR}/ablation_comparison.json"
 echo "  ${OUTPUT_DIR}/retrieval_curves.png"
 echo "  ${OUTPUT_DIR}/retrieval_coverage.png"
+
+if [[ "$STAGE_TO_JOBFS" == "true" ]]; then
+    JOBFS_DIR="${SLURM_TMPDIR:-${TMPDIR:-${JOBFS:-}}}"
+    if [[ -n "$JOBFS_DIR" ]]; then
+        echo "Staging data files to local disk: $JOBFS_DIR"
+        cp -f "$TEST_DATA_PATH" "$JOBFS_DIR"/
+        TEST_DATA_PATH="$JOBFS_DIR/$(basename "$TEST_DATA_PATH")"
+
+        if [[ -n "$NEG_DATA_PATH" && "$NEG_DATA_PATH" != "null" ]]; then
+            cp -f "$NEG_DATA_PATH" "$JOBFS_DIR"/
+            NEG_DATA_PATH="$JOBFS_DIR/$(basename "$NEG_DATA_PATH")"
+        fi
+        if [[ -n "$TUTORIAL_NEG_DATA_PATH" && "$TUTORIAL_NEG_DATA_PATH" != "null" ]]; then
+            cp -f "$TUTORIAL_NEG_DATA_PATH" "$JOBFS_DIR"/
+        fi
+        if [[ -n "${NEG_OFFSET_DIST_NPZ:-}" && "${NEG_OFFSET_DIST_NPZ}" != "null" ]]; then
+            cp -f "$NEG_OFFSET_DIST_NPZ" "$JOBFS_DIR"/
+        fi
+        export JOBFS_DIR
+        echo "Staging complete. Using JOBFS_DIR=$JOBFS_DIR"
+    else
+        echo "No local tmp dir found; skip staging."
+    fi
+fi
+
 echo "Command: python -u ${EVAL_SCRIPT} --config ${config_file}"
 
 cd "${REPO_ROOT}"

@@ -11,6 +11,25 @@ import torch
 
 TABLE_METRIC_LABELS = ["R@1", "R@5", "R@10", "MRR"]
 TABLE_METRIC_KEYS = ["recall_at_1", "recall_at_5", "recall_at_10", "mrr"]
+PLOT_DPI = 300
+PLOT_METHOD_LABELS = {
+    "skymap-only": "Skymap-only",
+    "optical-only": "Optical-only",
+    "w/o \u5bf9\u6bd4\u5b66\u4e60": "w/o Contrastive Learning",
+    "w/o \u4ea4\u53c9\u6ce8\u610f\u529b": "w/o Cross-Attention",
+    "w/o \u878d\u5408\u5206\u652f": "w/o Fusion Branch",
+    "\u5168\u6a21\u6001": "Full Multimodal",
+    "\u5168\u6a21\u6001 + \u56f0\u96be\u6837\u672c\u6316\u6398": "Full Multimodal + Hard Mining",
+}
+
+
+def _plot_method_label(method: str) -> str:
+    return PLOT_METHOD_LABELS.get(str(method), str(method))
+
+
+def _remove_stale_pdf(path: Path) -> None:
+    if path.exists():
+        path.unlink()
 
 
 def _as_numpy_1d(value: Any, *, dtype: np.dtype) -> np.ndarray:
@@ -533,7 +552,7 @@ def plot_retrieval_curves(curve_rows: Sequence[Mapping[str, Any]], output_dir: P
                 [float(row["metric_value"]) for row in method_rows],
                 marker="o",
                 linewidth=2,
-                label=method,
+                label=_plot_method_label(method),
             )
         ax.set_xscale("log")
         ax.set_xlabel("Gallery Size")
@@ -545,8 +564,8 @@ def plot_retrieval_curves(curve_rows: Sequence[Mapping[str, Any]], output_dir: P
     if handles:
         fig.legend(handles, labels, loc="upper center", ncol=max(1, min(4, len(labels))), frameon=False)
     fig.tight_layout(rect=(0, 0, 1, 0.92))
-    fig.savefig(output_dir / "retrieval_curves.png", dpi=180, bbox_inches="tight")
-    fig.savefig(output_dir / "retrieval_curves.pdf", bbox_inches="tight")
+    fig.savefig(output_dir / "retrieval_curves.png", dpi=PLOT_DPI, bbox_inches="tight")
+    _remove_stale_pdf(output_dir / "retrieval_curves.pdf")
     plt.close(fig)
 
 
@@ -584,7 +603,7 @@ def plot_retrieval_coverage(curve_rows: Sequence[Mapping[str, Any]], output_dir:
             [payload["coverage"] for _, payload in ordered],
             marker="o",
             linewidth=2,
-            label=method,
+            label=_plot_method_label(method),
         )
 
     ax.set_xscale("log")
@@ -595,6 +614,6 @@ def plot_retrieval_coverage(curve_rows: Sequence[Mapping[str, Any]], output_dir:
     ax.grid(True, alpha=0.3)
     ax.legend(frameon=False)
     fig.tight_layout()
-    fig.savefig(output_dir / "retrieval_coverage.png", dpi=180, bbox_inches="tight")
-    fig.savefig(output_dir / "retrieval_coverage.pdf", bbox_inches="tight")
+    fig.savefig(output_dir / "retrieval_coverage.png", dpi=PLOT_DPI, bbox_inches="tight")
+    _remove_stale_pdf(output_dir / "retrieval_coverage.pdf")
     plt.close(fig)

@@ -168,6 +168,25 @@ def parse_day_windows(text: str) -> List[float]:
     return vals
 
 
+def normalize_lupt_m5_mag(value) -> Tuple[float, float, float, float, float, float]:
+    """Normalize mTAN luptitude m5 values from JSON/checkpoint/HDF5 sources."""
+    if value is None:
+        value = (23.9, 25.0, 24.7, 24.0, 23.3, 22.1)
+    if isinstance(value, str):
+        parts = [part.strip() for part in value.split(",") if part.strip()]
+    else:
+        parts = list(np.asarray(value).reshape(-1))
+    if len(parts) != 6:
+        raise ValueError(f"mtan_lupt_m5_mag must contain 6 values in u,g,r,i,z,Y order; got {len(parts)}.")
+    try:
+        out = tuple(float(part) for part in parts)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("mtan_lupt_m5_mag contains non-numeric values.") from exc
+    if not np.all(np.isfinite(np.asarray(out, dtype=np.float64))):
+        raise ValueError("mtan_lupt_m5_mag values must be finite.")
+    return out
+
+
 def resolve_mtan_eval_config(test_data_path: str, saved_args: Dict[str, object]) -> Dict[str, object]:
     cfg: Dict[str, object] = {
         "mtan_snr_s0": float(saved_args.get("mtan_snr_s0", 3.0)),
@@ -177,7 +196,7 @@ def resolve_mtan_eval_config(test_data_path: str, saved_args: Dict[str, object])
         "mtan_snr_eps": float(saved_args.get("mtan_snr_eps", 1e-9)),
         "mtan_lupt_psfflux_zp": float(saved_args.get("mtan_lupt_psfflux_zp", 31.4)),
         "mtan_lupt_k": float(saved_args.get("mtan_lupt_k", 1.0)),
-        "mtan_lupt_m5_mag": tuple(saved_args.get("mtan_lupt_m5_mag", (23.9, 25.0, 24.7, 24.0, 23.3, 22.1))),
+        "mtan_lupt_m5_mag": normalize_lupt_m5_mag(saved_args.get("mtan_lupt_m5_mag")),
     }
     if test_data_path and os.path.exists(test_data_path):
         try:
@@ -812,7 +831,7 @@ def load_negative_optical_samples(
     
     rng = np.random.default_rng(seed)
     
-    with h5py.File(neg_data_path, 'r') as f:
+    with h5py.File(neg_data_path, 'r', rdcc_nbytes=4 * 1024 * 1024 * 1024) as f:
         grp = f[neg_group]
         total_samples = grp['values'].shape[0]
         has_zero_time_mjd_base = 'zero_time_mjd_base' in grp
@@ -842,23 +861,40 @@ def load_negative_optical_samples(
             sample_indices = np.sort(sample_indices)  # Sort for efficient HDF5 access
             print(f"Loading {n_samples} negative optical samples from {neg_data_path}")
         
-        # Load data
-        neg_data = {
-            'values': torch.from_numpy(grp['values'][sample_indices]),
-            'times': torch.from_numpy(grp['times'][sample_indices]),
-            'masks': torch.from_numpy(grp['masks'][sample_indices]),
-            'errors': torch.from_numpy(grp['errors'][sample_indices]),
-            'coordinates': torch.from_numpy(grp['coordinates'][sample_indices]),
-        }
+        # Load data.  When sampling a random subset, sequential full-array
+        # reads are faster than chunk-by-chunk fancy indexing because the
+        # random indices scatter across virtually every chunk anyway.
+        if n_samples < total_samples:
+            full_vals = np.asarray(grp['values'][:])
+            neg_data = {'values': torch.from_numpy(full_vals[sample_indices])}
+            del full_vals
+            full_times = np.asarray(grp['times'][:])
+            neg_data['times'] = torch.from_numpy(full_times[sample_indices])
+            del full_times
+            full_masks = np.asarray(grp['masks'][:])
+            neg_data['masks'] = torch.from_numpy(full_masks[sample_indices])
+            del full_masks
+            full_errs = np.asarray(grp['errors'][:])
+            neg_data['errors'] = torch.from_numpy(full_errs[sample_indices])
+            del full_errs
+            neg_data['coordinates'] = torch.from_numpy(grp['coordinates'][:][sample_indices])
+        else:
+            neg_data = {
+                'values': torch.from_numpy(grp['values'][:]),
+                'times': torch.from_numpy(grp['times'][:]),
+                'masks': torch.from_numpy(grp['masks'][:]),
+                'errors': torch.from_numpy(grp['errors'][:]),
+                'coordinates': torch.from_numpy(grp['coordinates'][:]),
+            }
         if has_zero_time_mjd_base:
             neg_data['zero_time_mjd_base'] = torch.from_numpy(grp['zero_time_mjd_base'][sample_indices])
         if has_zero_time_mjd_cls_base:
             neg_data['zero_time_mjd_cls_base'] = torch.from_numpy(grp[str(nonkn_cls_base_field)][sample_indices])
         
-        # Load types if available
+        # Load types if available (bulk read to avoid per-element HDF5 access)
         if 'types' in grp:
-            neg_data['types'] = [grp['types'][i].decode() if isinstance(grp['types'][i], bytes) 
-                                 else grp['types'][i] for i in sample_indices]
+            raw_types = np.asarray(grp['types'][sample_indices])
+            neg_data['types'] = [t.decode() if isinstance(t, bytes) else t for t in raw_types]
 
     if runtime_input_window_start is not None and runtime_input_window_end is not None:
         cropped_time, cropped_val, cropped_mask, cropped_err, _ = apply_runtime_input_window_torch(

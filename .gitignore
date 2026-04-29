@@ -31,6 +31,7 @@ hpo_results/
 # User-local JSON configs (track .json.example templates only)
 *.json
 !*.json.example
+!Model/args/eval/retrieval_gw170817a_lsst.json
 
 # Generated exports
 *.html
@@ -40,5 +41,6 @@ PRD/
 docs/superpowers/
 
 # test 
+tmp/
 tests/
 optical_only/submit_create_elasticc_test_negative_h5.sh
