@@ -43,6 +43,7 @@ from data_loader import (  # noqa: E402
     BalancedGWBatchedSampler,
     _build_dataloader,
     _read_root_time_window_attrs,
+    apply_runtime_input_window_torch,
     build_effective_input_window_metadata,
     build_gw_to_lc_mapping,
 )
@@ -112,6 +113,11 @@ def _resolve_path(base_dir: Path, value: Optional[str]) -> Optional[str]:
     path = Path(str(value)).expanduser()
     if not path.is_absolute():
         path = (base_dir / path).resolve()
+    jobfs_dir = os.environ.get("JOBFS_DIR")
+    if jobfs_dir:
+        staged = Path(jobfs_dir) / path.name
+        if staged.is_file():
+            return str(staged)
     return str(path)
 
 
@@ -432,6 +438,9 @@ def load_test_positive_index_map(test_data_path: str) -> Tuple[Dict[int, np.ndar
 def load_selected_positive_bank(
     test_data_path: str,
     selected_optical_indices: np.ndarray,
+    *,
+    runtime_input_window_start: Optional[float] = None,
+    runtime_input_window_end: Optional[float] = None,
 ) -> Tuple[Dict[str, torch.Tensor], Dict[int, int]]:
     selected = np.unique(np.asarray(selected_optical_indices, dtype=np.int64).reshape(-1))
     if selected.size == 0:
@@ -446,29 +455,134 @@ def load_selected_positive_bank(
             if field not in opt:
                 raise KeyError(f"Missing required field 'events/optical_data/{field}' in {test_data_path}")
 
-        opt_t_raw = torch.from_numpy(np.asarray(opt["times"][selected], dtype=np.float32))
-        opt_v_raw = torch.from_numpy(np.asarray(opt["values"][selected], dtype=np.float32))
-        opt_mask_raw = torch.from_numpy(np.asarray(opt["masks"][selected], dtype=np.float32))
-        opt_err_raw = torch.from_numpy(np.asarray(opt["errors"][selected], dtype=np.float32))
+        opt_t = torch.from_numpy(np.asarray(opt["times"][selected], dtype=np.float32))
+        opt_v = torch.from_numpy(np.asarray(opt["values"][selected], dtype=np.float32))
+        opt_mask = torch.from_numpy(np.asarray(opt["masks"][selected], dtype=np.float32))
+        opt_err = torch.from_numpy(np.asarray(opt["errors"][selected], dtype=np.float32))
         opt_coords = torch.from_numpy(np.asarray(opt["coordinates"][selected], dtype=np.float32))
         gw_indices = torch.from_numpy(np.asarray(opt["parent_gw_idx"][selected], dtype=np.int64))
 
+    apply_window = (runtime_input_window_start is not None) and (runtime_input_window_end is not None)
+    if apply_window:
+        opt_t, opt_v, opt_mask, opt_err, _ = apply_runtime_input_window_torch(
+            opt_t, opt_v, opt_mask, opt_err,
+            window_start=runtime_input_window_start,
+            window_end=runtime_input_window_end,
+        )
+
     bank: Dict[str, torch.Tensor] = {
-        "times": opt_t_raw,
-        "values": opt_v_raw,
-        "masks": opt_mask_raw,
-        "errors": opt_err_raw,
+        "times": opt_t,
+        "values": opt_v,
+        "masks": opt_mask,
+        "errors": opt_err,
         "coordinates": opt_coords,
         "gw_indices": gw_indices,
         "source_optical_indices": torch.from_numpy(selected.astype(np.int64, copy=False)),
-        "opt_t_raw": opt_t_raw,
-        "opt_v_raw": opt_v_raw,
-        "opt_mask_raw": opt_mask_raw,
-        "opt_err_raw": opt_err_raw,
+        "opt_t_raw": opt_t,
+        "opt_v_raw": opt_v,
+        "opt_mask_raw": opt_mask,
+        "opt_err_raw": opt_err,
         "opt_coords": opt_coords,
     }
     remap = {int(source_idx): int(compact_idx) for compact_idx, source_idx in enumerate(selected.tolist())}
     return bank, remap
+
+
+def build_batch_positive_bank_and_galleries(
+    cached_batches,
+    candidate_sequences,
+    gallery_sizes,
+    n_trials,
+    include_undersized,
+    seed: int = 42,
+):
+    """Build positive bank from Phase 1 batch samples (batch-based mode).
+
+    The bank preserves every sampled row in the cached batches. Galleries then
+    draw positives from those sampled rows, matching the original batch-sampled
+    retrieval evaluation instead of the full-test positive pool.
+
+    Returns:
+        bank: Dict[str, torch.Tensor] — same format as load_selected_positive_bank
+        galleries: Dict keyed by (gallery_size, trial, gw_id)
+        unique_gw: List of GW ids present in the bank
+    """
+    # --- Keep all sampled positive rows from cached batches ---
+    opt_t_parts: List[torch.Tensor] = []
+    opt_v_parts: List[torch.Tensor] = []
+    opt_mask_parts: List[torch.Tensor] = []
+    opt_err_parts: List[torch.Tensor] = []
+    opt_coords_parts: List[torch.Tensor] = []
+    gw_idx_parts: List[torch.Tensor] = []
+    for batch_data in cached_batches:
+        opt_t_parts.append(batch_data[2].float().cpu())
+        opt_v_parts.append(batch_data[3].float().cpu())
+        opt_mask_parts.append(batch_data[4].float().cpu())
+        opt_err_parts.append(batch_data[5].float().cpu())
+        opt_coords_parts.append(batch_data[6].float().cpu())
+        gw_idx_parts.append(batch_data[7].long().cpu())
+
+    if not gw_idx_parts:
+        raise ValueError("cached_batches is empty; cannot build batch-sampled positive bank.")
+
+    bank: Dict[str, torch.Tensor] = {
+        "times": torch.cat(opt_t_parts, dim=0),
+        "values": torch.cat(opt_v_parts, dim=0),
+        "masks": torch.cat(opt_mask_parts, dim=0),
+        "errors": torch.cat(opt_err_parts, dim=0),
+        "coordinates": torch.cat(opt_coords_parts, dim=0),
+        "gw_indices": torch.cat(gw_idx_parts, dim=0),
+    }
+    n_pos = int(bank["gw_indices"].shape[0])
+    bank["source_optical_indices"] = torch.arange(n_pos, dtype=torch.long)
+    bank["opt_t_raw"] = bank["times"]
+    bank["opt_v_raw"] = bank["values"]
+    bank["opt_mask_raw"] = bank["masks"]
+    bank["opt_err_raw"] = bank["errors"]
+    bank["opt_coords"] = bank["coordinates"]
+
+    gw_to_bank_indices: Dict[int, List[int]] = {}
+    for bank_idx, gw_id in enumerate(bank["gw_indices"].tolist()):
+        gw_to_bank_indices.setdefault(int(gw_id), []).append(int(bank_idx))
+    gw_to_bank_arrays = {
+        gw_id: np.asarray(indices, dtype=np.int64)
+        for gw_id, indices in gw_to_bank_indices.items()
+    }
+
+    # --- Build galleries referencing compact bank indices ---
+    galleries: Dict[Tuple[int, int, int], Dict[str, Any]] = {}
+    used_gw = sorted(gw_to_bank_arrays.keys())
+
+    for trial in range(int(n_trials)):
+        trial_rng = np.random.default_rng(int(seed) + 15485863 * int(trial))
+        for gw_id in used_gw:
+            gw_bank_indices = gw_to_bank_arrays[int(gw_id)]
+            positive_index = int(gw_bank_indices[trial_rng.integers(gw_bank_indices.size)])
+            seq = candidate_sequences.get((int(trial), int(gw_id)), {})
+            neg_idx_full = np.asarray(seq.get("candidate_indices", []), dtype=np.int64).reshape(-1)
+            neg_cred_full = np.asarray(seq.get("credible_levels", []), dtype=np.float32).reshape(-1)
+            neg_dt_full = np.asarray(seq.get("abs_dt_days", []), dtype=np.float32).reshape(-1)
+
+            for gallery_size in gallery_sizes:
+                requested = int(gallery_size)
+                target_neg = max(requested - 1, 0)
+                available_neg = int(neg_idx_full.shape[0])
+                if target_neg > available_neg and not bool(include_undersized):
+                    continue
+                take_neg = min(target_neg, available_neg)
+                actual_gallery_size = 1 + int(take_neg)
+                galleries[(requested, int(trial), int(gw_id))] = {
+                    "positive_index": positive_index,
+                    "negative_indices": neg_idx_full[:take_neg].astype(np.int64, copy=False),
+                    "negative_credible_levels": neg_cred_full[:take_neg].astype(np.float32, copy=False),
+                    "negative_abs_dt_days": neg_dt_full[:take_neg].astype(np.float32, copy=False),
+                    "requested_gallery_size": requested,
+                    "actual_gallery_size": actual_gallery_size,
+                    "coverage_met": bool(actual_gallery_size >= requested),
+                    "is_undersized": bool(actual_gallery_size < requested),
+                }
+
+    return bank, galleries, used_gw
 
 
 def remap_gallery_positive_indices(
@@ -632,45 +746,64 @@ def precompute_tutorial_galleries(
     n_trials,
     seed,
 ):
-    """Build galleries with one matched KN and tutorial non-KN distractors."""
-    rng = np.random.default_rng(int(seed))
-    unique_gw = sorted(int(gw_id) for gw_id in gw_positive_indices.keys())
-    galleries: Dict[Tuple[int, int, int], Dict[str, Any]] = {}
-    neg_pool = np.arange(int(n_tutorial_negatives), dtype=np.int64)
+    """Build galleries with one matched KN and tutorial non-KN distractors.
 
-    for gallery_size in gallery_sizes:
-        for trial in range(int(n_trials)):
-            for gw_id in unique_gw:
-                gw_idxs = np.asarray(gw_positive_indices.get(int(gw_id), []), dtype=np.int64).reshape(-1)
-                if gw_idxs.size == 0:
-                    raise ValueError(f"GW event {gw_id} has no positive optical samples available for gallery construction.")
-                correct_idx = int(gw_idxs[rng.integers(gw_idxs.size)])
-                if int(gallery_size) <= 1:
-                    galleries[(int(gallery_size), int(trial), int(gw_id))] = {
+    For each (trial, gw_id) the positive is sampled once and reused across
+    all gallery sizes.  Negative distractors are generated as one random
+    permutation per (trial, gw_id); larger galleries use the prefix of
+    that permutation so that a small gallery is always a subset of a
+    larger gallery for the same (trial, gw_id).
+    """
+    base_rng = np.random.default_rng(int(seed))
+    unique_gw = sorted(int(gw_id) for gw_id in gw_positive_indices.keys())
+    max_neg_pool = int(n_tutorial_negatives)
+    max_neg_needed = max(int(s) - 1 for s in gallery_sizes)
+    max_neg_needed = max(0, min(max_neg_needed, max_neg_pool))
+    galleries: Dict[Tuple[int, int, int], Dict[str, Any]] = {}
+    gallery_sizes = [int(s) for s in gallery_sizes]
+
+    for trial in range(int(n_trials)):
+        for gw_id in unique_gw:
+            gw_idxs = np.asarray(gw_positive_indices.get(int(gw_id), []), dtype=np.int64).reshape(-1)
+            if gw_idxs.size == 0:
+                raise ValueError(
+                    f"GW event {gw_id} has no positive optical samples available for gallery construction."
+                )
+            correct_idx = int(gw_idxs[base_rng.integers(gw_idxs.size)])
+            # One negative permutation per (trial, gw_id)
+            if max_neg_needed > 0:
+                trial_neg_order = base_rng.choice(max_neg_pool, size=max_neg_needed, replace=False)
+            else:
+                trial_neg_order = np.empty((0,), dtype=np.int64)
+
+            for gallery_size in gallery_sizes:
+                requested = int(gallery_size)
+                if requested <= 1:
+                    galleries[(requested, int(trial), int(gw_id))] = {
                         "positive_index": correct_idx,
                         "negative_indices": np.empty((0,), dtype=np.int64),
                         "negative_credible_levels": np.empty((0,), dtype=np.float32),
                         "negative_abs_dt_days": np.empty((0,), dtype=np.float32),
-                        "requested_gallery_size": int(gallery_size),
+                        "requested_gallery_size": requested,
                         "actual_gallery_size": 1,
                         "coverage_met": True,
                         "is_undersized": False,
                     }
                     continue
 
-                n_distract = min(int(gallery_size) - 1, len(neg_pool))
-                if n_distract <= 0:
+                take_neg = min(requested - 1, max_neg_needed)
+                if take_neg <= 0:
                     continue
-                distract_idxs = rng.choice(neg_pool, size=n_distract, replace=False)
-                galleries[(int(gallery_size), int(trial), int(gw_id))] = {
+                actual_size = 1 + int(take_neg)
+                galleries[(requested, int(trial), int(gw_id))] = {
                     "positive_index": correct_idx,
-                    "negative_indices": np.asarray(distract_idxs, dtype=np.int64),
-                    "negative_credible_levels": np.full((n_distract,), np.nan, dtype=np.float32),
-                    "negative_abs_dt_days": np.full((n_distract,), np.nan, dtype=np.float32),
-                    "requested_gallery_size": int(gallery_size),
-                    "actual_gallery_size": 1 + int(n_distract),
-                    "coverage_met": True,
-                    "is_undersized": False,
+                    "negative_indices": trial_neg_order[:take_neg].astype(np.int64, copy=False),
+                    "negative_credible_levels": np.full((take_neg,), np.nan, dtype=np.float32),
+                    "negative_abs_dt_days": np.full((take_neg,), np.nan, dtype=np.float32),
+                    "requested_gallery_size": requested,
+                    "actual_gallery_size": actual_size,
+                    "coverage_met": bool(actual_size >= requested),
+                    "is_undersized": bool(actual_size < requested),
                 }
 
     return galleries, unique_gw
@@ -1432,15 +1565,29 @@ def evaluate_multimodal_classification(
 
 def normalize_shared_config(cfg: Dict[str, Any], cfg_path: Path) -> Dict[str, Any]:
     cfg_dir = cfg_path.parent
-    comparison_window = (
-        float(cfg.get("comparison_window_start", DEFAULT_COMPARISON_WINDOW[0])),
-        float(cfg.get("comparison_window_end", DEFAULT_COMPARISON_WINDOW[1])),
-    )
+    # Resolve comparison window: opt_ref_start/end > comparison_window_start/end > default
+    opt_ref_start = cfg.get("opt_ref_start")
+    opt_ref_end = cfg.get("opt_ref_end")
+    if opt_ref_start is not None and opt_ref_end is not None:
+        comparison_window = (float(opt_ref_start), float(opt_ref_end))
+        comparison_window_source = "opt_ref"
+    elif cfg.get("comparison_window_start") is not None and cfg.get("comparison_window_end") is not None:
+        comparison_window = (
+            float(cfg["comparison_window_start"]),
+            float(cfg["comparison_window_end"]),
+        )
+        comparison_window_source = "comparison_window_start_end"
+    else:
+        comparison_window = DEFAULT_COMPARISON_WINDOW
+        comparison_window_source = "default"
     requested_neg_data_path = _resolve_path(cfg_dir, cfg.get("neg_data_path"))
     requested_neg_group = str(cfg.get("neg_group", DEFAULT_TUTORIAL_NEG_GROUP))
     tutorial_neg_data_path = _resolve_path(cfg_dir, cfg.get("tutorial_neg_data_path")) or DEFAULT_TUTORIAL_NEG_DATA_PATH
     tutorial_neg_group = str(cfg.get("tutorial_neg_group", DEFAULT_TUTORIAL_NEG_GROUP))
     force_tutorial_distractors = _as_bool(cfg.get("force_tutorial_distractors", True), default=True)
+    positive_selection = str(cfg.get("positive_selection", "random")).strip().lower()
+    if positive_selection not in {"random", "batch"}:
+        raise ValueError("positive_selection must be one of {'random', 'batch'}.")
     normalized = {
         "input_config": str(cfg_path),
         "test_data_path": _resolve_path(cfg_dir, cfg.get("test_data_path")),
@@ -1463,12 +1610,14 @@ def normalize_shared_config(cfg: Dict[str, Any], cfg_path: Path) -> Dict[str, An
         "gallery_candidate_time_window_days": float(cfg.get("gallery_candidate_time_window_days", 50.0)),
         "gallery_candidate_credible_level_max": float(cfg.get("gallery_candidate_credible_level_max", 0.9)),
         "gallery_include_undersized": _as_bool(cfg.get("gallery_include_undersized", True), default=True),
+        "positive_selection": positive_selection,
         "n_neg_samples": _parse_n_neg_samples(cfg.get("n_neg_samples", -1), default=-1),
         "amp_dtype": str(cfg.get("amp_dtype", "auto")),
         "no_latex": _as_bool(cfg.get("no_latex", False)),
         "comparison_window": [float(comparison_window[0]), float(comparison_window[1])],
         "comparison_window_start": float(comparison_window[0]),
         "comparison_window_end": float(comparison_window[1]),
+        "comparison_window_source": comparison_window_source,
         "neg_time_offset_enable": _as_bool(cfg.get("neg_time_offset_enable", False)),
         "neg_offset_dist_npz": _resolve_path(cfg_dir, cfg.get("neg_offset_dist_npz")),
         "neg_offset_dist_key": str(cfg.get("neg_offset_dist_key", "delta_days_combined")),
@@ -1508,7 +1657,7 @@ def main():
     print("Unified Ablation Comparison")
     print("=" * 60)
     print(f"Device: {device}")
-    print(f"Comparison window: {comparison_window}")
+    print(f"Input optical window: {comparison_window}  (source: {cfg.get('comparison_window_source', 'N/A')})")
     print(f"Gallery sizes: {gallery_sizes}")
     print(f"Models: {[spec['name'] for spec in model_specs]}")
     print(f"Gallery distractor pool: {cfg['neg_data_path']} [{cfg['neg_group']}]")
@@ -1540,41 +1689,49 @@ def main():
             f"Tutorial distractor dataset is required but unavailable: {cfg['neg_data_path']}"
         )
 
-    print(f"\n{'=' * 60}")
-    print("Phase 1: Load and cache shared retrieval batches")
-    print("=" * 60)
-    cached_batches, used_num_workers = build_cached_batches(
-        test_data_path=cfg["test_data_path"],
-        neg_data_path=None,
-        neg_group=cfg["neg_group"],
-        comparison_window=comparison_window,
-        batch_size=cfg["batch_size"],
-        test_steps=cfg["test_steps"],
-        num_workers=cfg["num_workers"],
-        target_samples=neg_target_samples,
-        nonkn_cls_base_field=cfg["nonkn_cls_base_field"],
-    )
-    cfg["used_num_workers"] = int(used_num_workers)
+    positive_selection = str(cfg["positive_selection"]).strip().lower()
 
-    gw_indices_parts = []
-    for batch_data in cached_batches:
-        gw_indices_parts.append(batch_data[7].long().cpu())
-    shared_gw_indices = torch.cat(gw_indices_parts)
-    unique_sampled_gw = sorted(torch.unique(shared_gw_indices).cpu().tolist())
-    sampled_positive_counts = np.asarray(
-        [int((shared_gw_indices == int(gw_id)).sum().item()) for gw_id in unique_sampled_gw],
-        dtype=np.int64,
-    )
-    sampled_positive_summary = {
-        "n_unique_gw": int(len(unique_sampled_gw)),
-        "n_sampled_positives": int(shared_gw_indices.numel()),
-        "sampled_positives_per_gw": {
-            "min": int(sampled_positive_counts.min()) if sampled_positive_counts.size else 0,
-            "median": float(np.median(sampled_positive_counts)) if sampled_positive_counts.size else 0.0,
-            "mean": float(np.mean(sampled_positive_counts)) if sampled_positive_counts.size else 0.0,
-            "max": int(sampled_positive_counts.max()) if sampled_positive_counts.size else 0,
-        },
-    }
+    if positive_selection == "batch":
+        print(f"\n{'=' * 60}")
+        print("Phase 1: Load and cache shared retrieval batches")
+        print("=" * 60)
+        cached_batches, used_num_workers = build_cached_batches(
+            test_data_path=cfg["test_data_path"],
+            neg_data_path=None,
+            neg_group=cfg["neg_group"],
+            comparison_window=comparison_window,
+            batch_size=cfg["batch_size"],
+            test_steps=cfg["test_steps"],
+            num_workers=cfg["num_workers"],
+            target_samples=neg_target_samples,
+            nonkn_cls_base_field=cfg["nonkn_cls_base_field"],
+        )
+        cfg["used_num_workers"] = int(used_num_workers)
+
+        gw_indices_parts = []
+        for batch_data in cached_batches:
+            gw_indices_parts.append(batch_data[7].long().cpu())
+        shared_gw_indices = torch.cat(gw_indices_parts)
+        unique_sampled_gw = sorted(torch.unique(shared_gw_indices).cpu().tolist())
+        sampled_positive_counts = np.asarray(
+            [int((shared_gw_indices == int(gw_id)).sum().item()) for gw_id in unique_sampled_gw],
+            dtype=np.int64,
+        )
+        sampled_positive_summary = {
+            "n_unique_gw": int(len(unique_sampled_gw)),
+            "n_sampled_positives": int(shared_gw_indices.numel()),
+            "sampled_positives_per_gw": {
+                "min": int(sampled_positive_counts.min()) if sampled_positive_counts.size else 0,
+                "median": float(np.median(sampled_positive_counts)) if sampled_positive_counts.size else 0.0,
+                "mean": float(np.mean(sampled_positive_counts)) if sampled_positive_counts.size else 0.0,
+                "max": int(sampled_positive_counts.max()) if sampled_positive_counts.size else 0,
+            },
+        }
+    else:
+        cached_batches = []
+        cfg["used_num_workers"] = cfg["num_workers"]
+        sampled_positive_summary = None
+
     gw_positive_indices, all_test_gw_ids = load_test_positive_index_map(cfg["test_data_path"])
     full_test_positive_counts = np.asarray(
         [int(np.asarray(gw_positive_indices[int(gw_id)]).size) for gw_id in all_test_gw_ids],
@@ -1597,60 +1754,106 @@ def main():
     print("=" * 60)
     gallery_candidate_mode = str(cfg["gallery_candidate_mode"]).strip().lower()
     gallery_gw_skymaps: Dict[int, torch.Tensor] = {}
-    if gallery_candidate_mode == "time_sky_hard":
-        candidate_sequences, gallery_gw_skymaps, _gallery_gw_times = build_time_sky_candidate_sequences(
-            test_data_path=cfg["test_data_path"],
-            unique_gw_ids=all_test_gw_ids,
-            neg_optical_data=neg_optical_data,
-            n_trials=n_trials,
-            seed=seed,
-            time_window_days=cfg["gallery_candidate_time_window_days"],
-            credible_level_max=cfg["gallery_candidate_credible_level_max"],
-            zero_time_field=cfg["nonkn_cls_base_field"],
-        )
-        galleries, unique_gw = build_prefixed_gallery_specs(
-            gw_positive_indices=gw_positive_indices,
-            candidate_sequences=candidate_sequences,
-            gallery_sizes=gallery_sizes,
-            n_trials=n_trials,
-            seed=seed,
-            include_undersized=bool(cfg["gallery_include_undersized"]),
-        )
-        print(
-            "  Built hard-filtered galleries with "
-            f"time_window=±{cfg['gallery_candidate_time_window_days']:.1f} days, "
-            f"credible<= {cfg['gallery_candidate_credible_level_max']:.3f}, "
-            f"include_undersized={bool(cfg['gallery_include_undersized'])}"
-        )
-    elif gallery_candidate_mode == "tutorial_random":
-        galleries, unique_gw = precompute_tutorial_galleries(
-            gw_positive_indices,
-            int(neg_optical_data["times"].shape[0]),
-            gallery_sizes,
-            n_trials,
-            seed,
-        )
+
+    if gallery_candidate_mode in ("time_sky_hard", "tutorial_random"):
+        # Build candidate sequences (shared across both modes for time_sky_hard)
+        if gallery_candidate_mode == "time_sky_hard":
+            candidate_sequences, gallery_gw_skymaps, _gallery_gw_times = build_time_sky_candidate_sequences(
+                test_data_path=cfg["test_data_path"],
+                unique_gw_ids=all_test_gw_ids,
+                neg_optical_data=neg_optical_data,
+                n_trials=n_trials,
+                seed=seed,
+                time_window_days=cfg["gallery_candidate_time_window_days"],
+                credible_level_max=cfg["gallery_candidate_credible_level_max"],
+                zero_time_field=cfg["nonkn_cls_base_field"],
+            )
+        else:
+            candidate_sequences = {}
+
+        if positive_selection == "batch":
+            # --- Batch-based: one positive per GW from Phase 1 samples ---
+            positive_query_bank, galleries, unique_gw = build_batch_positive_bank_and_galleries(
+                cached_batches,
+                candidate_sequences,
+                gallery_sizes,
+                n_trials,
+                include_undersized=bool(cfg["gallery_include_undersized"]),
+                seed=seed,
+            )
+            print(
+                "  Built galleries with batch-sampled positives, "
+                f"time_window=±{cfg['gallery_candidate_time_window_days']:.1f} days, "
+                f"credible<= {cfg['gallery_candidate_credible_level_max']:.3f}, "
+                f"include_undersized={bool(cfg['gallery_include_undersized'])}"
+            )
+        else:
+            # --- Random: each trial randomly selects a positive per GW ---
+            if gallery_candidate_mode == "time_sky_hard":
+                galleries, unique_gw = build_prefixed_gallery_specs(
+                    gw_positive_indices=gw_positive_indices,
+                    candidate_sequences=candidate_sequences,
+                    gallery_sizes=gallery_sizes,
+                    n_trials=n_trials,
+                    seed=seed,
+                    include_undersized=bool(cfg["gallery_include_undersized"]),
+                )
+            else:
+                galleries, unique_gw = precompute_tutorial_galleries(
+                    gw_positive_indices,
+                    int(neg_optical_data["times"].shape[0]),
+                    gallery_sizes,
+                    n_trials,
+                    seed,
+                )
+            print(
+                "  Built hard-filtered galleries with "
+                f"time_window=±{cfg['gallery_candidate_time_window_days']:.1f} days, "
+                f"credible<= {cfg['gallery_candidate_credible_level_max']:.3f}, "
+                f"include_undersized={bool(cfg['gallery_include_undersized'])}"
+            )
+            if not galleries:
+                raise ValueError("Gallery construction produced no instances.")
+            selected_positive_indices = np.unique(
+                np.asarray([int(spec["positive_index"]) for spec in galleries.values()], dtype=np.int64)
+            )
+            positive_query_bank, positive_index_remap = load_selected_positive_bank(
+                cfg["test_data_path"],
+                selected_positive_indices,
+                runtime_input_window_start=comparison_window[0],
+                runtime_input_window_end=comparison_window[1],
+            )
+            galleries = remap_gallery_positive_indices(galleries, positive_index_remap)
     else:
         raise ValueError(
             f"Unsupported gallery_candidate_mode='{gallery_candidate_mode}'. "
             "Expected one of {'time_sky_hard', 'tutorial_random'}."
         )
+
     if not galleries:
         raise ValueError("Gallery construction produced no instances.")
-    selected_positive_indices = np.unique(
-        np.asarray([int(spec["positive_index"]) for spec in galleries.values()], dtype=np.int64)
-    )
-    positive_query_bank, positive_index_remap = load_selected_positive_bank(
-        cfg["test_data_path"],
-        selected_positive_indices,
-    )
-    galleries = remap_gallery_positive_indices(galleries, positive_index_remap)
+
+    positive_source_label = "cached test batches" if positive_selection == "batch" else "the full test set"
     print(
         "  Selected "
         f"{int(positive_query_bank['opt_t_raw'].shape[0])} positive optical queries "
-        "from the full test set"
+        f"from {positive_source_label}"
     )
     print(f"  Built {len(galleries)} gallery instances for {len(unique_gw)} GW events")
+
+    selected_gw_indices_np = positive_query_bank["gw_indices"].detach().cpu().numpy().astype(np.int64, copy=False)
+    selected_unique_gw, selected_counts = np.unique(selected_gw_indices_np, return_counts=True)
+    selected_positive_summary = {
+        "source": positive_selection,
+        "n_unique_gw": int(selected_unique_gw.size),
+        "n_selected_positives": int(selected_gw_indices_np.size),
+        "selected_positives_per_gw": {
+            "min": int(selected_counts.min()) if selected_counts.size else 0,
+            "median": float(np.median(selected_counts)) if selected_counts.size else 0.0,
+            "mean": float(np.mean(selected_counts)) if selected_counts.size else 0.0,
+            "max": int(selected_counts.max()) if selected_counts.size else 0,
+        },
+    }
 
     dt_bin_edges = parse_dt_bin_edges(cfg["dt_bin_edges"]) if cfg["report_dt_bins"] else None
     model_results: OrderedDict[str, Dict[str, Any]] = OrderedDict()
@@ -1923,6 +2126,7 @@ def main():
         "models": dict(model_results),
         "sampled_positive_summary": sampled_positive_summary,
         "gallery_positive_summary": gallery_positive_summary,
+        "selected_positive_summary": selected_positive_summary,
         "config": {
             "input_config": cfg["input_config"],
             "test_data_path": cfg["test_data_path"],
@@ -1947,6 +2151,7 @@ def main():
             "gallery_candidate_time_window_days": cfg["gallery_candidate_time_window_days"],
             "gallery_candidate_credible_level_max": cfg["gallery_candidate_credible_level_max"],
             "gallery_include_undersized": cfg["gallery_include_undersized"],
+            "positive_selection": cfg["positive_selection"],
             "comparison_window": list(comparison_window),
             "n_neg_samples": cfg["n_neg_samples"],
             "neg_time_offset_enable": cfg["neg_time_offset_enable"],
@@ -1963,9 +2168,12 @@ def main():
             "n_unique_gw": gallery_positive_summary["n_unique_gw"],
             "n_gallery_positives": gallery_positive_summary["n_total_positives"],
             "gallery_positives_per_gw": gallery_positive_summary["positives_per_gw"],
-            "n_sampled_positives": sampled_positive_summary["n_sampled_positives"],
-            "n_sampled_positive_gw": sampled_positive_summary["n_unique_gw"],
-            "sampled_positives_per_gw": sampled_positive_summary["sampled_positives_per_gw"],
+            "n_sampled_positives": sampled_positive_summary["n_sampled_positives"] if sampled_positive_summary else None,
+            "n_sampled_positive_gw": sampled_positive_summary["n_unique_gw"] if sampled_positive_summary else None,
+            "sampled_positives_per_gw": sampled_positive_summary["sampled_positives_per_gw"] if sampled_positive_summary else None,
+            "n_selected_positives": selected_positive_summary["n_selected_positives"],
+            "n_selected_positive_gw": selected_positive_summary["n_unique_gw"],
+            "selected_positives_per_gw": selected_positive_summary["selected_positives_per_gw"],
             "models": [
                 {
                     "name": spec["name"],
