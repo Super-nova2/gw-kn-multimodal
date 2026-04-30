@@ -32,6 +32,9 @@ hpo_results/
 *.json
 !*.json.example
 !Model/args/eval/retrieval_gw170817a_lsst.json
+!Model/args/eval/retrieval_gw170817a_lsst_balanced.json
+Model/args/eval/retrieval_gw170817a_lsst.json
+Model/args/eval/retrieval_gw170817a_lsst_balanced.json
 
 # Generated exports
 *.html
