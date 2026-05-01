@@ -533,8 +533,8 @@ def plot_retrieval_curves(curve_rows: Sequence[Mapping[str, Any]], output_dir: P
     output_dir.mkdir(parents=True, exist_ok=True)
 
     methods = sorted({str(row["method"]) for row in rows})
-    metrics = ["R@1", "R@5", "R@10"]
-    fig, axes = plt.subplots(1, len(metrics), figsize=(16, 4.8), sharex=False, sharey=False)
+    metrics = ["R@1", "R@10", "MRR"]
+    fig, axes = plt.subplots(1, len(metrics), figsize=(15, 4.8), sharex=False, sharey=False)
     if len(metrics) == 1:
         axes = [axes]
 
