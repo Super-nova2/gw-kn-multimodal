@@ -35,6 +35,7 @@ from retrieval_gallery import (  # noqa: E402
     aggregate_gallery_outcomes,
     build_curve_rows,
     build_prefixed_gallery_specs,
+    build_synthetic_time_sky_candidate_sequences,
     build_time_sky_candidate_sequences,
     plot_retrieval_coverage,
     plot_retrieval_curves,
@@ -164,6 +165,7 @@ def normalize_config(raw_cfg: Mapping[str, Any], cfg_path: Path) -> Dict[str, An
         "num_workers": int(raw_cfg.get("num_workers", 2)),
         "gallery_sizes": _parse_gallery_sizes(raw_cfg.get("gallery_sizes", "10,100,500")),
         "gallery_trials": int(raw_cfg.get("gallery_trials", 5)),
+        "gallery_candidate_mode": str(raw_cfg.get("gallery_candidate_mode", "time_sky_hard")).strip().lower(),
         "gallery_candidate_time_window_days": float(raw_cfg.get("gallery_candidate_time_window_days", 50.0)),
         "gallery_candidate_credible_level_max": float(raw_cfg.get("gallery_candidate_credible_level_max", 0.9)),
         "gallery_include_undersized": bool(raw_cfg.get("gallery_include_undersized", True)),
@@ -285,15 +287,18 @@ def aggregate_redshift_metrics(
                         "redshifts": [],
                         "rank": [],
                         "coverage": [],
+                        "full_coverage": [],
                         "actual_sizes": [],
                     },
                 )
                 rank = int(outcome["rank"])
                 actual_size = int(outcome.get("actual_gallery_size", gallery_size))
                 coverage_met = bool(outcome.get("coverage_met", actual_size >= gallery_size))
+                fill_ratio = min(1.0, max(0.0, float(actual_size) / float(max(int(gallery_size), 1))))
                 bucket["redshifts"].append(float(meta["redshift"]))
                 bucket["rank"].append(rank)
-                bucket["coverage"].append(1.0 if coverage_met else 0.0)
+                bucket["coverage"].append(fill_ratio)
+                bucket["full_coverage"].append(1.0 if coverage_met else 0.0)
                 bucket["actual_sizes"].append(actual_size)
 
         for bin_id in sorted(buckets):
@@ -311,6 +316,8 @@ def aggregate_redshift_metrics(
                     "recall_at_10": float(np.mean(ranks < 10)) if ranks.size else 0.0,
                     "mrr": float(np.mean(1.0 / (ranks.astype(np.float64) + 1.0))) if ranks.size else 0.0,
                     "coverage": float(np.mean(bucket["coverage"])) if bucket["coverage"] else 0.0,
+                    "fill_ratio_mean": float(np.mean(bucket["coverage"])) if bucket["coverage"] else 0.0,
+                    "full_coverage": float(np.mean(bucket["full_coverage"])) if bucket["full_coverage"] else 0.0,
                     "effective_gallery_size_mean": float(np.mean(bucket["actual_sizes"])) if bucket["actual_sizes"] else 0.0,
                 }
             )
@@ -394,9 +401,9 @@ def plot_redshift_coverage(rows: Sequence[Mapping[str, Any]], output_dir: Path |
                     label=_plot_method_label(method),
                 )
         ax.set_xlabel("Redshift")
-        ax.set_ylabel("Coverage")
+        ax.set_ylabel("Mean Fill Ratio")
         ax.set_ylim(0.0, 1.05)
-        ax.set_title(f"Hard Gallery Coverage vs Redshift  (gallery_size={gallery_size})")
+        ax.set_title(f"Mean Gallery Fill Ratio vs Redshift  (gallery_size={gallery_size})")
         ax.grid(True, alpha=0.3)
         ax.legend(frameon=False)
         fig.tight_layout()
@@ -421,6 +428,8 @@ def write_redshift_csv(rows: Sequence[Mapping[str, Any]], output_path: Path | st
         "recall_at_10",
         "mrr",
         "coverage",
+        "fill_ratio_mean",
+        "full_coverage",
         "effective_gallery_size_mean",
     ]
     path = Path(output_path)
@@ -473,16 +482,34 @@ def main(argv: Sequence[str] | None = None) -> int:
         runtime_input_window_start=comparison_window[0],
         runtime_input_window_end=comparison_window[1],
     )
-    candidate_sequences, gallery_gw_skymaps, _gallery_gw_times = build_time_sky_candidate_sequences(
-        test_data_path=cfg["test_data_path"],
-        unique_gw_ids=all_test_gw_ids,
-        neg_optical_data=neg_optical_data,
-        n_trials=n_trials,
-        seed=int(cfg["seed"]),
-        time_window_days=float(cfg["gallery_candidate_time_window_days"]),
-        credible_level_max=float(cfg["gallery_candidate_credible_level_max"]),
-        zero_time_field=cfg["nonkn_cls_base_field"],
-    )
+    gallery_candidate_mode = str(cfg["gallery_candidate_mode"]).strip().lower()
+    if gallery_candidate_mode == "time_sky_hard":
+        candidate_sequences, gallery_gw_skymaps, _gallery_gw_times = build_time_sky_candidate_sequences(
+            test_data_path=cfg["test_data_path"],
+            unique_gw_ids=all_test_gw_ids,
+            neg_optical_data=neg_optical_data,
+            n_trials=n_trials,
+            seed=int(cfg["seed"]),
+            time_window_days=float(cfg["gallery_candidate_time_window_days"]),
+            credible_level_max=float(cfg["gallery_candidate_credible_level_max"]),
+            zero_time_field=cfg["nonkn_cls_base_field"],
+        )
+    elif gallery_candidate_mode == "synthetic_time_sky_hard":
+        candidate_sequences, gallery_gw_skymaps, _gallery_gw_times = build_synthetic_time_sky_candidate_sequences(
+            test_data_path=cfg["test_data_path"],
+            unique_gw_ids=all_test_gw_ids,
+            neg_optical_data=neg_optical_data,
+            gallery_sizes=gallery_sizes,
+            n_trials=n_trials,
+            seed=int(cfg["seed"]),
+            time_window_days=float(cfg["gallery_candidate_time_window_days"]),
+            credible_level_max=float(cfg["gallery_candidate_credible_level_max"]),
+        )
+    else:
+        raise ValueError(
+            f"Unsupported gallery_candidate_mode='{gallery_candidate_mode}'. "
+            "Expected one of {'time_sky_hard', 'synthetic_time_sky_hard'}."
+        )
     galleries, unique_gw = build_prefixed_gallery_specs(
         gw_positive_indices=gw_positive_indices,
         candidate_sequences=candidate_sequences,

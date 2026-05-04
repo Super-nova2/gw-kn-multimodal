@@ -1840,9 +1840,18 @@ def _compute_credible_level_single_gw(gw_m_single, opt_coords):
     dot = torch.matmul(opt_xyz, pix_xyz)  # [B, 19200]
     nearest_idx = dot.argmax(dim=-1)  # [B]
 
+    dA = gw_m_single[3, :]  # [19200]
     dP = gw_m_single[4, :]  # [19200]
-    dP_at_opt = dP[nearest_idx]  # [B]
-    cred_level = (dP.unsqueeze(0) >= dP_at_opt.unsqueeze(-1)).float().mean(dim=-1)
+    dA = torch.nan_to_num(dA.to(torch.float32), nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
+    dP = torch.nan_to_num(dP.to(torch.float32), nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
+    density = dP / dA.clamp_min(torch.finfo(dP.dtype).eps)
+    density_at_opt = density[nearest_idx]  # [B]
+    total_probability = dP.sum().clamp_min(torch.finfo(dP.dtype).eps)
+    cred_level = torch.where(
+        density.unsqueeze(0) >= density_at_opt.unsqueeze(-1),
+        dP.unsqueeze(0),
+        torch.zeros_like(dP).unsqueeze(0),
+    ).sum(dim=-1) / total_probability
     return cred_level.unsqueeze(-1)  # [B, 1]
 
 

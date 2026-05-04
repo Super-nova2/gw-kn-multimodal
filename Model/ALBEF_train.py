@@ -913,8 +913,8 @@ def compute_credible_level(gw_m, opt_coords):
     transient's sky position in the GW skymap.
 
     Uses skymap channels 0-2 (x, y, z unit vectors of pixel centers) to find
-    the nearest pixel to the optical RA/Dec, then computes what fraction of
-    the sky has higher or equal probability (dP) than that pixel.
+    the nearest pixel to the optical RA/Dec, then computes the cumulative
+    probability mass with higher or equal probability density than that pixel.
 
     Args:
         gw_m: [B, 7, 19200] — skymap channels [x, y, z, dA, dP, distmu, distsigma]
@@ -945,11 +945,20 @@ def compute_credible_level(gw_m, opt_coords):
     dot = torch.bmm(opt_xyz.unsqueeze(1), pix_xyz).squeeze(1)  # [B, 19200]
     nearest_idx = dot.argmax(dim=-1)  # [B]
 
+    dA = gw_m[:, 3, :]  # [B, 19200]
     dP = gw_m[:, 4, :]  # [B, 19200]
-    dP_at_opt = dP[torch.arange(dP.size(0), device=dP.device), nearest_idx]  # [B]
+    dA = torch.nan_to_num(dA.to(torch.float32), nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
+    dP = torch.nan_to_num(dP.to(torch.float32), nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
+    density = dP / dA.clamp_min(torch.finfo(dP.dtype).eps)
+    density_at_opt = density[torch.arange(density.size(0), device=density.device), nearest_idx]  # [B]
 
-    # Credible level: fraction of pixels with dP >= dP at optical position
-    cred_level = (dP >= dP_at_opt.unsqueeze(-1)).float().mean(dim=-1)  # [B]
+    # Credible level: posterior mass with density >= density at the optical position.
+    total_probability = dP.sum(dim=-1).clamp_min(torch.finfo(dP.dtype).eps)
+    cred_level = torch.where(
+        density >= density_at_opt.unsqueeze(-1),
+        dP,
+        torch.zeros_like(dP),
+    ).sum(dim=-1) / total_probability  # [B]
     return cred_level.unsqueeze(-1)  # [B, 1]
 
 

@@ -172,10 +172,9 @@ def compute_credible_levels_single_gw(gw_skymap: torch.Tensor, opt_coords: torch
     dot = torch.matmul(opt_xyz, pix_xyz)
     nearest_idx = dot.argmax(dim=-1)
 
+    dA = gw_skymap[3, :].to(torch.float32)
     dP = gw_skymap[4, :].to(torch.float32)
-    dP_at_opt = dP[nearest_idx]
-    cred_level = (dP.unsqueeze(0) >= dP_at_opt.unsqueeze(-1)).float().mean(dim=-1)
-    return cred_level
+    return _credible_levels_from_probability_density_torch(dP, dA, nearest_idx)
 
 
 def _nearest_pixel_indices_from_xyz(opt_xyz: torch.Tensor, pixel_xyz: torch.Tensor, chunk_size: int = 4096) -> np.ndarray:
@@ -192,6 +191,87 @@ def _nearest_pixel_indices_from_xyz(opt_xyz: torch.Tensor, pixel_xyz: torch.Tens
 
 def _nearest_pixel_indices(opt_coords: torch.Tensor, pixel_xyz: torch.Tensor, chunk_size: int = 4096) -> np.ndarray:
     return _nearest_pixel_indices_from_xyz(_coords_to_unit_xyz(opt_coords), pixel_xyz, chunk_size=int(chunk_size))
+
+
+def _credible_levels_from_probability_density_torch(
+    dP: torch.Tensor,
+    dA: torch.Tensor,
+    nearest_idx: torch.Tensor,
+) -> torch.Tensor:
+    dP = torch.nan_to_num(dP.to(torch.float32), nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
+    dA = torch.nan_to_num(dA.to(torch.float32), nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
+    total_probability = dP.sum().clamp_min(torch.finfo(dP.dtype).eps)
+    density = dP / dA.clamp_min(torch.finfo(dP.dtype).eps)
+    density_at_opt = density[nearest_idx]
+    credible_mass = torch.where(
+        density.unsqueeze(0) >= density_at_opt.unsqueeze(-1),
+        dP.unsqueeze(0),
+        torch.zeros_like(dP).unsqueeze(0),
+    ).sum(dim=-1)
+    return credible_mass / total_probability
+
+
+def _credible_levels_from_probability_density_numpy(
+    dP: np.ndarray,
+    dA: np.ndarray,
+    nearest_idx: np.ndarray,
+) -> np.ndarray:
+    dP_clean = np.nan_to_num(np.asarray(dP, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+    dP_clean = np.maximum(dP_clean, 0.0)
+    dA_clean = np.nan_to_num(np.asarray(dA, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+    dA_clean = np.maximum(dA_clean, 0.0)
+    total_probability = float(dP_clean.sum())
+    if total_probability <= 0.0:
+        return np.full(np.asarray(nearest_idx).shape, np.nan, dtype=np.float64)
+
+    density = np.divide(dP_clean, dA_clean, out=np.zeros_like(dP_clean), where=dA_clean > 0.0)
+    order = np.argsort(density, kind="mergesort")
+    sorted_density = density[order]
+    cumulative = np.concatenate(([0.0], np.cumsum(dP_clean[order], dtype=np.float64)))
+    thresholds = density[np.asarray(nearest_idx, dtype=np.int64)]
+    first_ge = np.searchsorted(sorted_density, thresholds, side="left")
+    credible_mass = total_probability - cumulative[first_ge]
+    return credible_mass / total_probability
+
+
+def _cell_credible_levels_from_probability_density_numpy(dP: np.ndarray, dA: np.ndarray) -> np.ndarray:
+    dP_clean = np.nan_to_num(np.asarray(dP, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+    dP_clean = np.maximum(dP_clean, 0.0)
+    dA_clean = np.nan_to_num(np.asarray(dA, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+    dA_clean = np.maximum(dA_clean, 0.0)
+    total_probability = float(dP_clean.sum())
+    if total_probability <= 0.0:
+        return np.full(dP_clean.shape, np.nan, dtype=np.float64)
+
+    density = np.divide(dP_clean, dA_clean, out=np.zeros_like(dP_clean), where=dA_clean > 0.0)
+    order = np.argsort(density, kind="mergesort")
+    sorted_density = density[order]
+    cumulative = np.concatenate(([0.0], np.cumsum(dP_clean[order], dtype=np.float64)))
+    first_ge = np.searchsorted(sorted_density, density, side="left")
+    credible_mass = total_probability - cumulative[first_ge]
+    return credible_mass / total_probability
+
+
+def _unit_xyz_to_radec_degrees(xyz: np.ndarray) -> np.ndarray:
+    xyz = np.asarray(xyz, dtype=np.float64)
+    if xyz.ndim != 2 or xyz.shape[1] != 3:
+        raise ValueError(f"Expected xyz with shape [N, 3], got {xyz.shape}")
+    norm = np.linalg.norm(xyz, axis=1)
+    norm = np.where(norm > 0.0, norm, 1.0)
+    x = xyz[:, 0] / norm
+    y = xyz[:, 1] / norm
+    z = np.clip(xyz[:, 2] / norm, -1.0, 1.0)
+    ra = np.degrees(np.arctan2(y, x)) % 360.0
+    dec = np.degrees(np.arcsin(z))
+    return np.stack([ra, dec], axis=1).astype(np.float32)
+
+
+def _infer_negative_pool_size(neg_optical_data: Mapping[str, Any]) -> int:
+    for key in ("times", "coordinates", "values", "zero_time_mjd_cls_base", "zero_time_mjd_base"):
+        if key in neg_optical_data:
+            value = neg_optical_data[key]
+            return int(value.shape[0] if hasattr(value, "shape") else len(value))
+    raise KeyError("Cannot infer negative pool size; expected one of times/coordinates/values/zero_time_mjd fields.")
 
 
 def build_time_sky_candidate_sequence(
@@ -293,8 +373,8 @@ def build_time_sky_candidate_sequences(
         anchor_time = float(gw_event_times[local_idx])
         gw_time_lookup[int(gw_id)] = anchor_time
 
+        dA = np.asarray(gw_skymaps_np[local_idx, 3, :], dtype=np.float64)
         dP = np.asarray(gw_skymaps_np[local_idx, 4, :], dtype=np.float64)
-        sorted_dP = np.sort(dP, kind="mergesort")
         candidate_credible = np.full(neg_times.shape, np.nan, dtype=np.float64)
         if np.isfinite(anchor_time):
             time_mask = np.isfinite(neg_times) & (np.abs(neg_times - anchor_time) <= float(time_window_days))
@@ -303,10 +383,11 @@ def build_time_sky_candidate_sequences(
                     neg_opt_xyz[time_mask],
                     gw_skymap[:3, :],
                 )
-                candidate_dP = dP[event_pixel_idx]
-                candidate_credible[time_mask] = (
-                    dP.size - np.searchsorted(sorted_dP, candidate_dP, side="left")
-                ) / float(dP.size)
+                candidate_credible[time_mask] = _credible_levels_from_probability_density_numpy(
+                    dP,
+                    dA,
+                    event_pixel_idx,
+                )
 
         for trial in range(int(n_trials)):
             seq_seed = int(seed) + 7919 * int(trial) + 104729 * int(gw_id)
@@ -318,6 +399,105 @@ def build_time_sky_candidate_sequences(
                 credible_level_max=float(credible_level_max),
                 seed=seq_seed,
             )
+
+    return candidate_sequences, gw_skymaps, gw_time_lookup
+
+
+def build_synthetic_time_sky_candidate_sequences(
+    *,
+    test_data_path: str,
+    unique_gw_ids: Sequence[int],
+    neg_optical_data: Mapping[str, Any],
+    gallery_sizes: Sequence[int],
+    n_trials: int,
+    seed: int,
+    time_window_days: float,
+    credible_level_max: float,
+) -> Tuple[Dict[Tuple[int, int], Dict[str, np.ndarray]], Dict[int, torch.Tensor], Dict[int, float]]:
+    unique_gw = [int(gw_id) for gw_id in unique_gw_ids]
+    gallery_sizes = [int(size) for size in gallery_sizes]
+    max_neg_needed = max([max(int(size) - 1, 0) for size in gallery_sizes] or [0])
+    neg_pool_size = _infer_negative_pool_size(neg_optical_data)
+    if max_neg_needed > 0 and neg_pool_size <= 0:
+        raise ValueError("Synthetic gallery construction requires at least one negative optical sample.")
+    if not unique_gw:
+        return {}, {}, {}
+
+    with h5py.File(test_data_path, "r") as f:
+        if "events/gw_data/event_time_mjd" not in f:
+            raise KeyError(f"Missing required field 'events/gw_data/event_time_mjd' in {test_data_path}")
+        if "events/gw_data/skymaps" not in f:
+            raise KeyError(f"Missing required field 'events/gw_data/skymaps' in {test_data_path}")
+
+        gw_event_times = np.asarray(f["events/gw_data/event_time_mjd"][unique_gw], dtype=np.float64)
+        gw_skymaps_np = np.asarray(f["events/gw_data/skymaps"][unique_gw], dtype=np.float32)
+
+    candidate_sequences: Dict[Tuple[int, int], Dict[str, np.ndarray]] = {}
+    gw_skymaps: Dict[int, torch.Tensor] = {}
+    gw_time_lookup: Dict[int, float] = {}
+
+    for local_idx, gw_id in enumerate(unique_gw):
+        gw_skymap_np = gw_skymaps_np[local_idx]
+        gw_skymap = torch.from_numpy(gw_skymap_np).to(torch.float32)
+        gw_skymaps[int(gw_id)] = gw_skymap
+        anchor_time = float(gw_event_times[local_idx])
+        gw_time_lookup[int(gw_id)] = anchor_time
+        if not np.isfinite(anchor_time):
+            raise ValueError(f"GW event {gw_id} has non-finite event_time_mjd; cannot synthesize time-conditioned gallery.")
+
+        dA = np.asarray(gw_skymap_np[3, :], dtype=np.float64)
+        dP = np.asarray(gw_skymap_np[4, :], dtype=np.float64)
+        cell_credible = _cell_credible_levels_from_probability_density_numpy(dP, dA)
+        eligible = np.isfinite(cell_credible) & (cell_credible <= float(credible_level_max)) & np.isfinite(dA) & (dA > 0.0)
+        eligible_idx = np.nonzero(eligible)[0].astype(np.int64, copy=False)
+        if eligible_idx.size == 0 and max_neg_needed > 0:
+            raise ValueError(
+                f"GW event {gw_id} has no skymap cells with credible_level <= {float(credible_level_max):.3f}."
+            )
+        eligible_area = np.asarray(dA[eligible_idx], dtype=np.float64)
+        eligible_area = np.maximum(np.nan_to_num(eligible_area, nan=0.0, posinf=0.0, neginf=0.0), 0.0)
+        area_sum = float(eligible_area.sum())
+        cell_prob = eligible_area / area_sum if area_sum > 0.0 else None
+
+        for trial in range(int(n_trials)):
+            seq_seed = int(seed) + 7919 * int(trial) + 104729 * int(gw_id)
+            rng = np.random.default_rng(seq_seed)
+            if max_neg_needed <= 0:
+                neg_indices = np.empty((0,), dtype=np.int64)
+                synthetic_abs_dt = np.empty((0,), dtype=np.float32)
+                synthetic_times = np.empty((0,), dtype=np.float64)
+                synthetic_coords = np.empty((0, 2), dtype=np.float32)
+                synthetic_credible = np.empty((0,), dtype=np.float32)
+            else:
+                replace_neg = bool(neg_pool_size < max_neg_needed)
+                neg_indices = rng.choice(
+                    int(neg_pool_size),
+                    size=int(max_neg_needed),
+                    replace=replace_neg,
+                ).astype(np.int64, copy=False)
+                delta_t = rng.uniform(
+                    -float(time_window_days),
+                    float(time_window_days),
+                    size=int(max_neg_needed),
+                )
+                sampled_cells = rng.choice(
+                    eligible_idx,
+                    size=int(max_neg_needed),
+                    replace=True,
+                    p=cell_prob,
+                ).astype(np.int64, copy=False)
+                synthetic_abs_dt = np.abs(delta_t).astype(np.float32)
+                synthetic_times = (anchor_time + delta_t).astype(np.float64)
+                synthetic_coords = _unit_xyz_to_radec_degrees(gw_skymap_np[:3, sampled_cells].T)
+                synthetic_credible = np.asarray(cell_credible[sampled_cells], dtype=np.float32)
+
+            candidate_sequences[(int(trial), int(gw_id))] = {
+                "candidate_indices": neg_indices,
+                "credible_levels": synthetic_credible,
+                "abs_dt_days": synthetic_abs_dt,
+                "synthetic_coordinates": synthetic_coords,
+                "synthetic_zero_time_mjd_cls_base": synthetic_times,
+            }
 
     return candidate_sequences, gw_skymaps, gw_time_lookup
 
@@ -347,6 +527,12 @@ def build_prefixed_gallery_specs(
             neg_idx_full = _as_numpy_1d(seq.get("candidate_indices", []), dtype=np.int64)
             neg_cred_full = _as_numpy_1d(seq.get("credible_levels", []), dtype=np.float32)
             neg_dt_full = _as_numpy_1d(seq.get("abs_dt_days", []), dtype=np.float32)
+            neg_coords_full = None
+            if "synthetic_coordinates" in seq:
+                neg_coords_full = np.asarray(seq["synthetic_coordinates"], dtype=np.float32).reshape(-1, 2)
+            neg_time_full = None
+            if "synthetic_zero_time_mjd_cls_base" in seq:
+                neg_time_full = _as_numpy_1d(seq["synthetic_zero_time_mjd_cls_base"], dtype=np.float64)
 
             for gallery_size in gallery_sizes:
                 requested = int(gallery_size)
@@ -356,7 +542,7 @@ def build_prefixed_gallery_specs(
                     continue
                 take_neg = min(target_neg, available_neg)
                 actual_gallery_size = 1 + int(take_neg)
-                galleries[(requested, int(trial), int(gw_id))] = {
+                gallery_spec = {
                     "positive_index": positive_index,
                     "negative_indices": neg_idx_full[:take_neg].astype(np.int64, copy=False),
                     "negative_credible_levels": neg_cred_full[:take_neg].astype(np.float32, copy=False),
@@ -366,6 +552,11 @@ def build_prefixed_gallery_specs(
                     "coverage_met": bool(actual_gallery_size >= requested),
                     "is_undersized": bool(actual_gallery_size < requested),
                 }
+                if neg_coords_full is not None:
+                    gallery_spec["negative_synthetic_coordinates"] = neg_coords_full[:take_neg].astype(np.float32, copy=False)
+                if neg_time_full is not None:
+                    gallery_spec["negative_synthetic_zero_time_mjd_cls_base"] = neg_time_full[:take_neg].astype(np.float64, copy=False)
+                galleries[(requested, int(trial), int(gw_id))] = gallery_spec
 
     return galleries, unique_gw
 
@@ -423,7 +614,8 @@ def aggregate_gallery_outcomes(
     for gallery_size in [int(size) for size in gallery_sizes]:
         recalls = {1: [], 5: [], 10: []}
         mrrs: List[float] = []
-        coverage_flags: List[float] = []
+        fill_ratios: List[float] = []
+        full_coverage_flags: List[float] = []
         actual_sizes: List[int] = []
 
         for trial in range(int(n_trials)):
@@ -435,11 +627,16 @@ def aggregate_gallery_outcomes(
                 rank = int(outcome["rank"])
                 actual_gallery_size = int(outcome["actual_gallery_size"])
                 coverage_met = bool(outcome.get("coverage_met", actual_gallery_size >= int(gallery_size)))
+                fill_ratio = min(
+                    1.0,
+                    max(0.0, float(actual_gallery_size) / float(max(int(gallery_size), 1))),
+                )
 
                 for k in recalls:
                     recalls[k].append(1.0 if rank < k else 0.0)
                 mrrs.append(1.0 / float(rank + 1))
-                coverage_flags.append(1.0 if coverage_met else 0.0)
+                fill_ratios.append(fill_ratio)
+                full_coverage_flags.append(1.0 if coverage_met else 0.0)
                 actual_sizes.append(actual_gallery_size)
 
                 if gw_source_map is not None:
@@ -462,10 +659,15 @@ def aggregate_gallery_outcomes(
 
         coverage_key = f"gallery_{gallery_size}"
         if actual_sizes:
+            full_coverage_count = int(sum(1 for flag in full_coverage_flags if flag > 0.0))
+            fill_ratio_mean = float(np.mean(fill_ratios))
             coverage_stats[coverage_key] = {
-                "coverage": float(np.mean(coverage_flags)),
+                "coverage": fill_ratio_mean,
+                "fill_ratio_mean": fill_ratio_mean,
+                "full_coverage": float(np.mean(full_coverage_flags)),
                 "n_queries_total": int(len(actual_sizes)),
-                "n_queries_covered": int(sum(1 for flag in coverage_flags if flag > 0.0)),
+                "n_queries_covered": full_coverage_count,
+                "n_queries_full_coverage": full_coverage_count,
                 "effective_gallery_size_mean": float(np.mean(actual_sizes)),
                 "effective_gallery_size_min": int(np.min(actual_sizes)),
                 "effective_gallery_size_max": int(np.max(actual_sizes)),
@@ -473,8 +675,11 @@ def aggregate_gallery_outcomes(
         else:
             coverage_stats[coverage_key] = {
                 "coverage": 0.0,
+                "fill_ratio_mean": 0.0,
+                "full_coverage": 0.0,
                 "n_queries_total": 0,
                 "n_queries_covered": 0,
+                "n_queries_full_coverage": 0,
                 "effective_gallery_size_mean": 0.0,
                 "effective_gallery_size_min": 0,
                 "effective_gallery_size_max": 0,
@@ -509,6 +714,8 @@ def build_curve_rows(
                     "gallery_size_target": int(gallery_size),
                     "gallery_size_actual": float(coverage_info.get("effective_gallery_size_mean", float(gallery_size))),
                     "coverage": float(coverage_info.get("coverage", 0.0)),
+                    "fill_ratio_mean": float(coverage_info.get("fill_ratio_mean", coverage_info.get("coverage", 0.0))),
+                    "full_coverage": float(coverage_info.get("full_coverage", coverage_info.get("coverage", 0.0))),
                     "metric_name": metric_label,
                     "metric_value": float(retrieval_metrics.get(f"gallery_{gallery_size}_{metric_key}", 0.0)),
                 }
@@ -608,9 +815,9 @@ def plot_retrieval_coverage(curve_rows: Sequence[Mapping[str, Any]], output_dir:
 
     ax.set_xscale("log")
     ax.set_xlabel("Gallery Size")
-    ax.set_ylabel("Coverage")
+    ax.set_ylabel("Mean Fill Ratio")
     ax.set_ylim(0.0, 1.05)
-    ax.set_title("Coverage Under Hard Candidate Constraints")
+    ax.set_title("Mean Gallery Fill Ratio Under Candidate Constraints")
     ax.grid(True, alpha=0.3)
     ax.legend(frameon=False)
     fig.tight_layout()

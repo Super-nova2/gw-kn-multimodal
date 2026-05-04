@@ -27,9 +27,10 @@ from collections import OrderedDict
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
+import pandas as pd
 import torch
 from tqdm import tqdm
 
@@ -53,6 +54,7 @@ from retrieval_gallery import (  # noqa: E402
     build_comparison_model_specs,
     build_curve_rows,
     build_prefixed_gallery_specs,
+    build_synthetic_time_sky_candidate_sequences,
     build_time_sky_candidate_sequences,
     plot_retrieval_coverage,
     plot_retrieval_curves,
@@ -92,6 +94,23 @@ DEFAULT_TUTORIAL_NEG_DATA_PATH = str(
     (WORKSPACE_DIR / "data" / "Optical_Only_dataset" / "Tutorial_negative_dataset.h5").resolve()
 )
 DEFAULT_TUTORIAL_NEG_GROUP = "Tutorial/optical_data"
+
+# Scalar column validation mapping for redshift catalog cross-check.
+# Each entry: (catalog_column, scalar_index, transform)
+#   transform "direct"     → scalar == catalog_value
+#   transform "cos"        → scalar == cos(catalog_value)
+#   transform "scale_1000" → scalar == catalog_value / 1000
+_SCALAR_VALIDATION_COLS: List[Tuple[str, int, str]] = [
+    ("mass1_detector", 0, "direct"),
+    ("mass2_detector", 1, "direct"),
+    ("spin1z",         2, "direct"),
+    ("spin2z",         3, "direct"),
+    ("inclination",    4, "cos"),
+    ("distmean",       5, "scale_1000"),
+    ("diststd",        6, "scale_1000"),
+]
+_SCALAR_VALIDATION_RTOL = 1e-4
+_SCALAR_VALIDATION_ATOL = 1e-6
 
 
 def _seed_all(seed: int) -> None:
@@ -163,6 +182,484 @@ def _parse_n_neg_samples(value: Any, default: int = -1) -> int:
 def _resolve_target_samples(n_neg_samples: int) -> Optional[int]:
     value = int(n_neg_samples)
     return value if value > 0 else None
+
+
+def _gallery_mode_supports_skymap_only(gallery_candidate_mode: str) -> bool:
+    return str(gallery_candidate_mode).strip().lower() in {
+        "time_sky_hard",
+        "synthetic_time_sky_hard",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Redshift metadata recovery helpers
+# ---------------------------------------------------------------------------
+def _parse_hdf5_gw_id(gw_id) -> Tuple[str, int]:
+    """Parse an HDF5 GW ID of the form ``<source>_<event_id>``.
+
+    Args:
+        gw_id: String or bytes, e.g. ``"bns_6"`` or ``b"nsbh_114"``.
+
+    Returns:
+        (source, event_id) tuple, e.g. ``("bns", 6)``.
+
+    Raises:
+        ValueError: If the format is malformed.
+    """
+    if isinstance(gw_id, bytes):
+        gw_id = gw_id.decode("ascii")
+    gw_id = str(gw_id).strip()
+    if "_" not in gw_id:
+        raise ValueError(f"GW ID must contain '_' separating source and event_id: {gw_id!r}")
+    parts = gw_id.rsplit("_", 1)
+    if len(parts) != 2:
+        raise ValueError(f"GW ID format error: {gw_id!r}")
+    source = parts[0].strip()
+    if not source:
+        raise ValueError(f"GW ID has empty source: {gw_id!r}")
+    try:
+        event_id = int(parts[1])
+    except ValueError:
+        raise ValueError(f"GW ID event_id must be an integer: {gw_id!r}")
+    return source, event_id
+
+
+def _load_catalog_redshift_map(catalog_path: str) -> Dict[int, float]:
+    """Load ``simulation_id`` → ``redshift`` from a CSV catalog.
+
+    Args:
+        catalog_path: Path to a CSV with ``simulation_id`` and ``redshift`` columns.
+
+    Returns:
+        Dict mapping integer simulation_id to float redshift.
+
+    Raises:
+        FileNotFoundError: If the CSV does not exist.
+        KeyError: If required columns are missing.
+    """
+    if not os.path.exists(catalog_path):
+        raise FileNotFoundError(f"Redshift catalog not found: {catalog_path}")
+    df = pd.read_csv(catalog_path)
+    for col in ("simulation_id", "redshift"):
+        if col not in df.columns:
+            raise KeyError(f"Catalog {catalog_path} is missing required column '{col}'")
+    z_map: Dict[int, float] = {}
+    for _, row in df.iterrows():
+        sim_id = int(row["simulation_id"])
+        z_map[sim_id] = float(row["redshift"])
+    return z_map
+
+
+def _normalize_redshift_catalog_paths(
+    redshift_catalogs: Optional[Dict[str, str]],
+    cfg_dir: Path,
+) -> Dict[str, str]:
+    """Resolve relative catalog paths against the config directory.
+
+    Args:
+        redshift_catalogs: Source label → CSV path mapping, or None/empty.
+        cfg_dir: Config file directory for resolving relative paths.
+
+    Returns:
+        Resolved source → absolute path mapping.  Empty dict if input is None/empty.
+    """
+    if not redshift_catalogs:
+        return {}
+    resolved: Dict[str, str] = {}
+    for source, path_str in redshift_catalogs.items():
+        p = Path(str(path_str)).expanduser()
+        if not p.is_absolute():
+            p = (cfg_dir / p).resolve()
+        resolved[str(source)] = str(p)
+    return resolved
+
+
+def _build_redshift_metadata_from_catalogs(
+    test_data_path: str,
+    redshift_catalogs: Dict[str, str],
+    *,
+    validate_scalars: bool = True,
+) -> Dict[int, Dict[str, Any]]:
+    """Recover redshift for each GW event from source catalogs.
+
+    Reads HDF5 ``events/gw_data/ids`` and ``events/gw_data/source_type``,
+    parses each GW ID, and looks up the redshift in the appropriate source
+    catalog (BNS or NSBH).
+
+    Args:
+        test_data_path: Path to the combined HDF5 test dataset.
+        redshift_catalogs: Source label → CSV path mapping.
+        validate_scalars: If True, cross-check HDF5 ``gw_data/scalars`` against
+            catalog GW parameters to catch wrong-catalog misconfigurations.
+
+    Returns:
+        Dict mapping GW index (int) to ``{"redshift": float}``.
+
+    Raises:
+        ValueError: If a GW event's source has no configured catalog, its
+            event_id is not found in the catalog, the parsed-ID source does not
+            match ``source_type``, or scalar validation fails.
+    """
+    with h5py.File(test_data_path, "r") as f:
+        if "events/gw_data/ids" not in f or "events/gw_data/source_type" not in f:
+            raise KeyError("HDF5 missing events/gw_data/ids or events/gw_data/source_type")
+        ids_arr = np.asarray(f["events/gw_data/ids"][:])
+        source_arr = np.asarray(f["events/gw_data/source_type"][:])
+        scalars_arr = np.asarray(f["events/gw_data/scalars"][:]) if validate_scalars else None
+
+    if validate_scalars and scalars_arr is not None and scalars_arr.shape[1] < len(_SCALAR_VALIDATION_COLS):
+        raise ValueError(
+            f"HDF5 scalars has {scalars_arr.shape[1]} columns; "
+            f"expected at least {len(_SCALAR_VALIDATION_COLS)} for validation"
+        )
+
+    # Load catalog redshift maps lazily; also cache DataFrames for scalar validation
+    catalog_maps: Dict[str, Dict[int, float]] = {}
+    catalog_dfs: Dict[str, "pd.DataFrame"] = {}
+
+    metadata: Dict[int, Dict[str, Any]] = {}
+    for idx in range(ids_arr.shape[0]):
+        raw_id = ids_arr[idx]
+        if isinstance(raw_id, bytes):
+            raw_id = raw_id.decode("ascii")
+        source_str = source_arr[idx]
+        if isinstance(source_str, bytes):
+            source_str = source_str.decode("ascii")
+
+        id_source, event_id = _parse_hdf5_gw_id(str(raw_id))
+
+        # --- Fix 2: cross-check parsed-ID source against HDF5 source_type ---
+        if id_source != str(source_str):
+            raise ValueError(
+                f"GW ID source mismatch at index {idx}: "
+                f"ids={raw_id!r} parses to source={id_source!r}, "
+                f"but source_type={source_str!r}"
+            )
+
+        if str(source_str) not in redshift_catalogs:
+            raise ValueError(
+                f"No redshift catalog configured for source '{source_str}' "
+                f"(GW idx {idx}, id={raw_id}). Available: {list(redshift_catalogs.keys())}"
+            )
+
+        catalog_path = redshift_catalogs[str(source_str)]
+        if str(source_str) not in catalog_maps:
+            catalog_maps[str(source_str)] = _load_catalog_redshift_map(catalog_path)
+            if validate_scalars:
+                catalog_dfs[str(source_str)] = pd.read_csv(catalog_path)
+
+        z_map = catalog_maps[str(source_str)]
+        if event_id not in z_map:
+            raise ValueError(
+                f"Event ID {event_id} (source={source_str}, id={raw_id}) "
+                f"not found in catalog {catalog_path}"
+            )
+
+        # --- Fix 1: scalar consistency validation ---
+        if validate_scalars and scalars_arr is not None:
+            cat_df = catalog_dfs[str(source_str)]
+            cat_row = cat_df[cat_df["simulation_id"] == event_id]
+            if len(cat_row) != 1:
+                raise ValueError(
+                    f"Expected exactly 1 catalog row for simulation_id={event_id} "
+                    f"in {catalog_path}; got {len(cat_row)}"
+                )
+            row = cat_row.iloc[0]
+            gw_scalars = scalars_arr[idx]
+            for cat_col, s_idx, transform in _SCALAR_VALIDATION_COLS:
+                if cat_col not in cat_df.columns:
+                    raise KeyError(f"Catalog {catalog_path} missing column '{cat_col}'")
+                catalog_val = float(row[cat_col])
+                scalar_val = float(gw_scalars[s_idx])
+                if transform == "direct":
+                    expected = catalog_val
+                elif transform == "cos":
+                    expected = float(np.cos(catalog_val))
+                elif transform == "scale_1000":
+                    expected = catalog_val / 1000.0
+                else:
+                    raise ValueError(f"Unknown scalar transform: {transform}")
+                if not np.isclose(scalar_val, expected, rtol=_SCALAR_VALIDATION_RTOL, atol=_SCALAR_VALIDATION_ATOL):
+                    raise ValueError(
+                        f"Scalar mismatch for GW idx {idx} (id={raw_id}, source={source_str}): "
+                        f"catalog '{cat_col}' (scalar_idx={s_idx}, transform={transform}) → "
+                        f"expected={expected:.8g}, got scalar={scalar_val:.8g}. "
+                        f"Check that the correct catalog is configured for source '{source_str}'."
+                    )
+
+        metadata[int(idx)] = {"redshift": float(z_map[event_id])}
+
+    return metadata
+
+
+def _normalize_redshift_bin_config(
+    edges: Optional[List[float]],
+    labels: Optional[List[str]],
+) -> Tuple[List[float], List[str]]:
+    """Validate and normalize redshift bin edges and labels.
+
+    Args:
+        edges: Redshift bin edges, e.g. ``[0.0, 0.04, 0.065, 0.10]``.
+        labels: Optional per-bin labels.  If None, auto-generated from edges.
+
+    Returns:
+        (edges, labels) tuple, both lists of equal length (labels one shorter).
+
+    Raises:
+        ValueError: If edges/labels are invalid.
+    """
+    if edges is None or len(edges) < 2:
+        raise ValueError("redshift_bin_edges must have at least 2 values")
+    edges = [float(e) for e in edges]
+    for i in range(len(edges) - 1):
+        if edges[i] >= edges[i + 1]:
+            raise ValueError(
+                f"redshift_bin_edges must be strictly increasing; "
+                f"got {edges[i]} >= {edges[i + 1]} at index {i}"
+            )
+    if labels is None:
+        labels = [f"{edges[i]:.2f}-{edges[i + 1]:.2f}" for i in range(len(edges) - 1)]
+    else:
+        labels = [str(lbl) for lbl in labels]
+        if len(labels) != len(edges) - 1:
+            raise ValueError(
+                f"redshift_bin_labels length ({len(labels)}) must be "
+                f"one less than edges ({len(edges)})"
+            )
+    return edges, labels
+
+
+def _aggregate_redshift_metrics(
+    *,
+    outcomes: Mapping[Tuple[int, int, int], Mapping[str, Any]],
+    gallery_sizes: Sequence[int],
+    n_trials: int,
+    unique_gw: Sequence[int],
+    redshift_metadata: Mapping[int, Mapping[str, Any]],
+    bin_edges: List[float],
+    bin_labels: List[str],
+    method_name: str = "",
+) -> List[Dict[str, Any]]:
+    """Aggregate per-gallery outcomes by redshift bin.
+
+    Only positive-query GW events present in ``redshift_metadata`` contribute.
+    Gallery distractors are not binned by redshift.
+
+    Returns:
+        List of per-bin rows, one per (gallery_size, bin_index).
+        Bins with zero queries are omitted.
+    """
+    rows: List[Dict[str, Any]] = []
+    for gallery_size in [int(s) for s in gallery_sizes]:
+        # Collect GW-level values per redshift bin
+        buckets: Dict[int, Dict[str, List[float]]] = {}
+        for trial in range(int(n_trials)):
+            for gw_id in [int(g) for g in unique_gw]:
+                key = (gallery_size, trial, gw_id)
+                if key not in outcomes or gw_id not in redshift_metadata:
+                    continue
+                outcome = outcomes[key]
+                z = float(redshift_metadata[gw_id]["redshift"])
+                # Determine bin index from edges
+                bin_idx = _find_redshift_bin(z, bin_edges)
+                if bin_idx < 0:
+                    continue
+                bucket = buckets.setdefault(
+                    bin_idx,
+                    {
+                        "redshifts": [],
+                        "ranks": [],
+                        "coverage": [],
+                        "full_coverage": [],
+                        "actual_sizes": [],
+                    },
+                )
+                actual_size = float(outcome.get("actual_gallery_size", gallery_size))
+                coverage_met = bool(outcome.get("coverage_met", actual_size >= gallery_size))
+                fill_ratio = min(1.0, max(0.0, actual_size / float(max(int(gallery_size), 1))))
+                bucket["redshifts"].append(z)
+                bucket["ranks"].append(float(outcome["rank"]))
+                bucket["coverage"].append(fill_ratio)
+                bucket["full_coverage"].append(1.0 if coverage_met else 0.0)
+                bucket["actual_sizes"].append(actual_size)
+
+        for bin_idx in sorted(buckets):
+            bucket = buckets[bin_idx]
+            ranks = np.asarray(bucket["ranks"], dtype=np.float64)
+            n = int(ranks.size)
+            rows.append({
+                "method": str(method_name),
+                "redshift_bin_label": str(bin_labels[bin_idx]),
+                "bin_left": float(bin_edges[bin_idx]),
+                "bin_right": float(bin_edges[bin_idx + 1]),
+                "redshift": float(np.mean(bucket["redshifts"])) if n else 0.0,
+                "gallery_size": int(gallery_size),
+                "n_queries": n,
+                "recall_at_1": float(np.mean(ranks < 1)) if n else 0.0,
+                "recall_at_5": float(np.mean(ranks < 5)) if n else 0.0,
+                "recall_at_10": float(np.mean(ranks < 10)) if n else 0.0,
+                "mrr": float(np.mean(1.0 / (ranks + 1.0))) if n else 0.0,
+                "coverage": float(np.mean(bucket["coverage"])) if n else 0.0,
+                "fill_ratio_mean": float(np.mean(bucket["coverage"])) if n else 0.0,
+                "full_coverage": float(np.mean(bucket["full_coverage"])) if n else 0.0,
+                "effective_gallery_size_mean": float(np.mean(bucket["actual_sizes"])) if n else 0.0,
+            })
+    return rows
+
+
+def _find_redshift_bin(z: float, edges: List[float]) -> int:
+    """Return the bin index for a redshift value, or -1 if outside all bins."""
+    for i in range(len(edges) - 1):
+        if edges[i] <= z < edges[i + 1]:
+            return i
+    # Right-inclusive for the last bin
+    if z == edges[-1]:
+        return len(edges) - 2
+    return -1
+
+
+# ---------------------------------------------------------------------------
+# Redshift CSV and plot writers (adapted from eval_gw170817a_retrieval.py)
+# ---------------------------------------------------------------------------
+def write_redshift_csv(rows: Sequence[Mapping[str, Any]], output_path: Path) -> None:
+    """Write redshift-binned metrics to a CSV file."""
+    import csv
+
+    rows = list(rows)
+    if not rows:
+        return
+    fieldnames = [
+        "method",
+        "redshift_bin_label",
+        "bin_left",
+        "bin_right",
+        "redshift",
+        "gallery_size",
+        "n_queries",
+        "recall_at_1",
+        "recall_at_5",
+        "recall_at_10",
+        "mrr",
+        "coverage",
+        "fill_ratio_mean",
+        "full_coverage",
+        "effective_gallery_size_mean",
+    ]
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({key: row.get(key, "") for key in fieldnames})
+
+
+def plot_redshift_metrics(
+    rows: Sequence[Mapping[str, Any]],
+    output_dir: Path,
+    *,
+    _plot_method_label_fn=None,
+) -> None:
+    """Plot R@1, R@10, MRR vs redshift per gallery size.
+
+    Style matches the GW170817A redshift evaluation: one figure per gallery
+    size, three panels showing the three metrics against mean bin redshift.
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception:
+        return
+    rows = list(rows)
+    if not rows:
+        return
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    methods = sorted({str(row["method"]) for row in rows})
+    metrics = [("recall_at_1", "R@1"), ("recall_at_10", "R@10"), ("mrr", "MRR")]
+    all_gallery_sizes = sorted({int(row["gallery_size"]) for row in rows})
+
+    label_fn = _plot_method_label_fn or (lambda x: x)
+
+    for gallery_size in all_gallery_sizes:
+        fig, axes = plt.subplots(1, 3, figsize=(15, 4.6), sharex=True)
+        for ax, (key, metric_label) in zip(axes, metrics):
+            for method in methods:
+                method_rows = sorted(
+                    [
+                        row
+                        for row in rows
+                        if str(row["method"]) == method
+                        and int(row["gallery_size"]) == gallery_size
+                    ],
+                    key=lambda row: float(row["redshift"]),
+                )
+                if method_rows:
+                    ax.plot(
+                        [float(row["redshift"]) for row in method_rows],
+                        [float(row[key]) for row in method_rows],
+                        marker="o",
+                        linewidth=2,
+                        label=label_fn(method),
+                    )
+            ax.set_xlabel("Redshift")
+            ax.set_ylabel(metric_label)
+            ax.set_title(f"{metric_label} vs Redshift  (gallery_size={gallery_size})")
+            ax.grid(True, alpha=0.3)
+        handles, labels = axes[0].get_legend_handles_labels()
+        if handles:
+            fig.legend(handles, labels, loc="upper center", ncol=min(4, len(labels)), frameon=False)
+        fig.tight_layout(rect=(0, 0, 1, 0.90))
+        fig.savefig(str(out / f"redshift_retrieval_metrics_g{gallery_size}.png"), dpi=300, bbox_inches="tight")
+        plt.close(fig)
+
+
+def plot_redshift_coverage(rows: Sequence[Mapping[str, Any]], output_dir: Path) -> None:
+    """Plot coverage vs redshift per gallery size."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception:
+        return
+    rows = list(rows)
+    if not rows:
+        return
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    methods = sorted({str(row["method"]) for row in rows})
+    all_gallery_sizes = sorted({int(row["gallery_size"]) for row in rows})
+
+    for gallery_size in all_gallery_sizes:
+        fig, ax = plt.subplots(figsize=(7, 4.8))
+        for method in methods:
+            method_rows = sorted(
+                [
+                    row
+                    for row in rows
+                    if str(row["method"]) == method
+                    and int(row["gallery_size"]) == gallery_size
+                ],
+                key=lambda row: float(row["redshift"]),
+            )
+            if method_rows:
+                ax.plot(
+                    [float(row["redshift"]) for row in method_rows],
+                    [float(row["coverage"]) for row in method_rows],
+                    marker="o",
+                    linewidth=2,
+                    label=method,
+                )
+        ax.set_xlabel("Redshift")
+        ax.set_ylabel("Mean Fill Ratio")
+        ax.set_ylim(0.0, 1.05)
+        ax.set_title(f"Mean Gallery Fill Ratio vs Redshift  (gallery_size={gallery_size})")
+        ax.grid(True, alpha=0.3)
+        ax.legend(frameon=False)
+        fig.tight_layout()
+        fig.savefig(str(out / f"redshift_coverage_g{gallery_size}.png"), dpi=300, bbox_inches="tight")
+        plt.close(fig)
 
 
 def _json_safe(obj: Any) -> Any:
@@ -562,6 +1059,12 @@ def build_batch_positive_bank_and_galleries(
             neg_idx_full = np.asarray(seq.get("candidate_indices", []), dtype=np.int64).reshape(-1)
             neg_cred_full = np.asarray(seq.get("credible_levels", []), dtype=np.float32).reshape(-1)
             neg_dt_full = np.asarray(seq.get("abs_dt_days", []), dtype=np.float32).reshape(-1)
+            neg_coords_full = None
+            if "synthetic_coordinates" in seq:
+                neg_coords_full = np.asarray(seq["synthetic_coordinates"], dtype=np.float32).reshape(-1, 2)
+            neg_time_full = None
+            if "synthetic_zero_time_mjd_cls_base" in seq:
+                neg_time_full = np.asarray(seq["synthetic_zero_time_mjd_cls_base"], dtype=np.float64).reshape(-1)
 
             for gallery_size in gallery_sizes:
                 requested = int(gallery_size)
@@ -571,7 +1074,7 @@ def build_batch_positive_bank_and_galleries(
                     continue
                 take_neg = min(target_neg, available_neg)
                 actual_gallery_size = 1 + int(take_neg)
-                galleries[(requested, int(trial), int(gw_id))] = {
+                gallery_spec = {
                     "positive_index": positive_index,
                     "negative_indices": neg_idx_full[:take_neg].astype(np.int64, copy=False),
                     "negative_credible_levels": neg_cred_full[:take_neg].astype(np.float32, copy=False),
@@ -581,6 +1084,11 @@ def build_batch_positive_bank_and_galleries(
                     "coverage_met": bool(actual_gallery_size >= requested),
                     "is_undersized": bool(actual_gallery_size < requested),
                 }
+                if neg_coords_full is not None:
+                    gallery_spec["negative_synthetic_coordinates"] = neg_coords_full[:take_neg].astype(np.float32, copy=False)
+                if neg_time_full is not None:
+                    gallery_spec["negative_synthetic_zero_time_mjd_cls_base"] = neg_time_full[:take_neg].astype(np.float64, copy=False)
+                galleries[(requested, int(trial), int(gw_id))] = gallery_spec
 
     return bank, galleries, used_gw
 
@@ -891,7 +1399,14 @@ def extract_negative_gallery_embeddings(
     all_opt_v = []
     all_opt_mask = []
     all_opt_err = []
+    all_z_curve = []
 
+    optical_encoder = getattr(core_model, "optical_encoder", None)
+    supports_curve_coord_cache = (
+        optical_encoder is not None
+        and hasattr(optical_encoder, "encode_components")
+        and hasattr(optical_encoder, "contrastive_head")
+    )
     total = int(neg_optical_data["times"].shape[0])
     for start in tqdm(range(0, total, int(chunk_size)), desc="  Extracting tutorial distractor embeddings"):
         end = min(start + int(chunk_size), total)
@@ -903,19 +1418,28 @@ def extract_negative_gallery_embeddings(
         opt_err = neg_optical_data["errors"].index_select(0, chunk_idx).to(device)
         ref_time = build_ref_time(opt_t.size(0), n_ref, ref_start, ref_end, device, opt_t.dtype)
         with _autocast_context(device, amp_dtype, enabled=amp_enabled):
-            z_l, h_l = core_model.encode_optical(
-                opt_coords, opt_t, opt_v, ref_time, opt_mask, opt_err
-            )
+            if supports_curve_coord_cache:
+                z_curve, coord_feat, h_l = optical_encoder.encode_components(
+                    opt_coords, opt_t, opt_v, ref_time, opt_mask, opt_err=opt_err
+                )
+                z_l = optical_encoder.contrastive_head(z_curve, coord_feat)
+            else:
+                z_curve = None
+                z_l, h_l = core_model.encode_optical(
+                    opt_coords, opt_t, opt_v, ref_time, opt_mask, opt_err
+                )
 
         all_h_l.append(h_l.float().cpu())
         all_z_l.append(z_l.float().cpu())
+        if z_curve is not None:
+            all_z_curve.append(z_curve.float().cpu())
         all_opt_coords.append(opt_coords.float().cpu())
         all_opt_t.append(opt_t.float().cpu())
         all_opt_v.append(opt_v.float().cpu())
         all_opt_mask.append(opt_mask.float().cpu())
         all_opt_err.append(opt_err.float().cpu())
 
-    return {
+    result = {
         "h_l_cls": torch.cat(all_h_l),
         "z_l_cls": torch.cat(all_z_l),
         "opt_coords": torch.cat(all_opt_coords),
@@ -924,6 +1448,49 @@ def extract_negative_gallery_embeddings(
         "opt_mask_raw": torch.cat(all_opt_mask),
         "opt_err_raw": torch.cat(all_opt_err),
     }
+    if all_z_curve:
+        result["z_curve_cls"] = torch.cat(all_z_curve)
+    return result
+
+
+def _candidate_coords_for_chunk(
+    candidate_bank: Dict[str, torch.Tensor],
+    chunk_idx: torch.Tensor,
+    candidate_coords: Optional[np.ndarray],
+    *,
+    start: int,
+    end: int,
+    device: torch.device,
+) -> torch.Tensor:
+    if candidate_coords is None:
+        return candidate_bank["opt_coords"].index_select(0, chunk_idx).to(device)
+    coords_np = np.asarray(candidate_coords, dtype=np.float32)
+    if coords_np.ndim != 2 or coords_np.shape[1] != 2:
+        raise ValueError(f"candidate_coords must have shape [N, 2], got {coords_np.shape}")
+    return torch.as_tensor(coords_np[int(start):int(end)], dtype=torch.float32, device=device)
+
+
+def _candidate_z_l_for_chunk(
+    model,
+    candidate_bank: Dict[str, torch.Tensor],
+    chunk_idx: torch.Tensor,
+    opt_coords_chunk: torch.Tensor,
+    device: torch.device,
+    *,
+    use_synthetic_coords: bool,
+) -> torch.Tensor:
+    if use_synthetic_coords and "z_curve_cls" in candidate_bank:
+        core_model = model._orig_mod if hasattr(model, "_orig_mod") else model
+        optical_encoder = getattr(core_model, "optical_encoder", None)
+        if (
+            optical_encoder is not None
+            and hasattr(optical_encoder, "encode_coord_only")
+            and hasattr(optical_encoder, "contrastive_head")
+        ):
+            z_curve = candidate_bank["z_curve_cls"].index_select(0, chunk_idx).to(device)
+            coord_feat = optical_encoder.encode_coord_only(opt_coords_chunk)
+            return optical_encoder.contrastive_head(z_curve, coord_feat)
+    return candidate_bank["z_l_cls"].index_select(0, chunk_idx).to(device)
 
 
 @torch.no_grad()
@@ -935,6 +1502,7 @@ def _score_candidate_bank_with_logits(
     device: torch.device,
     dual: bool,
     *,
+    candidate_coords: Optional[np.ndarray] = None,
     amp_dtype: torch.dtype = torch.float32,
     amp_enabled: bool = False,
 ) -> np.ndarray:
@@ -951,12 +1519,21 @@ def _score_candidate_bank_with_logits(
         gw_m_query = query_cache["gw_m"].to(device)
 
     candidate_indices = np.asarray(candidate_indices, dtype=np.int64)
+    if candidate_coords is not None and np.asarray(candidate_coords).shape[0] != candidate_indices.shape[0]:
+        raise ValueError("candidate_coords must have the same first dimension as candidate_indices.")
+    use_synthetic_coords = candidate_coords is not None
     for start in range(0, len(candidate_indices), 1024):
         chunk_np = candidate_indices[start:start + 1024]
         chunk_idx = torch.from_numpy(chunk_np).long()
         h_chunk = candidate_bank["h_l_cls"].index_select(0, chunk_idx).to(device)
-        opt_coords_chunk = candidate_bank["opt_coords"].index_select(0, chunk_idx).to(device)
-        z_chunk = candidate_bank["z_l_cls"].index_select(0, chunk_idx).to(device) if dual else None
+        opt_coords_chunk = _candidate_coords_for_chunk(
+            candidate_bank,
+            chunk_idx,
+            candidate_coords,
+            start=start,
+            end=start + len(chunk_np),
+            device=device,
+        )
 
         batch_size = h_chunk.size(0)
         g_chunk = g_query.unsqueeze(0).expand(batch_size, -1)
@@ -972,6 +1549,14 @@ def _score_candidate_bank_with_logits(
             cred_chunk = None
 
         with _autocast_context(device, amp_dtype, enabled=amp_enabled):
+            z_chunk = _candidate_z_l_for_chunk(
+                model,
+                candidate_bank,
+                chunk_idx,
+                opt_coords_chunk,
+                device,
+                use_synthetic_coords=use_synthetic_coords,
+            )
             logits = model.fusion_logits(
                 g_chunk,
                 h_chunk,
@@ -996,6 +1581,7 @@ def _score_candidate_bank_contrastive(
     candidate_bank: Dict[str, torch.Tensor],
     device: torch.device,
     *,
+    candidate_coords: Optional[np.ndarray] = None,
     amp_dtype: torch.dtype = torch.float32,
     amp_enabled: bool = False,
 ) -> np.ndarray:
@@ -1010,11 +1596,29 @@ def _score_candidate_bank_contrastive(
 
     scores = []
     candidate_indices = np.asarray(candidate_indices, dtype=np.int64)
+    if candidate_coords is not None and np.asarray(candidate_coords).shape[0] != candidate_indices.shape[0]:
+        raise ValueError("candidate_coords must have the same first dimension as candidate_indices.")
+    use_synthetic_coords = candidate_coords is not None
     for start in range(0, len(candidate_indices), 1024):
         chunk_np = candidate_indices[start:start + 1024]
         chunk_idx = torch.from_numpy(chunk_np).long()
-        z_chunk = candidate_bank["z_l_cls"].index_select(0, chunk_idx).to(device)
+        opt_coords_chunk = _candidate_coords_for_chunk(
+            candidate_bank,
+            chunk_idx,
+            candidate_coords,
+            start=start,
+            end=start + len(chunk_np),
+            device=device,
+        )
         with _autocast_context(device, amp_dtype, enabled=amp_enabled):
+            z_chunk = _candidate_z_l_for_chunk(
+                model,
+                candidate_bank,
+                chunk_idx,
+                opt_coords_chunk,
+                device,
+                use_synthetic_coords=use_synthetic_coords,
+            )
             feat_o = core_model.project_optical_features(z_chunk)
         sims = torch.matmul(feat_g, feat_o.T).squeeze(0)
         scores.append(sims.float().cpu())
@@ -1054,6 +1658,7 @@ def score_all_galleries_multimodal(
         _gallery_size, _trial, gw_id = key
         pos_index = int(gallery_spec["positive_index"])
         neg_indices = np.asarray(gallery_spec["negative_indices"], dtype=np.int64)
+        neg_candidate_coords = gallery_spec.get("negative_synthetic_coordinates")
         pos_probs = _score_candidate_bank_with_logits(
             model,
             query_cache[int(gw_id)],
@@ -1071,6 +1676,7 @@ def score_all_galleries_multimodal(
             negative_bank,
             device,
             dual,
+            candidate_coords=neg_candidate_coords,
             amp_dtype=amp_dtype,
             amp_enabled=amp_enabled,
         )
@@ -1112,6 +1718,7 @@ def score_all_galleries_contrastive(
         _gallery_size, _trial, gw_id = key
         pos_index = int(gallery_spec["positive_index"])
         neg_indices = np.asarray(gallery_spec["negative_indices"], dtype=np.int64)
+        neg_candidate_coords = gallery_spec.get("negative_synthetic_coordinates")
         pos_sims = _score_candidate_bank_contrastive(
             model,
             query_cache[int(gw_id)],
@@ -1127,6 +1734,7 @@ def score_all_galleries_contrastive(
             neg_indices,
             negative_bank,
             device,
+            candidate_coords=neg_candidate_coords,
             amp_dtype=amp_dtype,
             amp_enabled=amp_enabled,
         )
@@ -1588,6 +2196,20 @@ def normalize_shared_config(cfg: Dict[str, Any], cfg_path: Path) -> Dict[str, An
     positive_selection = str(cfg.get("positive_selection", "random")).strip().lower()
     if positive_selection not in {"random", "batch"}:
         raise ValueError("positive_selection must be one of {'random', 'batch'}.")
+    # --- Redshift analysis ---
+    redshift_analysis_enable = _as_bool(cfg.get("redshift_analysis_enable", False), default=False)
+    redshift_catalogs = _normalize_redshift_catalog_paths(
+        cfg.get("redshift_catalogs"), cfg_dir
+    )
+    redshift_bin_edges_raw = cfg.get("redshift_bin_edges")
+    redshift_bin_labels_raw = cfg.get("redshift_bin_labels")
+    redshift_bin_edges = None
+    redshift_bin_labels = None
+    if redshift_analysis_enable:
+        redshift_bin_edges, redshift_bin_labels = _normalize_redshift_bin_config(
+            redshift_bin_edges_raw, redshift_bin_labels_raw
+        )
+
     normalized = {
         "input_config": str(cfg_path),
         "test_data_path": _resolve_path(cfg_dir, cfg.get("test_data_path")),
@@ -1630,6 +2252,11 @@ def normalize_shared_config(cfg: Dict[str, Any], cfg_path: Path) -> Dict[str, An
         "dt_bin_edges": str(cfg.get("dt_bin_edges", DEFAULT_DT_BIN_EDGES)),
         "report_dt_macro": _as_bool(cfg.get("report_dt_macro", False)),
         "hard_negative_strategy": str(cfg.get("hard_negative_strategy", "simple")),
+        # Redshift analysis
+        "redshift_analysis_enable": bool(redshift_analysis_enable),
+        "redshift_catalogs": dict(redshift_catalogs),
+        "redshift_bin_edges": redshift_bin_edges,
+        "redshift_bin_labels": redshift_bin_labels,
     }
     if normalized["test_data_path"] is None:
         raise ValueError("Comparison config is missing test_data_path")
@@ -1749,13 +2376,22 @@ def main():
     }
     gw_source_map = build_gw_source_map(gw_source_types, all_test_gw_ids)
 
+    # --- Redshift metadata recovery from source catalogs ---
+    redshift_metadata = None
+    if cfg.get("redshift_analysis_enable"):
+        redshift_metadata = _build_redshift_metadata_from_catalogs(
+            cfg["test_data_path"],
+            cfg["redshift_catalogs"],
+        )
+        print(f"Loaded redshift metadata for {len(redshift_metadata)} GW events from source catalogs")
+
     print(f"\n{'=' * 60}")
     print("Phase 2: Pre-generate shared galleries")
     print("=" * 60)
     gallery_candidate_mode = str(cfg["gallery_candidate_mode"]).strip().lower()
     gallery_gw_skymaps: Dict[int, torch.Tensor] = {}
 
-    if gallery_candidate_mode in ("time_sky_hard", "tutorial_random"):
+    if gallery_candidate_mode in ("time_sky_hard", "synthetic_time_sky_hard", "tutorial_random"):
         # Build candidate sequences (shared across both modes for time_sky_hard)
         if gallery_candidate_mode == "time_sky_hard":
             candidate_sequences, gallery_gw_skymaps, _gallery_gw_times = build_time_sky_candidate_sequences(
@@ -1767,6 +2403,17 @@ def main():
                 time_window_days=cfg["gallery_candidate_time_window_days"],
                 credible_level_max=cfg["gallery_candidate_credible_level_max"],
                 zero_time_field=cfg["nonkn_cls_base_field"],
+            )
+        elif gallery_candidate_mode == "synthetic_time_sky_hard":
+            candidate_sequences, gallery_gw_skymaps, _gallery_gw_times = build_synthetic_time_sky_candidate_sequences(
+                test_data_path=cfg["test_data_path"],
+                unique_gw_ids=all_test_gw_ids,
+                neg_optical_data=neg_optical_data,
+                gallery_sizes=gallery_sizes,
+                n_trials=n_trials,
+                seed=seed,
+                time_window_days=cfg["gallery_candidate_time_window_days"],
+                credible_level_max=cfg["gallery_candidate_credible_level_max"],
             )
         else:
             candidate_sequences = {}
@@ -1789,7 +2436,7 @@ def main():
             )
         else:
             # --- Random: each trial randomly selects a positive per GW ---
-            if gallery_candidate_mode == "time_sky_hard":
+            if gallery_candidate_mode in ("time_sky_hard", "synthetic_time_sky_hard"):
                 galleries, unique_gw = build_prefixed_gallery_specs(
                     gw_positive_indices=gw_positive_indices,
                     candidate_sequences=candidate_sequences,
@@ -1807,7 +2454,7 @@ def main():
                     seed,
                 )
             print(
-                "  Built hard-filtered galleries with "
+                f"  Built {gallery_candidate_mode} galleries with "
                 f"time_window=±{cfg['gallery_candidate_time_window_days']:.1f} days, "
                 f"credible<= {cfg['gallery_candidate_credible_level_max']:.3f}, "
                 f"include_undersized={bool(cfg['gallery_include_undersized'])}"
@@ -1827,7 +2474,7 @@ def main():
     else:
         raise ValueError(
             f"Unsupported gallery_candidate_mode='{gallery_candidate_mode}'. "
-            "Expected one of {'time_sky_hard', 'tutorial_random'}."
+            "Expected one of {'time_sky_hard', 'synthetic_time_sky_hard', 'tutorial_random'}."
         )
 
     if not galleries:
@@ -1859,6 +2506,7 @@ def main():
     model_results: OrderedDict[str, Dict[str, Any]] = OrderedDict()
     retrieval_rows: OrderedDict[str, Dict[str, float]] = OrderedDict()
     curve_rows: List[Dict[str, Any]] = []
+    redshift_rows: List[Dict[str, Any]] = []
     model_names: List[str] = []
 
     for idx, model_spec in enumerate(model_specs, start=1):
@@ -2040,8 +2688,11 @@ def main():
             }
             del negative_embeddings, embeddings, model
         elif model_type == "skymap":
-            if gallery_candidate_mode != "time_sky_hard":
-                raise ValueError("skymap-only model requires gallery_candidate_mode='time_sky_hard'")
+            if not _gallery_mode_supports_skymap_only(gallery_candidate_mode):
+                raise ValueError(
+                    "skymap-only model requires gallery_candidate_mode to provide "
+                    "time/sky credible-level galleries."
+                )
             outcomes = score_all_galleries_skymap(
                 positive_bank={"opt_coords": positive_query_bank["opt_coords"]},
                 galleries=galleries,
@@ -2082,6 +2733,19 @@ def main():
         model_results[name]["curve_rows"] = model_curve_rows
         curve_rows.extend(model_curve_rows)
 
+        if redshift_metadata is not None:
+            model_redshift_rows = _aggregate_redshift_metrics(
+                outcomes=outcomes,
+                gallery_sizes=gallery_sizes,
+                n_trials=n_trials,
+                unique_gw=unique_gw,
+                redshift_metadata=redshift_metadata,
+                bin_edges=cfg["redshift_bin_edges"],
+                bin_labels=cfg["redshift_bin_labels"],
+                method_name=name,
+            )
+            redshift_rows.extend(model_redshift_rows)
+
         for gallery_size in gallery_sizes:
             coverage_info = model_results[name]["effective_gallery_size_stats"].get(f"gallery_{gallery_size}", {})
             r1 = model_results[name]["retrieval"].get(f"gallery_{gallery_size}_recall_at_1", 0.0)
@@ -2116,6 +2780,11 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
     plot_retrieval_curves(curve_rows, output_dir)
     plot_retrieval_coverage(curve_rows, output_dir)
+    if redshift_rows:
+        write_redshift_csv(redshift_rows, output_dir / "redshift_metrics.csv")
+        plot_redshift_metrics(redshift_rows, output_dir)
+        plot_redshift_coverage(redshift_rows, output_dir)
+        print(f"Wrote redshift-binned outputs to {output_dir}")
     output = {
         "table": {
             "gallery_sizes": gallery_sizes,
@@ -2123,6 +2792,13 @@ def main():
             "rows": build_table_rows(retrieval_rows, gallery_sizes, model_names),
         },
         "curve_rows": curve_rows,
+        "redshift_rows": redshift_rows,
+        "redshift_config": {
+            "enabled": bool(cfg.get("redshift_analysis_enable", False)),
+            "catalogs": cfg.get("redshift_catalogs", {}),
+            "bin_edges": cfg.get("redshift_bin_edges"),
+            "bin_labels": cfg.get("redshift_bin_labels"),
+        } if cfg.get("redshift_analysis_enable") else None,
         "models": dict(model_results),
         "sampled_positive_summary": sampled_positive_summary,
         "gallery_positive_summary": gallery_positive_summary,
