@@ -16,6 +16,7 @@ set -euo pipefail
 SCRIPT_SUBDIR="Model"
 SCRIPT_REL_PATH="Model/ALBEF_train.sh"
 REPO_NAME="gw-kn-multimodal"
+DEFAULT_CONFIG_REL_PATH="Model/args/defaults/ALBEF_BNS_NSBH_v9_default.json"
 if [[ -n "${SLURM_JOB_ID:-}" && -n "${SLURM_SUBMIT_DIR:-}" ]]; then
     if [[ "$(basename "${SLURM_SUBMIT_DIR}")" == "${REPO_NAME}" ]]; then
         REPO_ROOT="${SLURM_SUBMIT_DIR}"
@@ -34,13 +35,23 @@ if [[ ! -f "${SCRIPT_PATH}" ]]; then
 fi
 
 args_file=${1:-}
+default_file=${2:-}
 if [[ -z "${args_file}" || ! -f "${args_file}" ]]; then
-    echo "Usage: $0 <args.json>"
+    echo "Usage: $0 <experiment.json> [default.json]"
     exit 1
 fi
 
 args_dir="$(cd "$(dirname "${args_file}")" && pwd)"
 args_file="${args_dir}/$(basename "${args_file}")"
+if [[ -z "${default_file}" ]]; then
+    default_file="${REPO_ROOT}/${DEFAULT_CONFIG_REL_PATH}"
+fi
+if [[ ! -f "${default_file}" ]]; then
+    echo "Default config file not found: ${default_file}" >&2
+    exit 1
+fi
+default_dir="$(cd "$(dirname "${default_file}")" && pwd)"
+default_file="${default_dir}/$(basename "${default_file}")"
 
 if [[ -z "${SLURM_JOB_ID:-}" ]]; then
     if ! command -v sbatch >/dev/null 2>&1; then
@@ -82,137 +93,23 @@ if [[ -z "${SLURM_JOB_ID:-}" ]]; then
         sbatch_opts+=(--chdir="${CHDIR}")
     fi
 
-    echo "Submitting job with: sbatch ${sbatch_opts[*]} ${script_path} ${args_file}"
+    echo "Submitting job with: sbatch ${sbatch_opts[*]} ${script_path} ${args_file} ${default_file}"
     (
         cd "${REPO_ROOT}"
-        sbatch "${sbatch_opts[@]}" "${script_path}" "${args_file}"
+        sbatch "${sbatch_opts[@]}" "${script_path}" "${args_file}" "${default_file}"
     )
     exit 0
 fi
 
 which python
 
-DATA_PATH=$(jq -r '.data_path' "$args_file")
-NEG_DATA_PATH=$(jq -r '.neg_data_path // empty' "$args_file")
-NEG_GROUP=$(jq -r '.neg_group // empty' "$args_file")
-CKPT_PATH=$(jq -r '.ckpt_path' "$args_file")
-STAGE_TO_JOBFS=$(jq -r '.stage_to_jobfs // false' "$args_file")
-RESUME=$(jq -r '.resume // empty' "$args_file")
-EPOCHS=$(jq -r '.epochs' "$args_file")
-BATCH_SIZE=$(jq -r '.batch_size' "$args_file")
-LR=$(jq -r '.lr' "$args_file")
-WEIGHT_DECAY=$(jq -r '.weight_decay // empty' "$args_file")
-GRAD_CLIP_NORM=$(jq -r '.grad_clip_norm // empty' "$args_file")
-LR_SCHEDULER=$(jq -r '.lr_scheduler // empty' "$args_file")
-WARMUP_EPOCHS=$(jq -r '.warmup_epochs // empty' "$args_file")
-MIN_LR=$(jq -r '.min_lr // empty' "$args_file")
-NUM_WORKERS=$(jq -r '.num_workers' "$args_file")
-STEPS_PER_EPOCH=$(jq -r '.steps_per_epoch // empty' "$args_file")
-PIN_MEMORY=$(jq -r '.pin_memory // empty' "$args_file")
-PERSISTENT_WORKERS=$(jq -r '.persistent_workers // empty' "$args_file")
-PREFETCH_FACTOR=$(jq -r '.prefetch_factor // empty' "$args_file")
-CACHE_IN_MEMORY=$(jq -r '.cache_in_memory // false' "$args_file")
-VAL_SPLIT=$(jq -r '.val_split // empty' "$args_file")
-VAL_BATCH_SIZE=$(jq -r '.val_batch_size // empty' "$args_file")
-VAL_STEPS_PER_EPOCH=$(jq -r '.val_steps_per_epoch // empty' "$args_file")
-SPLIT_SEED=$(jq -r '.split_seed // empty' "$args_file")
-EARLY_STOP_PATIENCE=$(jq -r '.early_stop_patience // empty' "$args_file")
-EARLY_STOP_MIN_DELTA=$(jq -r '.early_stop_min_delta // empty' "$args_file")
-BEST_CKPT_METRIC=$(jq -r '.best_ckpt_metric // empty' "$args_file")
-N_REF=$(jq -r '.n_ref // empty' "$args_file")
-REF_START=$(jq -r '.ref_start // empty' "$args_file")
-REF_END=$(jq -r '.ref_end // empty' "$args_file")
-REF_DIM=$(jq -r '.ref_dim // empty' "$args_file")
-ENC_DIM=$(jq -r '.enc_dim // empty' "$args_file")
-PROJ_DIM=$(jq -r '.proj_dim // empty' "$args_file")
-FUSION_ATTN_DIM=$(jq -r '.fusion_attn_dim // empty' "$args_file")
-FUSION_HIDDEN_DIM=$(jq -r '.fusion_hidden_dim // empty' "$args_file")
-FUSION_DROPOUT=$(jq -r '.fusion_dropout // empty' "$args_file")
-TEMP_INIT=$(jq -r '.temp_init // empty' "$args_file")
-TEMP_FINAL=$(jq -r '.temp_final // empty' "$args_file")
-TEMP_MIN=$(jq -r '.temp_min // empty' "$args_file")
-TEMP_MAX=$(jq -r '.temp_max // empty' "$args_file")
-TEMP_SCHEDULE=$(jq -r '.temp_schedule // empty' "$args_file")
-MTAN_SNR_S0=$(jq -r '.mtan_snr_s0 // empty' "$args_file")
-MTAN_SNR_BETA=$(jq -r '.mtan_snr_beta // empty' "$args_file")
-MTAN_SNR_CLIP_MIN=$(jq -r '.mtan_snr_clip_min // empty' "$args_file")
-MTAN_SNR_CLIP_MAX=$(jq -r '.mtan_snr_clip_max // empty' "$args_file")
-MTAN_SNR_EPS=$(jq -r '.mtan_snr_eps // empty' "$args_file")
-MTAN_LUPT_PSFFLUX_ZP=$(jq -r '.mtan_lupt_psfflux_zp // empty' "$args_file")
-MTAN_LUPT_K=$(jq -r '.mtan_lupt_k // empty' "$args_file")
-MTAN_LUPT_M5_MAG=$(jq -r '.mtan_lupt_m5_mag // empty' "$args_file")
-TIME_COMPAT_WEIGHT=$(jq -r '.time_compat_weight // empty' "$args_file")
-TIME_COMPAT_TAU_DAYS=$(jq -r '.time_compat_tau_days // empty' "$args_file")
-TIME_COMPAT_POWER=$(jq -r '.time_compat_power // empty' "$args_file")
-TIME_COMPAT_MAX_PENALTY=$(jq -r '.time_compat_max_penalty // empty' "$args_file")
-USE_TIME_DELTA_CLS_FEATURE_STATE=$(jq -r 'if has("use_time_delta_cls_feature") then (.use_time_delta_cls_feature | tostring) else "unset" end' "$args_file")
-TIME_DELTA_CLS_SCALE_DAYS=$(jq -r '.time_delta_cls_scale_days // empty' "$args_file")
-TIME_DELTA_CLS_CLIP=$(jq -r '.time_delta_cls_clip // empty' "$args_file")
-FUSION_PHYSICAL_WEIGHT=$(jq -r '.fusion_physical_weight // empty' "$args_file")
-FUSION_SPATIAL_WEIGHT=$(jq -r '.fusion_spatial_weight // empty' "$args_file")
-NONKN_CLS_BASE_FIELD=$(jq -r '.nonkn_cls_base_field // empty' "$args_file")
-GW_DROPOUT=$(jq -r '.gw_dropout // empty' "$args_file")
-OPT_DROPOUT=$(jq -r '.opt_dropout // empty' "$args_file")
-PROJ_DROPOUT=$(jq -r '.proj_dropout // empty' "$args_file")
-LABEL_SMOOTHING=$(jq -r '.label_smoothing // empty' "$args_file")
-FEATURE_DROPOUT=$(jq -r '.feature_dropout // empty' "$args_file")
-ITC_WEIGHT=$(jq -r '.itc_weight // empty' "$args_file")
-CLS_WEIGHT=$(jq -r '.cls_weight // empty' "$args_file")
-CLS_POS_WEIGHT=$(jq -r '.cls_pos_weight // empty' "$args_file")
-CLS_NEG_WEIGHT=$(jq -r '.cls_neg_weight // empty' "$args_file")
-CLS_EXTRA_NEG_WEIGHT=$(jq -r '.cls_extra_neg_weight // empty' "$args_file")
-CLS_RAMP_EPOCHS=$(jq -r '.cls_ramp_epochs // empty' "$args_file")
-GALLERY_LOSS_WEIGHT=$(jq -r '.gallery_loss_weight // empty' "$args_file")
-GALLERY_SCORE_CHUNK_SIZE=$(jq -r '.gallery_score_chunk_size // empty' "$args_file")
-GALLERY_INCLUDE_EXTRA_NEGATIVES_STATE=$(jq -r 'if has("gallery_include_extra_negatives") then (.gallery_include_extra_negatives | tostring) else "unset" end' "$args_file")
-ITC_DECAY_START_EPOCH=$(jq -r '.itc_decay_start_epoch // empty' "$args_file")
-ITC_DECAY_EPOCHS=$(jq -r '.itc_decay_epochs // empty' "$args_file")
-ITC_DECAY_RATIO=$(jq -r '.itc_decay_ratio // empty' "$args_file")
-ITC_LABEL_SMOOTHING=$(jq -r '.itc_label_smoothing // empty' "$args_file")
-ITC_LOSS_TYPE=$(jq -r '.itc_loss_type // empty' "$args_file")
-SUPCON_MARGIN=$(jq -r '.supcon_margin // empty' "$args_file")
-SAMPLES_PER_GW=$(jq -r '.samples_per_gw // empty' "$args_file")
-MIN_LC_PER_GW=$(jq -r '.min_lc_per_gw // empty' "$args_file")
-HARD_NEG_START_EPOCH=$(jq -r '.hard_neg_start_epoch // empty' "$args_file")
-HARD_NEG_RAMP_EPOCHS=$(jq -r '.hard_neg_ramp_epochs // empty' "$args_file")
-SEMI_HARD=$(jq -r '.semi_hard // false' "$args_file")
-SEMI_HARD_MARGIN=$(jq -r '.semi_hard_margin // empty' "$args_file")
-HARDNEG_TIME_WINDOW_DAYS=$(jq -r '.hardneg_time_window_days // empty' "$args_file")
-HARDNEG_MIN_CANDIDATES=$(jq -r '.hardneg_min_candidates // empty' "$args_file")
-HARDNEG_FALLBACK_MODE=$(jq -r '.hardneg_fallback_mode // empty' "$args_file")
-HARDNEG_MEMORY_BANK_ENABLE=$(jq -r '.hardneg_memory_bank_enable // false' "$args_file")
-HARDNEG_MEMORY_BANK_SIZE=$(jq -r '.hardneg_memory_bank_size // empty' "$args_file")
-HARDNEG_MEMORY_TOPK=$(jq -r '.hardneg_memory_topk // empty' "$args_file")
-HARDNEG_MEMORY_WARMUP_STEPS=$(jq -r '.hardneg_memory_warmup_steps // empty' "$args_file")
-HARDNEG_MEMORY_INTERVAL=$(jq -r '.hardneg_memory_interval // empty' "$args_file")
-HARDNEG_MEMORY_MAX_ROWS=$(jq -r '.hardneg_memory_max_rows // empty' "$args_file")
-CLS_START_EPOCH=$(jq -r '.cls_start_epoch // empty' "$args_file")
-MASK_ITC=$(jq -r '.mask_itc // false' "$args_file")
-USE_LIGHTWEIGHT_GW=$(jq -r '.use_lightweight_gw // false' "$args_file")
-DUAL_FUSION=$(jq -r '.dual_fusion // false' "$args_file")
-FUSION_MODE=$(jq -r '.fusion_mode // empty' "$args_file")
-USE_SIMILARITY_AS_CLS_INPUT_STATE=$(jq -r 'if has("use_similarity_as_cls_input") then (.use_similarity_as_cls_input | tostring) else "unset" end' "$args_file")
-USE_CRED_LEVEL_FEATURE_STATE=$(jq -r 'if has("use_cred_level_feature") then (.use_cred_level_feature | tostring) else "unset" end' "$args_file")
-GW_AUG_NOISE=$(jq -r '.gw_aug_noise // empty' "$args_file")
-GW_AUG_JITTER=$(jq -r '.gw_aug_jitter // empty' "$args_file")
-GW_AUG_DROPOUT=$(jq -r '.gw_aug_dropout // empty' "$args_file")
-OPT_AUG_NOISE=$(jq -r '.opt_aug_noise // empty' "$args_file")
-OPT_AUG_TIME_JITTER=$(jq -r '.opt_aug_time_jitter // empty' "$args_file")
-OPT_AUG_DROPOUT=$(jq -r '.opt_aug_dropout // empty' "$args_file")
-OPT_AUG_BAND_DROPOUT=$(jq -r '.opt_aug_band_dropout // empty' "$args_file")
-SEED=$(jq -r '.seed // empty' "$args_file")
-NEG_TIME_OFFSET_ENABLE=$(jq -r '.neg_time_offset_enable // false' "$args_file")
-NEG_OFFSET_DIST_NPZ=$(jq -r '.neg_offset_dist_npz // empty' "$args_file")
-NEG_OFFSET_DIST_KEY=$(jq -r '.neg_offset_dist_key // empty' "$args_file")
-NEG_OFFSET_TRAIN_SAMPLING=$(jq -r '.neg_offset_train_sampling // empty' "$args_file")
-NEG_OFFSET_EVAL_MODE=$(jq -r '.neg_offset_eval_mode // empty' "$args_file")
-NEG_OFFSET_EVAL_QUANTILES=$(jq -r '.neg_offset_eval_quantiles // empty' "$args_file")
-NEG_OFFSET_SCALE_DAYS_DIVISOR=$(jq -r '.neg_offset_scale_days_divisor // empty' "$args_file")
-NEG_OFFSET_SEED=$(jq -r '.neg_offset_seed // empty' "$args_file")
-NEG_OFFSET_BANK_SIZE=$(jq -r '.neg_offset_bank_size // empty' "$args_file")
-TEST_DATA_PATH=$(jq -r '.test_data_path // empty' "$args_file")
-TEST_STEPS=$(jq -r '.test_steps // empty' "$args_file")
-ENABLE_OOD_MONITORING=$(jq -r '.enable_ood_monitoring // false' "$args_file")
+DATA_PATH=$(jq -r -s '.[0] * .[1] | .data_path' "$default_file" "$args_file")
+NEG_DATA_PATH=$(jq -r -s '.[0] * .[1] | .neg_data_path // empty' "$default_file" "$args_file")
+CKPT_PATH=$(jq -r -s '.[0] * .[1] | .ckpt_path' "$default_file" "$args_file")
+STAGE_TO_JOBFS=$(jq -r -s '.[0] * .[1] | .stage_to_jobfs // false' "$default_file" "$args_file")
+NEG_TIME_OFFSET_ENABLE=$(jq -r -s '.[0] * .[1] | .neg_time_offset_enable // false' "$default_file" "$args_file")
+NEG_OFFSET_DIST_NPZ=$(jq -r -s '.[0] * .[1] | .neg_offset_dist_npz // empty' "$default_file" "$args_file")
+TEST_DATA_PATH=$(jq -r -s '.[0] * .[1] | .test_data_path // empty' "$default_file" "$args_file")
 mkdir -p "$CKPT_PATH"
 
 echo "========================================"
@@ -228,6 +125,7 @@ echo "Start time: $(date)"
 echo "========================================"
 echo ""
 echo "Configuration File: $args_file"
+echo "Default Configuration File: $default_file"
 echo "Checkpoint Path: $CKPT_PATH"
 echo ""
 
@@ -274,363 +172,20 @@ fi
 
 cmd=(
     python -u "${SCRIPT_DIR}/ALBEF_train.py"
+    --default_json_config "$default_file"
+    --json_config "$args_file"
     --data_path "$DATA_PATH"
     --ckpt_path "$CKPT_PATH"
-    --epochs "$EPOCHS"
-    --batch_size "$BATCH_SIZE"
-    --lr "$LR"
-    --num_workers "$NUM_WORKERS"
 )
 
 if [[ -n "$NEG_DATA_PATH" && "$NEG_DATA_PATH" != "null" ]]; then
     cmd+=(--neg_data_path "$NEG_DATA_PATH")
 fi
-if [[ -n "$NEG_GROUP" && "$NEG_GROUP" != "null" ]]; then
-    cmd+=(--neg_group "$NEG_GROUP")
-fi
-if [[ "$NEG_TIME_OFFSET_ENABLE" == "true" ]]; then
-    cmd+=(--neg_time_offset_enable)
-fi
 if [[ -n "$NEG_OFFSET_DIST_NPZ" && "$NEG_OFFSET_DIST_NPZ" != "null" ]]; then
     cmd+=(--neg_offset_dist_npz "$NEG_OFFSET_DIST_NPZ")
 fi
-if [[ -n "$NEG_OFFSET_DIST_KEY" && "$NEG_OFFSET_DIST_KEY" != "null" ]]; then
-    cmd+=(--neg_offset_dist_key "$NEG_OFFSET_DIST_KEY")
-fi
-if [[ -n "$NEG_OFFSET_TRAIN_SAMPLING" && "$NEG_OFFSET_TRAIN_SAMPLING" != "null" ]]; then
-    cmd+=(--neg_offset_train_sampling "$NEG_OFFSET_TRAIN_SAMPLING")
-fi
-if [[ -n "$NEG_OFFSET_EVAL_MODE" && "$NEG_OFFSET_EVAL_MODE" != "null" ]]; then
-    cmd+=(--neg_offset_eval_mode "$NEG_OFFSET_EVAL_MODE")
-fi
-if [[ -n "$NEG_OFFSET_EVAL_QUANTILES" && "$NEG_OFFSET_EVAL_QUANTILES" != "null" ]]; then
-    cmd+=(--neg_offset_eval_quantiles "$NEG_OFFSET_EVAL_QUANTILES")
-fi
-if [[ -n "$NEG_OFFSET_SCALE_DAYS_DIVISOR" && "$NEG_OFFSET_SCALE_DAYS_DIVISOR" != "null" ]]; then
-    cmd+=(--neg_offset_scale_days_divisor "$NEG_OFFSET_SCALE_DAYS_DIVISOR")
-fi
-if [[ -n "$NEG_OFFSET_SEED" && "$NEG_OFFSET_SEED" != "null" ]]; then
-    cmd+=(--neg_offset_seed "$NEG_OFFSET_SEED")
-fi
-if [[ -n "$NEG_OFFSET_BANK_SIZE" && "$NEG_OFFSET_BANK_SIZE" != "null" ]]; then
-    cmd+=(--neg_offset_bank_size "$NEG_OFFSET_BANK_SIZE")
-fi
-if [[ -n "$STEPS_PER_EPOCH" && "$STEPS_PER_EPOCH" != "null" ]]; then
-    cmd+=(--steps_per_epoch "$STEPS_PER_EPOCH")
-fi
-if [[ -n "$RESUME" && "$RESUME" != "null" ]]; then
-    cmd+=(--resume "$RESUME")
-fi
-if [[ -n "$LR_SCHEDULER" && "$LR_SCHEDULER" != "null" ]]; then
-    cmd+=(--lr_scheduler "$LR_SCHEDULER")
-fi
-if [[ -n "$WARMUP_EPOCHS" && "$WARMUP_EPOCHS" != "null" ]]; then
-    cmd+=(--warmup_epochs "$WARMUP_EPOCHS")
-fi
-if [[ -n "$MIN_LR" && "$MIN_LR" != "null" ]]; then
-    cmd+=(--min_lr "$MIN_LR")
-fi
-if [[ -n "$WEIGHT_DECAY" && "$WEIGHT_DECAY" != "null" ]]; then
-    cmd+=(--weight_decay "$WEIGHT_DECAY")
-fi
-if [[ -n "$GRAD_CLIP_NORM" && "$GRAD_CLIP_NORM" != "null" ]]; then
-    cmd+=(--grad_clip_norm "$GRAD_CLIP_NORM")
-fi
-if [[ -n "$PIN_MEMORY" && "$PIN_MEMORY" != "null" ]]; then
-    cmd+=(--pin_memory "$PIN_MEMORY")
-fi
-if [[ -n "$PERSISTENT_WORKERS" && "$PERSISTENT_WORKERS" != "null" ]]; then
-    cmd+=(--persistent_workers "$PERSISTENT_WORKERS")
-fi
-if [[ -n "$PREFETCH_FACTOR" && "$PREFETCH_FACTOR" != "null" ]]; then
-    cmd+=(--prefetch_factor "$PREFETCH_FACTOR")
-fi
-if [[ "$CACHE_IN_MEMORY" == "true" ]]; then
-    cmd+=(--cache_in_memory)
-fi
-if [[ -n "$VAL_SPLIT" && "$VAL_SPLIT" != "null" ]]; then
-    cmd+=(--val_split "$VAL_SPLIT")
-fi
-if [[ -n "$VAL_BATCH_SIZE" && "$VAL_BATCH_SIZE" != "null" ]]; then
-    cmd+=(--val_batch_size "$VAL_BATCH_SIZE")
-fi
-if [[ -n "$VAL_STEPS_PER_EPOCH" && "$VAL_STEPS_PER_EPOCH" != "null" ]]; then
-    cmd+=(--val_steps_per_epoch "$VAL_STEPS_PER_EPOCH")
-fi
-if [[ -n "$SPLIT_SEED" && "$SPLIT_SEED" != "null" ]]; then
-    cmd+=(--split_seed "$SPLIT_SEED")
-fi
-if [[ -n "$SEED" && "$SEED" != "null" ]]; then
-    cmd+=(--seed "$SEED")
-fi
-if [[ -n "$EARLY_STOP_PATIENCE" && "$EARLY_STOP_PATIENCE" != "null" ]]; then
-    cmd+=(--early_stop_patience "$EARLY_STOP_PATIENCE")
-fi
-if [[ -n "$EARLY_STOP_MIN_DELTA" && "$EARLY_STOP_MIN_DELTA" != "null" ]]; then
-    cmd+=(--early_stop_min_delta "$EARLY_STOP_MIN_DELTA")
-fi
-if [[ -n "$BEST_CKPT_METRIC" && "$BEST_CKPT_METRIC" != "null" ]]; then
-    cmd+=(--best_ckpt_metric "$BEST_CKPT_METRIC")
-fi
-if [[ -n "$N_REF" && "$N_REF" != "null" ]]; then
-    cmd+=(--n_ref "$N_REF")
-fi
-if [[ -n "$REF_START" && "$REF_START" != "null" ]]; then
-    cmd+=(--ref_start "$REF_START")
-fi
-if [[ -n "$REF_END" && "$REF_END" != "null" ]]; then
-    cmd+=(--ref_end "$REF_END")
-fi
-if [[ -n "$REF_DIM" && "$REF_DIM" != "null" ]]; then
-    cmd+=(--ref_dim "$REF_DIM")
-fi
-if [[ -n "$ENC_DIM" && "$ENC_DIM" != "null" ]]; then
-    cmd+=(--enc_dim "$ENC_DIM")
-fi
-if [[ -n "$PROJ_DIM" && "$PROJ_DIM" != "null" ]]; then
-    cmd+=(--proj_dim "$PROJ_DIM")
-fi
-if [[ -n "$FUSION_ATTN_DIM" && "$FUSION_ATTN_DIM" != "null" ]]; then
-    cmd+=(--fusion_attn_dim "$FUSION_ATTN_DIM")
-fi
-if [[ -n "$FUSION_HIDDEN_DIM" && "$FUSION_HIDDEN_DIM" != "null" ]]; then
-    cmd+=(--fusion_hidden_dim "$FUSION_HIDDEN_DIM")
-fi
-if [[ -n "$FUSION_DROPOUT" && "$FUSION_DROPOUT" != "null" ]]; then
-    cmd+=(--fusion_dropout "$FUSION_DROPOUT")
-fi
-if [[ -n "$TEMP_INIT" && "$TEMP_INIT" != "null" ]]; then
-    cmd+=(--temp_init "$TEMP_INIT")
-fi
-if [[ -n "$TEMP_FINAL" && "$TEMP_FINAL" != "null" ]]; then
-    cmd+=(--temp_final "$TEMP_FINAL")
-fi
-if [[ -n "$TEMP_MIN" && "$TEMP_MIN" != "null" ]]; then
-    cmd+=(--temp_min "$TEMP_MIN")
-fi
-if [[ -n "$TEMP_MAX" && "$TEMP_MAX" != "null" ]]; then
-    cmd+=(--temp_max "$TEMP_MAX")
-fi
-if [[ -n "$TEMP_SCHEDULE" && "$TEMP_SCHEDULE" != "null" ]]; then
-    cmd+=(--temp_schedule "$TEMP_SCHEDULE")
-fi
-if [[ -n "$MTAN_SNR_S0" && "$MTAN_SNR_S0" != "null" ]]; then
-    cmd+=(--mtan_snr_s0 "$MTAN_SNR_S0")
-fi
-if [[ -n "$MTAN_SNR_BETA" && "$MTAN_SNR_BETA" != "null" ]]; then
-    cmd+=(--mtan_snr_beta "$MTAN_SNR_BETA")
-fi
-if [[ -n "$MTAN_SNR_CLIP_MIN" && "$MTAN_SNR_CLIP_MIN" != "null" ]]; then
-    cmd+=(--mtan_snr_clip_min "$MTAN_SNR_CLIP_MIN")
-fi
-if [[ -n "$MTAN_SNR_CLIP_MAX" && "$MTAN_SNR_CLIP_MAX" != "null" ]]; then
-    cmd+=(--mtan_snr_clip_max "$MTAN_SNR_CLIP_MAX")
-fi
-if [[ -n "$MTAN_SNR_EPS" && "$MTAN_SNR_EPS" != "null" ]]; then
-    cmd+=(--mtan_snr_eps "$MTAN_SNR_EPS")
-fi
-if [[ -n "$MTAN_LUPT_PSFFLUX_ZP" && "$MTAN_LUPT_PSFFLUX_ZP" != "null" ]]; then
-    cmd+=(--mtan_lupt_psfflux_zp "$MTAN_LUPT_PSFFLUX_ZP")
-fi
-if [[ -n "$MTAN_LUPT_K" && "$MTAN_LUPT_K" != "null" ]]; then
-    cmd+=(--mtan_lupt_k "$MTAN_LUPT_K")
-fi
-if [[ -n "$MTAN_LUPT_M5_MAG" && "$MTAN_LUPT_M5_MAG" != "null" ]]; then
-    cmd+=(--mtan_lupt_m5_mag "$MTAN_LUPT_M5_MAG")
-fi
-if [[ -n "$TIME_COMPAT_WEIGHT" && "$TIME_COMPAT_WEIGHT" != "null" ]]; then
-    cmd+=(--time_compat_weight "$TIME_COMPAT_WEIGHT")
-fi
-if [[ -n "$TIME_COMPAT_TAU_DAYS" && "$TIME_COMPAT_TAU_DAYS" != "null" ]]; then
-    cmd+=(--time_compat_tau_days "$TIME_COMPAT_TAU_DAYS")
-fi
-if [[ -n "$TIME_COMPAT_POWER" && "$TIME_COMPAT_POWER" != "null" ]]; then
-    cmd+=(--time_compat_power "$TIME_COMPAT_POWER")
-fi
-if [[ -n "$TIME_COMPAT_MAX_PENALTY" && "$TIME_COMPAT_MAX_PENALTY" != "null" ]]; then
-    cmd+=(--time_compat_max_penalty "$TIME_COMPAT_MAX_PENALTY")
-fi
-if [[ "$USE_TIME_DELTA_CLS_FEATURE_STATE" == "true" ]]; then
-    cmd+=(--use_time_delta_cls_feature)
-elif [[ "$USE_TIME_DELTA_CLS_FEATURE_STATE" == "false" ]]; then
-    cmd+=(--no-use_time_delta_cls_feature)
-fi
-if [[ -n "$TIME_DELTA_CLS_SCALE_DAYS" && "$TIME_DELTA_CLS_SCALE_DAYS" != "null" ]]; then
-    cmd+=(--time_delta_cls_scale_days "$TIME_DELTA_CLS_SCALE_DAYS")
-fi
-if [[ -n "$TIME_DELTA_CLS_CLIP" && "$TIME_DELTA_CLS_CLIP" != "null" ]]; then
-    cmd+=(--time_delta_cls_clip "$TIME_DELTA_CLS_CLIP")
-fi
-if [[ -n "$FUSION_PHYSICAL_WEIGHT" && "$FUSION_PHYSICAL_WEIGHT" != "null" ]]; then
-    cmd+=(--fusion_physical_weight "$FUSION_PHYSICAL_WEIGHT")
-fi
-if [[ -n "$FUSION_SPATIAL_WEIGHT" && "$FUSION_SPATIAL_WEIGHT" != "null" ]]; then
-    cmd+=(--fusion_spatial_weight "$FUSION_SPATIAL_WEIGHT")
-fi
-if [[ -n "$NONKN_CLS_BASE_FIELD" && "$NONKN_CLS_BASE_FIELD" != "null" ]]; then
-    cmd+=(--nonkn_cls_base_field "$NONKN_CLS_BASE_FIELD")
-fi
-if [[ -n "$GW_DROPOUT" && "$GW_DROPOUT" != "null" ]]; then
-    cmd+=(--gw_dropout "$GW_DROPOUT")
-fi
-if [[ -n "$OPT_DROPOUT" && "$OPT_DROPOUT" != "null" ]]; then
-    cmd+=(--opt_dropout "$OPT_DROPOUT")
-fi
-if [[ -n "$PROJ_DROPOUT" && "$PROJ_DROPOUT" != "null" ]]; then
-    cmd+=(--proj_dropout "$PROJ_DROPOUT")
-fi
-if [[ -n "$LABEL_SMOOTHING" && "$LABEL_SMOOTHING" != "null" ]]; then
-    cmd+=(--label_smoothing "$LABEL_SMOOTHING")
-fi
-if [[ -n "$FEATURE_DROPOUT" && "$FEATURE_DROPOUT" != "null" ]]; then
-    cmd+=(--feature_dropout "$FEATURE_DROPOUT")
-fi
-if [[ -n "$ITC_WEIGHT" && "$ITC_WEIGHT" != "null" ]]; then
-    cmd+=(--itc_weight "$ITC_WEIGHT")
-fi
-if [[ -n "$CLS_WEIGHT" && "$CLS_WEIGHT" != "null" ]]; then
-    cmd+=(--cls_weight "$CLS_WEIGHT")
-fi
-if [[ -n "$CLS_POS_WEIGHT" && "$CLS_POS_WEIGHT" != "null" ]]; then
-    cmd+=(--cls_pos_weight "$CLS_POS_WEIGHT")
-fi
-if [[ -n "$CLS_NEG_WEIGHT" && "$CLS_NEG_WEIGHT" != "null" ]]; then
-    cmd+=(--cls_neg_weight "$CLS_NEG_WEIGHT")
-fi
-if [[ -n "$CLS_EXTRA_NEG_WEIGHT" && "$CLS_EXTRA_NEG_WEIGHT" != "null" ]]; then
-    cmd+=(--cls_extra_neg_weight "$CLS_EXTRA_NEG_WEIGHT")
-fi
-if [[ -n "$CLS_RAMP_EPOCHS" && "$CLS_RAMP_EPOCHS" != "null" ]]; then
-    cmd+=(--cls_ramp_epochs "$CLS_RAMP_EPOCHS")
-fi
-if [[ -n "$GALLERY_LOSS_WEIGHT" && "$GALLERY_LOSS_WEIGHT" != "null" ]]; then
-    cmd+=(--gallery_loss_weight "$GALLERY_LOSS_WEIGHT")
-fi
-if [[ -n "$GALLERY_SCORE_CHUNK_SIZE" && "$GALLERY_SCORE_CHUNK_SIZE" != "null" ]]; then
-    cmd+=(--gallery_score_chunk_size "$GALLERY_SCORE_CHUNK_SIZE")
-fi
-if [[ "$GALLERY_INCLUDE_EXTRA_NEGATIVES_STATE" == "true" ]]; then
-    cmd+=(--gallery_include_extra_negatives)
-elif [[ "$GALLERY_INCLUDE_EXTRA_NEGATIVES_STATE" == "false" ]]; then
-    cmd+=(--no-gallery_include_extra_negatives)
-fi
-if [[ -n "$ITC_DECAY_START_EPOCH" && "$ITC_DECAY_START_EPOCH" != "null" ]]; then
-    cmd+=(--itc_decay_start_epoch "$ITC_DECAY_START_EPOCH")
-fi
-if [[ -n "$ITC_DECAY_EPOCHS" && "$ITC_DECAY_EPOCHS" != "null" ]]; then
-    cmd+=(--itc_decay_epochs "$ITC_DECAY_EPOCHS")
-fi
-if [[ -n "$ITC_DECAY_RATIO" && "$ITC_DECAY_RATIO" != "null" ]]; then
-    cmd+=(--itc_decay_ratio "$ITC_DECAY_RATIO")
-fi
-if [[ -n "$ITC_LABEL_SMOOTHING" && "$ITC_LABEL_SMOOTHING" != "null" ]]; then
-    cmd+=(--itc_label_smoothing "$ITC_LABEL_SMOOTHING")
-fi
-if [[ -n "$ITC_LOSS_TYPE" && "$ITC_LOSS_TYPE" != "null" ]]; then
-    cmd+=(--itc_loss_type "$ITC_LOSS_TYPE")
-fi
-if [[ -n "$SUPCON_MARGIN" && "$SUPCON_MARGIN" != "null" ]]; then
-    cmd+=(--supcon_margin "$SUPCON_MARGIN")
-fi
-if [[ -n "$SAMPLES_PER_GW" && "$SAMPLES_PER_GW" != "null" ]]; then
-    cmd+=(--samples_per_gw "$SAMPLES_PER_GW")
-fi
-if [[ -n "$MIN_LC_PER_GW" && "$MIN_LC_PER_GW" != "null" ]]; then
-    cmd+=(--min_lc_per_gw "$MIN_LC_PER_GW")
-fi
-if [[ -n "$HARD_NEG_START_EPOCH" && "$HARD_NEG_START_EPOCH" != "null" ]]; then
-    cmd+=(--hard_neg_start_epoch "$HARD_NEG_START_EPOCH")
-fi
-if [[ -n "$HARD_NEG_RAMP_EPOCHS" && "$HARD_NEG_RAMP_EPOCHS" != "null" ]]; then
-    cmd+=(--hard_neg_ramp_epochs "$HARD_NEG_RAMP_EPOCHS")
-fi
-if [[ "$SEMI_HARD" == "true" ]]; then
-    cmd+=(--semi_hard)
-fi
-if [[ -n "$SEMI_HARD_MARGIN" && "$SEMI_HARD_MARGIN" != "null" ]]; then
-    cmd+=(--semi_hard_margin "$SEMI_HARD_MARGIN")
-fi
-if [[ -n "$HARDNEG_TIME_WINDOW_DAYS" && "$HARDNEG_TIME_WINDOW_DAYS" != "null" ]]; then
-    cmd+=(--hardneg_time_window_days "$HARDNEG_TIME_WINDOW_DAYS")
-fi
-if [[ -n "$HARDNEG_MIN_CANDIDATES" && "$HARDNEG_MIN_CANDIDATES" != "null" ]]; then
-    cmd+=(--hardneg_min_candidates "$HARDNEG_MIN_CANDIDATES")
-fi
-if [[ -n "$HARDNEG_FALLBACK_MODE" && "$HARDNEG_FALLBACK_MODE" != "null" ]]; then
-    cmd+=(--hardneg_fallback_mode "$HARDNEG_FALLBACK_MODE")
-fi
-if [[ "$HARDNEG_MEMORY_BANK_ENABLE" == "true" ]]; then
-    cmd+=(--hardneg_memory_bank_enable)
-fi
-if [[ -n "$HARDNEG_MEMORY_BANK_SIZE" && "$HARDNEG_MEMORY_BANK_SIZE" != "null" ]]; then
-    cmd+=(--hardneg_memory_bank_size "$HARDNEG_MEMORY_BANK_SIZE")
-fi
-if [[ -n "$HARDNEG_MEMORY_TOPK" && "$HARDNEG_MEMORY_TOPK" != "null" ]]; then
-    cmd+=(--hardneg_memory_topk "$HARDNEG_MEMORY_TOPK")
-fi
-if [[ -n "$HARDNEG_MEMORY_WARMUP_STEPS" && "$HARDNEG_MEMORY_WARMUP_STEPS" != "null" ]]; then
-    cmd+=(--hardneg_memory_warmup_steps "$HARDNEG_MEMORY_WARMUP_STEPS")
-fi
-if [[ -n "$HARDNEG_MEMORY_INTERVAL" && "$HARDNEG_MEMORY_INTERVAL" != "null" ]]; then
-    cmd+=(--hardneg_memory_interval "$HARDNEG_MEMORY_INTERVAL")
-fi
-if [[ -n "$HARDNEG_MEMORY_MAX_ROWS" && "$HARDNEG_MEMORY_MAX_ROWS" != "null" ]]; then
-    cmd+=(--hardneg_memory_max_rows "$HARDNEG_MEMORY_MAX_ROWS")
-fi
-if [[ -n "$CLS_START_EPOCH" && "$CLS_START_EPOCH" != "null" ]]; then
-    cmd+=(--cls_start_epoch "$CLS_START_EPOCH")
-fi
-if [[ "$MASK_ITC" == "true" ]]; then
-    cmd+=(--mask_itc)
-fi
-if [[ "$USE_LIGHTWEIGHT_GW" == "true" ]]; then
-    cmd+=(--use_lightweight_gw)
-fi
-if [[ "$DUAL_FUSION" == "true" ]]; then
-    cmd+=(--dual_fusion)
-fi
-if [[ -n "$FUSION_MODE" && "$FUSION_MODE" != "null" ]]; then
-    cmd+=(--fusion_mode "$FUSION_MODE")
-fi
-if [[ "$USE_SIMILARITY_AS_CLS_INPUT_STATE" == "true" ]]; then
-    cmd+=(--use_similarity_as_cls_input)
-elif [[ "$USE_SIMILARITY_AS_CLS_INPUT_STATE" == "false" ]]; then
-    cmd+=(--no-use_similarity_as_cls_input)
-fi
-if [[ "$USE_CRED_LEVEL_FEATURE_STATE" == "true" ]]; then
-    cmd+=(--use_cred_level_feature)
-elif [[ "$USE_CRED_LEVEL_FEATURE_STATE" == "false" ]]; then
-    cmd+=(--no-use_cred_level_feature)
-fi
-if [[ -n "$GW_AUG_NOISE" && "$GW_AUG_NOISE" != "null" ]]; then
-    cmd+=(--gw_aug_noise "$GW_AUG_NOISE")
-fi
-if [[ -n "$GW_AUG_JITTER" && "$GW_AUG_JITTER" != "null" ]]; then
-    cmd+=(--gw_aug_jitter "$GW_AUG_JITTER")
-fi
-if [[ -n "$GW_AUG_DROPOUT" && "$GW_AUG_DROPOUT" != "null" ]]; then
-    cmd+=(--gw_aug_dropout "$GW_AUG_DROPOUT")
-fi
-if [[ -n "$OPT_AUG_NOISE" && "$OPT_AUG_NOISE" != "null" ]]; then
-    cmd+=(--opt_aug_noise "$OPT_AUG_NOISE")
-fi
-if [[ -n "$OPT_AUG_TIME_JITTER" && "$OPT_AUG_TIME_JITTER" != "null" ]]; then
-    cmd+=(--opt_aug_time_jitter "$OPT_AUG_TIME_JITTER")
-fi
-if [[ -n "$OPT_AUG_DROPOUT" && "$OPT_AUG_DROPOUT" != "null" ]]; then
-    cmd+=(--opt_aug_dropout "$OPT_AUG_DROPOUT")
-fi
-if [[ -n "$OPT_AUG_BAND_DROPOUT" && "$OPT_AUG_BAND_DROPOUT" != "null" ]]; then
-    cmd+=(--opt_aug_band_dropout "$OPT_AUG_BAND_DROPOUT")
-fi
 if [[ -n "$TEST_DATA_PATH" && "$TEST_DATA_PATH" != "null" ]]; then
     cmd+=(--test_data_path "$TEST_DATA_PATH")
-fi
-if [[ -n "$TEST_STEPS" && "$TEST_STEPS" != "null" ]]; then
-    cmd+=(--test_steps "$TEST_STEPS")
-fi
-if [[ "$ENABLE_OOD_MONITORING" == "true" ]]; then
-    cmd+=(--enable_ood_monitoring)
 fi
 echo "Command: ${cmd[*]}"
 "${cmd[@]}"

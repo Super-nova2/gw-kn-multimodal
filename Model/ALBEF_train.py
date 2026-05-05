@@ -21,8 +21,51 @@ import gc
 import json
 import time
 import warnings
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 warnings.filterwarnings("ignore", "Wswiglal-redir-stdio")
+
+
+BASH_ONLY_CONFIG_KEYS = {"stage_to_jobfs"}
+
+
+def _load_json_config_file(path: Optional[str]) -> Dict[str, Any]:
+    if not path:
+        return {}
+    with open(path, "r") as f:
+        cfg = json.load(f)
+    if not isinstance(cfg, dict):
+        raise ValueError(f"JSON config must contain an object: {path}")
+    return {
+        k: v
+        for k, v in cfg.items()
+        if k not in BASH_ONLY_CONFIG_KEYS and v is not None
+    }
+
+
+def load_merged_json_config(
+    *,
+    default_json_config: Optional[str] = None,
+    json_config: Optional[str] = None,
+) -> Dict[str, Any]:
+    merged: Dict[str, Any] = {}
+    merged.update(_load_json_config_file(default_json_config))
+    merged.update(_load_json_config_file(json_config))
+    return merged
+
+
+def apply_json_config_defaults(
+    parser: argparse.ArgumentParser,
+    *,
+    default_json_config: Optional[str] = None,
+    json_config: Optional[str] = None,
+) -> Dict[str, Any]:
+    merged = load_merged_json_config(
+        default_json_config=default_json_config,
+        json_config=json_config,
+    )
+    if merged:
+        parser.set_defaults(**merged)
+    return merged
 
 
 def _close_loader_dataset_handles(loader, *, cache_in_memory: bool, label: str) -> None:
@@ -269,7 +312,9 @@ def prepare_retrieval_extra_negative_inputs(
         )
     neg_event_time_mjd = None
     if neg_zero_time_mjd_base is not None:
-        neg_event_time_mjd = neg_zero_time_mjd_base.to(device=neg_t.device, dtype=torch.float32) + delta_days
+        # opt_t is shifted forward by +delta_days / scale_divisor, so the
+        # absolute event zero point moves backward by the same day offset.
+        neg_event_time_mjd = neg_zero_time_mjd_base.to(device=neg_t.device, dtype=torch.float32) - delta_days
     z_l_neg, _ = model.encode_optical(
         neg_coords, neg_t_for_retrieval, neg_v, opt_ref_t, neg_mask, neg_err
     )
@@ -2773,22 +2818,39 @@ def train(args):
                     z_gallery = torch.cat(z_candidates, dim=0)
                     coords_gallery = torch.cat(coords_candidates, dim=0)
                     gallery_gw_indices = torch.cat(candidate_gw_indices, dim=0)
-                    gallery_positive_mask = gw_indices.unsqueeze(1) == gallery_gw_indices.unsqueeze(0)
                     dt_gallery = torch.cat(dt_blocks, dim=1) if dt_blocks else None
+
+                    # Query subsampling: randomly select a subset of queries to
+                    # bound GPU memory when scoring against the full candidate gallery.
+                    max_queries = int(getattr(args, "max_gallery_queries", 0) or 0)
+                    n_q_total = int(g.size(0))
+                    if max_queries > 0 and n_q_total > max_queries:
+                        q_idx = torch.randperm(n_q_total, device=device)[:max_queries]
+                        g_q = g[q_idx]
+                        H_q = H_gw[q_idx] if H_gw is not None else None
+                        gw_s_q = gw_s[q_idx] if gw_s is not None else None
+                        gw_m_q = gw_m[q_idx] if gw_m is not None else None
+                        dt_q = dt_gallery[q_idx, :] if dt_gallery is not None else None
+                        gallery_pos_mask = gw_indices[q_idx].unsqueeze(1) == gallery_gw_indices.unsqueeze(0)
+                    else:
+                        g_q, H_q, gw_s_q, gw_m_q = g, H_gw, gw_s, gw_m
+                        dt_q = dt_gallery
+                        gallery_pos_mask = gw_indices.unsqueeze(1) == gallery_gw_indices.unsqueeze(0)
+
                     gallery_scores = compute_fusion_gallery_score_matrix(
                         model,
-                        g=g,
-                        H_gw=H_gw,
-                        gw_s=gw_s,
-                        gw_m=gw_m,
+                        g=g_q,
+                        H_gw=H_q,
+                        gw_s=gw_s_q,
+                        gw_m=gw_m_q,
                         h_candidates=h_gallery,
                         z_candidates=z_gallery,
                         opt_coords_candidates=coords_gallery,
-                        dt_days_matrix=dt_gallery,
+                        dt_days_matrix=dt_q,
                         need_cred_level=need_cred_level,
                         chunk_size=args.gallery_score_chunk_size,
                     )
-                    gallery_loss = compute_fusion_gallery_nce_loss(gallery_scores, gallery_positive_mask)
+                    gallery_loss = compute_fusion_gallery_nce_loss(gallery_scores, gallery_pos_mask)
                     total_loss = total_loss + float(args.gallery_loss_weight) * gallery_loss
 
             scaler.scale(total_loss).backward()
@@ -3348,6 +3410,8 @@ if __name__ == "__main__":
                         help="Weight for batch-level fusion mini-gallery retrieval loss (0 to disable).")
     parser.add_argument("--gallery_score_chunk_size", type=int, default=8192,
                         help="Approximate number of flattened query-candidate pairs scored per gallery chunk.")
+    parser.add_argument("--max_gallery_queries", type=int, default=0,
+                        help="Max queries for fusion gallery scoring during training (0 = use all queries).")
     parser.add_argument("--gallery_include_extra_negatives", action=argparse.BooleanOptionalAction, default=True,
                         help="Include external non-KN negatives in the fusion mini-gallery loss when available.")
     parser.add_argument("--itc_decay_start_epoch", type=int, default=0,
@@ -3426,6 +3490,20 @@ if __name__ == "__main__":
                         help="Optuna trial number (set automatically by HPO, not for manual use)")
     parser.add_argument("--skip_epoch_checkpoints", action='store_true',
                         help="Skip per-epoch checkpoint saves (only save best checkpoint). Useful for HPO.")
+    parser.add_argument("--default_json_config", type=str, default=None,
+                        help="Default JSON config file path. Loaded before --json_config.")
+    parser.add_argument("--json_config", type=str, default=None,
+                        help="JSON config file path. Values set defaults; CLI args override them.")
+
+    config_parser = argparse.ArgumentParser(add_help=False)
+    config_parser.add_argument("--default_json_config", type=str, default=None)
+    config_parser.add_argument("--json_config", type=str, default=None)
+    config_args, _ = config_parser.parse_known_args()
+    apply_json_config_defaults(
+        parser,
+        default_json_config=config_args.default_json_config,
+        json_config=config_args.json_config,
+    )
 
     args = parser.parse_args()
 

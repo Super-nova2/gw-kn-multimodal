@@ -435,7 +435,7 @@ def build_prefix_bucket_metrics(probs, labels, actual_target_k, is_terminal_pref
 
 class PrefixTrainPolicy:
     def __init__(self, args):
-        self.enabled = bool(getattr(args, "prefix_train_enable", False))
+        self.enabled = bool(getattr(args, "prefix_train_enable", getattr(args, "universal_train_enable", False)))
         self.min_det = int(getattr(args, "prefix_min_det", 2))
         self.sampling = str(getattr(args, "prefix_train_sampling", "bucket_uniform_terminal_mixture")).strip().lower()
         self.bucket_uniform_mix_weight = float(getattr(args, "prefix_bucket_uniform_mix_weight", 4.0))
@@ -503,6 +503,21 @@ class PrefixTrainPolicy:
 
     def describe(self) -> Dict[str, object]:
         return dict(self.info)
+
+
+UNIVERSAL_STAGE_MODES = {"single", "dual", "dual_adv"}
+
+
+def normalize_universal_stage_mode(value, arg_name: str) -> str:
+    mode = str(value).strip().lower()
+    if mode not in UNIVERSAL_STAGE_MODES:
+        allowed = ", ".join(sorted(UNIVERSAL_STAGE_MODES))
+        raise ValueError(f"{arg_name} must be one of: {allowed}.")
+    return mode
+
+
+def universal_stage_requires_aux(mode: str) -> bool:
+    return normalize_universal_stage_mode(mode, "stage_mode") in {"dual", "dual_adv"}
 
 
 class TimeOffsetPolicy:
@@ -1138,8 +1153,11 @@ def train_one_epoch(
         if bool(getattr(args, "universal_train_enable", False)):
             if slot_is_detection is None:
                 raise ValueError("universal_train_enable=true requires slot_is_detection in training batches.")
-            if not getattr(model, "universal_aux_enable", False):
-                raise ValueError("universal_train_enable=true requires model.universal_aux_enable=True.")
+            stage_needs_aux = universal_stage_requires_aux(
+                "single" if universal_stage_mode is None else universal_stage_mode
+            )
+            if stage_needs_aux and not getattr(model, "universal_aux_enable", False):
+                raise ValueError("dual/dual_adv universal stages require model.universal_aux_enable=True.")
 
         batch_size = opt_t.size(0)
         if (
@@ -1330,6 +1348,7 @@ def build_train_summary_payload(
         "task_mode": "prefix_right_censored"
         if bool(getattr(args, "universal_train_enable", False))
         else "full_window",
+        "universal_training": getattr(args, "_universal_training_metadata", None),
         "current_epoch": int(current_epoch),
         "current_stage": str(current_stage),
         "dataset_window_metadata": getattr(args, "_dataset_window_metadata", None),
@@ -1503,6 +1522,41 @@ def train(args):
     )
     print(f"Train Steps/Epoch: {steps_per_epoch} | Val Steps/Epoch: {val_steps}")
 
+    if not bool(getattr(args, "universal_train_enable", False)):
+        raise ValueError("universal_train_enable must be true. Non-universal training mode has been removed.")
+    stage2_mode = normalize_universal_stage_mode(
+        getattr(args, "universal_stage2_mode", "dual"),
+        "--universal_stage2_mode",
+    )
+    stage3_mode = normalize_universal_stage_mode(
+        getattr(args, "universal_stage3_mode", "dual_adv"),
+        "--universal_stage3_mode",
+    )
+    stage_plan = [
+        ("stage1_head_only", int(getattr(args, "universal_stage1_epochs", 2)), True, "single"),
+        (f"stage2_finetune_{stage2_mode}", int(getattr(args, "universal_stage2_epochs", 6)), False, stage2_mode),
+        (f"stage3_finetune_{stage3_mode}", int(getattr(args, "universal_stage3_epochs", 6)), False, stage3_mode),
+    ]
+    if not any(stage_epochs > 0 for _, stage_epochs, _, _ in stage_plan):
+        raise ValueError("At least one universal training stage must have epochs > 0.")
+    universal_aux_enable = any(
+        stage_epochs > 0 and universal_stage_requires_aux(stage_mode)
+        for _, stage_epochs, _, stage_mode in stage_plan
+    )
+    args._universal_training_metadata = {
+        "stage_plan": [
+            {
+                "name": name,
+                "epochs": int(epochs),
+                "freeze_encoder": bool(freeze_encoder),
+                "mode": mode,
+            }
+            for name, epochs, freeze_encoder, mode in stage_plan
+        ],
+        "aux_heads_enabled": bool(universal_aux_enable),
+    }
+    print(f"Universal training plan: {json.dumps(args._universal_training_metadata, indent=2)}")
+
     model = OpticalKNClassifier(
         optical_input_dim=6,
         ref_time_dim=args.ref_dim,
@@ -1511,7 +1565,7 @@ def train(args):
         feature_dropout=args.feature_dropout,
         head_hidden_dim=args.head_hidden_dim,
         head_dropout=args.head_dropout,
-        universal_aux_enable=bool(getattr(args, "universal_train_enable", False)),
+        universal_aux_enable=bool(universal_aux_enable),
         proj_dim=64,
         adv_hidden_dim=(args.head_hidden_dim if args.head_hidden_dim is not None else args.enc_dim),
         n_det_bucket_classes=5,
@@ -1543,14 +1597,6 @@ def train(args):
         args._init_source_metadata = None
 
     criterion = nn.BCEWithLogitsLoss()
-
-    if not bool(getattr(args, "universal_train_enable", False)):
-        raise ValueError("universal_train_enable must be true. Non-universal training mode has been removed.")
-    stage_plan = [
-        ("stage1_head_only", int(getattr(args, "universal_stage1_epochs", 2)), True, "single"),
-        ("stage2_finetune", int(getattr(args, "universal_stage2_epochs", 6)), False, "dual"),
-        ("stage3_finetune_adv", int(getattr(args, "universal_stage3_epochs", 6)), False, "dual_adv"),
-    ]
 
     best_score = float("-inf")
     best_metrics = {}
@@ -1591,12 +1637,13 @@ def train(args):
             continue
 
         optimizer = build_stage_optimizer(model, args, freeze_encoder=freeze_encoder)
-        if stage_name in {"stage2_finetune", "stage3_finetune_adv"}:
+        is_finetune_stage = stage_name.startswith("stage2_") or stage_name.startswith("stage3_")
+        if is_finetune_stage:
             no_improve = 0
 
         print(
             f"\n[{stage_name}] epochs={stage_epochs} freeze_encoder={freeze_encoder} "
-            f"lr_head={optimizer.param_groups[0]['lr']}"
+            f"mode={universal_stage_mode} lr_head={optimizer.param_groups[0]['lr']}"
         )
 
         for _ in range(stage_epochs):
@@ -1642,7 +1689,7 @@ def train(args):
                     tb_writer.add_scalar("train/lr_encoder", float(optimizer.param_groups[1]["lr"]), global_epoch)
                 tb_writer.add_scalar(
                     "train/stage_id",
-                    1.0 if stage_name == "stage1_head_only" else 2.0,
+                    1.0 if stage_name.startswith("stage1_") else (2.0 if stage_name.startswith("stage2_") else 3.0),
                     global_epoch,
                 )
 
@@ -1722,7 +1769,7 @@ def train(args):
                     tb_writer.add_scalar("best/auprc", float(val_metrics["auprc"]), global_epoch)
                     tb_writer.add_scalar("best/epoch", float(best_epoch), global_epoch)
             else:
-                if stage_name in {"stage2_finetune", "stage3_finetune_adv"}:
+                if is_finetune_stage:
                     no_improve += 1
                     if args.early_stop_patience > 0 and no_improve >= args.early_stop_patience:
                         print(f"Early stopping triggered in {stage_name}.")
@@ -1765,7 +1812,7 @@ def train(args):
             gc.collect()
 
         if (
-            stage_name in {"stage2_finetune", "stage3_finetune_adv"}
+            (stage_name.startswith("stage2_") or stage_name.startswith("stage3_"))
             and args.early_stop_patience > 0
             and no_improve >= args.early_stop_patience
         ):
@@ -1783,6 +1830,7 @@ def train(args):
         "task_mode": "prefix_right_censored"
         if bool(getattr(args, "universal_train_enable", False))
         else "full_window",
+        "universal_training": getattr(args, "_universal_training_metadata", None),
         "dataset_window_metadata": getattr(args, "_dataset_window_metadata", None),
         "init_source_metadata": getattr(args, "_init_source_metadata", None),
         **best_metrics,
@@ -1879,6 +1927,8 @@ def parse_args():
     parser.add_argument("--universal_stage1_epochs", type=int, default=2)
     parser.add_argument("--universal_stage2_epochs", type=int, default=6)
     parser.add_argument("--universal_stage3_epochs", type=int, default=6)
+    parser.add_argument("--universal_stage2_mode", type=str, default="dual")
+    parser.add_argument("--universal_stage3_mode", type=str, default="dual_adv")
 
     parser.add_argument("--view_keep_prob_min", type=float, default=0.55)
     parser.add_argument("--view_keep_prob_max", type=float, default=1.0)
@@ -1993,6 +2043,14 @@ def parse_args():
         raise ValueError("Adversarial weights must be >= 0.")
     if int(args.universal_stage1_epochs) < 0 or int(args.universal_stage2_epochs) < 0 or int(args.universal_stage3_epochs) < 0:
         raise ValueError("Universal stage epochs must be >= 0.")
+    args.universal_stage2_mode = normalize_universal_stage_mode(
+        args.universal_stage2_mode,
+        "--universal_stage2_mode",
+    )
+    args.universal_stage3_mode = normalize_universal_stage_mode(
+        args.universal_stage3_mode,
+        "--universal_stage3_mode",
+    )
 
     if float(args.grl_lambda) < 0:
         raise ValueError("--grl_lambda must be >= 0.")

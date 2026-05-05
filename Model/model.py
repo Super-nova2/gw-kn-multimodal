@@ -1924,24 +1924,35 @@ class GWOpticalALBEFModel(nn.Module):
                 sim_matrix[extra_start:extra_start + extra_count, :batch_size] = sim_matrix[extra_start:extra_start + extra_count, :batch_size] + extra_time_bias.T
 
         labels_eq = labels.unsqueeze(0) == labels.unsqueeze(1)
-        mask_pos = labels_eq.clone()
-        mask_pos[:batch_size, :batch_size] = False
-        mask_pos[batch_size:, batch_size:] = False
+        modality_ids = torch.cat(
+            [
+                torch.zeros(batch_size, device=device, dtype=torch.long),
+                torch.ones(total_count - batch_size, device=device, dtype=torch.long),
+            ],
+            dim=0,
+        )
+        same_modality = modality_ids.unsqueeze(0) == modality_ids.unsqueeze(1)
+        # Cross-modal positives only. Same-event same-modality samples are
+        # neither positives nor negatives, avoiding false-negative pressure.
+        mask_pos = labels_eq & ~same_modality
         mask_pos.fill_diagonal_(False)
         mask_pos = mask_pos.float()
         mask_neg = 1.0 - labels_eq.float()
 
         mask_self = torch.eye(total_count, device=device, dtype=torch.bool)
+        denominator_mask = ~mask_self & ~(labels_eq & same_modality)
 
         if margin > 0:
             margin_matrix = margin * mask_neg / temperature
             sim_matrix = sim_matrix - margin_matrix
 
-        logits_max, _ = sim_matrix.max(dim=1, keepdim=True)
+        neg_large = torch.finfo(sim_matrix.dtype).min
+        logits_for_max = sim_matrix.masked_fill(~denominator_mask, neg_large)
+        logits_max, _ = logits_for_max.max(dim=1, keepdim=True)
         logits = sim_matrix - logits_max.detach()
 
         exp_logits = torch.exp(logits)
-        exp_logits = exp_logits.masked_fill(mask_self, 0)
+        exp_logits = exp_logits.masked_fill(~denominator_mask, 0)
         log_sum_exp = torch.log(exp_logits.sum(dim=1, keepdim=True) + 1e-8)
 
         log_prob = logits - log_sum_exp

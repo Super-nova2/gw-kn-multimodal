@@ -193,6 +193,8 @@ UNIVERSAL_TRAIN_ENABLE=$(jq -r '.universal_train_enable // false' "$args_file")
 UNIVERSAL_STAGE1_EPOCHS=$(jq -r '.universal_stage1_epochs // empty' "$args_file")
 UNIVERSAL_STAGE2_EPOCHS=$(jq -r '.universal_stage2_epochs // empty' "$args_file")
 UNIVERSAL_STAGE3_EPOCHS=$(jq -r '.universal_stage3_epochs // empty' "$args_file")
+UNIVERSAL_STAGE2_MODE=$(jq -r '.universal_stage2_mode // empty' "$args_file")
+UNIVERSAL_STAGE3_MODE=$(jq -r '.universal_stage3_mode // empty' "$args_file")
 VIEW_KEEP_PROB_MIN=$(jq -r '.view_keep_prob_min // empty' "$args_file")
 VIEW_KEEP_PROB_MAX=$(jq -r '.view_keep_prob_max // empty' "$args_file")
 VIEW_BAND_DROPOUT_MAX=$(jq -r '.view_band_dropout_max // empty' "$args_file")
@@ -481,6 +483,12 @@ fi
 if [[ -n "$UNIVERSAL_STAGE3_EPOCHS" && "$UNIVERSAL_STAGE3_EPOCHS" != "null" ]]; then
     cmd+=(--universal_stage3_epochs "$UNIVERSAL_STAGE3_EPOCHS")
 fi
+if [[ -n "$UNIVERSAL_STAGE2_MODE" && "$UNIVERSAL_STAGE2_MODE" != "null" ]]; then
+    cmd+=(--universal_stage2_mode "$UNIVERSAL_STAGE2_MODE")
+fi
+if [[ -n "$UNIVERSAL_STAGE3_MODE" && "$UNIVERSAL_STAGE3_MODE" != "null" ]]; then
+    cmd+=(--universal_stage3_mode "$UNIVERSAL_STAGE3_MODE")
+fi
 if [[ -n "$VIEW_KEEP_PROB_MIN" && "$VIEW_KEEP_PROB_MIN" != "null" ]]; then
     cmd+=(--view_keep_prob_min "$VIEW_KEEP_PROB_MIN")
 fi
@@ -525,7 +533,7 @@ if [[ -n "$META_FILTER_RELAX_T_SPAN_IF_BELOW_ROWS" && "$META_FILTER_RELAX_T_SPAN
 fi
 
 echo "Training Command: ${cmd[*]}"
-echo "Optical controls (from config): meta_matched_sampling=${META_MATCHED_SAMPLING:-<default>}, meta_match_fallback=${META_MATCH_FALLBACK:-<default>}, meta_filter_n_det=[${META_FILTER_N_DET_MIN:-<default>},${META_FILTER_N_DET_MAX:-<default>}], meta_filter_n_bands_max=${META_FILTER_N_BANDS_MAX:-<default>}, meta_filter_t_span_max=${META_FILTER_T_SPAN_MAX:-<default>}, meta_filter_relax=${META_FILTER_RELAX_T_SPAN_IF_BELOW_ROWS:-<default>}, universal_train_enable=${UNIVERSAL_TRAIN_ENABLE:-<default>}, universal_epochs=${UNIVERSAL_STAGE1_EPOCHS:-<default>}/${UNIVERSAL_STAGE2_EPOCHS:-<default>}/${UNIVERSAL_STAGE3_EPOCHS:-<default>}, view_keep_prob=${VIEW_KEEP_PROB_MIN:-<default>}..${VIEW_KEEP_PROB_MAX:-<default>}, view_band_dropout_max=${VIEW_BAND_DROPOUT_MAX:-<default>}, cons_weights=${CONSISTENCY_EMBED_WEIGHT:-<default>}/${CONSISTENCY_PROB_WEIGHT:-<default>}, adv_weights=${ADV_DET_WEIGHT:-<default>}/${ADV_BAND_WEIGHT:-<default>}/${ADV_SPAN_WEIGHT:-<default>}, grl_lambda=${GRL_LAMBDA:-<default>}, shortcut_audit_enable=${SHORTCUT_AUDIT_ENABLE:-<default>}, shortcut_audit_val_samples=${SHORTCUT_AUDIT_VAL_SAMPLES:-<default>}, prefix_min_det=${PREFIX_MIN_DET:-<default>}, prefix_train_sampling=${PREFIX_TRAIN_SAMPLING:-<default>}, prefix_mix_weights=${PREFIX_BUCKET_UNIFORM_MIX_WEIGHT:-<default>}:${PREFIX_TERMINAL_MIX_WEIGHT:-<default>}"
+echo "Optical controls (from config): meta_matched_sampling=${META_MATCHED_SAMPLING:-<default>}, meta_match_fallback=${META_MATCH_FALLBACK:-<default>}, meta_filter_n_det=[${META_FILTER_N_DET_MIN:-<default>},${META_FILTER_N_DET_MAX:-<default>}], meta_filter_n_bands_max=${META_FILTER_N_BANDS_MAX:-<default>}, meta_filter_t_span_max=${META_FILTER_T_SPAN_MAX:-<default>}, meta_filter_relax=${META_FILTER_RELAX_T_SPAN_IF_BELOW_ROWS:-<default>}, universal_train_enable=${UNIVERSAL_TRAIN_ENABLE:-<default>}, universal_epochs=${UNIVERSAL_STAGE1_EPOCHS:-<default>}/${UNIVERSAL_STAGE2_EPOCHS:-<default>}/${UNIVERSAL_STAGE3_EPOCHS:-<default>}, universal_modes=single/${UNIVERSAL_STAGE2_MODE:-<default>}/${UNIVERSAL_STAGE3_MODE:-<default>}, view_keep_prob=${VIEW_KEEP_PROB_MIN:-<default>}..${VIEW_KEEP_PROB_MAX:-<default>}, view_band_dropout_max=${VIEW_BAND_DROPOUT_MAX:-<default>}, cons_weights=${CONSISTENCY_EMBED_WEIGHT:-<default>}/${CONSISTENCY_PROB_WEIGHT:-<default>}, adv_weights=${ADV_DET_WEIGHT:-<default>}/${ADV_BAND_WEIGHT:-<default>}/${ADV_SPAN_WEIGHT:-<default>}, grl_lambda=${GRL_LAMBDA:-<default>}, shortcut_audit_enable=${SHORTCUT_AUDIT_ENABLE:-<default>}, shortcut_audit_val_samples=${SHORTCUT_AUDIT_VAL_SAMPLES:-<default>}, prefix_min_det=${PREFIX_MIN_DET:-<default>}, prefix_train_sampling=${PREFIX_TRAIN_SAMPLING:-<default>}, prefix_mix_weights=${PREFIX_BUCKET_UNIFORM_MIX_WEIGHT:-<default>}:${PREFIX_TERMINAL_MIX_WEIGHT:-<default>}"
 set +e
 "${cmd[@]}"
 train_exit_code=$?
