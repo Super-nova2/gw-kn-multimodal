@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 
 import h5py
 import numpy as np
@@ -559,6 +559,33 @@ def build_prefixed_gallery_specs(
                 galleries[(requested, int(trial), int(gw_id))] = gallery_spec
 
     return galleries, unique_gw
+
+
+def extract_gallery_negative_abs_dt_days(
+    gallery_spec: Mapping[str, Any],
+    *,
+    gw_event_time_mjd: Optional[float],
+    n_negative: int,
+) -> Optional[np.ndarray]:
+    """Return per-negative |dt| for a gallery spec when time metadata is available."""
+    n_negative = int(n_negative)
+    if n_negative <= 0:
+        return np.asarray([], dtype=np.float32)
+
+    if "negative_abs_dt_days" in gallery_spec:
+        dt = _as_numpy_1d(gallery_spec["negative_abs_dt_days"], dtype=np.float32)[:n_negative]
+        if dt.shape[0] == n_negative:
+            return np.abs(dt).astype(np.float32, copy=False)
+
+    if "negative_synthetic_zero_time_mjd_cls_base" not in gallery_spec:
+        return None
+    if gw_event_time_mjd is None or not np.isfinite(float(gw_event_time_mjd)):
+        return None
+
+    times = _as_numpy_1d(gallery_spec["negative_synthetic_zero_time_mjd_cls_base"], dtype=np.float64)[:n_negative]
+    if times.shape[0] != n_negative:
+        return None
+    return np.abs(times - float(gw_event_time_mjd)).astype(np.float32, copy=False)
 
 
 def score_all_galleries_skymap(

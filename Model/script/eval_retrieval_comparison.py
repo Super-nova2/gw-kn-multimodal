@@ -56,6 +56,7 @@ from retrieval_gallery import (  # noqa: E402
     build_prefixed_gallery_specs,
     build_synthetic_time_sky_candidate_sequences,
     build_time_sky_candidate_sequences,
+    extract_gallery_negative_abs_dt_days,
     plot_retrieval_coverage,
     plot_retrieval_curves,
     score_all_galleries_skymap,
@@ -88,6 +89,18 @@ from test_evaluate import (  # noqa: E402
 DEFAULT_COMPARISON_WINDOW = (-0.1, 0.2)
 DEFAULT_DT_BIN_EDGES = "0,3,5,10,30,100,300,inf"
 TABLE_METRIC_LABELS = ["R@1", "R@5", "R@10", "MRR"]
+
+
+def _lookup_event_time_mjd(gw_event_time_mjd_table, gw_id: int) -> Optional[float]:
+    if gw_event_time_mjd_table is None:
+        return None
+    if isinstance(gw_event_time_mjd_table, torch.Tensor):
+        value = gw_event_time_mjd_table[int(gw_id)].detach().float().cpu().item()
+    else:
+        value = np.asarray(gw_event_time_mjd_table, dtype=np.float64).reshape(-1)[int(gw_id)]
+    if not np.isfinite(float(value)):
+        return None
+    return float(value)
 TABLE_METRIC_KEYS = ["recall_at_1", "recall_at_5", "recall_at_10", "mrr"]
 WORKSPACE_DIR = MODEL_DIR.parent.parent
 DEFAULT_TUTORIAL_NEG_DATA_PATH = str(
@@ -1503,6 +1516,7 @@ def _score_candidate_bank_with_logits(
     dual: bool,
     *,
     candidate_coords: Optional[np.ndarray] = None,
+    candidate_abs_dt_days: Optional[np.ndarray] = None,
     amp_dtype: torch.dtype = torch.float32,
     amp_enabled: bool = False,
 ) -> np.ndarray:
@@ -1521,6 +1535,8 @@ def _score_candidate_bank_with_logits(
     candidate_indices = np.asarray(candidate_indices, dtype=np.int64)
     if candidate_coords is not None and np.asarray(candidate_coords).shape[0] != candidate_indices.shape[0]:
         raise ValueError("candidate_coords must have the same first dimension as candidate_indices.")
+    if candidate_abs_dt_days is not None and np.asarray(candidate_abs_dt_days).shape[0] != candidate_indices.shape[0]:
+        raise ValueError("candidate_abs_dt_days must have the same first dimension as candidate_indices.")
     use_synthetic_coords = candidate_coords is not None
     for start in range(0, len(candidate_indices), 1024):
         chunk_np = candidate_indices[start:start + 1024]
@@ -1540,7 +1556,7 @@ def _score_candidate_bank_with_logits(
         if dual:
             H_chunk = H_query.unsqueeze(0).expand(batch_size, -1, -1)
             gw_s_chunk = gw_s_query.unsqueeze(0).expand(batch_size, -1)
-            gw_m_chunk = gw_m_query.unsqueeze(0).expand(batch_size, -1, -1)
+            gw_m_chunk = gw_m_query.unsqueeze(0).expand(batch_size, -1, -1) if need_cred else None
             cred_chunk = _compute_credible_level_single_gw(gw_m_query, opt_coords_chunk) if need_cred else None
         else:
             H_chunk = None
@@ -1549,6 +1565,12 @@ def _score_candidate_bank_with_logits(
             cred_chunk = None
 
         with _autocast_context(device, amp_dtype, enabled=amp_enabled):
+            if candidate_abs_dt_days is None:
+                dt_chunk = None
+            else:
+                dt_chunk = torch.from_numpy(
+                    np.asarray(candidate_abs_dt_days[start:start + len(chunk_np)], dtype=np.float32)
+                ).to(device=device)
             z_chunk = _candidate_z_l_for_chunk(
                 model,
                 candidate_bank,
@@ -1566,6 +1588,7 @@ def _score_candidate_bank_with_logits(
                 gw_s=gw_s_chunk,
                 gw_m=gw_m_chunk,
                 opt_coords=opt_coords_chunk,
+                dt_days=dt_chunk,
             )
             probs = torch.softmax(logits, dim=1)[:, 1]
         scores.append(probs.float().cpu())
@@ -1659,6 +1682,12 @@ def score_all_galleries_multimodal(
         pos_index = int(gallery_spec["positive_index"])
         neg_indices = np.asarray(gallery_spec["negative_indices"], dtype=np.int64)
         neg_candidate_coords = gallery_spec.get("negative_synthetic_coordinates")
+        gw_event_time_mjd = _lookup_event_time_mjd(gw_event_time_mjd_table, int(gw_id))
+        neg_abs_dt_days = extract_gallery_negative_abs_dt_days(
+            gallery_spec,
+            gw_event_time_mjd=gw_event_time_mjd,
+            n_negative=int(neg_indices.shape[0]),
+        )
         pos_probs = _score_candidate_bank_with_logits(
             model,
             query_cache[int(gw_id)],
@@ -1666,6 +1695,7 @@ def score_all_galleries_multimodal(
             positive_bank,
             device,
             dual,
+            candidate_abs_dt_days=np.asarray([0.0], dtype=np.float32),
             amp_dtype=amp_dtype,
             amp_enabled=amp_enabled,
         )
@@ -1677,6 +1707,7 @@ def score_all_galleries_multimodal(
             device,
             dual,
             candidate_coords=neg_candidate_coords,
+            candidate_abs_dt_days=neg_abs_dt_days,
             amp_dtype=amp_dtype,
             amp_enabled=amp_enabled,
         )

@@ -145,6 +145,11 @@ TIME_COMPAT_WEIGHT=$(jq -r '.time_compat_weight // empty' "$args_file")
 TIME_COMPAT_TAU_DAYS=$(jq -r '.time_compat_tau_days // empty' "$args_file")
 TIME_COMPAT_POWER=$(jq -r '.time_compat_power // empty' "$args_file")
 TIME_COMPAT_MAX_PENALTY=$(jq -r '.time_compat_max_penalty // empty' "$args_file")
+USE_TIME_DELTA_CLS_FEATURE_STATE=$(jq -r 'if has("use_time_delta_cls_feature") then (.use_time_delta_cls_feature | tostring) else "unset" end' "$args_file")
+TIME_DELTA_CLS_SCALE_DAYS=$(jq -r '.time_delta_cls_scale_days // empty' "$args_file")
+TIME_DELTA_CLS_CLIP=$(jq -r '.time_delta_cls_clip // empty' "$args_file")
+FUSION_PHYSICAL_WEIGHT=$(jq -r '.fusion_physical_weight // empty' "$args_file")
+FUSION_SPATIAL_WEIGHT=$(jq -r '.fusion_spatial_weight // empty' "$args_file")
 NONKN_CLS_BASE_FIELD=$(jq -r '.nonkn_cls_base_field // empty' "$args_file")
 GW_DROPOUT=$(jq -r '.gw_dropout // empty' "$args_file")
 OPT_DROPOUT=$(jq -r '.opt_dropout // empty' "$args_file")
@@ -157,6 +162,9 @@ CLS_POS_WEIGHT=$(jq -r '.cls_pos_weight // empty' "$args_file")
 CLS_NEG_WEIGHT=$(jq -r '.cls_neg_weight // empty' "$args_file")
 CLS_EXTRA_NEG_WEIGHT=$(jq -r '.cls_extra_neg_weight // empty' "$args_file")
 CLS_RAMP_EPOCHS=$(jq -r '.cls_ramp_epochs // empty' "$args_file")
+GALLERY_LOSS_WEIGHT=$(jq -r '.gallery_loss_weight // empty' "$args_file")
+GALLERY_SCORE_CHUNK_SIZE=$(jq -r '.gallery_score_chunk_size // empty' "$args_file")
+GALLERY_INCLUDE_EXTRA_NEGATIVES_STATE=$(jq -r 'if has("gallery_include_extra_negatives") then (.gallery_include_extra_negatives | tostring) else "unset" end' "$args_file")
 ITC_DECAY_START_EPOCH=$(jq -r '.itc_decay_start_epoch // empty' "$args_file")
 ITC_DECAY_EPOCHS=$(jq -r '.itc_decay_epochs // empty' "$args_file")
 ITC_DECAY_RATIO=$(jq -r '.itc_decay_ratio // empty' "$args_file")
@@ -442,6 +450,23 @@ fi
 if [[ -n "$TIME_COMPAT_MAX_PENALTY" && "$TIME_COMPAT_MAX_PENALTY" != "null" ]]; then
     cmd+=(--time_compat_max_penalty "$TIME_COMPAT_MAX_PENALTY")
 fi
+if [[ "$USE_TIME_DELTA_CLS_FEATURE_STATE" == "true" ]]; then
+    cmd+=(--use_time_delta_cls_feature)
+elif [[ "$USE_TIME_DELTA_CLS_FEATURE_STATE" == "false" ]]; then
+    cmd+=(--no-use_time_delta_cls_feature)
+fi
+if [[ -n "$TIME_DELTA_CLS_SCALE_DAYS" && "$TIME_DELTA_CLS_SCALE_DAYS" != "null" ]]; then
+    cmd+=(--time_delta_cls_scale_days "$TIME_DELTA_CLS_SCALE_DAYS")
+fi
+if [[ -n "$TIME_DELTA_CLS_CLIP" && "$TIME_DELTA_CLS_CLIP" != "null" ]]; then
+    cmd+=(--time_delta_cls_clip "$TIME_DELTA_CLS_CLIP")
+fi
+if [[ -n "$FUSION_PHYSICAL_WEIGHT" && "$FUSION_PHYSICAL_WEIGHT" != "null" ]]; then
+    cmd+=(--fusion_physical_weight "$FUSION_PHYSICAL_WEIGHT")
+fi
+if [[ -n "$FUSION_SPATIAL_WEIGHT" && "$FUSION_SPATIAL_WEIGHT" != "null" ]]; then
+    cmd+=(--fusion_spatial_weight "$FUSION_SPATIAL_WEIGHT")
+fi
 if [[ -n "$NONKN_CLS_BASE_FIELD" && "$NONKN_CLS_BASE_FIELD" != "null" ]]; then
     cmd+=(--nonkn_cls_base_field "$NONKN_CLS_BASE_FIELD")
 fi
@@ -477,6 +502,17 @@ if [[ -n "$CLS_EXTRA_NEG_WEIGHT" && "$CLS_EXTRA_NEG_WEIGHT" != "null" ]]; then
 fi
 if [[ -n "$CLS_RAMP_EPOCHS" && "$CLS_RAMP_EPOCHS" != "null" ]]; then
     cmd+=(--cls_ramp_epochs "$CLS_RAMP_EPOCHS")
+fi
+if [[ -n "$GALLERY_LOSS_WEIGHT" && "$GALLERY_LOSS_WEIGHT" != "null" ]]; then
+    cmd+=(--gallery_loss_weight "$GALLERY_LOSS_WEIGHT")
+fi
+if [[ -n "$GALLERY_SCORE_CHUNK_SIZE" && "$GALLERY_SCORE_CHUNK_SIZE" != "null" ]]; then
+    cmd+=(--gallery_score_chunk_size "$GALLERY_SCORE_CHUNK_SIZE")
+fi
+if [[ "$GALLERY_INCLUDE_EXTRA_NEGATIVES_STATE" == "true" ]]; then
+    cmd+=(--gallery_include_extra_negatives)
+elif [[ "$GALLERY_INCLUDE_EXTRA_NEGATIVES_STATE" == "false" ]]; then
+    cmd+=(--no-gallery_include_extra_negatives)
 fi
 if [[ -n "$ITC_DECAY_START_EPOCH" && "$ITC_DECAY_START_EPOCH" != "null" ]]; then
     cmd+=(--itc_decay_start_epoch "$ITC_DECAY_START_EPOCH")

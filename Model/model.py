@@ -1336,6 +1336,11 @@ class CrossAttentionFusion(nn.Module):
         fusion_mode="legacy_g2o",
         use_cred_level_feature=False,
         use_similarity_as_cls_input=False,
+        use_time_delta_cls_feature=False,
+        time_delta_cls_scale_days=30.0,
+        time_delta_cls_clip=10.0,
+        fusion_physical_weight=1.0,
+        fusion_spatial_weight=1.0,
     ):
         super().__init__()
         self.attn_dim = d = attn_dim if attn_dim is not None else opt_dim
@@ -1344,6 +1349,11 @@ class CrossAttentionFusion(nn.Module):
         self.fusion_mode = normalize_fusion_mode(fusion_mode, dual_fusion=dual)
         self.use_cred_level_feature = bool(use_cred_level_feature)
         self.use_similarity_as_cls_input = bool(use_similarity_as_cls_input)
+        self.use_time_delta_cls_feature = bool(use_time_delta_cls_feature)
+        self.time_delta_cls_scale_days = float(time_delta_cls_scale_days)
+        self.time_delta_cls_clip = float(time_delta_cls_clip)
+        self.fusion_physical_weight = float(fusion_physical_weight)
+        self.fusion_spatial_weight = float(fusion_spatial_weight)
         coord_dim = opt_dim if coord_dim is None else int(coord_dim)
 
         if self.fusion_mode in {"legacy_g2o", "legacy_dual"}:
@@ -1376,6 +1386,8 @@ class CrossAttentionFusion(nn.Module):
                 cls_input_dim += 1
             if self.use_cred_level_feature:
                 cls_input_dim += 1
+            if self.use_time_delta_cls_feature:
+                cls_input_dim += 1
 
         self.classifier = nn.Sequential(
             nn.Linear(cls_input_dim, self.hidden_dim),
@@ -1389,6 +1401,21 @@ class CrossAttentionFusion(nn.Module):
             return True
         return bool(self.use_cred_level_feature)
 
+    def _build_time_delta_feature(self, dt_days, batch_size, dtype, device):
+        if dt_days is None:
+            dt = torch.zeros((batch_size, 1), dtype=dtype, device=device)
+        else:
+            dt = torch.as_tensor(dt_days, dtype=dtype, device=device)
+            if dt.ndim == 0:
+                dt = dt.reshape(1).expand(batch_size)
+            dt = dt.reshape(batch_size, -1)[:, :1]
+
+        scale = max(float(self.time_delta_cls_scale_days), 1e-8)
+        dt = dt.abs() / scale
+        if self.time_delta_cls_clip > 0:
+            dt = dt.clamp(max=float(self.time_delta_cls_clip))
+        return dt
+
     def forward(
         self,
         g_feat,
@@ -1399,6 +1426,7 @@ class CrossAttentionFusion(nn.Module):
         g_param=None,
         coord_feat=None,
         sim_itc_pair=None,
+        dt_days=None,
     ):
         """
         Args:
@@ -1459,7 +1487,10 @@ class CrossAttentionFusion(nn.Module):
             attn = torch.softmax(scores, dim=-1)
             fused_gw = self.coord2gw_norm((attn @ v2).squeeze(1))
 
-            pieces = [fused_opt, fused_gw]
+            pieces = [
+                fused_opt * self.fusion_physical_weight,
+                fused_gw * self.fusion_spatial_weight,
+            ]
             if self.use_similarity_as_cls_input:
                 if sim_itc_pair is None:
                     sim_itc_pair = torch.zeros((g_feat.size(0), 1), dtype=g_feat.dtype, device=g_feat.device)
@@ -1468,6 +1499,15 @@ class CrossAttentionFusion(nn.Module):
                 if cred_level is None:
                     cred_level = torch.zeros((g_feat.size(0), 1), dtype=g_feat.dtype, device=g_feat.device)
                 pieces.append(cred_level)
+            if self.use_time_delta_cls_feature:
+                pieces.append(
+                    self._build_time_delta_feature(
+                        dt_days,
+                        batch_size=g_feat.size(0),
+                        dtype=g_feat.dtype,
+                        device=g_feat.device,
+                    )
+                )
             combined = torch.cat(pieces, dim=-1)
             aux["max_attention"] = attn.squeeze(1).max(dim=-1).values
 
@@ -1530,6 +1570,11 @@ class GWOpticalALBEFModel(nn.Module):
         time_compat_tau_days=30.0,
         time_compat_power=2.0,
         time_compat_max_penalty=8.0,
+        use_time_delta_cls_feature=False,
+        time_delta_cls_scale_days=None,
+        time_delta_cls_clip=10.0,
+        fusion_physical_weight=1.0,
+        fusion_spatial_weight=1.0,
         mtan_snr_s0=3.0,
         mtan_snr_beta=1.0,
         mtan_snr_clip_min=-8.0,
@@ -1625,6 +1670,15 @@ class GWOpticalALBEFModel(nn.Module):
         self.time_compat_tau_days = float(time_compat_tau_days)
         self.time_compat_power = float(time_compat_power)
         self.time_compat_max_penalty = float(time_compat_max_penalty)
+        self.use_time_delta_cls_feature = bool(use_time_delta_cls_feature)
+        self.time_delta_cls_scale_days = (
+            float(time_compat_tau_days)
+            if time_delta_cls_scale_days is None
+            else float(time_delta_cls_scale_days)
+        )
+        self.time_delta_cls_clip = float(time_delta_cls_clip)
+        self.fusion_physical_weight = float(fusion_physical_weight)
+        self.fusion_spatial_weight = float(fusion_spatial_weight)
         self.itc_criterion = nn.CrossEntropyLoss(label_smoothing=itc_label_smoothing)
 
         if self.fusion_mode == "concat_proj":
@@ -1645,6 +1699,11 @@ class GWOpticalALBEFModel(nn.Module):
                 fusion_mode=self.fusion_mode,
                 use_cred_level_feature=use_cred_level_feature,
                 use_similarity_as_cls_input=use_similarity_as_cls_input,
+                use_time_delta_cls_feature=self.use_time_delta_cls_feature,
+                time_delta_cls_scale_days=self.time_delta_cls_scale_days,
+                time_delta_cls_clip=self.time_delta_cls_clip,
+                fusion_physical_weight=self.fusion_physical_weight,
+                fusion_spatial_weight=self.fusion_spatial_weight,
             )
         self.cls_criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
 
@@ -1912,6 +1971,7 @@ class GWOpticalALBEFModel(nn.Module):
         gw_s=None,
         gw_m=None,
         opt_coords=None,
+        dt_days=None,
     ):
         if self.fusion_mode == "concat_proj":
             # Use L2-normalized contrastive projections as classifier input
@@ -1923,6 +1983,7 @@ class GWOpticalALBEFModel(nn.Module):
             "z_l": z_l,
             "H_gw": H_gw,
             "cred_level": cred_level,
+            "dt_days": dt_days,
         }
         if self.fusion_mode == "physical_dual_hgw":
             if gw_s is None or opt_coords is None:

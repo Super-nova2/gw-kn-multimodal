@@ -673,6 +673,14 @@ def load_model(args, device):
         "time_compat_tau_days": _get("time_compat_tau_days", 30.0),
         "time_compat_power": _get("time_compat_power", 2.0),
         "time_compat_max_penalty": _get("time_compat_max_penalty", 8.0),
+        "use_time_delta_cls_feature": _get("use_time_delta_cls_feature", False),
+        "time_delta_cls_scale_days": _get(
+            "time_delta_cls_scale_days",
+            _get("time_compat_tau_days", 30.0),
+        ),
+        "time_delta_cls_clip": _get("time_delta_cls_clip", 10.0),
+        "fusion_physical_weight": _get("fusion_physical_weight", 1.0),
+        "fusion_spatial_weight": _get("fusion_spatial_weight", 1.0),
         "neg_offset_scale_days_divisor": _get("neg_offset_scale_days_divisor", 100.0),
         "nonkn_cls_base_field": str(
             choose_value(
@@ -712,6 +720,11 @@ def load_model(args, device):
         time_compat_tau_days=model_args["time_compat_tau_days"],
         time_compat_power=model_args["time_compat_power"],
         time_compat_max_penalty=model_args["time_compat_max_penalty"],
+        use_time_delta_cls_feature=model_args["use_time_delta_cls_feature"],
+        time_delta_cls_scale_days=model_args["time_delta_cls_scale_days"],
+        time_delta_cls_clip=model_args["time_delta_cls_clip"],
+        fusion_physical_weight=model_args["fusion_physical_weight"],
+        fusion_spatial_weight=model_args["fusion_spatial_weight"],
         mtan_snr_s0=float(model_args["mtan_snr_s0"]),
         mtan_snr_beta=float(model_args["mtan_snr_beta"]),
         mtan_snr_clip_min=float(model_args["mtan_snr_clip_min"]),
@@ -731,8 +744,8 @@ def load_model(args, device):
         msg = str(exc)
         if "size mismatch" in msg:
             raise RuntimeError(
-                "Checkpoint is incompatible with the no-delta-time classifier head. "
-                "Use a checkpoint trained after dt removal."
+                "Checkpoint is incompatible with the current classifier head shape. "
+                "Use a checkpoint trained with matching fusion/time-delta settings."
             ) from exc
         raise
     model.to(device)
@@ -1246,9 +1259,11 @@ def extract_all_embeddings(model, loader, device, model_args, gw_source_types=No
                     cred_level = None
 
                 # Positive pairs (matched GW-optical)
+                dt_pos = torch.zeros((batch_size,), device=device, dtype=torch.float32)
                 logits_pos = model.fusion_logits(
                     g, h_l, z_l=z_l, H_gw=H_gw, cred_level=cred_level,
                     gw_s=gw_s, gw_m=gw_m, opt_coords=opt_coords,
+                    dt_days=dt_pos,
                 )
 
                 # Negative pairs (shift optical by 1 so each GW pairs with wrong optical)
@@ -1264,6 +1279,14 @@ def extract_all_embeddings(model, loader, device, model_args, gw_source_types=No
                 logits_neg = model.fusion_logits(
                     g, h_l_neg, z_l=z_l_neg, H_gw=H_gw, cred_level=cred_level_neg,
                     gw_s=gw_s, gw_m=gw_m, opt_coords=opt_coords_neg,
+                    dt_days=(
+                        compute_time_delta_days(
+                            torch.roll(batch_event_time_mjd, shifts=shift, dims=0),
+                            batch_event_time_mjd,
+                        )
+                        if batch_event_time_mjd is not None
+                        else None
+                    ),
                 )
 
                 # Similarity matrix for retrieval (aligned with training ITC/SupCon path)
@@ -1540,6 +1563,7 @@ def extract_triplet_logits(model, loader, device, model_args, neg_optical_data,
                 logits_pos = model.fusion_logits(
                     g, h_l, z_l=z_l, H_gw=H_gw, cred_level=_cred,
                     gw_s=gw_s, gw_m=gw_m, opt_coords=opt_coords,
+                    dt_days=dt_pos,
                 )
                 logits_positive.append(logits_pos.float().cpu())
                 if _cred is not None:
@@ -1610,6 +1634,7 @@ def extract_triplet_logits(model, loader, device, model_args, neg_optical_data,
                 logits_hard = model.fusion_logits(
                     g, h_l_hard, z_l=z_l_hard, H_gw=H_gw, cred_level=_cred_hard,
                     gw_s=gw_s, gw_m=gw_m, opt_coords=coords_hard,
+                    dt_days=dt_hard,
                 )
                 logits_hard_neg.append(logits_hard.float().cpu())
                 if _cred_hard is not None:
@@ -1649,6 +1674,7 @@ def extract_triplet_logits(model, loader, device, model_args, neg_optical_data,
                     logits_gw = model.fusion_logits(
                         g_gw_neg, h_l_gw_neg, z_l=z_l_gw_neg, H_gw=H_gw_neg, cred_level=_cred_gw_neg,
                         gw_s=gw_s_neg, gw_m=gw_m_neg, opt_coords=opt_coords,
+                        dt_days=dt_gw_neg,
                     )
                     logits_gw_neg.append(logits_gw.float().cpu())
                     if _cred_gw_neg is not None:
@@ -1701,6 +1727,7 @@ def extract_triplet_logits(model, loader, device, model_args, neg_optical_data,
                         logits_optical = model.fusion_logits(
                             g, h_l_neg_i, z_l=z_l_neg_i, H_gw=H_gw, cred_level=_cred_neg,
                             gw_s=gw_s, gw_m=gw_m, opt_coords=neg_c_batch,
+                            dt_days=dt_optical,
                         )
                     else:
                         _, z_l_neg, h_l_neg, _ = model.encode(
@@ -1717,6 +1744,7 @@ def extract_triplet_logits(model, loader, device, model_args, neg_optical_data,
                         logits_optical = model.fusion_logits(
                             g, h_l_neg, z_l=z_l_neg, H_gw=H_gw, cred_level=_cred_neg,
                             gw_s=gw_s, gw_m=gw_m, opt_coords=neg_c_batch,
+                            dt_days=dt_optical,
                         )
                     logits_optical_neg.append(logits_optical.float().cpu())
                     if _cred_neg is not None:
@@ -1912,16 +1940,20 @@ def _score_gallery_candidates_with_logits(model, query_cache, candidate_indices,
         chunk_idx = torch.from_numpy(chunk_np).long()
 
         opt_coords_chunk = opt_coords_all.index_select(0, chunk_idx).to(device)
+        dt_chunk = None
+        cand_gw_idx_chunk = None
+        if gw_event_time_mjd_table is not None and query_gw_id is not None:
+            cand_gw_idx_chunk = gw_idx_all.index_select(0, chunk_idx).to(device=device, dtype=torch.long)
+            query_gw_idx_chunk = torch.full_like(cand_gw_idx_chunk, int(query_gw_id))
+            cand_gw_time = gw_event_time_mjd_table[cand_gw_idx_chunk]
+            query_gw_time = gw_event_time_mjd_table[query_gw_idx_chunk]
+            dt_chunk = compute_time_delta_days(cand_gw_time, query_gw_time)
         if can_reencode_with_shift:
             opt_t_chunk = opt_t_all.index_select(0, chunk_idx).to(device)
             opt_v_chunk = opt_v_all.index_select(0, chunk_idx).to(device)
             opt_mask_chunk = opt_mask_all.index_select(0, chunk_idx).to(device)
             opt_err_chunk = opt_err_all.index_select(0, chunk_idx).to(device)
-            cand_gw_idx_chunk = gw_idx_all.index_select(0, chunk_idx).to(device=device, dtype=torch.long)
-            query_gw_idx_chunk = torch.full_like(cand_gw_idx_chunk, int(query_gw_id))
-            cand_gw_time = gw_event_time_mjd_table[cand_gw_idx_chunk]
-            query_gw_time = gw_event_time_mjd_table[query_gw_idx_chunk]
-            delta_days = compute_time_delta_days(cand_gw_time, query_gw_time)
+            delta_days = dt_chunk
             shifted_opt_t = apply_time_offsets(
                 opt_t_chunk, opt_mask_chunk, delta_days, scale_divisor
             )
@@ -1946,7 +1978,7 @@ def _score_gallery_candidates_with_logits(model, query_cache, candidate_indices,
             H_chunk = H_query.unsqueeze(0).expand(batch_size, -1, -1)
             cred_chunk = _compute_credible_level_single_gw(gw_m_query, opt_coords_chunk) if need_cred else None
             gw_s_chunk = gw_s_query.unsqueeze(0).expand(batch_size, -1)
-            gw_m_chunk = gw_m_query.unsqueeze(0).expand(batch_size, -1, -1)
+            gw_m_chunk = gw_m_query.unsqueeze(0).expand(batch_size, -1, -1) if need_cred else None
         else:
             H_chunk = None
             cred_chunk = None
@@ -1957,6 +1989,7 @@ def _score_gallery_candidates_with_logits(model, query_cache, candidate_indices,
             logits = model.fusion_logits(
                 g_chunk, h_chunk, z_l=z_chunk, H_gw=H_chunk, cred_level=cred_chunk,
                 gw_s=gw_s_chunk, gw_m=gw_m_chunk, opt_coords=opt_coords_chunk,
+                dt_days=dt_chunk,
             )
         probs = torch.softmax(logits.float(), dim=1)[:, 1]
         scores.append(probs.cpu())
@@ -3274,10 +3307,11 @@ def main():
             "WARNING: 'events/gw_data/event_time_mjd' missing in eval dataset; "
             "hard-negative time-shift re-encoding will fall back to unshifted optical timelines."
         )
+    need_zero_time_mjd_for_cls = bool(runtime_model_args.get("use_time_delta_cls_feature", False))
 
     # Build test dataloader
     loader, dataset = build_test_dataloader(
-        args, saved_args, return_zero_time_mjd=False,
+        args, saved_args, return_zero_time_mjd=need_zero_time_mjd_for_cls,
         nonkn_cls_base_field=nonkn_cls_base_field,
     )
     print(f"Test set: {len(loader)} batches")
@@ -3297,7 +3331,7 @@ def main():
                   "Retrying with num_workers=0.")
             args.num_workers = 0
             loader, dataset = build_test_dataloader(
-                args, saved_args, return_zero_time_mjd=False,
+                args, saved_args, return_zero_time_mjd=need_zero_time_mjd_for_cls,
                 nonkn_cls_base_field=nonkn_cls_base_field,
             )
             embeddings = extract_all_embeddings(
@@ -3369,7 +3403,7 @@ def main():
 
     def _extract_triplets_with_retry(*, shuffle_gw=False):
         loader_local, _ = build_test_dataloader(
-            args, saved_args, return_zero_time_mjd=False,
+            args, saved_args, return_zero_time_mjd=need_zero_time_mjd_for_cls,
             nonkn_cls_base_field=nonkn_cls_base_field,
         )
         try:
@@ -3392,7 +3426,7 @@ def main():
             print("WARNING: DataLoader multiprocessing failed (PermissionError). Retrying with num_workers=0.")
             args.num_workers = 0
             loader_local, _ = build_test_dataloader(
-                args, saved_args, return_zero_time_mjd=False,
+                args, saved_args, return_zero_time_mjd=need_zero_time_mjd_for_cls,
                 nonkn_cls_base_field=nonkn_cls_base_field,
             )
             return extract_triplet_logits(
