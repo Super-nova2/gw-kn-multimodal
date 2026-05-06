@@ -1401,6 +1401,9 @@ class CrossAttentionFusion(nn.Module):
             return True
         return bool(self.use_cred_level_feature)
 
+    def uses_time_delta_input(self):
+        return bool(getattr(self, "use_time_delta_cls_feature", False))
+
     def _build_time_delta_feature(self, dt_days, batch_size, dtype, device):
         if dt_days is None:
             dt = torch.zeros((batch_size, 1), dtype=dtype, device=device)
@@ -1534,6 +1537,9 @@ class ConcatProjectionFusion(nn.Module):
         return logits, combined, {}
 
     def uses_cred_level_input(self):
+        return False
+
+    def uses_time_delta_input(self):
         return False
 
 
@@ -1730,6 +1736,9 @@ class GWOpticalALBEFModel(nn.Module):
 
     def uses_cred_level_input(self):
         return bool(self.fusion.uses_cred_level_input())
+
+    def uses_time_delta_input(self):
+        return bool(self.fusion.uses_time_delta_input())
 
     def encode_coord_query(self, opt_coords):
         if self.fusion_mode in {"physical_dual_hgw", "concat_proj"}:

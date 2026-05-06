@@ -107,8 +107,6 @@ DATA_PATH=$(jq -r -s '.[0] * .[1] | .data_path' "$default_file" "$args_file")
 NEG_DATA_PATH=$(jq -r -s '.[0] * .[1] | .neg_data_path // empty' "$default_file" "$args_file")
 CKPT_PATH=$(jq -r -s '.[0] * .[1] | .ckpt_path' "$default_file" "$args_file")
 STAGE_TO_JOBFS=$(jq -r -s '.[0] * .[1] | .stage_to_jobfs // false' "$default_file" "$args_file")
-NEG_TIME_OFFSET_ENABLE=$(jq -r -s '.[0] * .[1] | .neg_time_offset_enable // false' "$default_file" "$args_file")
-NEG_OFFSET_DIST_NPZ=$(jq -r -s '.[0] * .[1] | .neg_offset_dist_npz // empty' "$default_file" "$args_file")
 TEST_DATA_PATH=$(jq -r -s '.[0] * .[1] | .test_data_path // empty' "$default_file" "$args_file")
 mkdir -p "$CKPT_PATH"
 
@@ -129,21 +127,6 @@ echo "Default Configuration File: $default_file"
 echo "Checkpoint Path: $CKPT_PATH"
 echo ""
 
-if [[ "$NEG_TIME_OFFSET_ENABLE" == "true" ]]; then
-    if [[ -z "$NEG_DATA_PATH" || "$NEG_DATA_PATH" == "null" ]]; then
-        echo "neg_time_offset_enable=true requires non-empty neg_data_path."
-        exit 1
-    fi
-    if [[ -z "$NEG_OFFSET_DIST_NPZ" || "$NEG_OFFSET_DIST_NPZ" == "null" ]]; then
-        echo "neg_time_offset_enable=true requires neg_offset_dist_npz."
-        exit 1
-    fi
-    if [[ ! -f "$NEG_OFFSET_DIST_NPZ" ]]; then
-        echo "Negative offset distribution file not found: $NEG_OFFSET_DIST_NPZ"
-        exit 1
-    fi
-fi
-
 # Optional: stage large HDF5 to local disk to reduce Lustre I/O
 if [ "$STAGE_TO_JOBFS" = "true" ]; then
     JOBFS_DIR="${SLURM_TMPDIR:-${TMPDIR:-${JOBFS:-}}}"
@@ -154,11 +137,6 @@ if [ "$STAGE_TO_JOBFS" = "true" ]; then
         if [[ -n "$NEG_DATA_PATH" && "$NEG_DATA_PATH" != "null" ]]; then
             cp -f "$NEG_DATA_PATH" "$JOBFS_DIR"/
             NEG_DATA_PATH="$JOBFS_DIR/$(basename "$NEG_DATA_PATH")"
-        fi
-        if [[ "$NEG_TIME_OFFSET_ENABLE" == "true" && -n "$NEG_OFFSET_DIST_NPZ" && "$NEG_OFFSET_DIST_NPZ" != "null" ]]; then
-            NEG_OFFSET_STAGED_NAME="neg_offset_$(basename "$NEG_OFFSET_DIST_NPZ")"
-            cp -f "$NEG_OFFSET_DIST_NPZ" "$JOBFS_DIR/$NEG_OFFSET_STAGED_NAME"
-            NEG_OFFSET_DIST_NPZ="$JOBFS_DIR/$NEG_OFFSET_STAGED_NAME"
         fi
         if [[ -n "$TEST_DATA_PATH" && "$TEST_DATA_PATH" != "null" ]]; then
             TEST_STAGED_NAME="test_$(basename "$TEST_DATA_PATH")"
@@ -180,9 +158,6 @@ cmd=(
 
 if [[ -n "$NEG_DATA_PATH" && "$NEG_DATA_PATH" != "null" ]]; then
     cmd+=(--neg_data_path "$NEG_DATA_PATH")
-fi
-if [[ -n "$NEG_OFFSET_DIST_NPZ" && "$NEG_OFFSET_DIST_NPZ" != "null" ]]; then
-    cmd+=(--neg_offset_dist_npz "$NEG_OFFSET_DIST_NPZ")
 fi
 if [[ -n "$TEST_DATA_PATH" && "$TEST_DATA_PATH" != "null" ]]; then
     cmd+=(--test_data_path "$TEST_DATA_PATH")

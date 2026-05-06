@@ -295,11 +295,12 @@ def build_time_sky_candidate_sequence(
             "abs_dt_days": np.empty((0,), dtype=np.float32),
         }
 
-    abs_dt_days = np.abs(candidate_times - float(anchor_time_mjd))
+    signed_dt_days = candidate_times - float(anchor_time_mjd)
     keep = (
         np.isfinite(candidate_times)
         & np.isfinite(candidate_credible)
-        & (abs_dt_days <= float(time_window_days))
+        & (signed_dt_days >= 0.0)
+        & (signed_dt_days <= float(time_window_days))
         & (candidate_credible <= float(credible_level_max))
     )
 
@@ -317,14 +318,14 @@ def build_time_sky_candidate_sequence(
         (
             tie_break,
             candidate_credible[valid_idx],
-            abs_dt_days[valid_idx],
+            signed_dt_days[valid_idx],
         )
     )
     ordered_idx = valid_idx[order]
     return {
         "candidate_indices": ordered_idx.astype(np.int64, copy=False),
         "credible_levels": np.asarray(candidate_credible[ordered_idx], dtype=np.float32),
-        "abs_dt_days": np.asarray(abs_dt_days[ordered_idx], dtype=np.float32),
+        "abs_dt_days": np.asarray(signed_dt_days[ordered_idx], dtype=np.float32),
     }
 
 
@@ -340,7 +341,13 @@ def build_time_sky_candidate_sequences(
     zero_time_field: str = "zero_time_mjd_cls_base",
 ) -> Tuple[Dict[Tuple[int, int], Dict[str, np.ndarray]], Dict[int, torch.Tensor], Dict[int, float]]:
     if zero_time_field not in neg_optical_data:
-        raise KeyError(f"Negative optical data is missing '{zero_time_field}' required for time-aware gallery filtering.")
+        # Try fallback fields in order
+        for fallback in ("first_detection_mjd", "zero_time_mjd_base"):
+            if fallback in neg_optical_data:
+                zero_time_field = fallback
+                break
+        else:
+            raise KeyError(f"Negative optical data is missing '{zero_time_field}' and fallbacks.")
     if "coordinates" not in neg_optical_data:
         raise KeyError("Negative optical data is missing 'coordinates' required for skymap filtering.")
 
@@ -377,7 +384,11 @@ def build_time_sky_candidate_sequences(
         dP = np.asarray(gw_skymaps_np[local_idx, 4, :], dtype=np.float64)
         candidate_credible = np.full(neg_times.shape, np.nan, dtype=np.float64)
         if np.isfinite(anchor_time):
-            time_mask = np.isfinite(neg_times) & (np.abs(neg_times - anchor_time) <= float(time_window_days))
+            time_mask = (
+                np.isfinite(neg_times)
+                & (neg_times >= anchor_time)
+                & (neg_times <= anchor_time + float(time_window_days))
+            )
             if np.any(time_mask):
                 event_pixel_idx = _nearest_pixel_indices_from_xyz(
                     neg_opt_xyz[time_mask],
@@ -476,7 +487,7 @@ def build_synthetic_time_sky_candidate_sequences(
                     replace=replace_neg,
                 ).astype(np.int64, copy=False)
                 delta_t = rng.uniform(
-                    -float(time_window_days),
+                    0.0,
                     float(time_window_days),
                     size=int(max_neg_needed),
                 )
@@ -486,7 +497,7 @@ def build_synthetic_time_sky_candidate_sequences(
                     replace=True,
                     p=cell_prob,
                 ).astype(np.int64, copy=False)
-                synthetic_abs_dt = np.abs(delta_t).astype(np.float32)
+                synthetic_abs_dt = delta_t.astype(np.float32)
                 synthetic_times = (anchor_time + delta_t).astype(np.float64)
                 synthetic_coords = _unit_xyz_to_radec_degrees(gw_skymap_np[:3, sampled_cells].T)
                 synthetic_credible = np.asarray(cell_credible[sampled_cells], dtype=np.float32)

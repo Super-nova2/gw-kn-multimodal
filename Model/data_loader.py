@@ -509,6 +509,7 @@ class RelationalHDF5Dataset(Dataset):
         self.return_zero_time_mjd = bool(return_zero_time_mjd)
         self.nonkn_cls_base_field = str(nonkn_cls_base_field)
         self.has_opt_zero_time_mjd_base = False
+        self.has_opt_first_detection_mjd = False
         self.has_gw_event_time_mjd = False
         self.has_neg_zero_time_mjd_base = False
         self.has_neg_zero_time_mjd_cls_base = False
@@ -545,6 +546,7 @@ class RelationalHDF5Dataset(Dataset):
         with h5py.File(h5_path, 'r') as f:
             self.length = f['events/optical_data/values'].shape[0]
             self.has_opt_zero_time_mjd_base = "events/optical_data/zero_time_mjd_base" in f
+            self.has_opt_first_detection_mjd = "events/optical_data/first_detection_mjd" in f
             self.has_gw_event_time_mjd = "events/gw_data/event_time_mjd" in f
             if self.has_gw_event_time_mjd:
                 self.gw_event_time_mjd_np = np.asarray(
@@ -572,6 +574,10 @@ class RelationalHDF5Dataset(Dataset):
                 if self.has_opt_zero_time_mjd_base:
                     self.data_cache["opt_zero_time_mjd_base"] = torch.from_numpy(
                         f["events/optical_data/zero_time_mjd_base"][:]
+                    )
+                if self.has_opt_first_detection_mjd:
+                    self.data_cache["opt_first_detection_mjd"] = torch.from_numpy(
+                        f["events/optical_data/first_detection_mjd"][:]
                     )
                 elif self.return_zero_time_mjd and self.has_gw_event_time_mjd:
                     self.data_cache["gw_event_time_mjd"] = torch.from_numpy(
@@ -838,6 +844,12 @@ class RelationalHDF5Dataset(Dataset):
                     opt_zero_time_mjd_base = torch.as_tensor(
                         self.h5_file["events/gw_data/event_time_mjd"][gw_idx], dtype=torch.float32
                     )
+                if self.has_opt_first_detection_mjd:
+                    opt_first_detection_mjd = torch.as_tensor(
+                        self.h5_file["events/optical_data/first_detection_mjd"][opt_idx], dtype=torch.float32
+                    )
+                elif self.has_opt_zero_time_mjd_base:
+                    opt_first_detection_mjd = opt_zero_time_mjd_base.clone()
                 else:
                     raise KeyError(
                         "Missing both 'events/optical_data/zero_time_mjd_base' and "
@@ -863,6 +875,10 @@ class RelationalHDF5Dataset(Dataset):
                         "Missing both cached opt_zero_time_mjd_base and gw_event_time_mjd while "
                         "return_zero_time_mjd=True."
                     )
+                if "opt_first_detection_mjd" in self.data_cache:
+                    opt_first_detection_mjd = self.data_cache["opt_first_detection_mjd"][opt_idx].to(torch.float32)
+                elif "opt_zero_time_mjd_base" in self.data_cache:
+                    opt_first_detection_mjd = opt_zero_time_mjd_base.clone()
 
         if self.opt_input_window_active:
             opt_time, opt_val, opt_mask, opt_err, _ = apply_runtime_input_window_torch(
@@ -946,7 +962,8 @@ class RelationalHDF5Dataset(Dataset):
                 neg_time, neg_val, neg_mask, neg_err, neg_coords,
             ]
             if self.return_zero_time_mjd:
-                out.extend([opt_zero_time_mjd_base, neg_zero_time_mjd_base, neg_zero_time_mjd_cls_base])
+                out.extend([opt_zero_time_mjd_base, neg_zero_time_mjd_base,
+                            neg_zero_time_mjd_cls_base, opt_first_detection_mjd])
             if neg_gw_local_idx is not None:
                 out.append(is_neg_gw)
             return tuple(out)
@@ -955,7 +972,7 @@ class RelationalHDF5Dataset(Dataset):
         # gw_idx is returned for masking the contrastive loss (handling same-source negatives)
         out = [gw_scalar, gw_skymap, opt_time, opt_val, opt_mask, opt_err, opt_coords, int(gw_idx)]
         if self.return_zero_time_mjd:
-            out.append(opt_zero_time_mjd_base)
+            out.extend([opt_zero_time_mjd_base, opt_first_detection_mjd])
         if neg_gw_local_idx is not None:
             out.append(is_neg_gw)
         return tuple(out)
@@ -3324,6 +3341,8 @@ def parse_snana_fits(
     fluxcal_to_psfflux_factor=None,
     psfflux_zp=31.4,
     lupt_b_njy=None,
+    normalize_to_first_detection=False,
+    snr_threshold=5.0,
 ):
     """
     Parses {event_id}_HEAD.fits and {event_id}_PHOT.fits.
@@ -3430,12 +3449,26 @@ def parse_snana_fits(
                 err_mat = np.zeros((MAX_LC_LENGTH, NUM_BANDS), dtype=np.float32)    # Errors matrix (flux errors)
                 mask_mat = np.zeros((MAX_LC_LENGTH, NUM_BANDS), dtype=np.float32)
                 time_vec = np.zeros((MAX_LC_LENGTH,), dtype=np.float32)
-                
-                # 1. Time Normalization (Relative to BNS merger time)
-                if len(lc_mjd) > 0:
-                    rel_times = (lc_mjd - mjd_explode) / 100  # Scale down to manageable range[-0.3, 0.6]
+
+                if normalize_to_first_detection:
+                    # Find first detection (SNR > threshold) and use as time zero
+                    det_idx = _first_detection_index(
+                        flux=np.asarray(lc_flux, dtype=np.float64),
+                        fluxerr=np.asarray(lc_fluxerr, dtype=np.float64),
+                        photflag=None,
+                        snr_threshold=float(snr_threshold),
+                    )
+                    if det_idx is None:
+                        continue
+                    first_detection_mjd = float(np.asarray(lc_mjd, dtype=np.float64)[det_idx])
+                    rel_times = (lc_mjd - first_detection_mjd) / 100.0
                 else:
-                    continue # Skip empty light curves
+                    # 1. Time Normalization (Relative to BNS merger time)
+                    if len(lc_mjd) > 0:
+                        rel_times = (lc_mjd - mjd_explode) / 100  # Scale down to manageable range[-0.3, 0.6]
+                    else:
+                        continue # Skip empty light curves
+                    first_detection_mjd = None
 
                 # 2. Fill Matrices
                 # Truncate if longer than MAX_LC_LENGTH
@@ -3465,9 +3498,12 @@ def parse_snana_fits(
 
                 if not np.any(mask_mat):
                     continue
-                
-                extracted_lcs.append((val_mat, err_mat, mask_mat, time_vec, coordinates))
-                
+
+                if normalize_to_first_detection:
+                    extracted_lcs.append((val_mat, err_mat, mask_mat, time_vec, coordinates, first_detection_mjd))
+                else:
+                    extracted_lcs.append((val_mat, err_mat, mask_mat, time_vec, coordinates))
+
             return extracted_lcs
 
     except Exception as e:

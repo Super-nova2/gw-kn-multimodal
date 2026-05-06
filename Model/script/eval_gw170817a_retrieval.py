@@ -33,13 +33,13 @@ if str(SCRIPT_DIR) not in sys.path:
 from retrieval_gallery import (  # noqa: E402
     _plot_method_label,
     aggregate_gallery_outcomes,
+    build_comparison_model_specs,
     build_curve_rows,
     build_prefixed_gallery_specs,
     build_synthetic_time_sky_candidate_sequences,
     build_time_sky_candidate_sequences,
     plot_retrieval_coverage,
     plot_retrieval_curves,
-    resolve_checkpoint_path,
     score_all_galleries_skymap,
 )
 from test_evaluate import (  # noqa: E402
@@ -50,12 +50,6 @@ from test_evaluate import (  # noqa: E402
 import eval_retrieval_comparison as base_eval  # noqa: E402
 
 
-EXPECTED_MODEL_SIGNATURE = (
-    ("Skymap-only", "skymap"),
-    ("Optical-only", "optical"),
-    ("Full Multimodal + Hard Mining", "multimodal"),
-    ("Full Multimodal", "multimodal"),
-)
 TABLE_METRIC_LABELS = ["R@1", "R@5", "R@10", "MRR"]
 TABLE_METRIC_KEYS = ["recall_at_1", "recall_at_5", "recall_at_10", "mrr"]
 
@@ -111,39 +105,6 @@ def _parse_n_neg_samples(value: Any) -> int:
     return -1 if out <= 0 else out
 
 
-def validate_gw170817a_model_specs(raw_specs: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
-    specs = [dict(spec) for spec in raw_specs]
-    expected = list(EXPECTED_MODEL_SIGNATURE)
-    actual = [(str(spec.get("name")), str(spec.get("type"))) for spec in specs]
-    if actual != expected:
-        raise ValueError(
-            "GW170817A retrieval must define exactly these models in order: "
-            f"{expected}; got {actual}"
-        )
-    for spec in specs:
-        if spec["type"] in {"optical", "multimodal"} and not spec.get("checkpoint"):
-            raise ValueError(f"Model '{spec['name']}' requires checkpoint")
-        if spec["type"] == "multimodal" and not spec.get("config"):
-            raise ValueError(f"Model '{spec['name']}' requires config")
-    return specs
-
-
-def build_model_specs(raw_specs: Sequence[Mapping[str, Any]], cfg_dir: Path) -> List[Dict[str, Any]]:
-    specs = validate_gw170817a_model_specs(raw_specs)
-    for spec in specs:
-        spec["checkpoint"] = _resolve_path(cfg_dir, spec.get("checkpoint"))
-        spec["config"] = _resolve_path(cfg_dir, spec.get("config"))
-        if spec["type"] == "skymap":
-            spec["resolved_checkpoint"] = None
-            spec["resolved_config"] = None
-            spec["scoring"] = "skymap"
-        else:
-            spec["resolved_checkpoint"] = resolve_checkpoint_path(str(spec["checkpoint"]), str(spec["type"]))
-            spec["resolved_config"] = spec.get("config")
-            spec["scoring"] = "optical" if spec["type"] == "optical" else str(spec.get("scoring", "auto"))
-    return specs
-
-
 def normalize_config(raw_cfg: Mapping[str, Any], cfg_path: Path) -> Dict[str, Any]:
     cfg_dir = cfg_path.parent
     test_data_path = _resolve_path(cfg_dir, raw_cfg.get("test_data_path"))
@@ -166,7 +127,7 @@ def normalize_config(raw_cfg: Mapping[str, Any], cfg_path: Path) -> Dict[str, An
         "gallery_sizes": _parse_gallery_sizes(raw_cfg.get("gallery_sizes", "10,100,500")),
         "gallery_trials": int(raw_cfg.get("gallery_trials", 5)),
         "gallery_candidate_mode": str(raw_cfg.get("gallery_candidate_mode", "time_sky_hard")).strip().lower(),
-        "gallery_candidate_time_window_days": float(raw_cfg.get("gallery_candidate_time_window_days", 50.0)),
+        "gallery_candidate_time_window_days": float(raw_cfg.get("gallery_candidate_time_window_days", 30.0)),
         "gallery_candidate_credible_level_max": float(raw_cfg.get("gallery_candidate_credible_level_max", 0.9)),
         "gallery_include_undersized": bool(raw_cfg.get("gallery_include_undersized", True)),
         "max_kn_per_redshift_bin": int(raw_cfg.get("max_kn_per_redshift_bin", 0)) or None,
@@ -453,7 +414,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     cfg_path = Path(args.config).expanduser().resolve()
     raw_cfg = _load_json(cfg_path)
     cfg = normalize_config(raw_cfg, cfg_path)
-    model_specs = build_model_specs(raw_cfg.get("models", []), cfg_path.parent)
+    model_specs = build_comparison_model_specs(raw_cfg, cfg_path.parent)
     _seed_all(int(cfg["seed"]))
 
     device = torch.device(cfg["device"] if torch.cuda.is_available() else "cpu")

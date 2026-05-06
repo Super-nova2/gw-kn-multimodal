@@ -9,7 +9,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --time=6:00:00
 #SBATCH --partition=gpu
-#SBATCH --tmp=160G
+#SBATCH --tmp=200G
 
 set -euo pipefail
 
@@ -162,15 +162,6 @@ EVAL_POS_DATA_PATH=$(jq -r '.eval_pos_data_path // empty' "$args_file")
 EVAL_NEG_DATA_PATH=$(jq -r '.eval_neg_data_path // empty' "$args_file")
 EVAL_NEG_GROUP=$(jq -r '.eval_neg_group // empty' "$args_file")
 
-TIME_OFFSET_ENABLE=$(jq -r '.time_offset_enable // false' "$args_file")
-OFFSET_DIST_NPZ=$(jq -r '.offset_dist_npz // empty' "$args_file")
-OFFSET_DIST_KEY=$(jq -r '.offset_dist_key // empty' "$args_file")
-OFFSET_TRAIN_SAMPLING=$(jq -r '.offset_train_sampling // empty' "$args_file")
-OFFSET_EVAL_MODE=$(jq -r '.offset_eval_mode // empty' "$args_file")
-OFFSET_EVAL_QUANTILES=$(jq -r '.offset_eval_quantiles // empty' "$args_file")
-OFFSET_SCALE_DAYS_DIVISOR=$(jq -r '.offset_scale_days_divisor // empty' "$args_file")
-OFFSET_SEED=$(jq -r '.offset_seed // empty' "$args_file")
-OFFSET_BANK_SIZE=$(jq -r '.offset_bank_size // empty' "$args_file")
 META_MATCHED_SAMPLING=$(jq -r '.meta_matched_sampling // empty' "$args_file")
 META_MATCH_FALLBACK=$(jq -r '.meta_match_fallback // empty' "$args_file")
 META_FILTER_N_DET_MIN=$(jq -r '.meta_filter_n_det_min // empty' "$args_file")
@@ -282,9 +273,6 @@ if is_truthy "$STAGE_TO_JOBFS"; then
         TRAIN_NEG_LOCAL="$JOBFS_DIR/train_neg_$(basename "$NEG_DATA_PATH")"
         EVAL_POS_LOCAL="$JOBFS_DIR/eval_pos_$(basename "$EVAL_POS_DATA_PATH")"
         EVAL_NEG_LOCAL="$JOBFS_DIR/eval_neg_$(basename "$EVAL_NEG_DATA_PATH")"
-        OFFSET_DIST_LOCAL=""
-        PREFIX_REAL_HIST_LOCAL=""
-
         cp -f "$POS_DATA_PATH" "$TRAIN_POS_LOCAL"
         POS_DATA_PATH="$TRAIN_POS_LOCAL"
         cp -f "$NEG_DATA_PATH" "$TRAIN_NEG_LOCAL"
@@ -293,11 +281,6 @@ if is_truthy "$STAGE_TO_JOBFS"; then
         EVAL_POS_DATA_PATH="$EVAL_POS_LOCAL"
         cp -f "$EVAL_NEG_DATA_PATH" "$EVAL_NEG_LOCAL"
         EVAL_NEG_DATA_PATH="$EVAL_NEG_LOCAL"
-        if is_truthy "$TIME_OFFSET_ENABLE" && [[ -n "$OFFSET_DIST_NPZ" && "$OFFSET_DIST_NPZ" != "null" ]]; then
-            OFFSET_DIST_LOCAL="$JOBFS_DIR/offset_dist_$(basename "$OFFSET_DIST_NPZ")"
-            cp -f "$OFFSET_DIST_NPZ" "$OFFSET_DIST_LOCAL"
-            OFFSET_DIST_NPZ="$OFFSET_DIST_LOCAL"
-        fi
         echo "Staging complete."
     else
         echo "No local tmp dir found; skip staging."
@@ -425,33 +408,6 @@ if is_truthy "$DISABLE_TENSORBOARD"; then
 fi
 if [[ -n "$RUN_NAME" && "$RUN_NAME" != "null" ]]; then
     cmd+=(--run_name "$RUN_NAME")
-fi
-if is_truthy "$TIME_OFFSET_ENABLE"; then
-    cmd+=(--time_offset_enable)
-fi
-if [[ -n "$OFFSET_DIST_NPZ" && "$OFFSET_DIST_NPZ" != "null" ]]; then
-    cmd+=(--offset_dist_npz "$OFFSET_DIST_NPZ")
-fi
-if [[ -n "$OFFSET_DIST_KEY" && "$OFFSET_DIST_KEY" != "null" ]]; then
-    cmd+=(--offset_dist_key "$OFFSET_DIST_KEY")
-fi
-if [[ -n "$OFFSET_TRAIN_SAMPLING" && "$OFFSET_TRAIN_SAMPLING" != "null" ]]; then
-    cmd+=(--offset_train_sampling "$OFFSET_TRAIN_SAMPLING")
-fi
-if [[ -n "$OFFSET_EVAL_MODE" && "$OFFSET_EVAL_MODE" != "null" ]]; then
-    cmd+=(--offset_eval_mode "$OFFSET_EVAL_MODE")
-fi
-if [[ -n "$OFFSET_EVAL_QUANTILES" && "$OFFSET_EVAL_QUANTILES" != "null" ]]; then
-    cmd+=(--offset_eval_quantiles "$OFFSET_EVAL_QUANTILES")
-fi
-if [[ -n "$OFFSET_SCALE_DAYS_DIVISOR" && "$OFFSET_SCALE_DAYS_DIVISOR" != "null" ]]; then
-    cmd+=(--offset_scale_days_divisor "$OFFSET_SCALE_DAYS_DIVISOR")
-fi
-if [[ -n "$OFFSET_SEED" && "$OFFSET_SEED" != "null" ]]; then
-    cmd+=(--offset_seed "$OFFSET_SEED")
-fi
-if [[ -n "$OFFSET_BANK_SIZE" && "$OFFSET_BANK_SIZE" != "null" ]]; then
-    cmd+=(--offset_bank_size "$OFFSET_BANK_SIZE")
 fi
 if [[ -n "$PREFIX_MIN_DET" && "$PREFIX_MIN_DET" != "null" ]]; then
     cmd+=(--prefix_min_det "$PREFIX_MIN_DET")
@@ -624,24 +580,6 @@ if [[ -n "$EVAL_TARGET_RECALL" && "$EVAL_TARGET_RECALL" != "null" ]]; then
 fi
 if is_truthy "$EVAL_NO_PLOTS"; then
     eval_cmd+=(--no_plots)
-fi
-if is_truthy "$TIME_OFFSET_ENABLE"; then
-    eval_cmd+=(--time_offset_enable)
-fi
-if [[ -n "$OFFSET_DIST_NPZ" && "$OFFSET_DIST_NPZ" != "null" ]]; then
-    eval_cmd+=(--offset_dist_npz "$OFFSET_DIST_NPZ")
-fi
-if [[ -n "$OFFSET_DIST_KEY" && "$OFFSET_DIST_KEY" != "null" ]]; then
-    eval_cmd+=(--offset_dist_key "$OFFSET_DIST_KEY")
-fi
-if [[ -n "$OFFSET_EVAL_MODE" && "$OFFSET_EVAL_MODE" != "null" ]]; then
-    eval_cmd+=(--offset_eval_mode "$OFFSET_EVAL_MODE")
-fi
-if [[ -n "$OFFSET_EVAL_QUANTILES" && "$OFFSET_EVAL_QUANTILES" != "null" ]]; then
-    eval_cmd+=(--offset_eval_quantiles "$OFFSET_EVAL_QUANTILES")
-fi
-if [[ -n "$OFFSET_SCALE_DAYS_DIVISOR" && "$OFFSET_SCALE_DAYS_DIVISOR" != "null" ]]; then
-    eval_cmd+=(--offset_scale_days_divisor "$OFFSET_SCALE_DAYS_DIVISOR")
 fi
 if is_truthy "$PREFIX_EVAL_ENABLE"; then
     eval_cmd+=(--prefix_eval_enable)

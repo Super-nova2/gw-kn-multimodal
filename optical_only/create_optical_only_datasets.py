@@ -1414,7 +1414,7 @@ def create_positive_h5(
         for k, v in stats.items():
             f.attrs[k] = int(v)
 
-        f.attrs["time_zero_anchor"] = "first_detection_plus_fixed_offset"
+        f.attrs["time_zero_anchor"] = "first_detection"
         f.attrs["first_detection_rule"] = "merged_psfflux_snr_gt_threshold"
         f.attrs["time_scale_divisor_days"] = 100.0
         f.attrs["time_zero_version"] = "fd_v1"
@@ -1423,7 +1423,7 @@ def create_positive_h5(
         f.attrs["detection_photflags"] = "unused"
         f.attrs["fixed_offset_days"] = float(fixed_offset_days)
         f.attrs["num_workers"] = int(worker_count)
-        f.attrs["time_zero_base_semantics"] = "first_detection_mjd_plus_fixed_offset_days"
+        f.attrs["time_zero_base_semantics"] = "first_detection_mjd"
         f.attrs["time_unit"] = "mjd_days"
         f.attrs["runtime_offset_applied"] = int(abs(float(fixed_offset_days)) > 0.0)
         f.attrs["enforce_time_window"] = int(bool(enforce_time_window))

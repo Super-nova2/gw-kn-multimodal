@@ -205,7 +205,7 @@ class EventProcessResult:
     event_id: int
     include_lightcurves: bool
     status: str
-    lcs: Optional[List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]]] = None
+    lcs: Optional[List[Tuple]] = None  # 5-tuple normally; 6-tuple when first_detection mode
     skymap: Optional[np.ndarray] = None
 
 
@@ -251,6 +251,7 @@ def _process_event_task(task: EventProcessTask) -> EventProcessResult:
             fluxcal_to_psfflux_factor=float(task.fluxcal_to_psfflux_factor),
             psfflux_zp=float(task.psfflux_zp),
             lupt_b_njy=np.asarray(task.lupt_b_njy, dtype=np.float64),
+            normalize_to_first_detection=True,
         )
         if len(lcs) == 0:
             return EventProcessResult(
@@ -896,6 +897,13 @@ def create_dataset_with_neg_gw_bns_nsbh_fast(
             dtype="f8",
             chunks=(chunk_size,),
         )
+        ds_opt_first_detection_mjd = grp_opt.create_dataset(
+            "first_detection_mjd",
+            (0,),
+            maxshape=(None,),
+            dtype="f8",
+            chunks=(chunk_size,),
+        )
         ds_opt_coordinates = grp_opt.create_dataset(
             "coordinates",
             (0, 2),
@@ -941,6 +949,7 @@ def create_dataset_with_neg_gw_bns_nsbh_fast(
         opt_buffer_masks: List[np.ndarray] = []
         opt_buffer_times: List[np.ndarray] = []
         opt_buffer_zero_time_mjd_base: List[float] = []
+        opt_buffer_first_detection_mjd: List[float] = []
         opt_buffer_parent_idx: List[int] = []
         opt_buffer_coordinates: List[np.ndarray] = []
 
@@ -991,6 +1000,7 @@ def create_dataset_with_neg_gw_bns_nsbh_fast(
             ds_opt_masks.resize(new_size, axis=0)
             ds_opt_times.resize(new_size, axis=0)
             ds_opt_zero_time_mjd_base.resize(new_size, axis=0)
+            ds_opt_first_detection_mjd.resize(new_size, axis=0)
             ds_opt_coordinates.resize(new_size, axis=0)
             ds_parent_idx.resize(new_size, axis=0)
 
@@ -1001,6 +1011,9 @@ def create_dataset_with_neg_gw_bns_nsbh_fast(
             ds_opt_zero_time_mjd_base[cur:new_size] = np.asarray(
                 opt_buffer_zero_time_mjd_base, dtype=np.float64
             )
+            ds_opt_first_detection_mjd[cur:new_size] = np.asarray(
+                opt_buffer_first_detection_mjd, dtype=np.float64
+            )
             ds_opt_coordinates[cur:new_size] = np.asarray(opt_buffer_coordinates)
             ds_parent_idx[cur:new_size] = np.asarray(opt_buffer_parent_idx, dtype=np.int32)
 
@@ -1010,6 +1023,7 @@ def create_dataset_with_neg_gw_bns_nsbh_fast(
             opt_buffer_masks.clear()
             opt_buffer_times.clear()
             opt_buffer_zero_time_mjd_base.clear()
+            opt_buffer_first_detection_mjd.clear()
             opt_buffer_coordinates.clear()
             opt_buffer_parent_idx.clear()
 
@@ -1094,12 +1108,13 @@ def create_dataset_with_neg_gw_bns_nsbh_fast(
             if not np.isfinite(event_time_val):
                 source_counts[tag]["invalid_event_time_written"] += 1
 
-            for vals, errs, masks, times, coordinates in lcs:
+            for vals, errs, masks, times, coordinates, first_detection_mjd in lcs:
                 opt_buffer_vals.append(vals)
                 opt_buffer_errs.append(errs)
                 opt_buffer_masks.append(masks)
                 opt_buffer_times.append(times)
-                opt_buffer_zero_time_mjd_base.append(event_time_val)
+                opt_buffer_zero_time_mjd_base.append(float(first_detection_mjd))
+                opt_buffer_first_detection_mjd.append(float(first_detection_mjd))
                 opt_buffer_coordinates.append(coordinates)
                 opt_buffer_parent_idx.append(gw_idx)
 
@@ -1236,9 +1251,10 @@ def create_dataset_with_neg_gw_bns_nsbh_fast(
             source_counts["bns"]["invalid_event_time_written"]
             + source_counts["nsbh"]["invalid_event_time_written"]
         )
-        f.attrs["time_zero_base_semantics"] = "optical zero_time_mjd_base stores parent GW event_time_mjd"
+        f.attrs["time_zero_base_semantics"] = "optical zero_time_mjd_base stores first_detection_mjd"
+        f.attrs["first_detection_snr_threshold"] = 5.0
         f.attrs["time_unit"] = "mjd_days"
-        f.attrs["runtime_offset_applied"] = 1
+        f.attrs["runtime_offset_applied"] = 0
         f.attrs["min_nobs_stage"] = "post_merge"
         write_luptitude_metadata_attrs(
             h5_obj=f,

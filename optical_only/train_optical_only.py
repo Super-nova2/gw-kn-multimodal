@@ -1,10 +1,6 @@
 #!/usr/bin/env python3
 """
-Train optical-only KN classifier with first-detection time-zero and time-offset modeling.
-
-Key additions versus baseline train script:
-1) Optional empirical-CDF offset sampling in training.
-2) Optional quantile-ensemble offset inference in validation (average logits).
+Train optical-only KN classifier with first-detection time-zero.
 """
 
 import argparse
@@ -206,21 +202,6 @@ def run_memory_maintenance(
         "file_handles_closed": closed,
         "heap_trimmed": trimmed,
     }
-
-
-def parse_quantiles(text: str) -> List[float]:
-    vals: List[float] = []
-    for part in str(text).split(","):
-        part = part.strip()
-        if not part:
-            continue
-        q = float(part)
-        if q < 0.0 or q > 1.0:
-            raise ValueError(f"Invalid quantile {q}; expected in [0, 1].")
-        vals.append(q)
-    if not vals:
-        raise ValueError("offset_eval_quantiles produced empty list.")
-    return vals
 
 
 def parse_bin_edges(text: str, default: str) -> List[float]:
@@ -520,114 +501,10 @@ def universal_stage_requires_aux(mode: str) -> bool:
     return normalize_universal_stage_mode(mode, "stage_mode") in {"dual", "dual_adv"}
 
 
-class TimeOffsetPolicy:
-    def __init__(self, args):
-        self.enabled = bool(args.time_offset_enable)
-        self.scale_divisor = float(args.offset_scale_days_divisor)
-        if self.scale_divisor <= 0:
-            raise ValueError("offset_scale_days_divisor must be > 0.")
-
-        self.train_sampling = str(args.offset_train_sampling).strip().lower()
-        self.eval_mode = str(args.offset_eval_mode).strip().lower()
-        self.eval_offsets_days: List[float] = [0.0]
-
-        seed = int(args.seed if args.offset_seed is None else args.offset_seed)
-        self.rng = np.random.default_rng(seed)
-        self.samples: Optional[np.ndarray] = None
-        self.sample_bank: Optional[np.ndarray] = None
-        self.info: Dict[str, object] = {
-            "enabled": bool(self.enabled),
-            "scale_divisor": float(self.scale_divisor),
-            "train_sampling": self.train_sampling,
-            "eval_mode": self.eval_mode,
-            "seed": int(seed),
-        }
-
-        if not self.enabled:
-            self.info["eval_offsets_days"] = [0.0]
-            return
-
-        dist_path = args.offset_dist_npz
-        if dist_path is None:
-            raise ValueError("time_offset_enable=true requires --offset_dist_npz.")
-
-        dist_path = Path(dist_path)
-        if not dist_path.exists():
-            raise FileNotFoundError(f"Offset distribution file not found: {dist_path}")
-
-        dist_key = str(args.offset_dist_key)
-        with np.load(dist_path, allow_pickle=False) as npz:
-            if dist_key not in npz:
-                raise KeyError(
-                    f"offset_dist_key '{dist_key}' not found in {dist_path}. "
-                    f"Available keys: {list(npz.keys())}"
-                )
-            raw = np.asarray(npz[dist_key], dtype=np.float64).reshape(-1)
-
-        raw = raw[np.isfinite(raw)]
-        if raw.size == 0:
-            raise ValueError(f"Offset distribution is empty after filtering NaN/Inf: {dist_path}:{dist_key}")
-
-        self.samples = raw.astype(np.float32, copy=False)
-
-        bank_size = max(1, min(int(args.offset_bank_size), int(self.samples.shape[0])))
-        if bank_size < int(self.samples.shape[0]):
-            bank_idx = self.rng.integers(0, int(self.samples.shape[0]), size=bank_size, endpoint=False)
-            self.sample_bank = self.samples[bank_idx].astype(np.float32, copy=False)
-        else:
-            self.sample_bank = self.samples
-
-        if self.train_sampling != "empirical_cdf":
-            raise ValueError(f"Unsupported offset_train_sampling: {self.train_sampling}")
-
-        if self.eval_mode == "quantile_ensemble":
-            quantiles = parse_quantiles(args.offset_eval_quantiles)
-            q_vals = np.quantile(self.samples.astype(np.float64), np.asarray(quantiles, dtype=np.float64))
-            self.eval_offsets_days = [float(v) for v in q_vals.tolist()]
-        elif self.eval_mode == "median":
-            self.eval_offsets_days = [float(np.quantile(self.samples.astype(np.float64), 0.5))]
-        elif self.eval_mode == "zero":
-            self.eval_offsets_days = [0.0]
-        else:
-            raise ValueError(f"Unsupported offset_eval_mode: {self.eval_mode}")
-
-        self.info.update(
-            {
-                "dist_path": str(dist_path),
-                "dist_key": dist_key,
-                "dist_count": int(self.samples.shape[0]),
-                "dist_min_days": float(np.min(self.samples)),
-                "dist_max_days": float(np.max(self.samples)),
-                "dist_mean_days": float(np.mean(self.samples)),
-                "dist_std_days": float(np.std(self.samples)),
-                "bank_size": int(self.sample_bank.shape[0]),
-                "eval_offsets_days": [float(v) for v in self.eval_offsets_days],
-            }
-        )
-
-    def sample_train_offsets(self, batch_size: int) -> np.ndarray:
-        if not self.enabled:
-            return np.zeros((int(batch_size),), dtype=np.float32)
-        if self.sample_bank is None:
-            raise RuntimeError("time offset sample bank is not initialized")
-        idx = self.rng.integers(0, int(self.sample_bank.shape[0]), size=int(batch_size), endpoint=False)
-        return self.sample_bank[idx].astype(np.float32, copy=False)
-
-    def describe(self) -> Dict[str, object]:
-        return dict(self.info)
-
 
 def build_ref_time(batch_size, n_ref, ref_start, ref_end, device, dtype):
     ref = torch.linspace(ref_start, ref_end, n_ref, dtype=dtype, device=device)
     return ref.unsqueeze(0).repeat(batch_size, 1)
-
-
-def apply_time_offsets(opt_t, opt_mask, delta_days, scale_divisor):
-    valid = (opt_mask.sum(dim=-1) > 0).to(dtype=opt_t.dtype)
-    shift = (delta_days.to(device=opt_t.device, dtype=opt_t.dtype) / float(scale_divisor)).unsqueeze(1)
-    return opt_t + shift * valid
-
-
 
 
 def sample_universal_target_k(
@@ -889,94 +766,7 @@ def select_threshold_for_target_recall(probs, labels, target_recall=0.98):
     return best
 
 
-def forward_logits_with_offsets(
-    model,
-    opt_t,
-    opt_v,
-    ref_time,
-    opt_mask,
-    opt_err,
-    device,
-    amp_dtype,
-    args,
-    offset_policy,
-    training,
-):
-    out = forward_outputs_with_offsets(
-        model=model,
-        opt_t=opt_t,
-        opt_v=opt_v,
-        ref_time=ref_time,
-        opt_mask=opt_mask,
-        opt_err=opt_err,
-        device=device,
-        amp_dtype=amp_dtype,
-        args=args,
-        offset_policy=offset_policy,
-        training=training,
-        return_aux=False,
-    )
-    return out["logits"]
-
-
-def forward_outputs_with_offsets(
-    model,
-    opt_t,
-    opt_v,
-    ref_time,
-    opt_mask,
-    opt_err,
-    device,
-    amp_dtype,
-    args,
-    offset_policy,
-    training,
-    return_aux,
-):
-    if not offset_policy.enabled:
-        with autocast(device_type="cuda", dtype=amp_dtype, enabled=(device.type == "cuda")):
-            out = model.forward_with_aux(opt_t, opt_v, ref_time, opt_mask, opt_err, return_aux=return_aux)
-        out["logits"] = out["logits"].squeeze(-1).float()
-        return out
-
-    if training:
-        delta_np = offset_policy.sample_train_offsets(opt_t.size(0))
-        delta_days = torch.from_numpy(delta_np).to(device=device, dtype=torch.float32)
-        shifted_opt_t = apply_time_offsets(opt_t, opt_mask, delta_days, args.offset_scale_days_divisor)
-        with autocast(device_type="cuda", dtype=amp_dtype, enabled=(device.type == "cuda")):
-            out = model.forward_with_aux(
-                shifted_opt_t,
-                opt_v,
-                ref_time,
-                opt_mask,
-                opt_err,
-                return_aux=return_aux,
-            )
-        out["logits"] = out["logits"].squeeze(-1).float()
-        return out
-
-    logits_sum = None
-    for off_days in offset_policy.eval_offsets_days:
-        delta_days = torch.full((opt_t.size(0),), float(off_days), device=device, dtype=torch.float32)
-        shifted_opt_t = apply_time_offsets(opt_t, opt_mask, delta_days, args.offset_scale_days_divisor)
-        with autocast(device_type="cuda", dtype=amp_dtype, enabled=(device.type == "cuda")):
-            out = model.forward_with_aux(
-                shifted_opt_t,
-                opt_v,
-                ref_time,
-                opt_mask,
-                opt_err,
-                return_aux=return_aux,
-            )
-        logits = out["logits"].squeeze(-1).float()
-        logits_sum = logits if logits_sum is None else logits_sum + logits
-
-    return {
-        "logits": logits_sum / float(max(1, len(offset_policy.eval_offsets_days))),
-    }
-
-
-def run_eval(model, loader, device, args, criterion, amp_dtype, offset_policy):
+def run_eval(model, loader, device, args, criterion, amp_dtype):
     model.eval()
     losses = 0.0
     n_batches = 0
@@ -1022,19 +812,9 @@ def run_eval(model, loader, device, args, criterion, amp_dtype, offset_policy):
                     batch_size, args.n_ref, args.ref_start, args.ref_end, device, opt_t.dtype
                 )
 
-            logits = forward_logits_with_offsets(
-                model=model,
-                opt_t=opt_t,
-                opt_v=opt_v,
-                ref_time=ref_time_cache,
-                opt_mask=opt_mask,
-                opt_err=opt_err,
-                device=device,
-                amp_dtype=amp_dtype,
-                args=args,
-                offset_policy=offset_policy,
-                training=False,
-            )
+            with autocast(device_type="cuda", dtype=amp_dtype, enabled=(device.type == "cuda")):
+                logits = model(opt_t, opt_v, ref_time_cache, opt_mask, opt_err).squeeze(-1)
+            logits = logits.float()
             loss = criterion(logits, labels)
 
             probs = torch.sigmoid(logits)
@@ -1090,7 +870,6 @@ def run_eval(model, loader, device, args, criterion, amp_dtype, offset_policy):
         "op_precision": op["precision"],
         "op_fpr": op["fpr"],
         "op_meets_target_recall": bool(op["meets_target_recall"]),
-        "offset_eval_count": int(len(offset_policy.eval_offsets_days)),
         "task_mode": "prefix_right_censored"
         if bool(getattr(args, "universal_train_enable", False))
         else "full_window",
@@ -1122,7 +901,6 @@ def train_one_epoch(
     criterion,
     scaler,
     amp_dtype,
-    offset_policy,
     prefix_policy,
     universal_stage_mode: Optional[str] = None,
 ):
@@ -1172,20 +950,13 @@ def train_one_epoch(
         optimizer.zero_grad(set_to_none=True)
         if bool(getattr(args, "universal_train_enable", False)):
             view_a = build_universal_view(opt_t, opt_v, opt_mask, opt_err, slot_is_detection, args)
-            out_a = forward_outputs_with_offsets(
-                model=model,
-                opt_t=view_a["opt_t"],
-                opt_v=view_a["opt_v"],
-                ref_time=ref_time_cache,
-                opt_mask=view_a["opt_mask"],
-                opt_err=view_a["opt_err"],
-                device=device,
-                amp_dtype=amp_dtype,
-                args=args,
-                offset_policy=offset_policy,
-                training=True,
-                return_aux=(universal_stage_mode in {"dual", "dual_adv"}),
-            )
+            with autocast(device_type="cuda", dtype=amp_dtype, enabled=(device.type == "cuda")):
+                out_a = model.forward_with_aux(
+                    view_a["opt_t"], view_a["opt_v"], ref_time_cache,
+                    view_a["opt_mask"], view_a["opt_err"],
+                    return_aux=(universal_stage_mode in {"dual", "dual_adv"}),
+                )
+            out_a["logits"] = out_a["logits"].squeeze(-1).float()
             out_a.update(
                 {
                     "bucket_n_det": view_a["bucket_n_det"],
@@ -1196,20 +967,13 @@ def train_one_epoch(
             out_b = None
             if universal_stage_mode in {"dual", "dual_adv"}:
                 view_b = build_universal_view(opt_t, opt_v, opt_mask, opt_err, slot_is_detection, args)
-                out_b = forward_outputs_with_offsets(
-                    model=model,
-                    opt_t=view_b["opt_t"],
-                    opt_v=view_b["opt_v"],
-                    ref_time=ref_time_cache,
-                    opt_mask=view_b["opt_mask"],
-                    opt_err=view_b["opt_err"],
-                    device=device,
-                    amp_dtype=amp_dtype,
-                    args=args,
-                    offset_policy=offset_policy,
-                    training=True,
-                    return_aux=True,
-                )
+                with autocast(device_type="cuda", dtype=amp_dtype, enabled=(device.type == "cuda")):
+                    out_b = model.forward_with_aux(
+                        view_b["opt_t"], view_b["opt_v"], ref_time_cache,
+                        view_b["opt_mask"], view_b["opt_err"],
+                        return_aux=True,
+                    )
+                out_b["logits"] = out_b["logits"].squeeze(-1).float()
                 out_b.update(
                     {
                         "bucket_n_det": view_b["bucket_n_det"],
@@ -1226,19 +990,9 @@ def train_one_epoch(
                 stage_mode=("single" if universal_stage_mode is None else universal_stage_mode),
             )
         else:
-            logits = forward_logits_with_offsets(
-                model=model,
-                opt_t=opt_t,
-                opt_v=opt_v,
-                ref_time=ref_time_cache,
-                opt_mask=opt_mask,
-                opt_err=opt_err,
-                device=device,
-                amp_dtype=amp_dtype,
-                args=args,
-                offset_policy=offset_policy,
-                training=True,
-            )
+            with autocast(device_type="cuda", dtype=amp_dtype, enabled=(device.type == "cuda")):
+                logits = model(opt_t, opt_v, ref_time_cache, opt_mask, opt_err).squeeze(-1)
+            logits = logits.float()
             loss = criterion(logits, labels)
             loss_metrics = None
 
@@ -1306,7 +1060,6 @@ def build_train_summary_payload(
     run_name: str,
     save_root: Path,
     args,
-    offset_policy,
     prefix_policy,
     best_score: float,
     best_epoch: int,
@@ -1322,7 +1075,6 @@ def build_train_summary_payload(
         "best_epoch": int(best_epoch),
         "best_auroc_plus_auprc": float(best_score),
         "best_precision_at_target_recall": float(best_metrics.get("op_precision", 0.0)) if best_metrics else 0.0,
-        "time_offset": offset_policy.describe(),
         "prefix_task": prefix_policy.describe(),
         "meta_filter": {
             "n_det_min": (
@@ -1457,8 +1209,6 @@ def train(args):
         scaler = GradScaler(enabled=False)
         print(f"Running on device: {device} | No AMP (CPU)")
 
-    offset_policy = TimeOffsetPolicy(args)
-    print(f"Time offset policy: {json.dumps(offset_policy.describe(), indent=2)}")
     prefix_policy = PrefixTrainPolicy(args)
     print(f"Prefix train policy: {json.dumps(prefix_policy.describe(), indent=2)}")
     meta_bins_n_det = parse_bin_edges(
@@ -1657,11 +1407,10 @@ def train(args):
                 criterion,
                 scaler,
                 amp_dtype,
-                offset_policy,
                 prefix_policy,
                 universal_stage_mode=universal_stage_mode,
             )
-            val_metrics = run_eval(model, val_loader, device, args, criterion, amp_dtype, offset_policy)
+            val_metrics = run_eval(model, val_loader, device, args, criterion, amp_dtype)
             if val_metrics is None:
                 epoch_metrics = {
                     "stage": stage_name,
@@ -1720,7 +1469,6 @@ def train(args):
                 f"| recall={val_metrics['op_recall']:.4f} "
                 f"| precision={val_metrics['op_precision']:.4f} "
                 f"| fpr={val_metrics['op_fpr']:.4f} "
-                f"| eval_k={val_metrics['offset_eval_count']}"
             )
 
             epoch_metrics = {
@@ -1781,7 +1529,6 @@ def train(args):
                     run_name=run_name,
                     save_root=save_root,
                     args=args,
-                    offset_policy=offset_policy,
                     prefix_policy=prefix_policy,
                     best_score=best_score,
                     best_epoch=best_epoch,
@@ -1825,7 +1572,6 @@ def train(args):
         "best_epoch": best_epoch,
         "best_auroc_plus_auprc": best_score,
         "best_precision_at_target_recall": float(best_metrics.get("op_precision", 0.0)) if best_metrics else 0.0,
-        "time_offset": offset_policy.describe(),
         "prefix_task": prefix_policy.describe(),
         "task_mode": "prefix_right_censored"
         if bool(getattr(args, "universal_train_enable", False))
@@ -1841,7 +1587,6 @@ def train(args):
             run_name=run_name,
             save_root=save_root,
             args=args,
-            offset_policy=offset_policy,
             prefix_policy=prefix_policy,
             best_score=best_score,
             best_epoch=best_epoch,
@@ -1974,15 +1719,6 @@ def parse_args():
     parser.add_argument("--tb_flush_secs", type=int, default=30)
     parser.add_argument("--disable_tensorboard", action="store_true")
 
-    parser.add_argument("--time_offset_enable", action="store_true")
-    parser.add_argument("--offset_dist_npz", type=str, default=None)
-    parser.add_argument("--offset_dist_key", type=str, default="delta_days_combined")
-    parser.add_argument("--offset_train_sampling", type=str, default="empirical_cdf")
-    parser.add_argument("--offset_eval_mode", type=str, default="quantile_ensemble")
-    parser.add_argument("--offset_eval_quantiles", type=str, default="0.1,0.3,0.5,0.7,0.9")
-    parser.add_argument("--offset_scale_days_divisor", type=float, default=100.0)
-    parser.add_argument("--offset_seed", type=int, default=None)
-    parser.add_argument("--offset_bank_size", type=int, default=1000000)
     parser.add_argument("--regime_eval_enable", action="store_true")
 
     pre_args, _ = parser.parse_known_args()
@@ -1997,8 +1733,6 @@ def parse_args():
         parser.set_defaults(**config)
 
     args = parser.parse_args()
-    if args.offset_seed is None:
-        args.offset_seed = int(args.seed)
     if int(args.recycle_dataloader_workers_every_n_epochs) < 0:
         raise ValueError("--recycle_dataloader_workers_every_n_epochs must be >= 0.")
     if int(args.step_memory_cleanup_interval) < 0:
@@ -2066,11 +1800,6 @@ if __name__ == "__main__":
         raise FileNotFoundError(f"Positive data file not found: {args.pos_data_path}")
     if not os.path.exists(args.neg_data_path):
         raise FileNotFoundError(f"Negative data file not found: {args.neg_data_path}")
-    if bool(args.time_offset_enable):
-        if args.offset_dist_npz is None:
-            raise ValueError("time_offset_enable=true requires --offset_dist_npz.")
-        if not os.path.exists(args.offset_dist_npz):
-            raise FileNotFoundError(f"Offset distribution file not found: {args.offset_dist_npz}")
 
     os.makedirs(args.ckpt_path, exist_ok=True)
 

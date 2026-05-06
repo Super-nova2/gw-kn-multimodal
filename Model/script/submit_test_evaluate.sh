@@ -144,12 +144,6 @@ N_NEG_SAMPLES=$(jq -r '.n_neg_samples // empty' "$args_file")
 TEST_STEPS=$(jq -r '.test_steps // empty' "$args_file")
 GALLERY_SIZES=$(jq -r '.gallery_sizes // empty' "$args_file")
 GALLERY_TRIALS=$(jq -r '.gallery_trials // empty' "$args_file")
-NEG_TIME_OFFSET_ENABLE=$(jq -r '.neg_time_offset_enable // false' "$args_file")
-NEG_OFFSET_DIST_NPZ=$(jq -r '.neg_offset_dist_npz // empty' "$args_file")
-NEG_OFFSET_DIST_KEY=$(jq -r '.neg_offset_dist_key // empty' "$args_file")
-NEG_OFFSET_EVAL_MODE=$(jq -r '.neg_offset_eval_mode // empty' "$args_file")
-NEG_OFFSET_EVAL_QUANTILES=$(jq -r '.neg_offset_eval_quantiles // empty' "$args_file")
-NEG_OFFSET_SCALE_DAYS_DIVISOR=$(jq -r '.neg_offset_scale_days_divisor // empty' "$args_file")
 NONKN_CLS_BASE_FIELD=$(jq -r '.nonkn_cls_base_field // empty' "$args_file")
 REPORT_DT_BINS_STATE=$(jq -r 'if has("report_dt_bins") then (.report_dt_bins | tostring) else "unset" end' "$args_file")
 DT_BIN_EDGES=$(jq -r '.dt_bin_edges // empty' "$args_file")
@@ -178,17 +172,6 @@ if [[ -n "$CONFIG_PATH" && "$CONFIG_PATH" != "null" && ! -f "$CONFIG_PATH" ]]; t
     echo "Config not found: $CONFIG_PATH"
     exit 1
 fi
-if [[ "$NEG_TIME_OFFSET_ENABLE" == "true" ]]; then
-    if [[ -z "$NEG_OFFSET_DIST_NPZ" || "$NEG_OFFSET_DIST_NPZ" == "null" ]]; then
-        echo "neg_time_offset_enable=true requires neg_offset_dist_npz"
-        exit 1
-    fi
-    if [[ ! -f "$NEG_OFFSET_DIST_NPZ" ]]; then
-        echo "Negative offset distribution file not found: $NEG_OFFSET_DIST_NPZ"
-        exit 1
-    fi
-fi
-
 if [[ -z "$OUTPUT_DIR" || "$OUTPUT_DIR" == "null" ]]; then
     OUTPUT_DIR="$(dirname "$CHECKPOINT")/eval_results"
 fi
@@ -230,11 +213,6 @@ if [[ "$STAGE_TO_JOBFS" == "true" ]]; then
         if [[ -n "$CONFIG_PATH" && "$CONFIG_PATH" != "null" ]]; then
             cp -f "$CONFIG_PATH" "$JOBFS_DIR"/
             CONFIG_PATH="$JOBFS_DIR/$(basename "$CONFIG_PATH")"
-        fi
-        if [[ "$NEG_TIME_OFFSET_ENABLE" == "true" && -n "$NEG_OFFSET_DIST_NPZ" && "$NEG_OFFSET_DIST_NPZ" != "null" ]]; then
-            NEG_OFFSET_STAGED_NAME="neg_offset_$(basename "$NEG_OFFSET_DIST_NPZ")"
-            cp -f "$NEG_OFFSET_DIST_NPZ" "$JOBFS_DIR/$NEG_OFFSET_STAGED_NAME"
-            NEG_OFFSET_DIST_NPZ="$JOBFS_DIR/$NEG_OFFSET_STAGED_NAME"
         fi
     else
         echo "No local tmp dir found; skip staging."
@@ -281,24 +259,6 @@ if [[ -n "$GALLERY_TRIALS" && "$GALLERY_TRIALS" != "null" ]]; then
 fi
 if [[ "$NO_PLOTS" == "true" ]]; then
     cmd+=(--no_plots)
-fi
-if [[ "$NEG_TIME_OFFSET_ENABLE" == "true" ]]; then
-    cmd+=(--neg_time_offset_enable)
-fi
-if [[ -n "$NEG_OFFSET_DIST_NPZ" && "$NEG_OFFSET_DIST_NPZ" != "null" ]]; then
-    cmd+=(--neg_offset_dist_npz "$NEG_OFFSET_DIST_NPZ")
-fi
-if [[ -n "$NEG_OFFSET_DIST_KEY" && "$NEG_OFFSET_DIST_KEY" != "null" ]]; then
-    cmd+=(--neg_offset_dist_key "$NEG_OFFSET_DIST_KEY")
-fi
-if [[ -n "$NEG_OFFSET_EVAL_MODE" && "$NEG_OFFSET_EVAL_MODE" != "null" ]]; then
-    cmd+=(--neg_offset_eval_mode "$NEG_OFFSET_EVAL_MODE")
-fi
-if [[ -n "$NEG_OFFSET_EVAL_QUANTILES" && "$NEG_OFFSET_EVAL_QUANTILES" != "null" ]]; then
-    cmd+=(--neg_offset_eval_quantiles "$NEG_OFFSET_EVAL_QUANTILES")
-fi
-if [[ -n "$NEG_OFFSET_SCALE_DAYS_DIVISOR" && "$NEG_OFFSET_SCALE_DAYS_DIVISOR" != "null" ]]; then
-    cmd+=(--neg_offset_scale_days_divisor "$NEG_OFFSET_SCALE_DAYS_DIVISOR")
 fi
 if [[ -n "$NONKN_CLS_BASE_FIELD" && "$NONKN_CLS_BASE_FIELD" != "null" ]]; then
     cmd+=(--nonkn_cls_base_field "$NONKN_CLS_BASE_FIELD")

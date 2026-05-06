@@ -68,10 +68,8 @@ from test_evaluate import (  # noqa: E402
     _is_dual_fusion_model,
     _lookup_source_type,
     _model_requires_cred_level,
+    _model_requires_time_delta,
     _resolve_eval_amp,
-    apply_time_offsets,
-    compute_time_delta_days,
-    EvalNegativeTimeOffsetPolicy,
     build_ref_time,
     evaluate_classification_triplet,
     evaluate_classification_triplet_by_source,
@@ -819,7 +817,8 @@ def load_multimodal_bundle(
 
 
 def _multimodal_has_cls_head(saved_args: Dict[str, Any]) -> bool:
-    return float(saved_args.get("cls_weight", 0.0) or 0.0) > 0.0
+    return (float(saved_args.get("cls_weight", 0.0) or 0.0) > 0.0
+            or float(saved_args.get("gallery_loss_weight", 0.0) or 0.0) > 0.0)
 
 
 def _resolve_multimodal_scoring(model_spec: Dict[str, Any], saved_args: Dict[str, Any]) -> str:
@@ -919,6 +918,7 @@ def build_cached_batches(
                 num_workers=try_num_workers,
                 target_samples=target_samples,
                 nonkn_cls_base_field=nonkn_cls_base_field,
+                return_zero_time_mjd=True,
             )
             return cache_test_batches(loader), try_num_workers
         except PermissionError:
@@ -972,6 +972,11 @@ def load_selected_positive_bank(
         opt_coords = torch.from_numpy(np.asarray(opt["coordinates"][selected], dtype=np.float32))
         gw_indices = torch.from_numpy(np.asarray(opt["parent_gw_idx"][selected], dtype=np.int64))
 
+        if "first_detection_mjd" in opt:
+            first_detection_mjd = torch.from_numpy(np.asarray(opt["first_detection_mjd"][selected], dtype=np.float32))
+        else:
+            first_detection_mjd = torch.from_numpy(np.asarray(opt["zero_time_mjd_base"][selected], dtype=np.float32))
+
     apply_window = (runtime_input_window_start is not None) and (runtime_input_window_end is not None)
     if apply_window:
         opt_t, opt_v, opt_mask, opt_err, _ = apply_runtime_input_window_torch(
@@ -993,6 +998,7 @@ def load_selected_positive_bank(
         "opt_mask_raw": opt_mask,
         "opt_err_raw": opt_err,
         "opt_coords": opt_coords,
+        "first_detection_mjd": first_detection_mjd,
     }
     remap = {int(source_idx): int(compact_idx) for compact_idx, source_idx in enumerate(selected.tolist())}
     return bank, remap
@@ -1024,6 +1030,7 @@ def build_batch_positive_bank_and_galleries(
     opt_err_parts: List[torch.Tensor] = []
     opt_coords_parts: List[torch.Tensor] = []
     gw_idx_parts: List[torch.Tensor] = []
+    first_det_mjd_parts: List[torch.Tensor] = []
     for batch_data in cached_batches:
         opt_t_parts.append(batch_data[2].float().cpu())
         opt_v_parts.append(batch_data[3].float().cpu())
@@ -1031,6 +1038,8 @@ def build_batch_positive_bank_and_galleries(
         opt_err_parts.append(batch_data[5].float().cpu())
         opt_coords_parts.append(batch_data[6].float().cpu())
         gw_idx_parts.append(batch_data[7].long().cpu())
+        if len(batch_data) >= 10 and batch_data[9] is not None:
+            first_det_mjd_parts.append(batch_data[9].float().cpu())
 
     if not gw_idx_parts:
         raise ValueError("cached_batches is empty; cannot build batch-sampled positive bank.")
@@ -1050,6 +1059,9 @@ def build_batch_positive_bank_and_galleries(
     bank["opt_mask_raw"] = bank["masks"]
     bank["opt_err_raw"] = bank["errors"]
     bank["opt_coords"] = bank["coordinates"]
+
+    if first_det_mjd_parts:
+        bank["first_detection_mjd"] = torch.cat(first_det_mjd_parts, dim=0)
 
     gw_to_bank_indices: Dict[int, List[int]] = {}
     for bank_idx, gw_id in enumerate(bank["gw_indices"].tolist()):
@@ -1257,6 +1269,8 @@ def extract_optical_candidate_embeddings(
             if isinstance(source_indices, torch.Tensor)
             else torch.as_tensor(source_indices, dtype=torch.long)
         )
+    if "first_detection_mjd" in optical_data:
+        result["first_detection_mjd"] = optical_data["first_detection_mjd"]
     return result
 
 
@@ -1524,6 +1538,14 @@ def _score_candidate_bank_with_logits(
     if len(candidate_indices) == 0:
         return np.array([], dtype=np.float32)
 
+    need_time_delta = _model_requires_time_delta(model)
+    if need_time_delta and candidate_abs_dt_days is None:
+        raise ValueError(
+            "Model requires time_delta_cls_feature but candidate_abs_dt_days is None. "
+            "The negative pool must provide time fields (zero_time_mjd_cls_base or "
+            "negative_synthetic_zero_time_mjd_cls_base) for this model."
+        )
+
     need_cred = _model_requires_cred_level(model)
     g_query = query_cache["g"].to(device)
     gw_s_query = query_cache["gw_s"].to(device)
@@ -1590,8 +1612,8 @@ def _score_candidate_bank_with_logits(
                 opt_coords=opt_coords_chunk,
                 dt_days=dt_chunk,
             )
-            probs = torch.softmax(logits, dim=1)[:, 1]
-        scores.append(probs.float().cpu())
+            logit_margin = logits[:, 1] - logits[:, 0]
+        scores.append(logit_margin.float().cpu())
 
     return torch.cat(scores).numpy()
 
@@ -1688,18 +1710,24 @@ def score_all_galleries_multimodal(
             gw_event_time_mjd=gw_event_time_mjd,
             n_negative=int(neg_indices.shape[0]),
         )
-        pos_probs = _score_candidate_bank_with_logits(
+        # Compute real abs_dt for the positive candidate
+        if "first_detection_mjd" in positive_bank and gw_event_time_mjd is not None and np.isfinite(gw_event_time_mjd):
+            pos_first_det = float(positive_bank["first_detection_mjd"][pos_index].item())
+            pos_dt = abs(pos_first_det - gw_event_time_mjd)
+        else:
+            pos_dt = 0.0
+        pos_scores = _score_candidate_bank_with_logits(
             model,
             query_cache[int(gw_id)],
             np.asarray([pos_index], dtype=np.int64),
             positive_bank,
             device,
             dual,
-            candidate_abs_dt_days=np.asarray([0.0], dtype=np.float32),
+            candidate_abs_dt_days=np.asarray([pos_dt], dtype=np.float32),
             amp_dtype=amp_dtype,
             amp_enabled=amp_enabled,
         )
-        neg_probs = _score_candidate_bank_with_logits(
+        neg_scores = _score_candidate_bank_with_logits(
             model,
             query_cache[int(gw_id)],
             neg_indices,
@@ -1711,8 +1739,8 @@ def score_all_galleries_multimodal(
             amp_dtype=amp_dtype,
             amp_enabled=amp_enabled,
         )
-        probs = np.concatenate([pos_probs, neg_probs], axis=0)
-        ranked = np.argsort(-probs)
+        scores = np.concatenate([pos_scores, neg_scores], axis=0)
+        ranked = np.argsort(-scores)
         ranks[key] = int(np.where(ranked == 0)[0][0])
 
     return ranks
@@ -1992,17 +2020,6 @@ def build_gw_source_map(gw_source_types, gw_ids):
     return {int(gw_id): _lookup_source_type(int(gw_id), gw_source_types) for gw_id in unique_gw}
 
 
-def build_neg_offset_policy(cfg: Dict[str, Any], seed: int) -> EvalNegativeTimeOffsetPolicy:
-    return EvalNegativeTimeOffsetPolicy(
-        enabled=_as_bool(cfg.get("neg_time_offset_enable", False)),
-        dist_npz=cfg.get("neg_offset_dist_npz"),
-        dist_key=str(cfg.get("neg_offset_dist_key", "delta_days_combined")),
-        eval_mode=str(cfg.get("neg_offset_eval_mode", "quantile_ensemble")),
-        eval_quantiles=str(cfg.get("neg_offset_eval_quantiles", "0.1,0.3,0.5,0.7,0.9")),
-        scale_divisor=float(cfg.get("neg_offset_scale_days_divisor", 100.0)),
-        seed=int(seed),
-        bank_size=int(cfg.get("neg_offset_bank_size", 1000000)),
-    )
 
 
 def build_simple_inbatch_negative_indices(gw_indices: torch.Tensor) -> torch.Tensor:
@@ -2141,9 +2158,8 @@ def evaluate_multimodal_classification(
                 num_workers=try_num_workers,
                 target_samples=n_neg_samples,
                 nonkn_cls_base_field=nonkn_cls_base_field,
-                return_zero_time_mjd=False,
+                return_zero_time_mjd=True,
             )
-            neg_offset_policy = build_neg_offset_policy(shared_cfg, seed)
             if hard_negative_strategy == "simple":
                 with temporary_simple_hard_negative_sampling(model):
                     triplet_logits = extract_triplet_logits(
@@ -2158,7 +2174,6 @@ def evaluate_multimodal_classification(
                         shuffle_seed=int(seed),
                         amp_dtype=amp_dtype,
                         amp_enabled=amp_enabled,
-                        neg_offset_policy=neg_offset_policy,
                         gw_event_time_mjd_table=gw_event_time_mjd_table,
                         hardneg_windows_days=hardneg_windows_days,
                         hardneg_min_candidates=hardneg_min_candidates,
@@ -2179,7 +2194,6 @@ def evaluate_multimodal_classification(
                     shuffle_seed=int(seed),
                     amp_dtype=amp_dtype,
                     amp_enabled=amp_enabled,
-                    neg_offset_policy=neg_offset_policy,
                     gw_event_time_mjd_table=gw_event_time_mjd_table,
                     hardneg_windows_days=hardneg_windows_days,
                     hardneg_min_candidates=hardneg_min_candidates,
@@ -2260,7 +2274,7 @@ def normalize_shared_config(cfg: Dict[str, Any], cfg_path: Path) -> Dict[str, An
         "gallery_sizes": _parse_gallery_sizes(cfg.get("gallery_sizes", "10,100,500,1000,2000,5000")),
         "gallery_trials": int(cfg.get("gallery_trials", 1)),
         "gallery_candidate_mode": str(cfg.get("gallery_candidate_mode", "time_sky_hard")).strip().lower(),
-        "gallery_candidate_time_window_days": float(cfg.get("gallery_candidate_time_window_days", 50.0)),
+        "gallery_candidate_time_window_days": float(cfg.get("gallery_candidate_time_window_days", 30.0)),
         "gallery_candidate_credible_level_max": float(cfg.get("gallery_candidate_credible_level_max", 0.9)),
         "gallery_include_undersized": _as_bool(cfg.get("gallery_include_undersized", True), default=True),
         "positive_selection": positive_selection,
@@ -2271,13 +2285,6 @@ def normalize_shared_config(cfg: Dict[str, Any], cfg_path: Path) -> Dict[str, An
         "comparison_window_start": float(comparison_window[0]),
         "comparison_window_end": float(comparison_window[1]),
         "comparison_window_source": comparison_window_source,
-        "neg_time_offset_enable": _as_bool(cfg.get("neg_time_offset_enable", False)),
-        "neg_offset_dist_npz": _resolve_path(cfg_dir, cfg.get("neg_offset_dist_npz")),
-        "neg_offset_dist_key": str(cfg.get("neg_offset_dist_key", "delta_days_combined")),
-        "neg_offset_eval_mode": str(cfg.get("neg_offset_eval_mode", "quantile_ensemble")),
-        "neg_offset_eval_quantiles": str(cfg.get("neg_offset_eval_quantiles", "0.1,0.3,0.5,0.7,0.9")),
-        "neg_offset_scale_days_divisor": float(cfg.get("neg_offset_scale_days_divisor", 100.0)),
-        "neg_offset_bank_size": int(cfg.get("neg_offset_bank_size", 1000000)),
         "nonkn_cls_base_field": str(cfg.get("nonkn_cls_base_field", "zero_time_mjd_cls_base")),
         "report_dt_bins": _as_bool(cfg.get("report_dt_bins", False)),
         "dt_bin_edges": str(cfg.get("dt_bin_edges", DEFAULT_DT_BIN_EDGES)),
@@ -2461,7 +2468,7 @@ def main():
             )
             print(
                 "  Built galleries with batch-sampled positives, "
-                f"time_window=±{cfg['gallery_candidate_time_window_days']:.1f} days, "
+                f"time_window=+0..{cfg['gallery_candidate_time_window_days']:.1f} days, "
                 f"credible<= {cfg['gallery_candidate_credible_level_max']:.3f}, "
                 f"include_undersized={bool(cfg['gallery_include_undersized'])}"
             )
@@ -2486,7 +2493,7 @@ def main():
                 )
             print(
                 f"  Built {gallery_candidate_mode} galleries with "
-                f"time_window=±{cfg['gallery_candidate_time_window_days']:.1f} days, "
+                f"time_window=+0..{cfg['gallery_candidate_time_window_days']:.1f} days, "
                 f"credible<= {cfg['gallery_candidate_credible_level_max']:.3f}, "
                 f"include_undersized={bool(cfg['gallery_include_undersized'])}"
             )
@@ -2861,12 +2868,6 @@ def main():
             "positive_selection": cfg["positive_selection"],
             "comparison_window": list(comparison_window),
             "n_neg_samples": cfg["n_neg_samples"],
-            "neg_time_offset_enable": cfg["neg_time_offset_enable"],
-            "neg_offset_dist_npz": cfg["neg_offset_dist_npz"],
-            "neg_offset_dist_key": cfg["neg_offset_dist_key"],
-            "neg_offset_eval_mode": cfg["neg_offset_eval_mode"],
-            "neg_offset_eval_quantiles": cfg["neg_offset_eval_quantiles"],
-            "neg_offset_scale_days_divisor": cfg["neg_offset_scale_days_divisor"],
             "nonkn_cls_base_field": cfg["nonkn_cls_base_field"],
             "report_dt_bins": cfg["report_dt_bins"],
             "dt_bin_edges": dt_bin_edges if dt_bin_edges is not None else None,

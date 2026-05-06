@@ -103,7 +103,7 @@ def parse_quantiles(text: str) -> List[float]:
             raise ValueError(f"Invalid quantile {q}; expected in [0, 1].")
         vals.append(q)
     if not vals:
-        raise ValueError("neg_offset_eval_quantiles produced empty list.")
+        raise ValueError("quantile string produced empty list.")
     return vals
 
 
@@ -283,48 +283,32 @@ def apply_hard_negative_time_shift(opt_t, opt_mask, delta_days, scale_divisor):
     return opt_t + shift * valid
 
 
-def prepare_retrieval_extra_negative_inputs(
-    model,
-    *,
-    neg_coords,
-    neg_t,
-    neg_v,
-    neg_mask,
-    neg_err,
-    opt_ref_t,
-    neg_offset_policy=None,
-    training=True,
-    neg_zero_time_mjd_base=None,
-):
-    batch_size = int(neg_t.size(0))
-    delta_days = torch.zeros((batch_size,), device=neg_t.device, dtype=torch.float32)
-    neg_t_for_retrieval = neg_t
-    if neg_offset_policy is not None and neg_offset_policy.enabled:
-        if training:
-            delta_np = neg_offset_policy.sample_train_offsets(batch_size)
-            delta_days = torch.from_numpy(delta_np).to(device=neg_t.device, dtype=torch.float32)
-        else:
-            eval_offsets = list(getattr(neg_offset_policy, "eval_offsets_days", []) or [0.0])
-            selected_offset = float(eval_offsets[len(eval_offsets) // 2])
-            delta_days = torch.full((batch_size,), selected_offset, device=neg_t.device, dtype=torch.float32)
-        neg_t_for_retrieval = apply_time_offsets(
-            neg_t, neg_mask, delta_days, neg_offset_policy.scale_divisor
-        )
-    neg_event_time_mjd = None
-    if neg_zero_time_mjd_base is not None:
-        # opt_t is shifted forward by +delta_days / scale_divisor, so the
-        # absolute event zero point moves backward by the same day offset.
-        neg_event_time_mjd = neg_zero_time_mjd_base.to(device=neg_t.device, dtype=torch.float32) - delta_days
-    z_l_neg, _ = model.encode_optical(
-        neg_coords, neg_t_for_retrieval, neg_v, opt_ref_t, neg_mask, neg_err
-    )
-    return z_l_neg, neg_event_time_mjd
+# NOTE: apply_time_offsets() and apply_hard_negative_time_shift() are kept as reusable
+# primitives for potential future time-shift experiments, but are no longer called in
+# the main training / eval pipeline after the offset infra removal.
 
 
 def compute_time_delta_days(opt_zero_time_mjd, gw_anchor_time_mjd):
     dt = opt_zero_time_mjd.to(torch.float32) - gw_anchor_time_mjd.to(torch.float32)
     dt = torch.where(torch.isfinite(dt), dt, torch.zeros_like(dt))
     return dt
+
+
+def resolve_optical_candidate_time_mjd(opt_first_detection_mjd, fallback_event_time_mjd):
+    """Return the absolute time anchor for optical candidates."""
+    if opt_first_detection_mjd is not None:
+        return opt_first_detection_mjd
+    return fallback_event_time_mjd
+
+
+def gather_candidate_optical_time_mjd(opt_first_detection_mjd, fallback_event_time_mjd, candidate_idx):
+    candidate_time = resolve_optical_candidate_time_mjd(
+        opt_first_detection_mjd,
+        fallback_event_time_mjd,
+    )
+    if candidate_time is None:
+        return None
+    return candidate_time[candidate_idx]
 
 
 def encode_hard_negative_with_time_shift(
@@ -433,6 +417,7 @@ def sample_inbatch_hard_negatives_with_time(
     semi_hard,
     semi_hard_margin,
     fallback_mode,
+    candidate_time_mjd=None,
     active_rows=None,
 ):
     sim = sim_g2o.detach()
@@ -456,9 +441,14 @@ def sample_inbatch_hard_negatives_with_time(
     finite_anchor = None
     if batch_event_time_mjd is not None:
         anchor_times = batch_event_time_mjd[active_rows]  # [A]
+        candidate_times = (
+            batch_event_time_mjd
+            if candidate_time_mjd is None
+            else candidate_time_mjd.to(device=device, dtype=torch.float32)
+        )
         finite_anchor = torch.isfinite(anchor_times)
         if finite_anchor.any():
-            dt_matrix = torch.abs(anchor_times.unsqueeze(1) - batch_event_time_mjd.unsqueeze(0))  # [A, B]
+            dt_matrix = torch.abs(candidate_times.unsqueeze(0) - anchor_times.unsqueeze(1))  # [A, B]
             for lvl, wnd in enumerate(window_days):
                 mask_lvl = candidate_mask & (dt_matrix <= float(wnd))
                 cand_count = mask_lvl.sum(dim=1)
@@ -578,12 +568,13 @@ class HardNegativeMemoryBank:
         h_l,
         z_l,
         opt_coords,
-        candidate_gw_time_mjd,
         gw_indices,
         opt_t,
         opt_v,
         opt_mask,
         opt_err,
+        candidate_time_mjd=None,
+        candidate_gw_time_mjd=None,
     ):
         if not self.enabled:
             return
@@ -591,7 +582,7 @@ class HardNegativeMemoryBank:
             feat_o is None
             or h_l is None
             or z_l is None
-            or candidate_gw_time_mjd is None
+            or (candidate_time_mjd is None and candidate_gw_time_mjd is None)
             or opt_t is None
             or opt_v is None
             or opt_mask is None
@@ -604,13 +595,14 @@ class HardNegativeMemoryBank:
         if n <= 0:
             return
 
-        feat_o_w = feat_o.detach().to(dtype=torch.float16)
-        gw_time_w = candidate_gw_time_mjd.detach().to(dtype=torch.float32)
-        gw_idx_w = gw_indices.detach().to(dtype=torch.long)
+        feat_o_w = feat_o.detach().to(device=self.device, dtype=torch.float16)
+        candidate_time = candidate_time_mjd if candidate_time_mjd is not None else candidate_gw_time_mjd
+        candidate_time_w = candidate_time.detach().to(device=self.device, dtype=torch.float32)
+        gw_idx_w = gw_indices.detach().to(device=self.device, dtype=torch.long)
         h_l_w = h_l.detach().to(device=self.device, dtype=torch.float16)
         z_l_w = z_l.detach().to(device=self.device, dtype=torch.float16)
         coords_w = opt_coords.detach().to(device=self.device, dtype=torch.float32)
-        zero_w = candidate_gw_time_mjd.detach().to(device=self.device, dtype=torch.float32)
+        zero_w = candidate_time_w
         opt_t_w = opt_t.detach().to(device=self.device, dtype=torch.float32)
         opt_v_w = opt_v.detach().to(device=self.device, dtype=torch.float16)
         opt_mask_w = opt_mask.detach().to(device=self.device, dtype=torch.float16)
@@ -619,7 +611,7 @@ class HardNegativeMemoryBank:
         first = min(n, self.capacity - self.ptr)
         sl1 = slice(self.ptr, self.ptr + first)
         self.feat_o_bank[sl1] = feat_o_w[:first]
-        self.gw_time_bank[sl1] = gw_time_w[:first]
+        self.gw_time_bank[sl1] = candidate_time_w[:first]
         self.gw_idx_bank[sl1] = gw_idx_w[:first]
         self.h_l_bank[sl1] = h_l_w[:first]
         self.z_l_bank[sl1] = z_l_w[:first]
@@ -634,7 +626,7 @@ class HardNegativeMemoryBank:
             rem = n - first
             sl2 = slice(0, rem)
             self.feat_o_bank[sl2] = feat_o_w[first:]
-            self.gw_time_bank[sl2] = gw_time_w[first:]
+            self.gw_time_bank[sl2] = candidate_time_w[first:]
             self.gw_idx_bank[sl2] = gw_idx_w[first:]
             self.h_l_bank[sl2] = h_l_w[first:]
             self.z_l_bank[sl2] = z_l_w[first:]
@@ -751,117 +743,6 @@ class HardNegativeMemoryBank:
             opt_mask_sel,
             opt_err_sel,
         )
-
-
-class NegativeTimeOffsetPolicy:
-    """
-    Time-offset policy for external non-KN optical negatives.
-
-    Training: sample delta_days from empirical distribution (empirical_cdf).
-    Eval: apply deterministic offsets (quantile ensemble / median / zero) and average logits.
-    """
-
-    def __init__(self, args):
-        self.enabled = bool(args.neg_time_offset_enable)
-        self.scale_divisor = float(args.neg_offset_scale_days_divisor)
-        if self.scale_divisor <= 0:
-            raise ValueError("neg_offset_scale_days_divisor must be > 0.")
-
-        self.train_sampling = str(args.neg_offset_train_sampling).strip().lower()
-        self.eval_mode = str(args.neg_offset_eval_mode).strip().lower()
-        self.eval_offsets_days: List[float] = [0.0]
-
-        seed = int(args.seed if args.neg_offset_seed is None else args.neg_offset_seed)
-        self.rng = np.random.default_rng(seed)
-        self.samples: Optional[np.ndarray] = None
-        self.sample_bank: Optional[np.ndarray] = None
-        self.info: Dict[str, object] = {
-            "enabled": bool(self.enabled),
-            "scale_divisor": float(self.scale_divisor),
-            "train_sampling": self.train_sampling,
-            "eval_mode": self.eval_mode,
-            "seed": int(seed),
-        }
-
-        if not self.enabled:
-            self.info["eval_offsets_days"] = [0.0]
-            return
-
-        dist_path = args.neg_offset_dist_npz
-        if dist_path is None:
-            raise ValueError("neg_time_offset_enable=true requires --neg_offset_dist_npz.")
-        if not os.path.exists(dist_path):
-            raise FileNotFoundError(f"Negative offset distribution file not found: {dist_path}")
-
-        dist_key = str(args.neg_offset_dist_key)
-        with np.load(dist_path, allow_pickle=False) as npz:
-            if dist_key not in npz:
-                raise KeyError(
-                    f"neg_offset_dist_key '{dist_key}' not found in {dist_path}. "
-                    f"Available keys: {list(npz.keys())}"
-                )
-            raw = np.asarray(npz[dist_key], dtype=np.float64).reshape(-1)
-
-        raw = raw[np.isfinite(raw)]
-        if raw.size == 0:
-            raise ValueError(
-                f"Negative offset distribution is empty after filtering NaN/Inf: "
-                f"{dist_path}:{dist_key}"
-            )
-        self.samples = raw.astype(np.float32, copy=False)
-
-        bank_size = max(1, int(args.neg_offset_bank_size))
-        if bank_size < int(self.samples.shape[0]):
-            bank_idx = self.rng.integers(0, int(self.samples.shape[0]), size=bank_size, endpoint=False)
-            self.sample_bank = self.samples[bank_idx].astype(np.float32, copy=False)
-        else:
-            self.sample_bank = self.samples
-
-        if self.train_sampling != "empirical_cdf":
-            raise ValueError(
-                f"Unsupported neg_offset_train_sampling='{self.train_sampling}'. "
-                "Only 'empirical_cdf' is supported."
-            )
-
-        if self.eval_mode == "quantile_ensemble":
-            quantiles = parse_quantiles(args.neg_offset_eval_quantiles)
-            q_vals = np.quantile(self.samples.astype(np.float64), np.asarray(quantiles, dtype=np.float64))
-            self.eval_offsets_days = [float(v) for v in q_vals.tolist()]
-        elif self.eval_mode == "median":
-            self.eval_offsets_days = [float(np.quantile(self.samples.astype(np.float64), 0.5))]
-        elif self.eval_mode == "zero":
-            self.eval_offsets_days = [0.0]
-        else:
-            raise ValueError(
-                f"Unsupported neg_offset_eval_mode='{self.eval_mode}'. "
-                "Expected one of: quantile_ensemble|median|zero."
-            )
-
-        self.info.update(
-            {
-                "dist_path": str(dist_path),
-                "dist_key": dist_key,
-                "dist_count": int(self.samples.shape[0]),
-                "dist_min_days": float(np.min(self.samples)),
-                "dist_max_days": float(np.max(self.samples)),
-                "dist_mean_days": float(np.mean(self.samples)),
-                "dist_std_days": float(np.std(self.samples)),
-                "bank_size": int(self.sample_bank.shape[0]),
-                "eval_offsets_days": [float(v) for v in self.eval_offsets_days],
-            }
-        )
-
-    def sample_train_offsets(self, batch_size: int) -> np.ndarray:
-        if not self.enabled:
-            return np.zeros((int(batch_size),), dtype=np.float32)
-        if self.sample_bank is None:
-            raise RuntimeError("Negative time offset sample bank is not initialized.")
-        idx = self.rng.integers(0, int(self.sample_bank.shape[0]), size=int(batch_size), endpoint=False)
-        return self.sample_bank[idx].astype(np.float32, copy=False)
-
-    def describe(self) -> Dict[str, object]:
-        return dict(self.info)
-
 
 def load_gw_event_time_mjd_table(h5_path, device):
     """
@@ -1209,6 +1090,56 @@ def compute_fusion_gallery_metrics(scores, positive_mask, ks=(1, 5)):
     return out
 
 
+def build_gallery_time_delta_matrix(
+    query_event_time_mjd,
+    candidate_event_time_mjd,
+    *,
+    positive_mask=None,
+    distractor_time_mode="actual",
+    distractor_time_window_days=30.0,
+):
+    """Build per-query/per-candidate dt for fusion mini-gallery scoring.
+
+    In ``actual`` mode this is the raw candidate-minus-query MJD difference.
+    In ``synthetic_after_gw`` mode, matching positives keep their real dt while
+    every non-matching distractor is assigned a synthetic first-detection offset
+    sampled uniformly from [0, distractor_time_window_days].
+    """
+    if query_event_time_mjd is None or candidate_event_time_mjd is None:
+        return None
+
+    query = query_event_time_mjd.to(torch.float32).reshape(-1, 1)
+    candidate = candidate_event_time_mjd.to(device=query.device, dtype=torch.float32).reshape(1, -1)
+    dt = candidate - query
+    dt = torch.where(torch.isfinite(dt), dt, torch.zeros_like(dt))
+
+    mode = str(distractor_time_mode).strip().lower()
+    if mode in {"actual", "real", "none"}:
+        return dt
+    if mode not in {"synthetic_after_gw", "synthetic", "after_gw"}:
+        raise ValueError(
+            f"Unsupported gallery_distractor_time_mode='{distractor_time_mode}'. "
+            "Expected 'actual' or 'synthetic_after_gw'."
+        )
+
+    window_days = float(distractor_time_window_days)
+    if window_days <= 0:
+        raise ValueError("gallery_distractor_time_window_days must be > 0 for synthetic_after_gw mode.")
+
+    if positive_mask is None:
+        positive_mask_t = torch.zeros_like(dt, dtype=torch.bool)
+    else:
+        positive_mask_t = positive_mask.to(device=query.device, dtype=torch.bool)
+        if tuple(positive_mask_t.shape) != tuple(dt.shape):
+            raise ValueError(
+                "positive_mask must have shape "
+                f"{tuple(dt.shape)}; got {tuple(positive_mask_t.shape)}."
+            )
+
+    synthetic_dt = torch.rand(dt.shape, device=dt.device, dtype=dt.dtype) * window_days
+    return torch.where(positive_mask_t, dt, synthetic_dt)
+
+
 def compute_fusion_gallery_score_matrix(
     model,
     *,
@@ -1386,7 +1317,6 @@ def evaluate(
     epoch,
     amp_dtype=torch.float32,
     gw_event_time_mjd_table=None,
-    neg_offset_policy: Optional[NegativeTimeOffsetPolicy] = None,
 ):
     from metrics import (compute_retrieval_metrics,
                          compute_classification_metrics,
@@ -1435,8 +1365,16 @@ def evaluate(
         for batch_data in val_loader:
             _neg_zero_time_mjd_base = None
             _neg_zero_time_mjd_cls_base = None
+            _opt_first_detection_mjd = None
             if has_negatives:
-                if len(batch_data) >= 16:
+                if len(batch_data) >= 17:
+                    (
+                        gw_s, gw_m, opt_t, opt_v, opt_mask, opt_err, opt_coords, gw_indices,
+                        neg_t, neg_v, neg_mask, neg_err, neg_coords,
+                        _opt_zero_time_mjd_base, _neg_zero_time_mjd_base, _neg_zero_time_mjd_cls_base,
+                        _opt_first_detection_mjd,
+                    ) = batch_data[:17]
+                elif len(batch_data) >= 16:
                     (
                         gw_s, gw_m, opt_t, opt_v, opt_mask, opt_err, opt_coords, gw_indices,
                         neg_t, neg_v, neg_mask, neg_err, neg_coords,
@@ -1454,7 +1392,9 @@ def evaluate(
                         neg_t, neg_v, neg_mask, neg_err, neg_coords,
                     ) = batch_data[:13]
             else:
-                if len(batch_data) >= 9:
+                if len(batch_data) >= 10:
+                    gw_s, gw_m, opt_t, opt_v, opt_mask, opt_err, opt_coords, gw_indices, _opt_zero_time_mjd_base, _opt_first_detection_mjd = batch_data[:10]
+                elif len(batch_data) >= 9:
                     gw_s, gw_m, opt_t, opt_v, opt_mask, opt_err, opt_coords, gw_indices, _opt_zero_time_mjd_base = batch_data[:9]
                 else:
                     gw_s, gw_m, opt_t, opt_v, opt_mask, opt_err, opt_coords, gw_indices = batch_data
@@ -1481,6 +1421,10 @@ def evaluate(
                     _neg_zero_time_mjd_base = _neg_zero_time_mjd_base.to(device, non_blocking=True)
                 if _neg_zero_time_mjd_cls_base is not None:
                     _neg_zero_time_mjd_cls_base = _neg_zero_time_mjd_cls_base.to(device, non_blocking=True)
+            if _opt_first_detection_mjd is not None:
+                _opt_first_detection_mjd = _opt_first_detection_mjd.to(device, non_blocking=True)
+            elif _opt_zero_time_mjd_base is not None:
+                _opt_first_detection_mjd = _opt_zero_time_mjd_base.to(device, non_blocking=True)
 
             batch_size = gw_s.size(0)
             if (
@@ -1504,23 +1448,18 @@ def evaluate(
                     neg_zero_time_mjd_for_itc = _neg_zero_time_mjd_cls_base
                     if neg_zero_time_mjd_for_itc is None:
                         neg_zero_time_mjd_for_itc = _neg_zero_time_mjd_base
-                    extra_neg_z_itc, extra_neg_event_time_mjd = prepare_retrieval_extra_negative_inputs(
-                        model,
-                        neg_coords=neg_coords,
-                        neg_t=neg_t,
-                        neg_v=neg_v,
-                        neg_mask=neg_mask,
-                        neg_err=neg_err,
-                        opt_ref_t=opt_ref_t,
-                        neg_offset_policy=neg_offset_policy,
-                        training=False,
-                        neg_zero_time_mjd_base=neg_zero_time_mjd_for_itc,
-                    )
+                    with torch.no_grad():
+                        extra_neg_z_itc, _ = model.encode_optical(
+                            neg_coords, neg_t, neg_v, opt_ref_t, neg_mask, neg_err,
+                        )
+                    extra_neg_event_time_mjd = neg_zero_time_mjd_for_itc
                 if args.itc_loss_type == "supcon":
                     itc_loss, sim_g2o = model.compute_supcon_loss(
                         g, z_l, gw_indices, margin=args.supcon_margin,
                         gw_event_time_mjd=batch_event_time_mjd,
-                        opt_event_time_mjd=batch_event_time_mjd,
+                        opt_event_time_mjd=resolve_optical_candidate_time_mjd(
+                            _opt_first_detection_mjd, batch_event_time_mjd
+                        ),
                         extra_neg_z=extra_neg_z_itc,
                         extra_neg_opt_event_time_mjd=extra_neg_event_time_mjd,
                     )
@@ -1528,7 +1467,9 @@ def evaluate(
                     itc_loss, sim_g2o = model.compute_itc_loss(
                         g, z_l, gw_indices, mask=args.mask_itc,
                         gw_event_time_mjd=batch_event_time_mjd,
-                        opt_event_time_mjd=batch_event_time_mjd,
+                        opt_event_time_mjd=resolve_optical_candidate_time_mjd(
+                            _opt_first_detection_mjd, batch_event_time_mjd
+                        ),
                         extra_neg_z=extra_neg_z_itc,
                         extra_neg_opt_event_time_mjd=extra_neg_event_time_mjd,
                     )
@@ -1542,7 +1483,10 @@ def evaluate(
                 if cls_branch_enabled:
                     # Compute per-pair credible level for dual fusion
                     cred_level = compute_credible_level(gw_m, opt_coords) if need_cred_level else None
-                    dt_pos = torch.zeros((batch_size,), device=device, dtype=torch.float32)
+                    if _opt_first_detection_mjd is not None and batch_event_time_mjd is not None:
+                        dt_pos = compute_time_delta_days(_opt_first_detection_mjd, batch_event_time_mjd)
+                    else:
+                        dt_pos = torch.zeros((batch_size,), device=device, dtype=torch.float32)
                     logits_pos = model.fusion_logits(
                         g, h_l, z_l=z_l, H_gw=H_gw, cred_level=cred_level,
                         gw_s=gw_s, gw_m=gw_m, opt_coords=opt_coords,
@@ -1563,6 +1507,9 @@ def evaluate(
                                 sim_g2o=sim_g2o,
                                 gw_indices=gw_indices,
                                 batch_event_time_mjd=batch_event_time_mjd,
+                                candidate_time_mjd=resolve_optical_candidate_time_mjd(
+                                    _opt_first_detection_mjd, batch_event_time_mjd
+                                ),
                                 window_days=hard_window_days,
                                 min_candidates=args.hardneg_min_candidates,
                                 semi_hard=args.semi_hard,
@@ -1593,39 +1540,20 @@ def evaluate(
                         z_l_hard = z_l[neg_idx].clone()
                         coords_hard = opt_coords[neg_idx].clone()
                         if batch_event_time_mjd is not None:
-                            dt_hard = compute_time_delta_days(batch_event_time_mjd[neg_idx], batch_event_time_mjd)
+                            dt_hard = compute_time_delta_days(
+                                gather_candidate_optical_time_mjd(
+                                    _opt_first_detection_mjd, batch_event_time_mjd, neg_idx
+                                ),
+                                batch_event_time_mjd,
+                            )
                         else:
                             dt_hard = torch.zeros((batch_size,), device=device, dtype=torch.float32)
                         if choose_hard_mask is None:
                             choose_hard_mask = torch.ones(batch_size, device=device, dtype=torch.bool)
-                        if choose_hard_mask.any():
-                            hard_rows = torch.nonzero(choose_hard_mask, as_tuple=False).squeeze(-1)
-                            hard_opt_idx = neg_idx[hard_rows]
-                            coords_hard_rows = opt_coords[hard_opt_idx]
-                            candidate_gw_time_hard = (
-                                batch_event_time_mjd[hard_opt_idx] if batch_event_time_mjd is not None else None
-                            )
-                            anchor_gw_time_hard = (
-                                batch_event_time_mjd[hard_rows] if batch_event_time_mjd is not None else None
-                            )
-                            z_hard_rows, h_hard_rows, dt_hard_rows = encode_hard_negative_with_time_shift(
-                                model,
-                                opt_coords=coords_hard_rows,
-                                opt_t=opt_t[hard_opt_idx],
-                                opt_v=opt_v[hard_opt_idx],
-                                opt_mask=opt_mask[hard_opt_idx],
-                                opt_err=opt_err[hard_opt_idx],
-                                opt_ref_t=opt_ref_t[hard_rows],
-                                candidate_zero_time_mjd=candidate_gw_time_hard,
-                                anchor_gw_time_mjd=anchor_gw_time_hard,
-                                scale_divisor=args.neg_offset_scale_days_divisor,
-                            )
-                            h_l_hard[hard_rows] = h_hard_rows
-                            z_l_hard[hard_rows] = z_hard_rows
-                            coords_hard[hard_rows] = coords_hard_rows
-                            dt_hard[hard_rows] = dt_hard_rows
+                        # NOTE: encode_hard_negative_with_time_shift removed.
+                        # Features already correctly encoded at h_l_hard/z_l_hard above.
                         cred_level_hard = compute_credible_level(gw_m, coords_hard) if need_cred_level else None
-                        if batch_event_time_mjd is not None and choose_hard_mask.any():
+                        if batch_event_time_mjd is not None and choose_hard_mask is not None and choose_hard_mask.any():
                             _accumulate_time_delta_stats(dt_stats, "hard", dt_hard[choose_hard_mask])
                         logits_hard = model.fusion_logits(
                             g, h_l_hard, z_l=z_l_hard, H_gw=H_gw, cred_level=cred_level_hard,
@@ -1642,69 +1570,31 @@ def evaluate(
                         neg_zero_time_mjd_for_cls = _neg_zero_time_mjd_cls_base
                         if neg_zero_time_mjd_for_cls is None:
                             neg_zero_time_mjd_for_cls = _neg_zero_time_mjd_base
-                        if neg_offset_policy is not None and neg_offset_policy.enabled:
-                            logits_neg_sum = None
-                            cred_level_neg = compute_credible_level(gw_m, neg_coords) if need_cred_level else None
-                            eval_offsets = list(neg_offset_policy.eval_offsets_days) or [0.0]
-                            gallery_offset_idx = len(eval_offsets) // 2
-                            for off_idx, off_days in enumerate(eval_offsets):
-                                delta_days = torch.full(
-                                    (batch_size,), float(off_days), device=device, dtype=torch.float32
-                                )
-                                shifted_neg_t = apply_time_offsets(
-                                    neg_t, neg_mask, delta_days, neg_offset_policy.scale_divisor
-                                )
-                                z_l_neg_i, h_l_neg_i = model.encode_optical(
-                                    neg_coords, shifted_neg_t, neg_v, opt_ref_t, neg_mask, neg_err
-                                )
-                                neg_event_time_i = (
-                                    neg_zero_time_mjd_for_cls.to(device=device, dtype=torch.float32) - delta_days
-                                    if neg_zero_time_mjd_for_cls is not None
-                                    else None
-                                )
-                                dt_neg_i = (
-                                    compute_time_delta_days(neg_event_time_i, batch_event_time_mjd)
-                                    if (neg_event_time_i is not None and batch_event_time_mjd is not None)
-                                    else delta_days.abs()
-                                )
-                                logits_neg_i = model.fusion_logits(
-                                    g, h_l_neg_i, z_l=z_l_neg_i, H_gw=H_gw, cred_level=cred_level_neg,
-                                    gw_s=gw_s, gw_m=gw_m, opt_coords=neg_coords,
-                                    dt_days=dt_neg_i,
-                                )
-                                logits_neg_sum = logits_neg_i if logits_neg_sum is None else logits_neg_sum + logits_neg_i
-                                if off_idx == gallery_offset_idx:
-                                    gallery_extra_h_l = h_l_neg_i
-                                    gallery_extra_z_l = z_l_neg_i
-                                    gallery_extra_coords = neg_coords
-                                    gallery_extra_event_time = neg_event_time_i
-                            logits_neg = logits_neg_sum / float(max(1, len(eval_offsets)))
-                        else:
-                            z_l_neg, h_l_neg = model.encode_optical(
-                                neg_coords, neg_t, neg_v, opt_ref_t, neg_mask, neg_err
-                            )
-                            cred_level_neg = compute_credible_level(gw_m, neg_coords) if need_cred_level else None
-                            neg_event_time = (
-                                neg_zero_time_mjd_for_cls.to(device=device, dtype=torch.float32)
-                                if neg_zero_time_mjd_for_cls is not None
-                                else None
-                            )
-                            dt_neg = (
-                                compute_time_delta_days(neg_event_time, batch_event_time_mjd)
-                                if (neg_event_time is not None and batch_event_time_mjd is not None)
-                                else torch.zeros((batch_size,), device=device, dtype=torch.float32)
-                            )
-                            logits_neg = model.fusion_logits(
-                                g, h_l_neg, z_l=z_l_neg, H_gw=H_gw, cred_level=cred_level_neg,
-                                gw_s=gw_s, gw_m=gw_m, opt_coords=neg_coords,
-                                dt_days=dt_neg,
-                            )
-                            gallery_extra_h_l = h_l_neg
-                            gallery_extra_z_l = z_l_neg
-                            gallery_extra_coords = neg_coords
-                            gallery_extra_event_time = neg_event_time
-                            if batch_event_time_mjd is not None:
-                                _accumulate_time_delta_stats(dt_stats, "extra", dt_neg)
+                        z_l_neg, h_l_neg = model.encode_optical(
+                            neg_coords, neg_t, neg_v, opt_ref_t, neg_mask, neg_err
+                        )
+                        cred_level_neg = compute_credible_level(gw_m, neg_coords) if need_cred_level else None
+                        neg_event_time = (
+                            neg_zero_time_mjd_for_cls.to(device=device, dtype=torch.float32)
+                            if neg_zero_time_mjd_for_cls is not None
+                            else None
+                        )
+                        dt_neg = (
+                            compute_time_delta_days(neg_event_time, batch_event_time_mjd)
+                            if (neg_event_time is not None and batch_event_time_mjd is not None)
+                            else torch.zeros((batch_size,), device=device, dtype=torch.float32)
+                        )
+                        logits_neg = model.fusion_logits(
+                            g, h_l_neg, z_l=z_l_neg, H_gw=H_gw, cred_level=cred_level_neg,
+                            gw_s=gw_s, gw_m=gw_m, opt_coords=neg_coords,
+                            dt_days=dt_neg,
+                        )
+                        gallery_extra_h_l = h_l_neg
+                        gallery_extra_z_l = z_l_neg
+                        gallery_extra_coords = neg_coords
+                        gallery_extra_event_time = neg_event_time
+                        if batch_event_time_mjd is not None:
+                            _accumulate_time_delta_stats(dt_stats, "extra", dt_neg)
                         neg_loss = model.cls_criterion(logits_neg, labels_neg)
                     else:
                         neg_loss = None
@@ -1756,9 +1646,12 @@ def evaluate(
                     z_candidates = [z_l]
                     coords_candidates = [opt_coords]
                     candidate_gw_indices = [gw_indices]
-                    dt_blocks = []
+                    candidate_time_blocks = []
                     if batch_event_time_mjd is not None:
-                        dt_blocks.append(build_pairwise_time_delta_matrix(batch_event_time_mjd, batch_event_time_mjd))
+                        pos_gallery_time = resolve_optical_candidate_time_mjd(
+                            _opt_first_detection_mjd, batch_event_time_mjd
+                        ).to(device=device, dtype=torch.float32)
+                        candidate_time_blocks.append(pos_gallery_time)
                     if (
                         has_negatives
                         and bool(args.gallery_include_extra_negatives)
@@ -1774,17 +1667,26 @@ def evaluate(
                         )
                         if batch_event_time_mjd is not None:
                             if gallery_extra_event_time is None:
-                                dt_blocks.append(torch.zeros((batch_size, batch_size), device=device, dtype=torch.float32))
+                                candidate_time_blocks.append(
+                                    torch.full((batch_size,), float("nan"), device=device, dtype=torch.float32)
+                                )
                             else:
-                                dt_blocks.append(
-                                    build_pairwise_time_delta_matrix(batch_event_time_mjd, gallery_extra_event_time)
+                                candidate_time_blocks.append(
+                                    gallery_extra_event_time.to(device=device, dtype=torch.float32)
                                 )
                     h_gallery = torch.cat(h_candidates, dim=0)
                     z_gallery = torch.cat(z_candidates, dim=0)
                     coords_gallery = torch.cat(coords_candidates, dim=0)
                     gallery_gw_indices = torch.cat(candidate_gw_indices, dim=0)
                     gallery_positive_mask = gw_indices.unsqueeze(1) == gallery_gw_indices.unsqueeze(0)
-                    dt_gallery = torch.cat(dt_blocks, dim=1) if dt_blocks else None
+                    gallery_candidate_time = torch.cat(candidate_time_blocks, dim=0) if candidate_time_blocks else None
+                    dt_gallery = build_gallery_time_delta_matrix(
+                        batch_event_time_mjd,
+                        gallery_candidate_time,
+                        positive_mask=gallery_positive_mask,
+                        distractor_time_mode=args.gallery_distractor_time_mode,
+                        distractor_time_window_days=args.gallery_distractor_time_window_days,
+                    )
                     gallery_scores = compute_fusion_gallery_score_matrix(
                         model,
                         g=g,
@@ -1944,15 +1846,6 @@ def train(args):
     if args.temp_min >= args.temp_max:
         raise ValueError("temp_min must be < temp_max.")
 
-    if args.neg_offset_scale_days_divisor <= 0:
-        raise ValueError("neg_offset_scale_days_divisor must be > 0.")
-    if args.neg_time_offset_enable:
-        if args.neg_data_path is None:
-            raise ValueError("neg_time_offset_enable=true requires --neg_data_path.")
-        if args.neg_offset_dist_npz is None:
-            raise ValueError("neg_time_offset_enable=true requires --neg_offset_dist_npz.")
-        if not os.path.exists(args.neg_offset_dist_npz):
-            raise FileNotFoundError(f"neg_offset_dist_npz not found: {args.neg_offset_dist_npz}")
     if args.hardneg_min_candidates < 1:
         raise ValueError("hardneg_min_candidates must be >= 1.")
     if args.hardneg_memory_bank_size < 1:
@@ -1967,6 +1860,15 @@ def train(args):
         raise ValueError("gallery_loss_weight must be >= 0.")
     if args.gallery_score_chunk_size < 1:
         raise ValueError("gallery_score_chunk_size must be >= 1.")
+    args.gallery_distractor_time_mode = str(args.gallery_distractor_time_mode).strip().lower()
+    if args.gallery_distractor_time_mode in {"synthetic", "after_gw"}:
+        args.gallery_distractor_time_mode = "synthetic_after_gw"
+    if args.gallery_distractor_time_mode in {"real", "none"}:
+        args.gallery_distractor_time_mode = "actual"
+    if args.gallery_distractor_time_mode not in {"actual", "synthetic_after_gw"}:
+        raise ValueError("gallery_distractor_time_mode must be 'actual' or 'synthetic_after_gw'.")
+    if args.gallery_distractor_time_window_days <= 0:
+        raise ValueError("gallery_distractor_time_window_days must be > 0.")
     if args.time_delta_cls_scale_days is None:
         args.time_delta_cls_scale_days = float(args.time_compat_tau_days)
     if args.time_delta_cls_scale_days <= 0:
@@ -1976,8 +1878,7 @@ def train(args):
     args.fusion_mode = normalize_fusion_mode(getattr(args, "fusion_mode", None), dual_fusion=args.dual_fusion)
     args.dual_fusion = args.fusion_mode != "legacy_g2o"
     args._hardneg_window_days = parse_day_windows(args.hardneg_time_window_days)
-    if args.neg_offset_seed is None:
-        args.neg_offset_seed = int(getattr(args, "seed", 42))
+
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -2207,12 +2108,11 @@ def train(args):
         print(f"Resumed from {args.resume} at epoch {start_epoch}.")
     model.train()
     has_negatives = args.neg_data_path is not None
-    neg_offset_policy = NegativeTimeOffsetPolicy(args)
-    if neg_offset_policy.enabled:
-        print("Negative time-offset policy enabled:")
-        print(json.dumps(neg_offset_policy.describe(), indent=2))
-    else:
-        print("Negative time-offset policy disabled.")
+    print(
+        "Fusion gallery distractor time policy: "
+        f"mode={args.gallery_distractor_time_mode}, "
+        f"window_days={float(args.gallery_distractor_time_window_days):.3g}"
+    )
     gw_event_time_mjd_table = load_gw_event_time_mjd_table(args.data_path, device)
     if gw_event_time_mjd_table is None:
         raise ValueError(
@@ -2351,8 +2251,16 @@ def train(args):
         for batch_idx, batch_data in enumerate(pbar):
             _neg_zero_time_mjd_base = None
             _neg_zero_time_mjd_cls_base = None
+            _opt_first_detection_mjd = None
             if has_negatives:
-                if len(batch_data) >= 16:
+                if len(batch_data) >= 17:
+                    (
+                        gw_s, gw_m, opt_t, opt_v, opt_mask, opt_err, opt_coords, gw_indices,
+                        neg_t, neg_v, neg_mask, neg_err, neg_coords,
+                        _opt_zero_time_mjd_base, _neg_zero_time_mjd_base, _neg_zero_time_mjd_cls_base,
+                        _opt_first_detection_mjd,
+                    ) = batch_data[:17]
+                elif len(batch_data) >= 16:
                     (
                         gw_s, gw_m, opt_t, opt_v, opt_mask, opt_err, opt_coords, gw_indices,
                         neg_t, neg_v, neg_mask, neg_err, neg_coords,
@@ -2370,7 +2278,9 @@ def train(args):
                         neg_t, neg_v, neg_mask, neg_err, neg_coords,
                     ) = batch_data[:13]
             else:
-                if len(batch_data) >= 9:
+                if len(batch_data) >= 10:
+                    gw_s, gw_m, opt_t, opt_v, opt_mask, opt_err, opt_coords, gw_indices, _opt_zero_time_mjd_base, _opt_first_detection_mjd = batch_data[:10]
+                elif len(batch_data) >= 9:
                     gw_s, gw_m, opt_t, opt_v, opt_mask, opt_err, opt_coords, gw_indices, _opt_zero_time_mjd_base = batch_data[:9]
                 else:
                     gw_s, gw_m, opt_t, opt_v, opt_mask, opt_err, opt_coords, gw_indices = batch_data
@@ -2403,6 +2313,10 @@ def train(args):
                     _neg_zero_time_mjd_base = _neg_zero_time_mjd_base.to(device, non_blocking=True)
                 if _neg_zero_time_mjd_cls_base is not None:
                     _neg_zero_time_mjd_cls_base = _neg_zero_time_mjd_cls_base.to(device, non_blocking=True)
+            if _opt_first_detection_mjd is not None:
+                _opt_first_detection_mjd = _opt_first_detection_mjd.to(device, non_blocking=True)
+            elif _opt_zero_time_mjd_base is not None:
+                _opt_first_detection_mjd = _opt_zero_time_mjd_base.to(device, non_blocking=True)
             opt_t_raw = opt_t.clone()
             opt_v_raw = opt_v.clone()
             opt_mask_raw = opt_mask.clone()
@@ -2457,23 +2371,18 @@ def train(args):
                     neg_zero_time_mjd_for_itc = _neg_zero_time_mjd_cls_base
                     if neg_zero_time_mjd_for_itc is None:
                         neg_zero_time_mjd_for_itc = _neg_zero_time_mjd_base
-                    extra_neg_z_itc, extra_neg_event_time_mjd = prepare_retrieval_extra_negative_inputs(
-                        model,
-                        neg_coords=neg_coords,
-                        neg_t=neg_t,
-                        neg_v=neg_v,
-                        neg_mask=neg_mask,
-                        neg_err=neg_err,
-                        opt_ref_t=opt_ref_t,
-                        neg_offset_policy=neg_offset_policy,
-                        training=True,
-                        neg_zero_time_mjd_base=neg_zero_time_mjd_for_itc,
-                    )
+                    with torch.no_grad():
+                        extra_neg_z_itc, _ = model.encode_optical(
+                            neg_coords, neg_t, neg_v, opt_ref_t, neg_mask, neg_err,
+                        )
+                    extra_neg_event_time_mjd = neg_zero_time_mjd_for_itc
                 if args.itc_loss_type == "supcon":
                     itc_loss, sim_g2o = model.compute_supcon_loss(
                         g, z_l, gw_indices, margin=args.supcon_margin,
                         gw_event_time_mjd=batch_event_time_mjd,
-                        opt_event_time_mjd=batch_event_time_mjd,
+                        opt_event_time_mjd=resolve_optical_candidate_time_mjd(
+                            _opt_first_detection_mjd, batch_event_time_mjd
+                        ),
                         extra_neg_z=extra_neg_z_itc,
                         extra_neg_opt_event_time_mjd=extra_neg_event_time_mjd,
                     )
@@ -2481,7 +2390,9 @@ def train(args):
                     itc_loss, sim_g2o = model.compute_itc_loss(
                         g, z_l, gw_indices, mask=args.mask_itc,
                         gw_event_time_mjd=batch_event_time_mjd,
-                        opt_event_time_mjd=batch_event_time_mjd,
+                        opt_event_time_mjd=resolve_optical_candidate_time_mjd(
+                            _opt_first_detection_mjd, batch_event_time_mjd
+                        ),
                         extra_neg_z=extra_neg_z_itc,
                         extra_neg_opt_event_time_mjd=extra_neg_event_time_mjd,
                     )
@@ -2494,7 +2405,10 @@ def train(args):
                 if cls_branch_enabled:
                     # Compute per-pair credible level for dual fusion
                     cred_level = compute_credible_level(gw_m, opt_coords) if need_cred_level else None
-                    dt_pos = torch.zeros((batch_size,), device=device, dtype=torch.float32)
+                    if _opt_first_detection_mjd is not None and batch_event_time_mjd is not None:
+                        dt_pos = compute_time_delta_days(_opt_first_detection_mjd, batch_event_time_mjd)
+                    else:
+                        dt_pos = torch.zeros((batch_size,), device=device, dtype=torch.float32)
                     logits_pos = model.fusion_logits(
                         g, h_l, z_l=z_l, H_gw=H_gw, cred_level=cred_level,
                         gw_s=gw_s, gw_m=gw_m, opt_coords=opt_coords,
@@ -2527,6 +2441,9 @@ def train(args):
                                     sim_g2o=sim_g2o,
                                     gw_indices=gw_indices,
                                     batch_event_time_mjd=batch_event_time_mjd,
+                                    candidate_time_mjd=resolve_optical_candidate_time_mjd(
+                                        _opt_first_detection_mjd, batch_event_time_mjd
+                                    ),
                                     window_days=args._hardneg_window_days,
                                     min_candidates=args.hardneg_min_candidates,
                                     semi_hard=args.semi_hard,
@@ -2556,37 +2473,19 @@ def train(args):
                         z_l_hard = z_l[neg_idx].clone()
                         coords_hard = opt_coords[neg_idx].clone()
                         if batch_event_time_mjd is not None:
-                            dt_hard = compute_time_delta_days(batch_event_time_mjd[neg_idx], batch_event_time_mjd)
+                            dt_hard = compute_time_delta_days(
+                                gather_candidate_optical_time_mjd(
+                                    _opt_first_detection_mjd, batch_event_time_mjd, neg_idx
+                                ),
+                                batch_event_time_mjd,
+                            )
                         else:
                             dt_hard = torch.zeros((batch_size,), device=device, dtype=torch.float32)
                         if choose_hard_mask is None:
                             choose_hard_mask = torch.ones(batch_size, device=device, dtype=torch.bool)
-                        if choose_hard_mask.any():
-                            hard_rows = torch.nonzero(choose_hard_mask, as_tuple=False).squeeze(-1)
-                            hard_opt_idx = neg_idx[hard_rows]
-                            coords_hard_rows = opt_coords[hard_opt_idx]
-                            candidate_gw_time_hard = (
-                                batch_event_time_mjd[hard_opt_idx] if batch_event_time_mjd is not None else None
-                            )
-                            anchor_gw_time_hard = (
-                                batch_event_time_mjd[hard_rows] if batch_event_time_mjd is not None else None
-                            )
-                            z_hard_rows, h_hard_rows, dt_hard_rows = encode_hard_negative_with_time_shift(
-                                model,
-                                opt_coords=coords_hard_rows,
-                                opt_t=opt_t[hard_opt_idx],
-                                opt_v=opt_v[hard_opt_idx],
-                                opt_mask=opt_mask[hard_opt_idx],
-                                opt_err=opt_err[hard_opt_idx],
-                                opt_ref_t=opt_ref_t[hard_rows],
-                                candidate_zero_time_mjd=candidate_gw_time_hard,
-                                anchor_gw_time_mjd=anchor_gw_time_hard,
-                                scale_divisor=args.neg_offset_scale_days_divisor,
-                            )
-                            h_l_hard[hard_rows] = h_hard_rows
-                            z_l_hard[hard_rows] = z_hard_rows
-                            coords_hard[hard_rows] = coords_hard_rows
-                            dt_hard[hard_rows] = dt_hard_rows
+                        # NOTE: encode_hard_negative_with_time_shift removed.
+                        # Hard negatives now use the first-detection-aligned features
+                        # already encoded in h_l[neg_idx], z_l[neg_idx] above.
 
                         # B5 memory-bank mining: replace selected hard rows with cross-batch candidates.
                         if (
@@ -2659,18 +2558,13 @@ def train(args):
                                         opt_mask_sel,
                                         opt_err_sel,
                                     ) = fetched
-                                    z_sel_re, h_sel_re, dt_sel = encode_hard_negative_with_time_shift(
-                                        model,
-                                        opt_coords=c_sel,
-                                        opt_t=opt_t_sel,
-                                        opt_v=opt_v_sel,
-                                        opt_mask=opt_mask_sel,
-                                        opt_err=opt_err_sel,
-                                        opt_ref_t=opt_ref_t[use_rows],
-                                        candidate_zero_time_mjd=t_sel,
-                                        anchor_gw_time_mjd=batch_event_time_mjd[use_rows],
-                                        scale_divisor=args.neg_offset_scale_days_divisor,
-                                    )
+                                    # Use stored features directly (no time-shift re-encoding)
+                                    h_sel_re = _h_sel.to(device=h_l.device, dtype=h_l.dtype)
+                                    z_sel_re = _z_sel.to(device=z_l.device, dtype=z_l.dtype)
+                                    if batch_event_time_mjd is not None:
+                                        dt_sel = compute_time_delta_days(t_sel, batch_event_time_mjd[use_rows])
+                                    else:
+                                        dt_sel = torch.zeros((use_rows.numel(),), device=device, dtype=torch.float32)
                                     h_l_hard[use_rows] = h_sel_re
                                     z_l_hard[use_rows] = z_sel_re
                                     coords_hard[use_rows] = c_sel
@@ -2704,30 +2598,22 @@ def train(args):
                     gallery_extra_coords = None
                     gallery_extra_event_time = None
                     if has_negatives:
-                        neg_t_for_cls = neg_t
-                        delta_days = torch.zeros((batch_size,), device=device, dtype=torch.float32)
-                        if neg_offset_policy.enabled:
-                            delta_np = neg_offset_policy.sample_train_offsets(batch_size)
-                            delta_days = torch.from_numpy(delta_np).to(device=device, dtype=torch.float32)
-                            neg_t_for_cls = apply_time_offsets(
-                                neg_t, neg_mask, delta_days, neg_offset_policy.scale_divisor
-                            )
                         z_l_neg, h_l_neg = model.encode_optical(
-                            neg_coords, neg_t_for_cls, neg_v, opt_ref_t, neg_mask, neg_err
+                            neg_coords, neg_t, neg_v, opt_ref_t, neg_mask, neg_err
                         )
                         cred_level_neg = compute_credible_level(gw_m, neg_coords) if need_cred_level else None
                         neg_zero_time_mjd_for_cls = _neg_zero_time_mjd_cls_base
                         if neg_zero_time_mjd_for_cls is None:
                             neg_zero_time_mjd_for_cls = _neg_zero_time_mjd_base
                         neg_event_time = (
-                            neg_zero_time_mjd_for_cls.to(device=device, dtype=torch.float32) - delta_days
+                            neg_zero_time_mjd_for_cls.to(device=device, dtype=torch.float32)
                             if neg_zero_time_mjd_for_cls is not None
                             else None
                         )
                         dt_neg = (
                             compute_time_delta_days(neg_event_time, batch_event_time_mjd)
                             if (neg_event_time is not None and batch_event_time_mjd is not None)
-                            else delta_days
+                            else torch.zeros((batch_size,), device=device, dtype=torch.float32)
                         )
                         logits_neg = model.fusion_logits(
                             g, h_l_neg, z_l=z_l_neg, H_gw=H_gw, cred_level=cred_level_neg,
@@ -2791,9 +2677,12 @@ def train(args):
                     z_candidates = [z_l]
                     coords_candidates = [opt_coords]
                     candidate_gw_indices = [gw_indices]
-                    dt_blocks = []
+                    candidate_time_blocks = []
                     if batch_event_time_mjd is not None:
-                        dt_blocks.append(build_pairwise_time_delta_matrix(batch_event_time_mjd, batch_event_time_mjd))
+                        pos_gallery_time = resolve_optical_candidate_time_mjd(
+                            _opt_first_detection_mjd, batch_event_time_mjd
+                        ).to(device=device, dtype=torch.float32)
+                        candidate_time_blocks.append(pos_gallery_time)
                     if (
                         has_negatives
                         and bool(args.gallery_include_extra_negatives)
@@ -2809,16 +2698,26 @@ def train(args):
                         )
                         if batch_event_time_mjd is not None:
                             if gallery_extra_event_time is None:
-                                dt_blocks.append(torch.zeros((batch_size, batch_size), device=device, dtype=torch.float32))
+                                candidate_time_blocks.append(
+                                    torch.full((batch_size,), float("nan"), device=device, dtype=torch.float32)
+                                )
                             else:
-                                dt_blocks.append(
-                                    build_pairwise_time_delta_matrix(batch_event_time_mjd, gallery_extra_event_time)
+                                candidate_time_blocks.append(
+                                    gallery_extra_event_time.to(device=device, dtype=torch.float32)
                                 )
                     h_gallery = torch.cat(h_candidates, dim=0)
                     z_gallery = torch.cat(z_candidates, dim=0)
                     coords_gallery = torch.cat(coords_candidates, dim=0)
                     gallery_gw_indices = torch.cat(candidate_gw_indices, dim=0)
-                    dt_gallery = torch.cat(dt_blocks, dim=1) if dt_blocks else None
+                    gallery_pos_mask_full = gw_indices.unsqueeze(1) == gallery_gw_indices.unsqueeze(0)
+                    gallery_candidate_time = torch.cat(candidate_time_blocks, dim=0) if candidate_time_blocks else None
+                    dt_gallery = build_gallery_time_delta_matrix(
+                        batch_event_time_mjd,
+                        gallery_candidate_time,
+                        positive_mask=gallery_pos_mask_full,
+                        distractor_time_mode=args.gallery_distractor_time_mode,
+                        distractor_time_window_days=args.gallery_distractor_time_window_days,
+                    )
 
                     # Query subsampling: randomly select a subset of queries to
                     # bound GPU memory when scoring against the full candidate gallery.
@@ -2831,11 +2730,11 @@ def train(args):
                         gw_s_q = gw_s[q_idx] if gw_s is not None else None
                         gw_m_q = gw_m[q_idx] if gw_m is not None else None
                         dt_q = dt_gallery[q_idx, :] if dt_gallery is not None else None
-                        gallery_pos_mask = gw_indices[q_idx].unsqueeze(1) == gallery_gw_indices.unsqueeze(0)
+                        gallery_pos_mask = gallery_pos_mask_full[q_idx, :]
                     else:
                         g_q, H_q, gw_s_q, gw_m_q = g, H_gw, gw_s, gw_m
                         dt_q = dt_gallery
-                        gallery_pos_mask = gw_indices.unsqueeze(1) == gallery_gw_indices.unsqueeze(0)
+                        gallery_pos_mask = gallery_pos_mask_full
 
                     gallery_scores = compute_fusion_gallery_score_matrix(
                         model,
@@ -2901,7 +2800,9 @@ def train(args):
                     h_l=h_l,
                     z_l=z_l,
                     opt_coords=opt_coords,
-                    candidate_gw_time_mjd=batch_event_time_mjd,
+                    candidate_time_mjd=resolve_optical_candidate_time_mjd(
+                        _opt_first_detection_mjd, batch_event_time_mjd
+                    ),
                     gw_indices=gw_indices,
                     opt_t=opt_t_raw,
                     opt_v=opt_v_raw,
@@ -3033,7 +2934,6 @@ def train(args):
                 epoch,
                 amp_dtype=amp_dtype,
                 gw_event_time_mjd_table=gw_event_time_mjd_table,
-                neg_offset_policy=neg_offset_policy,
             )
             _close_loader_dataset_handles(
                 val_loader,
@@ -3181,7 +3081,6 @@ def train(args):
                 epoch,
                 amp_dtype=amp_dtype,
                 gw_event_time_mjd_table=ood_event_time_mjd_table,
-                neg_offset_policy=neg_offset_policy,
             )
             _close_loader_dataset_handles(
                 ood_val_loader,
@@ -3287,25 +3186,6 @@ if __name__ == "__main__":
                         help="Opt-in OOD monitoring during training. Do NOT enable when test_data_path is final test set.")
     parser.add_argument("--neg_data_path", type=str, default=None)
     parser.add_argument("--neg_group", type=str, default="events/optical_data")
-    parser.add_argument("--neg_time_offset_enable", action='store_true',
-                        help="Enable time offsets for external non-KN negative optical branch.")
-    parser.add_argument("--neg_offset_dist_npz", type=str, default=None,
-                        help="NPZ path containing negative time-offset distribution.")
-    parser.add_argument("--neg_offset_dist_key", type=str, default="delta_days_combined",
-                        help="Key in neg_offset_dist_npz for delta-days samples.")
-    parser.add_argument("--neg_offset_train_sampling", type=str, default="empirical_cdf",
-                        help="Train sampling strategy for negative offsets (currently only empirical_cdf).")
-    parser.add_argument("--neg_offset_eval_mode", type=str, default="quantile_ensemble",
-                        choices=["quantile_ensemble", "median", "zero"],
-                        help="Eval mode for negative offsets.")
-    parser.add_argument("--neg_offset_eval_quantiles", type=str, default="0.1,0.3,0.5,0.7,0.9",
-                        help="Comma-separated quantiles for quantile_ensemble eval mode.")
-    parser.add_argument("--neg_offset_scale_days_divisor", type=float, default=100.0,
-                        help="Convert day offsets to model time unit by dividing this value.")
-    parser.add_argument("--neg_offset_seed", type=int, default=None,
-                        help="RNG seed for negative offset sampling; defaults to --seed.")
-    parser.add_argument("--neg_offset_bank_size", type=int, default=1000000,
-                        help="Max number of offset samples cached for training sampler.")
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--steps_per_epoch", type=int, default=None)
@@ -3414,6 +3294,11 @@ if __name__ == "__main__":
                         help="Max queries for fusion gallery scoring during training (0 = use all queries).")
     parser.add_argument("--gallery_include_extra_negatives", action=argparse.BooleanOptionalAction, default=True,
                         help="Include external non-KN negatives in the fusion mini-gallery loss when available.")
+    parser.add_argument("--gallery_distractor_time_mode", type=str, default="actual",
+                        choices=["actual", "synthetic_after_gw"],
+                        help="Time-delta policy for non-matching fusion mini-gallery distractors.")
+    parser.add_argument("--gallery_distractor_time_window_days", type=float, default=30.0,
+                        help="Upper bound in days for synthetic_after_gw gallery distractor dt sampling.")
     parser.add_argument("--itc_decay_start_epoch", type=int, default=0,
                         help="Epoch to start decaying ITC weight (ignored if itc_decay_epochs <= 0)")
     parser.add_argument("--itc_decay_epochs", type=int, default=0,

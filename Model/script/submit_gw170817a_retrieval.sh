@@ -17,7 +17,7 @@ SCRIPT_SUBDIR="Model/script"
 SCRIPT_REL_PATH="Model/script/submit_gw170817a_retrieval.sh"
 REPO_NAME="gw-kn-multimodal"
 WORKSPACE_ROOT_DEFAULT="/fred/oz016/bgao_kn"
-DEFAULT_CONFIG_REL="Model/args/eval/retrieval_gw170817a_lsst.json"
+DEFAULT_CONFIG_REL="Model/args/eval/retrieval_gw170817a_lsst_v9.json"
 
 if [[ -n "${SLURM_JOB_ID:-}" && -n "${SLURM_SUBMIT_DIR:-}" ]]; then
     if [[ "$(basename "${SLURM_SUBMIT_DIR}")" == "${REPO_NAME}" ]]; then
@@ -127,6 +127,7 @@ GALLERY_CANDIDATE_MODE=$(jq -r '.gallery_candidate_mode // "time_sky_hard"' "$co
 GALLERY_CANDIDATE_TIME_WINDOW_DAYS=$(jq -r '.gallery_candidate_time_window_days // empty' "$config_file")
 GALLERY_CANDIDATE_CREDIBLE_LEVEL_MAX=$(jq -r '.gallery_candidate_credible_level_max // empty' "$config_file")
 GALLERY_INCLUDE_UNDERSIZED=$(jq -r '.gallery_include_undersized // "true"' "$config_file")
+STAGE_TO_JOBFS=$(jq -r '.stage_to_jobfs // false' "$config_file")
 MODEL_NAMES=$(jq -r '[.models[].name] | join(", ")' "$config_file")
 MODEL_COUNT=$(jq -r '.models | length' "$config_file")
 
@@ -142,12 +143,46 @@ if [[ -n "$NEG_DATA_PATH" && "$NEG_DATA_PATH" != "null" && ! -f "$NEG_DATA_PATH"
     echo "Negative dataset not found: $NEG_DATA_PATH" >&2
     exit 1
 fi
-while IFS= read -r checkpoint_path; do
-    if [[ -n "$checkpoint_path" && "$checkpoint_path" != "null" && ! -e "$checkpoint_path" ]]; then
-        echo "Model checkpoint path not found: $checkpoint_path" >&2
-        exit 1
+# --- checkpoint pre-check ---
+DRY_RUN="${DRY_RUN:-false}"
+ALLOW_MISSING="${ALLOW_MISSING:-false}"
+
+check_checkpoints() {
+    local missing=0
+    while IFS= read -r entry; do
+        local name=$(echo "$entry" | jq -r '.name')
+        local ckpt=$(echo "$entry" | jq -r '.checkpoint // empty')
+        local type=$(echo "$entry" | jq -r '.type')
+        if [[ "$type" == "skymap" ]]; then continue; fi
+        if [[ -z "$ckpt" || "$ckpt" == "null" ]]; then
+            echo "MISSING checkpoint path: $name (type=$type)"
+            missing=1
+            continue
+        fi
+        if [[ ! -d "$ckpt" && ! -f "$ckpt" ]]; then
+            echo "MISSING: $name → $ckpt"
+            missing=1
+        fi
+    done < <(jq -c '.models[]' "$config_file")
+    if [[ "$missing" -eq 1 ]]; then
+        if [[ "$ALLOW_MISSING" == "true" ]]; then
+            echo "WARNING: Some checkpoints missing, continuing (ALLOW_MISSING=true)"
+        else
+            echo "ERROR: Missing checkpoints. Set ALLOW_MISSING=true to bypass, or DRY_RUN=true for config-only check."
+            exit 1
+        fi
+    else
+        echo "All checkpoints found."
     fi
-done < <(jq -r '.models[] | select(.type != "skymap") | .checkpoint // empty' "$config_file")
+}
+
+check_checkpoints
+
+if [[ "$DRY_RUN" == "true" ]]; then
+    echo "DRY_RUN=true: Config and checkpoint check complete. Exiting without running eval."
+    exit 0
+fi
+# --- end checkpoint pre-check ---
 if [[ -z "$OUTPUT_DIR" || "$OUTPUT_DIR" == "null" ]]; then
     OUTPUT_DIR="${DEFAULT_OUTPUT_DIR}"
 fi
@@ -182,10 +217,28 @@ echo "Expected outputs:"
 echo "  ${OUTPUT_DIR}/gw170817a_retrieval.json"
 echo "  ${OUTPUT_DIR}/redshift_metrics.csv"
 echo "  ${OUTPUT_DIR}/retrieval_curves.png"
-echo "  ${OUTPUT_DIR}/redshift_retrieval_metrics.png"
-echo "  ${OUTPUT_DIR}/redshift_coverage.png"
+echo "  ${OUTPUT_DIR}/retrieval_coverage.png"
+echo "  ${OUTPUT_DIR}/redshift_retrieval_metrics_g*.png  (per gallery size)"
+echo "  ${OUTPUT_DIR}/redshift_coverage_g*.png  (per gallery size)"
 echo "Command: python -u ${EVAL_SCRIPT} --config ${config_file}"
 echo "========================================"
+
+if [[ "$STAGE_TO_JOBFS" == "true" ]]; then
+    JOBFS_DIR="${SLURM_TMPDIR:-${TMPDIR:-${JOBFS:-}}}"
+    if [[ -n "$JOBFS_DIR" ]]; then
+        echo "Staging data files to local disk: $JOBFS_DIR"
+        cp -f "$TEST_DATA_PATH" "$JOBFS_DIR"/
+        TEST_DATA_PATH="$JOBFS_DIR/$(basename "$TEST_DATA_PATH")"
+        if [[ -n "$NEG_DATA_PATH" && "$NEG_DATA_PATH" != "null" ]]; then
+            cp -f "$NEG_DATA_PATH" "$JOBFS_DIR"/
+            NEG_DATA_PATH="$JOBFS_DIR/$(basename "$NEG_DATA_PATH")"
+        fi
+        export JOBFS_DIR
+        echo "Staging complete. Using JOBFS_DIR=$JOBFS_DIR"
+    else
+        echo "No local tmp dir found; skip staging."
+    fi
+fi
 
 cd "${REPO_ROOT}"
 python -u "${EVAL_SCRIPT}" --config "${config_file}"

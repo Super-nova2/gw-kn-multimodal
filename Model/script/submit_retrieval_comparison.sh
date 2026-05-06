@@ -17,7 +17,7 @@ SCRIPT_SUBDIR="Model/script"
 SCRIPT_REL_PATH="Model/script/submit_retrieval_comparison.sh"
 REPO_NAME="gw-kn-multimodal"
 WORKSPACE_ROOT_DEFAULT="/fred/oz016/bgao_kn"
-DEFAULT_CONFIG_REL="Model/args/eval/retrieval_comparison.json"
+DEFAULT_CONFIG_REL="Model/args/eval/retrieval_comparison_v9.json"
 
 if [[ -n "${SLURM_JOB_ID:-}" && -n "${SLURM_SUBMIT_DIR:-}" ]]; then
     if [[ "$(basename "${SLURM_SUBMIT_DIR}")" == "${REPO_NAME}" ]]; then
@@ -187,6 +187,50 @@ echo "Expected outputs:"
 echo "  ${OUTPUT_DIR}/ablation_comparison.json"
 echo "  ${OUTPUT_DIR}/retrieval_curves.png"
 echo "  ${OUTPUT_DIR}/retrieval_coverage.png"
+if [[ -n "${redshift_analysis_enable:-}" && "${redshift_analysis_enable}" != "false" ]]; then
+    echo "  ${OUTPUT_DIR}/redshift_metrics.csv"
+fi
+
+# --- checkpoint pre-check ---
+DRY_RUN="${DRY_RUN:-false}"
+ALLOW_MISSING="${ALLOW_MISSING:-false}"
+
+check_checkpoints() {
+    local missing=0
+    while IFS= read -r entry; do
+        local name=$(echo "$entry" | jq -r '.name')
+        local ckpt=$(echo "$entry" | jq -r '.checkpoint // empty')
+        local type=$(echo "$entry" | jq -r '.type')
+        if [[ "$type" == "skymap" ]]; then continue; fi
+        if [[ -z "$ckpt" || "$ckpt" == "null" ]]; then
+            echo "MISSING checkpoint path: $name (type=$type)"
+            missing=1
+            continue
+        fi
+        if [[ ! -d "$ckpt" && ! -f "$ckpt" ]]; then
+            echo "MISSING: $name → $ckpt"
+            missing=1
+        fi
+    done < <(jq -c '.models[]' "$config_file")
+    if [[ "$missing" -eq 1 ]]; then
+        if [[ "$ALLOW_MISSING" == "true" ]]; then
+            echo "WARNING: Some checkpoints missing, continuing (ALLOW_MISSING=true)"
+        else
+            echo "ERROR: Missing checkpoints. Set ALLOW_MISSING=true to bypass, or DRY_RUN=true for config-only check."
+            exit 1
+        fi
+    else
+        echo "All checkpoints found."
+    fi
+}
+
+check_checkpoints
+
+if [[ "$DRY_RUN" == "true" ]]; then
+    echo "DRY_RUN=true: Config and checkpoint check complete. Exiting without running eval."
+    exit 0
+fi
+# --- end checkpoint pre-check ---
 
 if [[ "$STAGE_TO_JOBFS" == "true" ]]; then
     JOBFS_DIR="${SLURM_TMPDIR:-${TMPDIR:-${JOBFS:-}}}"
