@@ -1865,7 +1865,7 @@ class GWOpticalALBEFModel(nn.Module):
             loss_o = self.itc_criterion(sim_o2g, labels)
             total_loss = (loss_g + loss_o) / 2
 
-        return total_loss, sim_g2o
+        return total_loss, sim_g2o, sim_g2o_for_loss
 
     def compute_supcon_loss(
         self,
@@ -1979,7 +1979,15 @@ class GWOpticalALBEFModel(nn.Module):
         if time_bias is not None:
             sim_g2o = sim_g2o + time_bias
 
-        return loss, sim_g2o
+        sim_g2o_ext = sim_g2o
+        if feat_o_extra is not None:
+            sim_g2o_extra = torch.matmul(feat_g, feat_o_extra.T) / temperature
+            if extra_time_bias is not None:
+                extra_time_bias = extra_time_bias.to(device=sim_g2o_extra.device, dtype=sim_g2o_extra.dtype)
+                sim_g2o_extra = sim_g2o_extra + extra_time_bias
+            sim_g2o_ext = torch.cat([sim_g2o, sim_g2o_extra], dim=1)
+
+        return loss, sim_g2o, sim_g2o_ext
 
     def fusion_logits(
         self,

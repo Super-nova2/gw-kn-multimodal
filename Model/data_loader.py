@@ -736,22 +736,19 @@ class RelationalHDF5Dataset(Dataset):
         sorted_to_orig = self.neg_cls_sorted_to_orig_idx
         windows = self.extra_negative_timeaware_windows_days
         min_cand = int(self.extra_negative_timeaware_min_candidates)
-        lefts = np.searchsorted(times, anchor - np.asarray(windows, dtype=np.float64), side="left")
-        rights = np.searchsorted(times, anchor + np.asarray(windows, dtype=np.float64), side="right")
+        # One-sided after-GW windows: [0, w0], then (previous, current].
+        window_edges = anchor + np.asarray(windows, dtype=np.float64)
+        lefts = np.empty((len(windows),), dtype=np.int64)
+        rights = np.searchsorted(times, window_edges, side="right")
 
         eligible_levels = []
         level_counts = []
         for i in range(len(windows)):
-            outer_l = int(lefts[i])
-            outer_r = int(rights[i])
             if i == 0:
-                count = max(0, outer_r - outer_l)
+                lefts[i] = np.searchsorted(times, anchor, side="left")
             else:
-                inner_l = int(lefts[i - 1])
-                inner_r = int(rights[i - 1])
-                left_count = max(0, inner_l - outer_l)
-                right_count = max(0, outer_r - inner_r)
-                count = left_count + right_count
+                lefts[i] = np.searchsorted(times, anchor + float(windows[i - 1]), side="right")
+            count = max(0, int(rights[i]) - int(lefts[i]))
             if count >= min_cand:
                 eligible_levels.append(i)
                 level_counts.append(count)
@@ -769,26 +766,11 @@ class RelationalHDF5Dataset(Dataset):
 
         outer_l = int(lefts[picked])
         outer_r = int(rights[picked])
-        if picked == 0:
-            count = max(0, outer_r - outer_l)
-            if count <= 0:
-                return self._sample_uniform_neg_idx()
-            sorted_idx = outer_l + int(np.random.randint(0, count))
-            return int(sorted_to_orig[sorted_idx])
-
-        inner_l = int(lefts[picked - 1])
-        inner_r = int(rights[picked - 1])
-        left_count = max(0, inner_l - outer_l)
-        right_count = max(0, outer_r - inner_r)
-        count = left_count + right_count
+        count = max(0, outer_r - outer_l)
         if count <= 0:
             return self._sample_uniform_neg_idx()
 
-        draw = int(np.random.randint(0, count))
-        if draw < left_count:
-            sorted_idx = outer_l + draw
-        else:
-            sorted_idx = inner_r + (draw - left_count)
+        sorted_idx = outer_l + int(np.random.randint(0, count))
         return int(sorted_to_orig[sorted_idx])
             
     def __len__(self):
@@ -3315,15 +3297,12 @@ def _first_detection_index(
     photflag: Optional[np.ndarray],
     snr_threshold: float = 5.0,
 ) -> Optional[int]:
+    flux = np.asarray(flux, dtype=np.float64)
+    fluxerr = np.asarray(fluxerr, dtype=np.float64)
     if flux.size == 0:
         return None
 
-    if photflag is not None:
-        det_mask = photflag.astype(np.int64) != 0
-        if np.any(det_mask):
-            return int(np.argmax(det_mask))
-
-    valid = np.isfinite(fluxerr) & (fluxerr > 0)
+    valid = np.isfinite(flux) & np.isfinite(fluxerr) & (fluxerr > 0)
     if np.any(valid):
         snr = np.full(flux.shape, -np.inf, dtype=np.float64)
         snr[valid] = flux[valid] / fluxerr[valid]
@@ -3331,7 +3310,77 @@ def _first_detection_index(
         if np.any(det_mask):
             return int(np.argmax(det_mask))
 
+    if photflag is not None:
+        flags = np.asarray(photflag, dtype=np.int64)
+        if flags.shape == flux.shape:
+            det_mask = (flags & (4096 | 1024)) != 0
+            if np.any(det_mask):
+                return int(np.argmax(det_mask))
+
     return None
+
+
+def _safe_float(value: object) -> Optional[float]:
+    try:
+        out = float(value)
+    except Exception:
+        return None
+    return float(out) if np.isfinite(out) else None
+
+
+def _valid_head_detection_mjd(value: object) -> Optional[float]:
+    out = _safe_float(value)
+    if out is None:
+        return None
+    # SNANA commonly uses -9 and 1e6 sentinels for missing detection fields.
+    if out <= 0.0 or out >= 900000.0:
+        return None
+    return float(out)
+
+
+def _first_photflag_detection_mjd(mjd: np.ndarray, photflag: Optional[np.ndarray]) -> Optional[float]:
+    if photflag is None:
+        return None
+    mjd_arr = np.asarray(mjd, dtype=np.float64)
+    flags = np.asarray(photflag, dtype=np.int64)
+    if mjd_arr.shape != flags.shape or mjd_arr.size == 0:
+        return None
+    det_mask = ((flags & (4096 | 1024)) != 0) & np.isfinite(mjd_arr)
+    if not np.any(det_mask):
+        return None
+    return float(mjd_arr[int(np.argmax(det_mask))])
+
+
+def resolve_first_detection_mjd(
+    *,
+    snr_mjd,
+    snr_flux,
+    snr_fluxerr,
+    photflag_mjd=None,
+    photflag=None,
+    head_mjd_detect_first=None,
+    snr_threshold: float = 5.0,
+) -> Optional[float]:
+    """Resolve first detection time using psfFlux SNR, PHOTFLAG, then HEAD fallback."""
+    mjd_arr = np.asarray(snr_mjd, dtype=np.float64)
+    flux_arr = np.asarray(snr_flux, dtype=np.float64)
+    fluxerr_arr = np.asarray(snr_fluxerr, dtype=np.float64)
+    if mjd_arr.shape == flux_arr.shape == fluxerr_arr.shape and mjd_arr.size > 0:
+        det_idx = _first_detection_index(
+            flux=flux_arr,
+            fluxerr=fluxerr_arr,
+            photflag=None,
+            snr_threshold=float(snr_threshold),
+        )
+        if det_idx is not None and np.isfinite(mjd_arr[int(det_idx)]):
+            return float(mjd_arr[int(det_idx)])
+
+    if photflag_mjd is not None:
+        out = _first_photflag_detection_mjd(np.asarray(photflag_mjd, dtype=np.float64), photflag)
+        if out is not None:
+            return out
+
+    return _valid_head_detection_mjd(head_mjd_detect_first)
 
 # Functions for parsing SNANA FITS files, and sampling MOC skymaps
 def parse_snana_fits(
@@ -3387,6 +3436,8 @@ def parse_snana_fits(
             flux_all = data_phot['FLUXCAL']
             fluxerr_all = data_phot['FLUXCALERR'] # Optional usage
             flt_all = data_phot['BAND'] # Filters
+            photflag_all = data_phot['PHOTFLAG'] if 'PHOTFLAG' in data_phot.columns.names else None
+            head_columns = set(data_head.columns.names)
 
             extracted_lcs = []
             use_luptitude = (
@@ -3416,6 +3467,12 @@ def parse_snana_fits(
                 lc_flux = flux_all[start_idx : end_idx]
                 lc_fluxerr = fluxerr_all[start_idx : end_idx]
                 lc_flt = flt_all[start_idx : end_idx]
+                lc_photflag = photflag_all[start_idx : end_idx] if photflag_all is not None else None
+                raw_lc_mjd = np.asarray(lc_mjd, dtype=np.float64)
+                raw_lc_flux = np.asarray(lc_flux, dtype=np.float64)
+                raw_lc_fluxerr = np.asarray(lc_fluxerr, dtype=np.float64)
+                head_mjd_detect_first = data_head['MJD_DETECT_FIRST'][i] if 'MJD_DETECT_FIRST' in head_columns else None
+                first_detection_mjd = None
 
                 if use_luptitude:
                     merged_mjd, merged_psfflux, merged_psffluxerr, merged_flt = merge_photometry_psfflux(
@@ -3427,6 +3484,18 @@ def parse_snana_fits(
                     )
                     if len(merged_mjd) < 5:
                         continue
+                    if normalize_to_first_detection:
+                        first_detection_mjd = resolve_first_detection_mjd(
+                            snr_mjd=merged_mjd,
+                            snr_flux=merged_psfflux,
+                            snr_fluxerr=merged_psffluxerr,
+                            photflag_mjd=raw_lc_mjd,
+                            photflag=lc_photflag,
+                            head_mjd_detect_first=head_mjd_detect_first,
+                            snr_threshold=float(snr_threshold),
+                        )
+                        if first_detection_mjd is None:
+                            continue
                     lc_mjd, lc_flux, lc_fluxerr, lc_flt = _transform_psfflux_to_luptitude(
                         mjd=merged_mjd,
                         psfflux=merged_psfflux,
@@ -3451,17 +3520,19 @@ def parse_snana_fits(
                 time_vec = np.zeros((MAX_LC_LENGTH,), dtype=np.float32)
 
                 if normalize_to_first_detection:
-                    # Find first detection (SNR > threshold) and use as time zero
-                    det_idx = _first_detection_index(
-                        flux=np.asarray(lc_flux, dtype=np.float64),
-                        fluxerr=np.asarray(lc_fluxerr, dtype=np.float64),
-                        photflag=None,
-                        snr_threshold=float(snr_threshold),
-                    )
-                    if det_idx is None:
+                    if first_detection_mjd is None:
+                        first_detection_mjd = resolve_first_detection_mjd(
+                            snr_mjd=raw_lc_mjd,
+                            snr_flux=raw_lc_flux,
+                            snr_fluxerr=raw_lc_fluxerr,
+                            photflag_mjd=raw_lc_mjd,
+                            photflag=lc_photflag,
+                            head_mjd_detect_first=head_mjd_detect_first,
+                            snr_threshold=float(snr_threshold),
+                        )
+                    if first_detection_mjd is None:
                         continue
-                    first_detection_mjd = float(np.asarray(lc_mjd, dtype=np.float64)[det_idx])
-                    rel_times = (lc_mjd - first_detection_mjd) / 100.0
+                    rel_times = (np.asarray(lc_mjd, dtype=np.float64) - float(first_detection_mjd)) / 100.0
                 else:
                     # 1. Time Normalization (Relative to BNS merger time)
                     if len(lc_mjd) > 0:

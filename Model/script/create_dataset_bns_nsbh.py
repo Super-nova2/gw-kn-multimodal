@@ -53,6 +53,9 @@ GPS_TIME_COLUMN_CANDIDATES = (
     "trigger_time_gps",
 )
 LUPT_BAND_ORDER = ("u", "g", "r", "i", "z", "Y")
+FIRST_DETECTION_POLICY = "psfflux_snr5_then_photflag_then_head_mjd_detect_first"
+FIRST_DETECTION_SNR_DOMAIN = "merged_psfflux"
+SCALAR_COLUMN_NAMES = "mass1_detector,mass2_detector,spin1z,spin2z,costheta,distmean_gpc,diststd_gpc"
 DEFAULT_MTAN_SNR_S0 = 3.0
 DEFAULT_MTAN_SNR_BETA = 1.0
 DEFAULT_MTAN_SNR_CLIP_MIN = -8.0
@@ -143,7 +146,7 @@ def write_luptitude_metadata_attrs(
     h5_obj.attrs["mtan_snr_clip_min"] = float(DEFAULT_MTAN_SNR_CLIP_MIN)
     h5_obj.attrs["mtan_snr_clip_max"] = float(DEFAULT_MTAN_SNR_CLIP_MAX)
     h5_obj.attrs["mtan_snr_eps"] = float(DEFAULT_MTAN_SNR_EPS)
-    h5_obj.attrs["mtan_snr_source"] = "flux_snr_from_luptitude"
+    h5_obj.attrs["mtan_snr_source"] = "flux_snr_from_psfflux"
 
 
 @dataclass
@@ -1252,7 +1255,10 @@ def create_dataset_with_neg_gw_bns_nsbh_fast(
             + source_counts["nsbh"]["invalid_event_time_written"]
         )
         f.attrs["time_zero_base_semantics"] = "optical zero_time_mjd_base stores first_detection_mjd"
+        f.attrs["first_detection_policy"] = FIRST_DETECTION_POLICY
+        f.attrs["first_detection_snr_domain"] = FIRST_DETECTION_SNR_DOMAIN
         f.attrs["first_detection_snr_threshold"] = 5.0
+        f.attrs["scalar_column_names"] = SCALAR_COLUMN_NAMES
         f.attrs["time_unit"] = "mjd_days"
         f.attrs["runtime_offset_applied"] = 0
         f.attrs["min_nobs_stage"] = "post_merge"

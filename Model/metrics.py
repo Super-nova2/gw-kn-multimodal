@@ -62,6 +62,7 @@ def compute_retrieval_metrics(sim_g2o, gw_indices, is_neg_gw=None, ks=(1, 5, 10)
 def _retrieval_metrics_one_direction(sim, gw_indices, anchor_mask, ks, device):
     """Compute Recall@K, MRR, mAP for one direction of retrieval."""
     B = sim.size(0)
+    G = sim.size(1)  # gallery size (may differ from B for extended galleries)
     max_k = max(ks)
 
     # Filter to valid anchors
@@ -69,28 +70,28 @@ def _retrieval_metrics_one_direction(sim, gw_indices, anchor_mask, ks, device):
     if len(valid_idx) == 0:
         return {f"recall_at_{k}": 0.0 for k in ks} | {"mrr": 0.0, "map": 0.0}
 
-    sim_valid = sim[valid_idx]  # [N_valid, B]
+    sim_valid = sim[valid_idx]  # [N_valid, G]
     anchor_gw = gw_indices[valid_idx]  # [N_valid]
 
     # For each anchor, build positive mask across gallery
     # positive[i, j] = True if gallery item j is a correct match for anchor i
-    positive = anchor_gw.unsqueeze(1) == gw_indices.unsqueeze(0)  # [N_valid, B]
+    positive = anchor_gw.unsqueeze(1) == gw_indices.unsqueeze(0)  # [N_valid, G]
 
     # Sort gallery by descending similarity
-    sorted_indices = sim_valid.argsort(dim=1, descending=True)  # [N_valid, B]
+    sorted_indices = sim_valid.argsort(dim=1, descending=True)  # [N_valid, G]
 
     # Gather relevance labels in sorted order
-    sorted_relevant = positive.gather(1, sorted_indices)  # [N_valid, B]
+    sorted_relevant = positive.gather(1, sorted_indices)  # [N_valid, G]
 
     n_valid = len(valid_idx)
     recall_at_k = {}
     for k in ks:
-        actual_k = min(k, B)
+        actual_k = min(k, G)
         hits = sorted_relevant[:, :actual_k].any(dim=1).float()
         recall_at_k[f"recall_at_{k}"] = hits.mean().item()
 
     # MRR: reciprocal rank of first positive
-    ranks = torch.arange(1, B + 1, device=device).unsqueeze(0).expand(n_valid, -1).float()
+    ranks = torch.arange(1, G + 1, device=device).unsqueeze(0).expand(n_valid, -1).float()
     # Mask non-relevant to inf rank
     first_pos_rank = torch.where(
         sorted_relevant,

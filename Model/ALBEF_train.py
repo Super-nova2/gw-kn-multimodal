@@ -971,6 +971,36 @@ def is_gallery_enabled(args):
     return float(getattr(args, "gallery_loss_weight", 0.0)) > 0.0
 
 
+CLS_BEST_CKPT_METRICS = {
+    "auprc",
+    "auroc",
+    "f1_optimal",
+    "acc_total",
+    "cls_composite_auprc_auroc",
+}
+G2O_BEST_CKPT_METRICS = {
+    "g2o_recall_at_1",
+    "g2o_recall_at_5",
+    "g2o_mrr",
+}
+FUSION_GALLERY_BEST_CKPT_METRICS = {
+    "fusion_gallery_recall_at_1",
+    "fusion_gallery_recall_at_5",
+    "fusion_gallery_mrr",
+}
+
+
+def should_compute_cls_metrics(args):
+    return bool(getattr(args, "compute_cls_metrics", True))
+
+
+def should_compute_fusion_gallery_metrics(args, epoch):
+    if not bool(getattr(args, "compute_fusion_gallery_metrics", True)):
+        return False
+    start = int(getattr(args, "fusion_gallery_metrics_start_epoch", 0))
+    return int(epoch) >= start
+
+
 def is_retrieval_active(args, epoch):
     """Return True when retrieval/gallery training is active at the given epoch."""
     if not is_gallery_enabled(args):
@@ -1020,13 +1050,71 @@ def hard_neg_full_activation_reachable(args):
 
 
 def is_best_ckpt_selection_eligible(args, epoch, hard_neg_ratio=None):
-    """Gate best-checkpoint selection until hard negatives or retrieval are fully enabled when reachable."""
-    if not is_cls_branch_enabled(args):
-        return is_retrieval_active(args, epoch)
-    if not hard_neg_full_activation_reachable(args):
-        return is_retrieval_active(args, epoch)
+    """Gate best-checkpoint selection until the requested metric is meaningful."""
+    metric_name = str(getattr(args, "best_ckpt_metric", "fusion_gallery_mrr"))
+
+    if metric_name in CLS_BEST_CKPT_METRICS:
+        if not should_compute_cls_metrics(args):
+            return False
+        if is_cls_branch_enabled(args) and not is_cls_active(epoch, args):
+            return False
+        if hard_neg_full_activation_reachable(args):
+            ratio = compute_hard_neg_ratio(args, epoch) if hard_neg_ratio is None else float(hard_neg_ratio)
+            return ratio >= (1.0 - 1e-8)
+        return True
+
+    if metric_name in FUSION_GALLERY_BEST_CKPT_METRICS:
+        if is_gallery_enabled(args):
+            metric_ready = is_retrieval_active(args, epoch)
+        else:
+            metric_ready = should_compute_fusion_gallery_metrics(args, epoch)
+        if not metric_ready:
+            return False
+        if is_cls_branch_enabled(args) and hard_neg_full_activation_reachable(args):
+            ratio = compute_hard_neg_ratio(args, epoch) if hard_neg_ratio is None else float(hard_neg_ratio)
+            return ratio >= (1.0 - 1e-8)
+        if gallery_hard_neg_full_activation_reachable(args):
+            hard_weight = compute_gallery_hard_neg_weight(args, epoch)
+            full_weight = float(getattr(args, "gallery_hard_neg_weight", 0.5))
+            if full_weight > 0.0 and hard_weight < (full_weight - 1e-8):
+                return False
+        return True
+
+    if metric_name in G2O_BEST_CKPT_METRICS:
+        return True
+
+    return True
+
+
+def describe_best_ckpt_selection_pending(args, epoch, hard_neg_ratio=None):
+    metric_name = str(getattr(args, "best_ckpt_metric", "fusion_gallery_mrr"))
     ratio = compute_hard_neg_ratio(args, epoch) if hard_neg_ratio is None else float(hard_neg_ratio)
-    return ratio >= (1.0 - 1e-8) and is_retrieval_active(args, epoch)
+
+    if metric_name in CLS_BEST_CKPT_METRICS:
+        if not should_compute_cls_metrics(args):
+            return "waiting for classification metrics to be enabled."
+        if is_cls_branch_enabled(args) and not is_cls_active(epoch, args):
+            return "waiting for CLS ramp/start before tracking classification metric."
+        if hard_neg_full_activation_reachable(args) and ratio < (1.0 - 1e-8):
+            return f"waiting for full hard-negative ratio (current={ratio:.3f}, required=1.000)."
+        return "waiting for classification metric to become available."
+
+    if metric_name in FUSION_GALLERY_BEST_CKPT_METRICS:
+        if is_gallery_enabled(args) and not is_retrieval_active(args, epoch):
+            start = int(getattr(args, "retrieval_start_epoch", 0))
+            return f"waiting for fusion-gallery training start (epoch {start + 1})."
+        if (not is_gallery_enabled(args)) and not should_compute_fusion_gallery_metrics(args, epoch):
+            return "waiting for fusion-gallery metrics to be enabled."
+        if is_cls_branch_enabled(args) and hard_neg_full_activation_reachable(args) and ratio < (1.0 - 1e-8):
+            return f"waiting for full hard-negative ratio (current={ratio:.3f}, required=1.000)."
+        if gallery_hard_neg_full_activation_reachable(args):
+            hard_weight = compute_gallery_hard_neg_weight(args, epoch)
+            full_weight = float(getattr(args, "gallery_hard_neg_weight", 0.5))
+            if full_weight > 0.0 and hard_weight < (full_weight - 1e-8):
+                return f"waiting for retrieval hard-mining ramp (current={hard_weight:.3f}, required={full_weight:.3f})."
+        return "waiting for fusion-gallery metric to become available."
+
+    return "waiting for requested best-checkpoint metric to become available."
 
 
 def compute_weighted_cls_loss(pos_loss, hard_loss, neg_loss, has_negatives, args):
@@ -1058,6 +1146,89 @@ def compute_fusion_gallery_nce_loss(scores, positive_mask):
     neg_large = torch.finfo(scores_valid.dtype).min
     pos_scores = scores_valid.masked_fill(~pos_valid, neg_large)
     return (torch.logsumexp(scores_valid, dim=1) - torch.logsumexp(pos_scores, dim=1)).mean()
+
+
+def is_gallery_hard_neg_enabled(args):
+    """Return True when retrieval hard-negative mining is enabled."""
+    return bool(getattr(args, "gallery_hard_neg_enable", False))
+
+
+def compute_gallery_hard_neg_weight(args, epoch):
+    """Compute ramp-ed weight for the retrieval hard-negative auxiliary loss.
+
+    Returns 0.0 when the hard-mining start epoch (``retrieval_start_epoch +
+    gallery_hard_neg_start_after_retrieval_epochs``) has not been reached, then
+    ramps linearly to ``gallery_hard_neg_weight`` over
+    ``gallery_hard_neg_ramp_epochs``.
+    """
+    if not is_gallery_hard_neg_enabled(args):
+        return 0.0
+    if float(getattr(args, "gallery_loss_weight", 0.0)) <= 0.0:
+        return 0.0
+    retrieval_start = int(getattr(args, "retrieval_start_epoch", 0))
+    offset = int(getattr(args, "gallery_hard_neg_start_after_retrieval_epochs", 2))
+    hard_start = retrieval_start + offset
+    epoch = int(epoch)
+    if epoch < hard_start:
+        return 0.0
+    ramp = int(getattr(args, "gallery_hard_neg_ramp_epochs", 2))
+    if ramp <= 0:
+        return float(args.gallery_hard_neg_weight)
+    progress = min(1.0, (epoch - hard_start + 1) / float(ramp))
+    return float(args.gallery_hard_neg_weight) * progress
+
+
+def gallery_hard_neg_full_activation_reachable(args):
+    """Return True when retrieval hard-mining can reach full weight within training."""
+    if not is_gallery_hard_neg_enabled(args):
+        return False
+    if not is_gallery_enabled(args):
+        return False
+    full_epoch = (
+        int(getattr(args, "retrieval_start_epoch", 0))
+        + int(getattr(args, "gallery_hard_neg_start_after_retrieval_epochs", 2))
+        + max(0, int(getattr(args, "gallery_hard_neg_ramp_epochs", 2)))
+        - 1
+    )
+    return full_epoch < int(getattr(args, "epochs", 0))
+
+
+def compute_fusion_gallery_hard_nce_loss(scores, positive_mask, topk):
+    """Top-k hard-negative NCE loss for fusion mini-gallery retrieval.
+
+    For each query row the loss uses only the true positives and the *top-k*
+    highest-scoring negative candidates (hard negatives).  When *topk* reaches
+    or exceeds the number of available negatives the result is identical to the
+    full-gallery NCE.
+    """
+    if scores.ndim != 2 or positive_mask.shape != scores.shape:
+        raise ValueError(
+            "scores and positive_mask must have matching shape [n_query, n_candidate]."
+        )
+    positive_mask = positive_mask.to(device=scores.device, dtype=torch.bool)
+
+    valid_rows = positive_mask.any(dim=1) & (~positive_mask).any(dim=1)
+    if not valid_rows.any():
+        return scores.sum() * 0.0
+
+    scores_v = scores[valid_rows]
+    pos_v = positive_mask[valid_rows]
+    neg_large = torch.finfo(scores_v.dtype).min
+
+    keep = pos_v.clone()
+    neg_scores = scores_v.masked_fill(pos_v, neg_large)
+
+    for i in range(scores_v.size(0)):
+        n_neg_i = int((~pos_v[i]).sum().item())
+        if n_neg_i == 0:
+            continue
+        k = min(topk, n_neg_i)
+        _, idx = neg_scores[i].topk(k)
+        keep[i, idx] = True
+
+    reduced = scores_v.masked_fill(~keep, neg_large)
+    pos_only = scores_v.masked_fill(~pos_v, neg_large)
+    return (torch.logsumexp(reduced, dim=1) - torch.logsumexp(pos_only, dim=1)).mean()
 
 
 def compute_fusion_gallery_metrics(scores, positive_mask, ks=(1, 5)):
@@ -1330,11 +1501,15 @@ def evaluate(
     cls_active = cls_weight > 0.0
     itc_weight = compute_itc_weight(args, epoch)
     hard_neg_ratio = compute_hard_neg_ratio(args, epoch)
+    cls_metrics_enabled = should_compute_cls_metrics(args)
+    fusion_gallery_metrics_enabled = should_compute_fusion_gallery_metrics(args, epoch)
+    gallery_loss_active = is_retrieval_active(args, epoch)
 
     val_total = 0.0
     val_itc = 0.0
     val_cls = 0.0
     val_gallery = 0.0
+    val_gallery_hard = 0.0
     val_itc_acc = 0.0
     val_pos_acc = 0.0
     val_hard_acc = 0.0
@@ -1454,7 +1629,7 @@ def evaluate(
                         )
                     extra_neg_event_time_mjd = neg_zero_time_mjd_for_itc
                 if args.itc_loss_type == "supcon":
-                    itc_loss, sim_g2o = model.compute_supcon_loss(
+                    itc_loss, sim_g2o, sim_g2o_for_loss = model.compute_supcon_loss(
                         g, z_l, gw_indices, margin=args.supcon_margin,
                         gw_event_time_mjd=batch_event_time_mjd,
                         opt_event_time_mjd=resolve_optical_candidate_time_mjd(
@@ -1464,7 +1639,7 @@ def evaluate(
                         extra_neg_opt_event_time_mjd=extra_neg_event_time_mjd,
                     )
                 else:
-                    itc_loss, sim_g2o = model.compute_itc_loss(
+                    itc_loss, sim_g2o, sim_g2o_for_loss = model.compute_itc_loss(
                         g, z_l, gw_indices, mask=args.mask_itc,
                         gw_event_time_mjd=batch_event_time_mjd,
                         opt_event_time_mjd=resolve_optical_candidate_time_mjd(
@@ -1479,8 +1654,16 @@ def evaluate(
                 labels_pos = torch.ones(batch_size, device=device, dtype=torch.long)
                 labels_neg = torch.zeros(batch_size, device=device, dtype=torch.long)
                 gallery_loss = torch.zeros((), device=device)
+                gallery_hard_loss = torch.zeros((), device=device)
+                gallery_hard_weight = 0.0
+                cls_logits_available = False
+                cls_hard_logits_available = False
+                cls_extra_neg_logits_available = False
 
                 if cls_branch_enabled:
+                    cls_logits_available = True
+                    cls_hard_logits_available = True
+                    cls_extra_neg_logits_available = bool(has_negatives)
                     # Compute per-pair credible level for dual fusion
                     cred_level = compute_credible_level(gw_m, opt_coords) if need_cred_level else None
                     if _opt_first_detection_mjd is not None and batch_event_time_mjd is not None:
@@ -1603,6 +1786,8 @@ def evaluate(
                         pos_loss, hard_loss, neg_loss, has_negatives, args
                     )
                     gallery_loss = torch.zeros((), device=device)
+                    gallery_hard_loss = torch.zeros((), device=device)
+                    gallery_hard_weight = 0.0
                     total_loss = (
                         itc_weight * itc_loss
                         + cls_weight * cls_loss
@@ -1616,7 +1801,17 @@ def evaluate(
                     neg_loss = torch.zeros((), device=device) if has_negatives else None
                     cls_loss = torch.zeros((), device=device)
                     gallery_loss = torch.zeros((), device=device)
-                    if is_retrieval_active(args, epoch) and has_negatives:
+                    gallery_hard_loss = torch.zeros((), device=device)
+                    gallery_hard_weight = 0.0
+                    need_extra_optical_features = (
+                        has_negatives
+                        and (
+                            gallery_loss_active
+                            or fusion_gallery_metrics_enabled
+                            or cls_metrics_enabled
+                        )
+                    )
+                    if need_extra_optical_features:
                         z_l_neg, h_l_neg = model.encode_optical(
                             neg_coords, neg_t, neg_v, opt_ref_t, neg_mask, neg_err
                         )
@@ -1641,7 +1836,10 @@ def evaluate(
                     total_loss = itc_weight * itc_loss
 
                 # --- Shared gallery computation (independent of CLS branch) ---
-                if is_retrieval_active(args, epoch) and gallery_extra_h_l is not None:
+                compute_gallery_this_epoch = (
+                    gallery_loss_active or fusion_gallery_metrics_enabled
+                )
+                if compute_gallery_this_epoch and gallery_extra_h_l is not None:
                     h_candidates = [h_l]
                     z_candidates = [z_l]
                     coords_candidates = [opt_coords]
@@ -1701,38 +1899,116 @@ def evaluate(
                         chunk_size=args.gallery_score_chunk_size,
                     )
                     gallery_loss = compute_fusion_gallery_nce_loss(gallery_scores, gallery_positive_mask)
-                    fusion_gallery_metrics_accum.append(
-                        compute_fusion_gallery_metrics(gallery_scores.detach(), gallery_positive_mask, ks=(1, 5))
+                    if fusion_gallery_metrics_enabled:
+                        fusion_gallery_metrics_accum.append(
+                            compute_fusion_gallery_metrics(gallery_scores.detach(), gallery_positive_mask, ks=(1, 5))
+                        )
+                    if gallery_loss_active:
+                        total_loss = total_loss + float(args.gallery_loss_weight) * gallery_loss
+                    gallery_hard_weight = compute_gallery_hard_neg_weight(args, epoch)
+                    if gallery_hard_weight > 0.0:
+                        gallery_hard_loss = compute_fusion_gallery_hard_nce_loss(
+                            gallery_scores, gallery_positive_mask,
+                            topk=int(args.gallery_hard_neg_topk),
+                        )
+                        total_loss = total_loss + (
+                            float(args.gallery_loss_weight)
+                            * gallery_hard_weight
+                            * gallery_hard_loss
+                        )
+
+                if cls_metrics_enabled and not cls_branch_enabled:
+                    cred_level = compute_credible_level(gw_m, opt_coords) if need_cred_level else None
+                    if _opt_first_detection_mjd is not None and batch_event_time_mjd is not None:
+                        dt_pos = compute_time_delta_days(_opt_first_detection_mjd, batch_event_time_mjd)
+                    else:
+                        dt_pos = torch.zeros((batch_size,), device=device, dtype=torch.float32)
+                    logits_pos = model.fusion_logits(
+                        g, h_l, z_l=z_l, H_gw=H_gw, cred_level=cred_level,
+                        gw_s=gw_s, gw_m=gw_m, opt_coords=opt_coords,
+                        dt_days=dt_pos,
                     )
-                    total_loss = total_loss + float(args.gallery_loss_weight) * gallery_loss
+                    cls_logits_available = True
+
+                    metric_neg_idx = sample_easy_negatives(batch_size, device)
+                    if metric_neg_idx is not None:
+                        h_l_metric_hard = h_l[metric_neg_idx].clone()
+                        z_l_metric_hard = z_l[metric_neg_idx].clone()
+                        coords_metric_hard = opt_coords[metric_neg_idx].clone()
+                        if batch_event_time_mjd is not None:
+                            dt_metric_hard = compute_time_delta_days(
+                                gather_candidate_optical_time_mjd(
+                                    _opt_first_detection_mjd, batch_event_time_mjd, metric_neg_idx
+                                ),
+                                batch_event_time_mjd,
+                            )
+                        else:
+                            dt_metric_hard = torch.zeros((batch_size,), device=device, dtype=torch.float32)
+                        cred_level_hard = compute_credible_level(gw_m, coords_metric_hard) if need_cred_level else None
+                        logits_hard = model.fusion_logits(
+                            g, h_l_metric_hard, z_l=z_l_metric_hard, H_gw=H_gw, cred_level=cred_level_hard,
+                            gw_s=gw_s, gw_m=gw_m, opt_coords=coords_metric_hard,
+                            dt_days=dt_metric_hard,
+                        )
+                        cls_hard_logits_available = True
+
+                    if has_negatives and gallery_extra_h_l is not None and gallery_extra_z_l is not None:
+                        cred_level_neg = compute_credible_level(gw_m, neg_coords) if need_cred_level else None
+                        dt_neg_metric = (
+                            compute_time_delta_days(gallery_extra_event_time, batch_event_time_mjd)
+                            if (gallery_extra_event_time is not None and batch_event_time_mjd is not None)
+                            else torch.zeros((batch_size,), device=device, dtype=torch.float32)
+                        )
+                        logits_neg = model.fusion_logits(
+                            g, gallery_extra_h_l, z_l=gallery_extra_z_l, H_gw=H_gw, cred_level=cred_level_neg,
+                            gw_s=gw_s, gw_m=gw_m, opt_coords=gallery_extra_coords,
+                            dt_days=dt_neg_metric,
+                        )
+                        cls_extra_neg_logits_available = True
 
             val_total += total_loss.item()
             val_itc += itc_loss.item()
             val_cls += cls_loss.item()
             val_gallery += gallery_loss.item()
+            val_gallery_hard += gallery_hard_loss.item()
 
-            # --- Per-batch retrieval metrics ---
+            # --- Per-batch retrieval metrics (unified gallery incl. external negs) ---
             sim_g2o_d = sim_g2o.detach()
-            batch_ret = compute_retrieval_metrics(
-                sim_g2o_d, gw_indices, ks=(1, 5, 10)
-            )
+            sim_ext = sim_g2o_for_loss.detach()
+            if sim_ext.size(1) > sim_g2o_d.size(1):
+                ext_count = int(sim_ext.size(1) - sim_g2o_d.size(1))
+                ext_gw_indices = torch.full(
+                    (ext_count,), -1,
+                    device=gw_indices.device, dtype=gw_indices.dtype,
+                )
+                batch_ret_gw = torch.cat([gw_indices, ext_gw_indices], dim=0)
+                batch_ret = compute_retrieval_metrics(
+                    sim_ext, batch_ret_gw, ks=(1, 5, 10)
+                )
+            else:
+                batch_ret = compute_retrieval_metrics(
+                    sim_ext, gw_indices, ks=(1, 5, 10)
+                )
             retrieval_metrics_accum.append(batch_ret)
 
-            # --- ITC accuracy ---
+            # --- ITC accuracy (in-batch only) ---
             itc_preds = sim_g2o_d.argmax(dim=1)
             anchor_gw = gw_indices
             pred_gw = gw_indices[itc_preds]
             itc_acc = (anchor_gw == pred_gw).float().mean().item()
 
-            if cls_branch_enabled:
+            if cls_logits_available:
                 pos_acc = (logits_pos.argmax(dim=1) == labels_pos).float().mean().item()
-                hard_acc = (logits_hard.argmax(dim=1) == labels_neg).float().mean().item()
+                acc_parts = [pos_acc]
+                hard_acc = 0.0
+                if cls_hard_logits_available:
+                    hard_acc = (logits_hard.argmax(dim=1) == labels_neg).float().mean().item()
+                    acc_parts.append(hard_acc)
                 neg_acc = 0.0
-                if has_negatives:
+                if has_negatives and cls_extra_neg_logits_available:
                     neg_acc = (logits_neg.argmax(dim=1) == labels_neg).float().mean().item()
-                    total_acc = (pos_acc + hard_acc + neg_acc) / 3.0
-                else:
-                    total_acc = (pos_acc + hard_acc) / 2.0
+                    acc_parts.append(neg_acc)
+                total_acc = sum(acc_parts) / float(max(1, len(acc_parts)))
             else:
                 pos_acc = 0.0
                 hard_acc = 0.0
@@ -1747,18 +2023,19 @@ def evaluate(
             val_batches += 1
 
             # --- Accumulate for global classification + embedding metrics ---
-            if cls_branch_enabled:
+            if cls_metrics_enabled and cls_logits_available:
                 pos_probs = torch.softmax(logits_pos.detach().float(), dim=1)[:, 1]
                 all_cls_probs.append(pos_probs.cpu())
                 all_cls_labels.append(labels_pos.cpu())
                 all_cls_sources.extend(['pos'] * batch_size)
 
-                hard_probs = torch.softmax(logits_hard.detach().float(), dim=1)[:, 1]
-                all_cls_probs.append(hard_probs.cpu())
-                all_cls_labels.append(labels_neg[:batch_size].cpu())
-                all_cls_sources.extend(['hard'] * batch_size)
+                if cls_hard_logits_available:
+                    hard_probs = torch.softmax(logits_hard.detach().float(), dim=1)[:, 1]
+                    all_cls_probs.append(hard_probs.cpu())
+                    all_cls_labels.append(labels_neg[:batch_size].cpu())
+                    all_cls_sources.extend(['hard'] * batch_size)
 
-                if has_negatives:
+                if has_negatives and cls_extra_neg_logits_available:
                     neg_probs_val = torch.softmax(logits_neg.detach().float(), dim=1)[:, 1]
                     all_cls_probs.append(neg_probs_val.cpu())
                     all_cls_labels.append(labels_neg[:batch_size].cpu())
@@ -1810,6 +2087,7 @@ def evaluate(
         "itc": val_itc / val_batches,
         "cls": val_cls / val_batches,
         "gallery": val_gallery / val_batches,
+        "gallery_hard": val_gallery_hard / val_batches,
         "itc_acc": val_itc_acc / val_batches,
         "pos_acc": val_pos_acc / val_batches,
         "hard_acc": val_hard_acc / val_batches,
@@ -1856,6 +2134,14 @@ def train(args):
         raise ValueError("hardneg_memory_interval must be >= 1.")
     if args.hardneg_memory_max_rows < 1:
         raise ValueError("hardneg_memory_max_rows must be >= 1.")
+    if args.gallery_hard_neg_topk < 1:
+        raise ValueError("gallery_hard_neg_topk must be >= 1.")
+    if args.gallery_hard_neg_weight < 0:
+        raise ValueError("gallery_hard_neg_weight must be >= 0.")
+    if args.gallery_hard_neg_start_after_retrieval_epochs < 0:
+        raise ValueError("gallery_hard_neg_start_after_retrieval_epochs must be >= 0.")
+    if args.gallery_hard_neg_ramp_epochs < 0:
+        raise ValueError("gallery_hard_neg_ramp_epochs must be >= 0.")
     if args.gallery_loss_weight < 0:
         raise ValueError("gallery_loss_weight must be >= 0.")
     if args.gallery_score_chunk_size < 1:
@@ -1903,7 +2189,7 @@ def train(args):
     print(f"CLS/gallery absolute-time metadata requested: {int(need_zero_time_mjd_for_cls)}")
 
     timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-    log_dir = os.path.join(os.path.dirname(args.ckpt_path), "tb_logs", f"run_albef_{timestamp}")
+    log_dir = os.path.join(os.path.dirname(args.ckpt_path), "tb_logs", f"run_albef_{timestamp}_pid{os.getpid()}")
     writer = SummaryWriter(log_dir=log_dir)
     print(f"TensorBoard logging started at: {log_dir}")
     extra_neg_timeaware_enable = bool(args.neg_data_path is not None)
@@ -2377,7 +2663,7 @@ def train(args):
                         )
                     extra_neg_event_time_mjd = neg_zero_time_mjd_for_itc
                 if args.itc_loss_type == "supcon":
-                    itc_loss, sim_g2o = model.compute_supcon_loss(
+                    itc_loss, sim_g2o, sim_g2o_for_loss = model.compute_supcon_loss(
                         g, z_l, gw_indices, margin=args.supcon_margin,
                         gw_event_time_mjd=batch_event_time_mjd,
                         opt_event_time_mjd=resolve_optical_candidate_time_mjd(
@@ -2387,7 +2673,7 @@ def train(args):
                         extra_neg_opt_event_time_mjd=extra_neg_event_time_mjd,
                     )
                 else:
-                    itc_loss, sim_g2o = model.compute_itc_loss(
+                    itc_loss, sim_g2o, sim_g2o_for_loss = model.compute_itc_loss(
                         g, z_l, gw_indices, mask=args.mask_itc,
                         gw_event_time_mjd=batch_event_time_mjd,
                         opt_event_time_mjd=resolve_optical_candidate_time_mjd(
@@ -2401,6 +2687,8 @@ def train(args):
                 labels_pos = torch.ones(batch_size, device=device, dtype=torch.long)
                 labels_neg = torch.zeros(batch_size, device=device, dtype=torch.long)
                 gallery_loss = torch.zeros((), device=device)
+                gallery_hard_loss = torch.zeros((), device=device)
+                gallery_hard_weight = 0.0
 
                 if cls_branch_enabled:
                     # Compute per-pair credible level for dual fusion
@@ -2633,6 +2921,8 @@ def train(args):
                     )
 
                     gallery_loss = torch.zeros((), device=device)
+                    gallery_hard_loss = torch.zeros((), device=device)
+                    gallery_hard_weight = 0.0
                     total_loss = (
                         itc_weight * itc_loss
                         + cls_weight * cls_loss
@@ -2646,6 +2936,8 @@ def train(args):
                     neg_loss = torch.zeros((), device=device) if has_negatives else None
                     cls_loss = torch.zeros((), device=device)
                     gallery_loss = torch.zeros((), device=device)
+                    gallery_hard_loss = torch.zeros((), device=device)
+                    gallery_hard_weight = 0.0
                     dt_hard = None
                     if is_retrieval_active(args, epoch) and has_negatives:
                         z_l_neg, h_l_neg = model.encode_optical(
@@ -2751,6 +3043,17 @@ def train(args):
                     )
                     gallery_loss = compute_fusion_gallery_nce_loss(gallery_scores, gallery_pos_mask)
                     total_loss = total_loss + float(args.gallery_loss_weight) * gallery_loss
+                    gallery_hard_weight = compute_gallery_hard_neg_weight(args, epoch)
+                    if gallery_hard_weight > 0.0:
+                        gallery_hard_loss = compute_fusion_gallery_hard_nce_loss(
+                            gallery_scores, gallery_pos_mask,
+                            topk=int(args.gallery_hard_neg_topk),
+                        )
+                        total_loss = total_loss + (
+                            float(args.gallery_loss_weight)
+                            * gallery_hard_weight
+                            * gallery_hard_loss
+                        )
 
             scaler.scale(total_loss).backward()
             if args.grad_clip_norm > 0:
@@ -2770,6 +3073,7 @@ def train(args):
                 neg_loss_val = neg_loss.item()
             cls_val = cls_loss.item()
             gallery_loss_val = gallery_loss.item()
+            gallery_hard_loss_val = gallery_hard_loss.item()
             epoch_total += total_val
             epoch_itc += itc_val
             epoch_cls += cls_val
@@ -2819,6 +3123,8 @@ def train(args):
                 writer.add_scalar('Train/Batch_ITC_Loss', itc_val, global_step)
                 writer.add_scalar('Train/Batch_CLS_Loss', cls_val, global_step)
                 writer.add_scalar('Train/Batch_Gallery_Loss', gallery_loss_val, global_step)
+                writer.add_scalar('Train/Batch_GalleryHard_Loss', gallery_hard_loss_val, global_step)
+                writer.add_scalar('Train/Batch_GalleryHard_Weight', gallery_hard_weight, global_step)
                 writer.add_scalar('Train/Batch_Pos_Loss', pos_loss_val, global_step)
                 writer.add_scalar('Train/Batch_HardNeg_Loss', hard_loss_val, global_step)
                 if has_negatives:
@@ -2887,13 +3193,15 @@ def train(args):
                     postfix['hard_dt'] = f"{dt_hard_mean:.2f}"
                 if args.gallery_loss_weight > 0:
                     postfix['Gallery'] = f"{gallery_loss_val:.4f}"
+                    if gallery_hard_weight > 0:
+                        postfix['GalleryHard'] = f"{gallery_hard_loss_val:.4f}"
                 if last_selection_score is not None:
                     postfix[f"{args.best_ckpt_metric}"] = f"{last_selection_score:.4f}"
                 pbar.set_postfix(postfix)
 
             # Memory cleanup: delete large tensors to free memory
             del g, z_l, h_l, sim_g2o, sim_g2o_detached, itc_loss, total_loss
-            del logits_pos, logits_hard, pos_loss, hard_loss, cls_loss, gallery_loss
+            del logits_pos, logits_hard, pos_loss, hard_loss, cls_loss, gallery_loss, gallery_hard_loss
             if has_negatives:
                 del logits_neg, neg_loss
             
@@ -2949,6 +3257,7 @@ def train(args):
                 writer.add_scalar('Val/Epoch_ITC_Loss', val_metrics['itc'], epoch)
                 writer.add_scalar('Val/Epoch_CLS_Loss', val_metrics['cls'], epoch)
                 writer.add_scalar('Val/Epoch_Gallery_Loss', val_metrics.get('gallery', 0.0), epoch)
+                writer.add_scalar('Val/Epoch_GalleryHard_Loss', val_metrics.get('gallery_hard', 0.0), epoch)
                 # Retrieval metrics
                 ret = val_metrics.get('retrieval', {})
                 for k, v in ret.items():
@@ -3003,8 +3312,8 @@ def train(args):
 
                 if not best_selection_eligible:
                     print(
-                        "  Best-CKPT selection pending: waiting for full hard-negative ratio "
-                        f"(current={hard_neg_ratio:.3f}, required=1.000)."
+                        "  Best-CKPT selection pending: "
+                        f"{describe_best_ckpt_selection_pending(args, epoch, hard_neg_ratio)}"
                     )
                 else:
                     prev_best = best_val_score
@@ -3288,6 +3597,12 @@ if __name__ == "__main__":
                         help="Epoch to start retrieval/gallery training (0 = start from epoch 0).")
     parser.add_argument("--gallery_loss_weight", type=float, default=0.0,
                         help="Weight for batch-level fusion mini-gallery retrieval loss (0 to disable).")
+    parser.add_argument("--compute_cls_metrics", action=argparse.BooleanOptionalAction, default=True,
+                        help="Compute validation pair/triplet classification metrics even when CLS loss is disabled.")
+    parser.add_argument("--compute_fusion_gallery_metrics", action=argparse.BooleanOptionalAction, default=True,
+                        help="Compute validation fusion-gallery retrieval metrics even when gallery loss is disabled.")
+    parser.add_argument("--fusion_gallery_metrics_start_epoch", type=int, default=0,
+                        help="Epoch to start validation-only fusion-gallery metrics.")
     parser.add_argument("--gallery_score_chunk_size", type=int, default=8192,
                         help="Approximate number of flattened query-candidate pairs scored per gallery chunk.")
     parser.add_argument("--max_gallery_queries", type=int, default=0,
@@ -3299,6 +3614,16 @@ if __name__ == "__main__":
                         help="Time-delta policy for non-matching fusion mini-gallery distractors.")
     parser.add_argument("--gallery_distractor_time_window_days", type=float, default=30.0,
                         help="Upper bound in days for synthetic_after_gw gallery distractor dt sampling.")
+    parser.add_argument("--gallery_hard_neg_enable", action=argparse.BooleanOptionalAction, default=False,
+                        help="Enable top-k hard-negative mining inside the fusion mini-gallery retrieval loss.")
+    parser.add_argument("--gallery_hard_neg_topk", type=int, default=32,
+                        help="Number of top-scoring negative candidates to keep per query in the hard gallery NCE term.")
+    parser.add_argument("--gallery_hard_neg_weight", type=float, default=0.5,
+                        help="Weight of the hard-gallery NCE auxiliary loss term.")
+    parser.add_argument("--gallery_hard_neg_start_after_retrieval_epochs", type=int, default=2,
+                        help="Epochs after retrieval_start_epoch to begin gallery hard-negative mining.")
+    parser.add_argument("--gallery_hard_neg_ramp_epochs", type=int, default=2,
+                        help="Epochs to ramp gallery hard-negative weight from 0 to gallery_hard_neg_weight.")
     parser.add_argument("--itc_decay_start_epoch", type=int, default=0,
                         help="Epoch to start decaying ITC weight (ignored if itc_decay_epochs <= 0)")
     parser.add_argument("--itc_decay_epochs", type=int, default=0,
