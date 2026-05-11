@@ -16,7 +16,7 @@ set -euo pipefail
 SCRIPT_SUBDIR="Model"
 SCRIPT_REL_PATH="Model/ALBEF_train.sh"
 REPO_NAME="gw-kn-multimodal"
-DEFAULT_CONFIG_REL_PATH="Model/args/defaults/ALBEF_BNS_NSBH_v9_default.json"
+DEFAULT_CONFIG_REL_PATH="Model/args/defaults/ALBEF_BNS_NSBH_v10_default.json"
 if [[ -n "${SLURM_JOB_ID:-}" && -n "${SLURM_SUBMIT_DIR:-}" ]]; then
     if [[ "$(basename "${SLURM_SUBMIT_DIR}")" == "${REPO_NAME}" ]]; then
         REPO_ROOT="${SLURM_SUBMIT_DIR}"

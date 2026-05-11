@@ -2535,6 +2535,7 @@ def train(args):
         )
         
         for batch_idx, batch_data in enumerate(pbar):
+            _opt_zero_time_mjd_base = None
             _neg_zero_time_mjd_base = None
             _neg_zero_time_mjd_cls_base = None
             _opt_first_detection_mjd = None
