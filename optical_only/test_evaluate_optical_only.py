@@ -147,6 +147,18 @@ def choose_value(cli_value, config_dict, ckpt_args, key, default=None):
     return default
 
 
+def parse_float_sequence(value, *, expected_len: int, name: str):
+    if isinstance(value, str):
+        vals = [float(part.strip()) for part in value.split(",") if part.strip()]
+    else:
+        vals = [float(part) for part in value]
+    if len(vals) != int(expected_len):
+        raise ValueError(f"{name} must contain exactly {expected_len} values.")
+    if np.any(~np.isfinite(np.asarray(vals, dtype=np.float64))):
+        raise ValueError(f"{name} must contain finite values.")
+    return tuple(vals)
+
+
 def _jsonify_metadata_value(value):
     if isinstance(value, np.generic):
         return value.item()
@@ -369,17 +381,43 @@ def load_model(checkpoint_path, device, config_dict):
         optical_input_dim=6,
         ref_time_dim=_get("ref_dim", 64),
         enc_dim=_get("enc_dim", 64),
+        optical_curve_dim=_get("optical_curve_dim", None),
+        optical_curve_hidden_dim=_get("optical_curve_hidden_dim", None),
+        num_heads=_get("num_heads", 4),
+        k_dim=_get("k_dim", 64),
         opt_dropout=_get("opt_dropout", 0.1),
         feature_dropout=_get("feature_dropout", 0.0),
         head_hidden_dim=_get("head_hidden_dim", None),
         head_dropout=_get("head_dropout", 0.2),
         universal_aux_enable=bool(has_universal_aux),
         proj_dim=64,
-        adv_hidden_dim=(_get("head_hidden_dim", None) if _get("head_hidden_dim", None) is not None else _get("enc_dim", 64)),
+        adv_hidden_dim=(
+            _get("head_hidden_dim", None)
+            if _get("head_hidden_dim", None) is not None
+            else (_get("optical_curve_dim", None) if _get("optical_curve_dim", None) is not None else _get("enc_dim", 64))
+        ),
         n_det_bucket_classes=5,
         n_bands_bucket_classes=4,
         t_span_bucket_classes=5,
         grl_lambda=float(_get("grl_lambda", 1.0)),
+        mtan_snr_s0=float(_get("mtan_snr_s0", 3.0)),
+        mtan_snr_beta=float(_get("mtan_snr_beta", 1.0)),
+        mtan_snr_clip_min=float(_get("mtan_snr_clip_min", -8.0)),
+        mtan_snr_clip_max=float(_get("mtan_snr_clip_max", 20.0)),
+        mtan_snr_eps=float(_get("mtan_snr_eps", 1e-9)),
+        mtan_lupt_psfflux_zp=float(_get("mtan_lupt_psfflux_zp", 31.4)),
+        mtan_lupt_k=float(_get("mtan_lupt_k", 1.0)),
+        mtan_lupt_m5_mag=parse_float_sequence(
+            _get("mtan_lupt_m5_mag", (23.9, 25.0, 24.7, 24.0, 23.3, 22.1)),
+            expected_len=6,
+            name="mtan_lupt_m5_mag",
+        ),
+        mtan_period_range_days=parse_float_sequence(
+            _get("mtan_period_range_days", (0.5, 100.0)),
+            expected_len=2,
+            name="mtan_period_range_days",
+        ),
+        mtan_time_scale_divisor=float(_get("mtan_time_scale_divisor", 100.0)),
     )
     state_dict = cleaned_state_dict
     model_state = model.state_dict()

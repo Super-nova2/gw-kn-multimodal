@@ -179,6 +179,18 @@ def _parse_gallery_sizes(value: Any) -> List[int]:
     return out or [100, 500]
 
 
+def _parse_float_sequence(value: Any, *, expected_len: int, name: str) -> Tuple[float, ...]:
+    if isinstance(value, str):
+        vals = [float(part.strip()) for part in value.split(",") if part.strip()]
+    else:
+        vals = [float(part) for part in value]
+    if len(vals) != int(expected_len):
+        raise ValueError(f"{name} must contain exactly {expected_len} values.")
+    if np.any(~np.isfinite(np.asarray(vals, dtype=np.float64))):
+        raise ValueError(f"{name} must contain finite values.")
+    return tuple(vals)
+
+
 def _parse_n_neg_samples(value: Any, default: int = -1) -> int:
     if value is None:
         return int(default)
@@ -744,8 +756,10 @@ def load_optical_model(checkpoint_path: str, device: torch.device) -> Tuple[Opti
 
     model = OpticalKNClassifier(
         optical_input_dim=int(ckpt_args.get("optical_input_dim", 6)),
-        ref_time_dim=int(ckpt_args.get("n_ref", 64)),
+        ref_time_dim=int(ckpt_args.get("ref_dim", ckpt_args.get("n_ref", 64))),
         enc_dim=int(ckpt_args.get("enc_dim", 128)),
+        optical_curve_dim=ckpt_args.get("optical_curve_dim"),
+        optical_curve_hidden_dim=ckpt_args.get("optical_curve_hidden_dim"),
         num_heads=int(ckpt_args.get("num_heads", 4)),
         k_dim=int(ckpt_args.get("k_dim", 64)),
         opt_dropout=0.0,
@@ -755,7 +769,23 @@ def load_optical_model(checkpoint_path: str, device: torch.device) -> Tuple[Opti
         universal_aux_enable=bool(ckpt_args.get("universal_aux_enable", False)),
         proj_dim=int(ckpt_args.get("proj_dim", 64)),
         grl_lambda=float(ckpt_args.get("grl_lambda", 1.0)),
-        mtan_period_range_days=tuple(ckpt_args.get("mtan_period_range_days", (0.5, 100.0))),
+        mtan_snr_s0=float(ckpt_args.get("mtan_snr_s0", 3.0)),
+        mtan_snr_beta=float(ckpt_args.get("mtan_snr_beta", 1.0)),
+        mtan_snr_clip_min=float(ckpt_args.get("mtan_snr_clip_min", -8.0)),
+        mtan_snr_clip_max=float(ckpt_args.get("mtan_snr_clip_max", 20.0)),
+        mtan_snr_eps=float(ckpt_args.get("mtan_snr_eps", 1e-9)),
+        mtan_lupt_psfflux_zp=float(ckpt_args.get("mtan_lupt_psfflux_zp", 31.4)),
+        mtan_lupt_k=float(ckpt_args.get("mtan_lupt_k", 1.0)),
+        mtan_lupt_m5_mag=_parse_float_sequence(
+            ckpt_args.get("mtan_lupt_m5_mag", (23.9, 25.0, 24.7, 24.0, 23.3, 22.1)),
+            expected_len=6,
+            name="mtan_lupt_m5_mag",
+        ),
+        mtan_period_range_days=_parse_float_sequence(
+            ckpt_args.get("mtan_period_range_days", (0.5, 100.0)),
+            expected_len=2,
+            name="mtan_period_range_days",
+        ),
         mtan_time_scale_divisor=float(ckpt_args.get("mtan_time_scale_divisor", 100.0)),
     )
 

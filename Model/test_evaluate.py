@@ -528,6 +528,10 @@ def load_model(args, device):
     model_args = {
         "enc_dim": _get("enc_dim", 128),
         "proj_dim": _get("proj_dim", 256),
+        "optical_curve_dim": _get("optical_curve_dim", None),
+        "optical_coord_dim": _get("optical_coord_dim", None),
+        "optical_curve_hidden_dim": _get("optical_curve_hidden_dim", None),
+        "contrastive_hidden_dim": _get("contrastive_hidden_dim", None),
         "n_ref": _get("n_ref", 64),
         "ref_start": _get("ref_start", -0.3),
         "ref_end": _get("ref_end", 0.6),
@@ -577,6 +581,10 @@ def load_model(args, device):
     model = GWOpticalALBEFModel(
         enc_dim=model_args["enc_dim"],
         proj_dim=model_args["proj_dim"],
+        optical_curve_dim=model_args["optical_curve_dim"],
+        optical_coord_dim=model_args["optical_coord_dim"],
+        optical_curve_hidden_dim=model_args["optical_curve_hidden_dim"],
+        contrastive_hidden_dim=model_args["contrastive_hidden_dim"],
         ref_time_dim=model_args["ref_dim"],
         use_lightweight_gw=model_args["use_lightweight_gw"],
         gw_dropout=model_args["gw_dropout"],

@@ -1538,6 +1538,7 @@ def evaluate(
 
     with torch.no_grad():
         for batch_data in val_loader:
+            _opt_zero_time_mjd_base = None
             _neg_zero_time_mjd_base = None
             _neg_zero_time_mjd_cls_base = None
             _opt_first_detection_mjd = None
@@ -2306,6 +2307,10 @@ def train(args):
         ref_time_dim=args.ref_dim,
         enc_dim=args.enc_dim,
         proj_dim=args.proj_dim,
+        optical_curve_dim=args.optical_curve_dim,
+        optical_coord_dim=args.optical_coord_dim,
+        optical_curve_hidden_dim=args.optical_curve_hidden_dim,
+        contrastive_hidden_dim=args.contrastive_hidden_dim,
         fusion_attn_dim=args.fusion_attn_dim,
         fusion_hidden_dim=args.fusion_hidden_dim,
         temp_init=args.temp_init,
@@ -3533,6 +3538,14 @@ if __name__ == "__main__":
     parser.add_argument("--ref_dim", type=int, default=64)
     parser.add_argument("--enc_dim", type=int, default=128)
     parser.add_argument("--proj_dim", type=int, default=256)
+    parser.add_argument("--optical_curve_dim", type=int, default=None,
+                        help="Physical-dual optical curve feature dimension (default: enc_dim).")
+    parser.add_argument("--optical_coord_dim", type=int, default=None,
+                        help="Physical-dual optical coordinate feature dimension (default: enc_dim).")
+    parser.add_argument("--optical_curve_hidden_dim", type=int, default=None,
+                        help="Hidden size for residual optical curve refiner; <=0 disables it.")
+    parser.add_argument("--contrastive_hidden_dim", type=int, default=None,
+                        help="Hidden size for physical-dual contrastive heads (default: max(input_dim, proj_dim)).")
     parser.add_argument("--fusion_attn_dim", type=int, default=None)
     parser.add_argument("--fusion_hidden_dim", type=int, default=None)
     parser.add_argument("--fusion_dropout", type=float, default=0.1)

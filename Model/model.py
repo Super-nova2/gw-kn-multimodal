@@ -571,8 +571,10 @@ class OpticalEncoderWithCLSNoCoord(nn.Module):
         mtan_lupt_m5_mag=(23.9, 25.0, 24.7, 24.0, 23.3, 22.1),
         mtan_period_range_days=(0.5, 100.0),
         mtan_time_scale_divisor: float = 100.0,
+        refine_hidden_dim=None,
     ):
         super().__init__()
+        self.output_dim = int(output_dim)
         self.time_embedding = LearnablePeriodicEmbedding(
             num_heads, ref_dim,
             period_range_days=mtan_period_range_days,
@@ -596,6 +598,16 @@ class OpticalEncoderWithCLSNoCoord(nn.Module):
             lupt_m5_mag=mtan_lupt_m5_mag,
         )
         self.output_dropout = nn.Dropout(dropout)
+        hidden = 0 if refine_hidden_dim is None else int(refine_hidden_dim)
+        self.curve_refiner = None
+        if hidden > 0:
+            self.curve_refiner = nn.Sequential(
+                nn.LayerNorm(self.output_dim),
+                nn.Linear(self.output_dim, hidden),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden, self.output_dim),
+            )
 
     def forward(self, t_obs, values_obs, t_ref, mask=None, errors_obs=None, return_attn: bool = False):
         batch_size = t_obs.size(0)
@@ -609,6 +621,8 @@ class OpticalEncoderWithCLSNoCoord(nn.Module):
         if return_attn:
             full_output, attn_weights = full_output
         full_output = self.output_dropout(full_output)
+        if self.curve_refiner is not None:
+            full_output = full_output + self.curve_refiner(full_output)
 
         z_l = full_output[:, 0, :]
         h_l = full_output[:, 1:, :]
@@ -1063,10 +1077,14 @@ class PhysicalDualOpticalEncoder(nn.Module):
         input_dim=6,
         ref_time_dim=64,
         enc_dim=128,
+        optical_curve_dim=None,
+        optical_coord_dim=None,
         num_heads=4,
         k_dim=64,
+        optical_curve_hidden_dim=None,
         curve_dropout=0.0,
         proj_dim=256,
+        contrastive_hidden_dim=None,
         proj_dropout=0.0,
         mtan_snr_s0: float = 3.0,
         mtan_snr_beta: float = 1.0,
@@ -1080,13 +1098,18 @@ class PhysicalDualOpticalEncoder(nn.Module):
         mtan_time_scale_divisor: float = 100.0,
     ):
         super().__init__()
+        curve_dim = enc_dim if optical_curve_dim is None else int(optical_curve_dim)
+        coord_dim = enc_dim if optical_coord_dim is None else int(optical_coord_dim)
+        self.curve_dim = int(curve_dim)
+        self.coord_dim = int(coord_dim)
         self.curve_encoder = OpticalLightCurveEncoder(
             input_dim=input_dim,
             num_heads=num_heads,
             ref_dim=ref_time_dim,
             k_dim=k_dim,
-            output_dim=enc_dim,
+            output_dim=self.curve_dim,
             dropout=curve_dropout,
+            refine_hidden_dim=optical_curve_hidden_dim,
             mtan_snr_s0=mtan_snr_s0,
             mtan_snr_beta=mtan_snr_beta,
             mtan_snr_clip_min=mtan_snr_clip_min,
@@ -1098,12 +1121,12 @@ class PhysicalDualOpticalEncoder(nn.Module):
             mtan_period_range_days=mtan_period_range_days,
             mtan_time_scale_divisor=mtan_time_scale_divisor,
         )
-        self.coord_encoder = OpticalCoordEncoder(output_dim=enc_dim)
+        self.coord_encoder = OpticalCoordEncoder(output_dim=self.coord_dim)
         self.contrastive_head = OptContrastiveFuseProj(
-            curve_dim=enc_dim,
-            coord_dim=enc_dim,
+            curve_dim=self.curve_dim,
+            coord_dim=self.coord_dim,
             proj_dim=proj_dim,
-            hidden_dim=max(enc_dim * 2, proj_dim),
+            hidden_dim=contrastive_hidden_dim,
             dropout=proj_dropout,
         )
 
@@ -1143,6 +1166,7 @@ class PhysicalDualGWEncoder(nn.Module):
         gw_dropout=0.1,
         proj_dropout=0.0,
         use_lightweight=False,
+        contrastive_hidden_dim=None,
     ):
         super().__init__()
         scalar_hidden = 128 if use_lightweight else 256
@@ -1162,7 +1186,7 @@ class PhysicalDualGWEncoder(nn.Module):
             scalar_dim=enc_dim,
             sky_dim=enc_dim,
             proj_dim=proj_dim,
-            hidden_dim=max(enc_dim * 2, proj_dim),
+            hidden_dim=contrastive_hidden_dim,
             dropout=proj_dropout,
         )
 
@@ -1555,6 +1579,10 @@ class GWOpticalALBEFModel(nn.Module):
         ref_time_dim=64,
         enc_dim=128,
         proj_dim=256,
+        optical_curve_dim=None,
+        optical_coord_dim=None,
+        optical_curve_hidden_dim=None,
+        contrastive_hidden_dim=None,
         fusion_attn_dim=None,
         fusion_hidden_dim=None,
         temp_init=0.07,
@@ -1597,6 +1625,10 @@ class GWOpticalALBEFModel(nn.Module):
         self.dual_fusion = self.fusion_mode != "legacy_g2o"
         self.use_cred_level_feature = bool(use_cred_level_feature)
         self.use_similarity_as_cls_input = bool(use_similarity_as_cls_input)
+        self.optical_curve_dim = enc_dim if optical_curve_dim is None else int(optical_curve_dim)
+        self.optical_coord_dim = enc_dim if optical_coord_dim is None else int(optical_coord_dim)
+        self.optical_curve_hidden_dim = optical_curve_hidden_dim
+        self.contrastive_hidden_dim = contrastive_hidden_dim
 
         if self.fusion_mode in {"physical_dual_hgw", "concat_proj"}:
             self.gw_encoder = PhysicalDualGWEncoder(
@@ -1607,15 +1639,20 @@ class GWOpticalALBEFModel(nn.Module):
                 gw_dropout=gw_dropout,
                 proj_dropout=proj_dropout,
                 use_lightweight=use_lightweight_gw,
+                contrastive_hidden_dim=contrastive_hidden_dim,
             )
             self.optical_encoder = PhysicalDualOpticalEncoder(
                 input_dim=optical_input_dim,
                 ref_time_dim=ref_time_dim,
                 enc_dim=enc_dim,
+                optical_curve_dim=self.optical_curve_dim,
+                optical_coord_dim=self.optical_coord_dim,
                 num_heads=4,
                 k_dim=64,
+                optical_curve_hidden_dim=optical_curve_hidden_dim,
                 curve_dropout=opt_dropout,
                 proj_dim=proj_dim,
+                contrastive_hidden_dim=contrastive_hidden_dim,
                 proj_dropout=proj_dropout,
                 mtan_snr_s0=mtan_snr_s0,
                 mtan_snr_beta=mtan_snr_beta,
@@ -1696,8 +1733,8 @@ class GWOpticalALBEFModel(nn.Module):
         else:
             self.fusion = CrossAttentionFusion(
                 gw_dim=enc_dim,
-                opt_dim=enc_dim,
-                coord_dim=enc_dim,
+                opt_dim=self.optical_curve_dim if self.fusion_mode in {"physical_dual_hgw", "concat_proj"} else enc_dim,
+                coord_dim=self.optical_coord_dim if self.fusion_mode in {"physical_dual_hgw", "concat_proj"} else enc_dim,
                 attn_dim=fusion_attn_dim,
                 hidden_dim=fusion_hidden_dim,
                 dropout=fusion_dropout,
@@ -2284,6 +2321,8 @@ class OpticalKNClassifier(nn.Module):
         optical_input_dim=6,
         ref_time_dim=64,
         enc_dim=128,
+        optical_curve_dim=None,
+        optical_curve_hidden_dim=None,
         num_heads=4,
         k_dim=64,
         opt_dropout=0.1,
@@ -2297,6 +2336,14 @@ class OpticalKNClassifier(nn.Module):
         n_bands_bucket_classes=4,
         t_span_bucket_classes=5,
         grl_lambda=1.0,
+        mtan_snr_s0: float = 3.0,
+        mtan_snr_beta: float = 1.0,
+        mtan_snr_clip_min: float = -8.0,
+        mtan_snr_clip_max: float = 20.0,
+        mtan_snr_eps: float = 1e-9,
+        mtan_lupt_psfflux_zp: float = 31.4,
+        mtan_lupt_k: float = 1.0,
+        mtan_lupt_m5_mag=(23.9, 25.0, 24.7, 24.0, 23.3, 22.1),
         mtan_period_range_days=(0.5, 100.0),
         mtan_time_scale_divisor: float = 100.0,
     ):
@@ -2304,20 +2351,31 @@ class OpticalKNClassifier(nn.Module):
         self.feature_dropout = nn.Dropout(feature_dropout)
         self.universal_aux_enable = bool(universal_aux_enable)
         self.optical_encoder_init_info = None
+        self.optical_curve_dim = int(enc_dim if optical_curve_dim is None else optical_curve_dim)
+        self.optical_curve_hidden_dim = optical_curve_hidden_dim
 
         self.optical_encoder = OpticalEncoderWithCLSNoCoord(
             input_dim=optical_input_dim,
-            output_dim=enc_dim,
+            output_dim=self.optical_curve_dim,
             num_heads=num_heads,
             ref_dim=ref_time_dim,
             k_dim=k_dim,
             dropout=opt_dropout,
+            refine_hidden_dim=optical_curve_hidden_dim,
+            mtan_snr_s0=mtan_snr_s0,
+            mtan_snr_beta=mtan_snr_beta,
+            mtan_snr_clip_min=mtan_snr_clip_min,
+            mtan_snr_clip_max=mtan_snr_clip_max,
+            mtan_snr_eps=mtan_snr_eps,
+            mtan_lupt_psfflux_zp=mtan_lupt_psfflux_zp,
+            mtan_lupt_k=mtan_lupt_k,
+            mtan_lupt_m5_mag=mtan_lupt_m5_mag,
             mtan_period_range_days=mtan_period_range_days,
             mtan_time_scale_divisor=mtan_time_scale_divisor,
         )
 
-        hidden = head_hidden_dim if head_hidden_dim is not None else enc_dim
-        self.feature_dim = enc_dim * 2
+        hidden = head_hidden_dim if head_hidden_dim is not None else self.optical_curve_dim
+        self.feature_dim = self.optical_curve_dim * 2
         self.classifier = nn.Sequential(
             nn.Linear(self.feature_dim, hidden),
             nn.ReLU(inplace=True),

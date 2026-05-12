@@ -220,6 +220,18 @@ def parse_bin_edges(text: str, default: str) -> List[float]:
     return [float(v) for v in arr.tolist()]
 
 
+def parse_float_sequence(value, *, expected_len: int, name: str) -> Tuple[float, ...]:
+    if isinstance(value, str):
+        vals = [float(part.strip()) for part in value.split(",") if part.strip()]
+    else:
+        vals = [float(part) for part in value]
+    if len(vals) != int(expected_len):
+        raise ValueError(f"{name} must contain exactly {expected_len} values.")
+    if np.any(~np.isfinite(np.asarray(vals, dtype=np.float64))):
+        raise ValueError(f"{name} must contain finite values.")
+    return tuple(vals)
+
+
 def parse_relax_t_span_thresholds(value, default_train: int = 500000, default_eval: int = 20000) -> Dict[str, int]:
     out = {
         "train": int(default_train),
@@ -1311,17 +1323,43 @@ def train(args):
         optical_input_dim=6,
         ref_time_dim=args.ref_dim,
         enc_dim=args.enc_dim,
+        optical_curve_dim=args.optical_curve_dim,
+        optical_curve_hidden_dim=args.optical_curve_hidden_dim,
+        num_heads=args.num_heads,
+        k_dim=args.k_dim,
         opt_dropout=args.opt_dropout,
         feature_dropout=args.feature_dropout,
         head_hidden_dim=args.head_hidden_dim,
         head_dropout=args.head_dropout,
         universal_aux_enable=bool(universal_aux_enable),
         proj_dim=64,
-        adv_hidden_dim=(args.head_hidden_dim if args.head_hidden_dim is not None else args.enc_dim),
+        adv_hidden_dim=(
+            args.head_hidden_dim
+            if args.head_hidden_dim is not None
+            else (args.optical_curve_dim if args.optical_curve_dim is not None else args.enc_dim)
+        ),
         n_det_bucket_classes=5,
         n_bands_bucket_classes=4,
         t_span_bucket_classes=5,
         grl_lambda=float(getattr(args, "grl_lambda", 1.0)),
+        mtan_snr_s0=float(args.mtan_snr_s0),
+        mtan_snr_beta=float(args.mtan_snr_beta),
+        mtan_snr_clip_min=float(args.mtan_snr_clip_min),
+        mtan_snr_clip_max=float(args.mtan_snr_clip_max),
+        mtan_snr_eps=float(args.mtan_snr_eps),
+        mtan_lupt_psfflux_zp=float(args.mtan_lupt_psfflux_zp),
+        mtan_lupt_k=float(args.mtan_lupt_k),
+        mtan_lupt_m5_mag=parse_float_sequence(
+            args.mtan_lupt_m5_mag,
+            expected_len=6,
+            name="mtan_lupt_m5_mag",
+        ),
+        mtan_period_range_days=parse_float_sequence(
+            args.mtan_period_range_days,
+            expected_len=2,
+            name="mtan_period_range_days",
+        ),
+        mtan_time_scale_divisor=float(args.mtan_time_scale_divisor),
     ).to(device)
 
     if args.pretrained_albef_ckpt:
@@ -1655,12 +1693,26 @@ def parse_args():
     parser.add_argument("--ref_end", type=float, default=0.6)
     parser.add_argument("--ref_dim", type=int, default=64)
     parser.add_argument("--enc_dim", type=int, default=64)
+    parser.add_argument("--optical_curve_dim", type=int, default=None)
+    parser.add_argument("--optical_curve_hidden_dim", type=int, default=None)
+    parser.add_argument("--num_heads", type=int, default=4)
+    parser.add_argument("--k_dim", type=int, default=64)
 
     parser.add_argument("--opt_dropout", type=float, default=0.1)
     parser.add_argument("--feature_dropout", type=float, default=0.0)
     parser.add_argument("--head_hidden_dim", type=int, default=None)
     parser.add_argument("--head_dropout", type=float, default=0.2)
     parser.add_argument("--arch_version", type=str, default="optical_only_nocoord_v1")
+    parser.add_argument("--mtan_snr_s0", type=float, default=3.0)
+    parser.add_argument("--mtan_snr_beta", type=float, default=1.0)
+    parser.add_argument("--mtan_snr_clip_min", type=float, default=-8.0)
+    parser.add_argument("--mtan_snr_clip_max", type=float, default=20.0)
+    parser.add_argument("--mtan_snr_eps", type=float, default=1e-9)
+    parser.add_argument("--mtan_lupt_psfflux_zp", type=float, default=31.4)
+    parser.add_argument("--mtan_lupt_k", type=float, default=1.0)
+    parser.add_argument("--mtan_lupt_m5_mag", default=(23.9, 25.0, 24.7, 24.0, 23.3, 22.1))
+    parser.add_argument("--mtan_period_range_days", default=(0.5, 100.0))
+    parser.add_argument("--mtan_time_scale_divisor", type=float, default=100.0)
 
     parser.add_argument("--prefix_min_det", type=int, default=2)
     parser.add_argument("--prefix_train_sampling", type=str, default="bucket_uniform_terminal_mixture")

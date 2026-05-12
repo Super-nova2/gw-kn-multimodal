@@ -17,7 +17,7 @@ SCRIPT_SUBDIR="Model/script"
 SCRIPT_REL_PATH="Model/script/submit_retrieval_comparison.sh"
 REPO_NAME="gw-kn-multimodal"
 WORKSPACE_ROOT_DEFAULT="/fred/oz016/bgao_kn"
-DEFAULT_CONFIG_REL="Model/args/eval/retrieval_comparison_v9.json"
+DEFAULT_CONFIG_REL="Model/args/eval/retrieval_comparison_v11.json"
 
 if [[ -n "${SLURM_JOB_ID:-}" && -n "${SLURM_SUBMIT_DIR:-}" ]]; then
     if [[ "$(basename "${SLURM_SUBMIT_DIR}")" == "${REPO_NAME}" ]]; then

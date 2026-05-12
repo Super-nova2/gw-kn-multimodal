@@ -34,7 +34,7 @@ if [[ ! -f "${SCRIPT_PATH}" ]]; then
     echo "Resolved script path not found: ${SCRIPT_PATH}" >&2
     exit 1
 fi
-DEFAULT_ARGS_FILE="${SCRIPT_DIR}/args/optical_only_kn_v6.json"
+DEFAULT_ARGS_FILE="${SCRIPT_DIR}/args/optical_only_kn_baseline.json"
 args_file=${1:-${OPTICAL_ONLY_ARGS_FILE:-${DEFAULT_ARGS_FILE}}}
 if [[ ! -f "${args_file}" ]]; then
     echo "Args file not found: ${args_file}"
@@ -130,6 +130,20 @@ REF_START=$(jq -r '.ref_start // empty' "$args_file")
 REF_END=$(jq -r '.ref_end // empty' "$args_file")
 REF_DIM=$(jq -r '.ref_dim // empty' "$args_file")
 ENC_DIM=$(jq -r '.enc_dim // empty' "$args_file")
+OPTICAL_CURVE_DIM=$(jq -r '.optical_curve_dim // empty' "$args_file")
+OPTICAL_CURVE_HIDDEN_DIM=$(jq -r '.optical_curve_hidden_dim // empty' "$args_file")
+NUM_HEADS=$(jq -r '.num_heads // empty' "$args_file")
+K_DIM=$(jq -r '.k_dim // empty' "$args_file")
+MTAN_SNR_S0=$(jq -r '.mtan_snr_s0 // empty' "$args_file")
+MTAN_SNR_BETA=$(jq -r '.mtan_snr_beta // empty' "$args_file")
+MTAN_SNR_CLIP_MIN=$(jq -r '.mtan_snr_clip_min // empty' "$args_file")
+MTAN_SNR_CLIP_MAX=$(jq -r '.mtan_snr_clip_max // empty' "$args_file")
+MTAN_SNR_EPS=$(jq -r '.mtan_snr_eps // empty' "$args_file")
+MTAN_LUPT_PSFFLUX_ZP=$(jq -r '.mtan_lupt_psfflux_zp // empty' "$args_file")
+MTAN_LUPT_K=$(jq -r '.mtan_lupt_k // empty' "$args_file")
+MTAN_LUPT_M5_MAG=$(jq -r 'if .mtan_lupt_m5_mag == null then empty elif (.mtan_lupt_m5_mag | type) == "array" then .mtan_lupt_m5_mag | join(",") else .mtan_lupt_m5_mag end' "$args_file")
+MTAN_PERIOD_RANGE_DAYS=$(jq -r 'if .mtan_period_range_days == null then empty elif (.mtan_period_range_days | type) == "array" then .mtan_period_range_days | join(",") else .mtan_period_range_days end' "$args_file")
+MTAN_TIME_SCALE_DIVISOR=$(jq -r '.mtan_time_scale_divisor // empty' "$args_file")
 
 OPT_DROPOUT=$(jq -r '.opt_dropout // empty' "$args_file")
 FEATURE_DROPOUT=$(jq -r '.feature_dropout // empty' "$args_file")
@@ -352,6 +366,48 @@ fi
 if [[ -n "$ENC_DIM" && "$ENC_DIM" != "null" ]]; then
     cmd+=(--enc_dim "$ENC_DIM")
 fi
+if [[ -n "$OPTICAL_CURVE_DIM" && "$OPTICAL_CURVE_DIM" != "null" ]]; then
+    cmd+=(--optical_curve_dim "$OPTICAL_CURVE_DIM")
+fi
+if [[ -n "$OPTICAL_CURVE_HIDDEN_DIM" && "$OPTICAL_CURVE_HIDDEN_DIM" != "null" ]]; then
+    cmd+=(--optical_curve_hidden_dim "$OPTICAL_CURVE_HIDDEN_DIM")
+fi
+if [[ -n "$NUM_HEADS" && "$NUM_HEADS" != "null" ]]; then
+    cmd+=(--num_heads "$NUM_HEADS")
+fi
+if [[ -n "$K_DIM" && "$K_DIM" != "null" ]]; then
+    cmd+=(--k_dim "$K_DIM")
+fi
+if [[ -n "$MTAN_SNR_S0" && "$MTAN_SNR_S0" != "null" ]]; then
+    cmd+=(--mtan_snr_s0 "$MTAN_SNR_S0")
+fi
+if [[ -n "$MTAN_SNR_BETA" && "$MTAN_SNR_BETA" != "null" ]]; then
+    cmd+=(--mtan_snr_beta "$MTAN_SNR_BETA")
+fi
+if [[ -n "$MTAN_SNR_CLIP_MIN" && "$MTAN_SNR_CLIP_MIN" != "null" ]]; then
+    cmd+=(--mtan_snr_clip_min "$MTAN_SNR_CLIP_MIN")
+fi
+if [[ -n "$MTAN_SNR_CLIP_MAX" && "$MTAN_SNR_CLIP_MAX" != "null" ]]; then
+    cmd+=(--mtan_snr_clip_max "$MTAN_SNR_CLIP_MAX")
+fi
+if [[ -n "$MTAN_SNR_EPS" && "$MTAN_SNR_EPS" != "null" ]]; then
+    cmd+=(--mtan_snr_eps "$MTAN_SNR_EPS")
+fi
+if [[ -n "$MTAN_LUPT_PSFFLUX_ZP" && "$MTAN_LUPT_PSFFLUX_ZP" != "null" ]]; then
+    cmd+=(--mtan_lupt_psfflux_zp "$MTAN_LUPT_PSFFLUX_ZP")
+fi
+if [[ -n "$MTAN_LUPT_K" && "$MTAN_LUPT_K" != "null" ]]; then
+    cmd+=(--mtan_lupt_k "$MTAN_LUPT_K")
+fi
+if [[ -n "$MTAN_LUPT_M5_MAG" && "$MTAN_LUPT_M5_MAG" != "null" ]]; then
+    cmd+=(--mtan_lupt_m5_mag "$MTAN_LUPT_M5_MAG")
+fi
+if [[ -n "$MTAN_PERIOD_RANGE_DAYS" && "$MTAN_PERIOD_RANGE_DAYS" != "null" ]]; then
+    cmd+=(--mtan_period_range_days "$MTAN_PERIOD_RANGE_DAYS")
+fi
+if [[ -n "$MTAN_TIME_SCALE_DIVISOR" && "$MTAN_TIME_SCALE_DIVISOR" != "null" ]]; then
+    cmd+=(--mtan_time_scale_divisor "$MTAN_TIME_SCALE_DIVISOR")
+fi
 
 if [[ -n "$OPT_DROPOUT" && "$OPT_DROPOUT" != "null" ]]; then
     cmd+=(--opt_dropout "$OPT_DROPOUT")
@@ -489,7 +545,7 @@ if [[ -n "$META_FILTER_RELAX_T_SPAN_IF_BELOW_ROWS" && "$META_FILTER_RELAX_T_SPAN
 fi
 
 echo "Training Command: ${cmd[*]}"
-echo "Optical controls (from config): meta_matched_sampling=${META_MATCHED_SAMPLING:-<default>}, meta_match_fallback=${META_MATCH_FALLBACK:-<default>}, meta_filter_n_det=[${META_FILTER_N_DET_MIN:-<default>},${META_FILTER_N_DET_MAX:-<default>}], meta_filter_n_bands_max=${META_FILTER_N_BANDS_MAX:-<default>}, meta_filter_t_span_max=${META_FILTER_T_SPAN_MAX:-<default>}, meta_filter_relax=${META_FILTER_RELAX_T_SPAN_IF_BELOW_ROWS:-<default>}, universal_train_enable=${UNIVERSAL_TRAIN_ENABLE:-<default>}, universal_epochs=${UNIVERSAL_STAGE1_EPOCHS:-<default>}/${UNIVERSAL_STAGE2_EPOCHS:-<default>}/${UNIVERSAL_STAGE3_EPOCHS:-<default>}, universal_modes=single/${UNIVERSAL_STAGE2_MODE:-<default>}/${UNIVERSAL_STAGE3_MODE:-<default>}, view_keep_prob=${VIEW_KEEP_PROB_MIN:-<default>}..${VIEW_KEEP_PROB_MAX:-<default>}, view_band_dropout_max=${VIEW_BAND_DROPOUT_MAX:-<default>}, cons_weights=${CONSISTENCY_EMBED_WEIGHT:-<default>}/${CONSISTENCY_PROB_WEIGHT:-<default>}, adv_weights=${ADV_DET_WEIGHT:-<default>}/${ADV_BAND_WEIGHT:-<default>}/${ADV_SPAN_WEIGHT:-<default>}, grl_lambda=${GRL_LAMBDA:-<default>}, shortcut_audit_enable=${SHORTCUT_AUDIT_ENABLE:-<default>}, shortcut_audit_val_samples=${SHORTCUT_AUDIT_VAL_SAMPLES:-<default>}, prefix_min_det=${PREFIX_MIN_DET:-<default>}, prefix_train_sampling=${PREFIX_TRAIN_SAMPLING:-<default>}, prefix_mix_weights=${PREFIX_BUCKET_UNIFORM_MIX_WEIGHT:-<default>}:${PREFIX_TERMINAL_MIX_WEIGHT:-<default>}"
+echo "Optical controls (from config): optical_curve_dim=${OPTICAL_CURVE_DIM:-<default>}, optical_curve_hidden_dim=${OPTICAL_CURVE_HIDDEN_DIM:-<default>}, ref_dim=${REF_DIM:-<default>}, n_ref=${N_REF:-<default>}, num_heads=${NUM_HEADS:-<default>}, k_dim=${K_DIM:-<default>}, mtan_time_scale_divisor=${MTAN_TIME_SCALE_DIVISOR:-<default>}, mtan_lupt_m5_mag=${MTAN_LUPT_M5_MAG:-<default>}, meta_matched_sampling=${META_MATCHED_SAMPLING:-<default>}, meta_match_fallback=${META_MATCH_FALLBACK:-<default>}, meta_filter_n_det=[${META_FILTER_N_DET_MIN:-<default>},${META_FILTER_N_DET_MAX:-<default>}], meta_filter_n_bands_max=${META_FILTER_N_BANDS_MAX:-<default>}, meta_filter_t_span_max=${META_FILTER_T_SPAN_MAX:-<default>}, meta_filter_relax=${META_FILTER_RELAX_T_SPAN_IF_BELOW_ROWS:-<default>}, universal_train_enable=${UNIVERSAL_TRAIN_ENABLE:-<default>}, universal_epochs=${UNIVERSAL_STAGE1_EPOCHS:-<default>}/${UNIVERSAL_STAGE2_EPOCHS:-<default>}/${UNIVERSAL_STAGE3_EPOCHS:-<default>}, universal_modes=single/${UNIVERSAL_STAGE2_MODE:-<default>}/${UNIVERSAL_STAGE3_MODE:-<default>}, view_keep_prob=${VIEW_KEEP_PROB_MIN:-<default>}..${VIEW_KEEP_PROB_MAX:-<default>}, view_band_dropout_max=${VIEW_BAND_DROPOUT_MAX:-<default>}, cons_weights=${CONSISTENCY_EMBED_WEIGHT:-<default>}/${CONSISTENCY_PROB_WEIGHT:-<default>}, adv_weights=${ADV_DET_WEIGHT:-<default>}/${ADV_BAND_WEIGHT:-<default>}/${ADV_SPAN_WEIGHT:-<default>}, grl_lambda=${GRL_LAMBDA:-<default>}, shortcut_audit_enable=${SHORTCUT_AUDIT_ENABLE:-<default>}, shortcut_audit_val_samples=${SHORTCUT_AUDIT_VAL_SAMPLES:-<default>}, prefix_min_det=${PREFIX_MIN_DET:-<default>}, prefix_train_sampling=${PREFIX_TRAIN_SAMPLING:-<default>}, prefix_mix_weights=${PREFIX_BUCKET_UNIFORM_MIX_WEIGHT:-<default>}:${PREFIX_TERMINAL_MIX_WEIGHT:-<default>}"
 set +e
 "${cmd[@]}"
 train_exit_code=$?

@@ -16,7 +16,7 @@ set -euo pipefail
 SCRIPT_SUBDIR="Model"
 SCRIPT_REL_PATH="Model/ALBEF_train.sh"
 REPO_NAME="gw-kn-multimodal"
-DEFAULT_CONFIG_REL_PATH="Model/args/defaults/ALBEF_BNS_NSBH_v10_default.json"
+DEFAULT_CONFIG_REL_PATH="Model/args/defaults/ALBEF_BNS_NSBH_v11_default.json"
 if [[ -n "${SLURM_JOB_ID:-}" && -n "${SLURM_SUBMIT_DIR:-}" ]]; then
     if [[ "$(basename "${SLURM_SUBMIT_DIR}")" == "${REPO_NAME}" ]]; then
         REPO_ROOT="${SLURM_SUBMIT_DIR}"
@@ -44,7 +44,21 @@ fi
 args_dir="$(cd "$(dirname "${args_file}")" && pwd)"
 args_file="${args_dir}/$(basename "${args_file}")"
 if [[ -z "${default_file}" ]]; then
-    default_file="${REPO_ROOT}/${DEFAULT_CONFIG_REL_PATH}"
+    args_base="$(basename "${args_file}")"
+    inferred_default_base="${args_base%.json}_default.json"
+    inferred_default="${REPO_ROOT}/Model/args/defaults/${inferred_default_base}"
+    if [[ -f "${inferred_default}" ]]; then
+        default_file="${inferred_default}"
+    elif [[ "${args_base}" =~ ^(.+_v[0-9]+)(_.+)?\.json$ ]]; then
+        versioned_default="${REPO_ROOT}/Model/args/defaults/${BASH_REMATCH[1]}_default.json"
+        if [[ -f "${versioned_default}" ]]; then
+            default_file="${versioned_default}"
+        else
+            default_file="${REPO_ROOT}/${DEFAULT_CONFIG_REL_PATH}"
+        fi
+    else
+        default_file="${REPO_ROOT}/${DEFAULT_CONFIG_REL_PATH}"
+    fi
 fi
 if [[ ! -f "${default_file}" ]]; then
     echo "Default config file not found: ${default_file}" >&2
