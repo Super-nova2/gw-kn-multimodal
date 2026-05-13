@@ -2092,9 +2092,10 @@ def sample_simple_inbatch_hard_negatives_with_time(
     semi_hard,
     semi_hard_margin,
     fallback_mode,
+    candidate_time_mjd=None,
     active_rows=None,
 ):
-    del sim_g2o, batch_event_time_mjd, window_days, min_candidates, semi_hard, semi_hard_margin, fallback_mode
+    del sim_g2o, batch_event_time_mjd, window_days, min_candidates, semi_hard, semi_hard_margin, fallback_mode, candidate_time_mjd
     full_idx = build_simple_inbatch_negative_indices(gw_indices)
     if active_rows is not None:
         active_rows = active_rows.to(device=gw_indices.device, dtype=torch.long)
