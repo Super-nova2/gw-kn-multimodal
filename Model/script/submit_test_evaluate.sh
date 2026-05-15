@@ -148,6 +148,9 @@ NONKN_CLS_BASE_FIELD=$(jq -r '.nonkn_cls_base_field // empty' "$args_file")
 REPORT_DT_BINS_STATE=$(jq -r 'if has("report_dt_bins") then (.report_dt_bins | tostring) else "unset" end' "$args_file")
 DT_BIN_EDGES=$(jq -r '.dt_bin_edges // empty' "$args_file")
 REPORT_DT_MACRO_STATE=$(jq -r 'if has("report_dt_macro") then (.report_dt_macro | tostring) else "unset" end' "$args_file")
+CLS_TIME_WINDOW_DAYS=$(jq -r '.cls_time_window_days // empty' "$args_file")
+CLS_TIME_FALLBACK=$(jq -r '.cls_time_fallback // empty' "$args_file")
+CLS_TIME_SEED=$(jq -r '.cls_time_seed // empty' "$args_file")
 if [[ -z "$CHECKPOINT" ]]; then
     echo "Required field missing in args: checkpoint"
     exit 1
@@ -277,6 +280,15 @@ if [[ "$REPORT_DT_MACRO_STATE" == "true" ]]; then
 fi
 if [[ "$REPORT_DT_MACRO_STATE" == "false" ]]; then
     cmd+=(--no_report_dt_macro)
+fi
+if [[ -n "$CLS_TIME_WINDOW_DAYS" && "$CLS_TIME_WINDOW_DAYS" != "null" ]]; then
+    cmd+=(--cls_time_window_days "$CLS_TIME_WINDOW_DAYS")
+fi
+if [[ -n "$CLS_TIME_FALLBACK" && "$CLS_TIME_FALLBACK" != "null" ]]; then
+    cmd+=(--cls_time_fallback "$CLS_TIME_FALLBACK")
+fi
+if [[ -n "$CLS_TIME_SEED" && "$CLS_TIME_SEED" != "null" ]]; then
+    cmd+=(--cls_time_seed "$CLS_TIME_SEED")
 fi
 echo "Command: ${cmd[*]}"
 "${cmd[@]}"

@@ -5,9 +5,9 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=160G
+#SBATCH --mem=80G
 #SBATCH --gres=gpu:1
-#SBATCH --time=36:00:00
+#SBATCH --time=8:00:00
 #SBATCH --partition=gpu
 #SBATCH --tmp=100G
 
@@ -216,8 +216,10 @@ echo "Include undersized galleries: ${GALLERY_INCLUDE_UNDERSIZED}"
 echo "Expected outputs:"
 echo "  ${OUTPUT_DIR}/gw170817a_retrieval.json"
 echo "  ${OUTPUT_DIR}/redshift_metrics.csv"
+echo "  ${OUTPUT_DIR}/redshift_macro_metrics_log10_weighted.csv"
 echo "  ${OUTPUT_DIR}/retrieval_curves.png"
 echo "  ${OUTPUT_DIR}/retrieval_coverage.png"
+echo "  ${OUTPUT_DIR}/redshift_macro_metrics_log10_weighted.png"
 echo "  ${OUTPUT_DIR}/redshift_retrieval_metrics_g*.png  (per gallery size)"
 echo "  ${OUTPUT_DIR}/redshift_coverage_g*.png  (per gallery size)"
 echo "Command: python -u ${EVAL_SCRIPT} --config ${config_file}"

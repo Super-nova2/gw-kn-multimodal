@@ -577,6 +577,97 @@ def write_redshift_csv(rows: Sequence[Mapping[str, Any]], output_path: Path) -> 
             writer.writerow({key: row.get(key, "") for key in fieldnames})
 
 
+def aggregate_redshift_macro_metrics(
+    rows: Sequence[Mapping[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Aggregate redshift-binned metrics across gallery sizes with log10(G) weights."""
+    grouped: Dict[Tuple[str, str, float, float], List[Mapping[str, Any]]] = {}
+    for row in rows:
+        key = (
+            str(row["method"]),
+            str(row["redshift_bin_label"]),
+            float(row["bin_left"]),
+            float(row["bin_right"]),
+        )
+        grouped.setdefault(key, []).append(row)
+
+    macro_rows: List[Dict[str, Any]] = []
+    metric_pairs = [
+        ("recall_at_1", "macro_recall_at_1"),
+        ("recall_at_10", "macro_recall_at_10"),
+        ("mrr", "macro_mrr"),
+    ]
+    for (method, label, bin_left, bin_right), group in grouped.items():
+        weighted_rows: List[Tuple[Mapping[str, Any], float]] = []
+        for row in group:
+            gallery_size = int(row["gallery_size"])
+            weight = float(np.log10(gallery_size)) if gallery_size > 1 else 0.0
+            if weight > 0.0 and np.isfinite(weight):
+                weighted_rows.append((row, weight))
+        if not weighted_rows:
+            continue
+        weight_sum = float(sum(weight for _, weight in weighted_rows))
+        out_row: Dict[str, Any] = {
+            "method": method,
+            "redshift_bin_label": label,
+            "bin_left": bin_left,
+            "bin_right": bin_right,
+            "redshift": float(
+                sum(float(row["redshift"]) * weight for row, weight in weighted_rows) / weight_sum
+            ),
+            "weight_scheme": "log10(gallery_size)",
+            "n_gallery_sizes": int(len({int(row["gallery_size"]) for row, _ in weighted_rows})),
+            "gallery_weight_sum": weight_sum,
+            "n_queries_mean": float(
+                sum(float(row.get("n_queries", 0.0)) * weight for row, weight in weighted_rows) / weight_sum
+            ),
+        }
+        for source_key, target_key in metric_pairs:
+            out_row[target_key] = float(
+                sum(float(row[source_key]) * weight for row, weight in weighted_rows) / weight_sum
+            )
+        macro_rows.append(out_row)
+
+    return sorted(
+        macro_rows,
+        key=lambda row: (
+            str(row["method"]),
+            float(row["bin_left"]),
+            float(row["bin_right"]),
+        ),
+    )
+
+
+def write_redshift_macro_csv(rows: Sequence[Mapping[str, Any]], output_path: Path) -> None:
+    """Write log10(G)-weighted redshift macro metrics to a CSV file."""
+    import csv
+
+    rows = list(rows)
+    if not rows:
+        return
+    fieldnames = [
+        "method",
+        "redshift_bin_label",
+        "bin_left",
+        "bin_right",
+        "redshift",
+        "weight_scheme",
+        "n_gallery_sizes",
+        "gallery_weight_sum",
+        "n_queries_mean",
+        "macro_recall_at_1",
+        "macro_recall_at_10",
+        "macro_mrr",
+    ]
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({key: row.get(key, "") for key in fieldnames})
+
+
 def plot_redshift_metrics(
     rows: Sequence[Mapping[str, Any]],
     output_dir: Path,
@@ -636,6 +727,69 @@ def plot_redshift_metrics(
         fig.tight_layout(rect=(0, 0, 1, 0.90))
         fig.savefig(str(out / f"redshift_retrieval_metrics_g{gallery_size}.png"), dpi=300, bbox_inches="tight")
         plt.close(fig)
+
+
+def plot_redshift_macro_metrics(
+    rows: Sequence[Mapping[str, Any]],
+    output_dir: Path,
+    *,
+    _plot_method_label_fn=None,
+) -> None:
+    """Plot log10(G)-weighted Macro R@1, R@10, and MRR vs redshift."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception:
+        return
+    rows = list(rows)
+    if not rows:
+        return
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    methods = sorted({str(row["method"]) for row in rows})
+    metrics = [
+        ("macro_recall_at_1", "Macro R@1"),
+        ("macro_recall_at_10", "Macro R@10"),
+        ("macro_mrr", "Macro MRR"),
+    ]
+    label_fn = _plot_method_label_fn or (lambda x: x)
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5.2), sharex=False, sharey=False)
+    for ax, (key, metric_label) in zip(axes, metrics):
+        for method in methods:
+            method_rows = sorted(
+                [row for row in rows if str(row["method"]) == method],
+                key=lambda row: float(row["redshift"]),
+            )
+            if not method_rows:
+                continue
+            ax.plot(
+                [float(row["redshift"]) for row in method_rows],
+                [float(row[key]) for row in method_rows],
+                marker="o",
+                linewidth=2,
+                label=label_fn(method),
+            )
+        ax.set_xlabel("Redshift")
+        ax.set_ylabel(metric_label)
+        ax.set_title(f"{metric_label} vs Redshift", fontsize=11)
+        ax.grid(True, alpha=0.3)
+
+    handles, labels = axes[0].get_legend_handles_labels()
+    if handles:
+        fig.legend(
+            handles,
+            labels,
+            loc="upper center",
+            ncol=max(1, min(6, len(labels))),
+            frameon=False,
+            fontsize=8,
+            bbox_to_anchor=(0.5, 0.98),
+        )
+    fig.tight_layout(rect=(0, 0, 1, 0.84))
+    fig.savefig(str(out / "redshift_macro_metrics_log10_weighted.png"), dpi=300, bbox_inches="tight")
+    plt.close(fig)
 
 
 def plot_redshift_coverage(rows: Sequence[Mapping[str, Any]], output_dir: Path) -> None:
@@ -2310,8 +2464,17 @@ def normalize_shared_config(cfg: Dict[str, Any], cfg_path: Path) -> Dict[str, An
         "gallery_include_undersized": _as_bool(cfg.get("gallery_include_undersized", True), default=True),
         "positive_selection": positive_selection,
         "n_neg_samples": _parse_n_neg_samples(cfg.get("n_neg_samples", -1), default=-1),
+        "negative_sample_strategy": str(cfg.get("negative_sample_strategy", "block_random")),
+        "negative_sample_block_rows": (
+            None
+            if cfg.get("negative_sample_block_rows") in (None, "", "null")
+            else int(cfg.get("negative_sample_block_rows"))
+        ),
+        "negative_sample_shuffle": _as_bool(cfg.get("negative_sample_shuffle", True), default=True),
+        "max_gw_events": int(cfg.get("max_gw_events", 0) or 0),
         "amp_dtype": str(cfg.get("amp_dtype", "auto")),
         "no_latex": _as_bool(cfg.get("no_latex", False)),
+        "compute_classification_metrics": _as_bool(cfg.get("compute_classification_metrics", True), default=True),
         "comparison_window": [float(comparison_window[0]), float(comparison_window[1])],
         "comparison_window_start": float(comparison_window[0]),
         "comparison_window_end": float(comparison_window[1]),
@@ -2379,6 +2542,9 @@ def main():
             nonkn_cls_base_field=cfg["nonkn_cls_base_field"],
             runtime_input_window_start=comparison_window[0],
             runtime_input_window_end=comparison_window[1],
+            negative_sample_strategy=cfg.get("negative_sample_strategy", "block_random"),
+            negative_sample_block_rows=cfg.get("negative_sample_block_rows", None),
+            negative_sample_shuffle=cfg.get("negative_sample_shuffle", True),
         )
     if neg_optical_data is None:
         raise FileNotFoundError(
@@ -2429,6 +2595,22 @@ def main():
         sampled_positive_summary = None
 
     gw_positive_indices, all_test_gw_ids = load_test_positive_index_map(cfg["test_data_path"])
+    if int(cfg["max_gw_events"]) > 0 and len(all_test_gw_ids) > int(cfg["max_gw_events"]):
+        rng = np.random.default_rng(seed)
+        selected_gw = sorted(
+            int(v)
+            for v in rng.choice(
+                np.asarray(all_test_gw_ids, dtype=np.int64),
+                size=int(cfg["max_gw_events"]),
+                replace=False,
+            ).tolist()
+        )
+        gw_positive_indices = {
+            int(gw_id): gw_positive_indices[int(gw_id)]
+            for gw_id in selected_gw
+        }
+        all_test_gw_ids = selected_gw
+        print(f"Limited evaluation to {len(all_test_gw_ids)} GW events (max_gw_events={cfg['max_gw_events']}).")
     full_test_positive_counts = np.asarray(
         [int(np.asarray(gw_positive_indices[int(gw_id)]).size) for gw_id in all_test_gw_ids],
         dtype=np.int64,
@@ -2576,6 +2758,7 @@ def main():
     retrieval_rows: OrderedDict[str, Dict[str, float]] = OrderedDict()
     curve_rows: List[Dict[str, Any]] = []
     redshift_rows: List[Dict[str, Any]] = []
+    redshift_macro_rows: List[Dict[str, Any]] = []
     model_names: List[str] = []
 
     for idx, model_spec in enumerate(model_specs, start=1):
@@ -2704,6 +2887,11 @@ def main():
 
             if scoring_mode == "contrastive":
                 print("  Skipping triplet classification (fusion classifier untrained for contrastive-only model)")
+                classification_metrics = None
+                classification_by_source = {}
+                classification_supported = False
+            elif not bool(cfg["compute_classification_metrics"]):
+                print("  Skipping triplet classification (compute_classification_metrics=false)")
                 classification_metrics = None
                 classification_by_source = {}
                 classification_supported = False
@@ -2851,7 +3039,10 @@ def main():
     plot_retrieval_coverage(curve_rows, output_dir)
     if redshift_rows:
         write_redshift_csv(redshift_rows, output_dir / "redshift_metrics.csv")
+        redshift_macro_rows = aggregate_redshift_macro_metrics(redshift_rows)
+        write_redshift_macro_csv(redshift_macro_rows, output_dir / "redshift_macro_metrics_log10_weighted.csv")
         plot_redshift_metrics(redshift_rows, output_dir)
+        plot_redshift_macro_metrics(redshift_macro_rows, output_dir)
         plot_redshift_coverage(redshift_rows, output_dir)
         print(f"Wrote redshift-binned outputs to {output_dir}")
     output = {
@@ -2862,11 +3053,13 @@ def main():
         },
         "curve_rows": curve_rows,
         "redshift_rows": redshift_rows,
+        "redshift_macro_rows": redshift_macro_rows,
         "redshift_config": {
             "enabled": bool(cfg.get("redshift_analysis_enable", False)),
             "catalogs": cfg.get("redshift_catalogs", {}),
             "bin_edges": cfg.get("redshift_bin_edges"),
             "bin_labels": cfg.get("redshift_bin_labels"),
+            "macro_gallery_weight_scheme": "log10(gallery_size)",
         } if cfg.get("redshift_analysis_enable") else None,
         "models": dict(model_results),
         "sampled_positive_summary": sampled_positive_summary,
@@ -2897,8 +3090,13 @@ def main():
             "gallery_candidate_credible_level_max": cfg["gallery_candidate_credible_level_max"],
             "gallery_include_undersized": cfg["gallery_include_undersized"],
             "positive_selection": cfg["positive_selection"],
+            "max_gw_events": cfg["max_gw_events"],
             "comparison_window": list(comparison_window),
             "n_neg_samples": cfg["n_neg_samples"],
+            "negative_sample_strategy": cfg["negative_sample_strategy"],
+            "negative_sample_block_rows": cfg["negative_sample_block_rows"],
+            "negative_sample_shuffle": cfg["negative_sample_shuffle"],
+            "compute_classification_metrics": cfg["compute_classification_metrics"],
             "nonkn_cls_base_field": cfg["nonkn_cls_base_field"],
             "report_dt_bins": cfg["report_dt_bins"],
             "dt_bin_edges": dt_bin_edges if dt_bin_edges is not None else None,

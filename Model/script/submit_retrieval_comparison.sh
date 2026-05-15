@@ -7,9 +7,9 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=80G
 #SBATCH --gres=gpu:1
-#SBATCH --time=8:00:00
+#SBATCH --time=12:00:00
 #SBATCH --partition=gpu
-#SBATCH --tmp=100G
+#SBATCH --tmp=200G
 
 set -euo pipefail
 
@@ -126,7 +126,9 @@ GALLERY_TRIALS=$(jq -r '.gallery_trials // empty' "$config_file")
 GALLERY_CANDIDATE_MODE=$(jq -r '.gallery_candidate_mode // "time_sky_hard"' "$config_file")
 GALLERY_CANDIDATE_TIME_WINDOW_DAYS=$(jq -r '.gallery_candidate_time_window_days // empty' "$config_file")
 GALLERY_CANDIDATE_CREDIBLE_LEVEL_MAX=$(jq -r '.gallery_candidate_credible_level_max // empty' "$config_file")
-GALLERY_INCLUDE_UNDERSIZED=$(jq -r '.gallery_include_undersized // "true"' "$config_file")
+GALLERY_INCLUDE_UNDERSIZED=$(jq -r 'if has("gallery_include_undersized") then .gallery_include_undersized else true end | tostring' "$config_file")
+MAX_GW_EVENTS=$(jq -r '.max_gw_events // empty' "$config_file")
+COMPUTE_CLASSIFICATION_METRICS=$(jq -r 'if has("compute_classification_metrics") then .compute_classification_metrics else true end | tostring' "$config_file")
 STAGE_TO_JOBFS=$(jq -r '.stage_to_jobfs // false' "$config_file")
 TUTORIAL_NEG_DATA_PATH=$(jq -r '.tutorial_neg_data_path // empty' "$config_file")
 MODEL_NAMES=$(jq -r '[.models[].name] | join(", ")' "$config_file")
@@ -183,6 +185,11 @@ if [[ -n "${GALLERY_CANDIDATE_CREDIBLE_LEVEL_MAX}" && "${GALLERY_CANDIDATE_CREDI
     echo "Candidate credible max: ${GALLERY_CANDIDATE_CREDIBLE_LEVEL_MAX}"
 fi
 echo "Include undersized galleries: ${GALLERY_INCLUDE_UNDERSIZED}"
+if [[ -n "${MAX_GW_EVENTS}" && "${MAX_GW_EVENTS}" != "null" ]]; then
+    echo "Max GW events: ${MAX_GW_EVENTS}"
+fi
+echo "Compute classification metrics: ${COMPUTE_CLASSIFICATION_METRICS}"
+echo "Run mode: retrieval comparison"
 echo "Expected outputs:"
 echo "  ${OUTPUT_DIR}/ablation_comparison.json"
 echo "  ${OUTPUT_DIR}/retrieval_curves.png"

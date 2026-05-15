@@ -121,6 +121,13 @@ def parse_args():
                    help="Report macro-averaged |dt| bin metrics (bins with both pos/neg only).")
     p.add_argument("--no_report_dt_macro", dest="report_dt_macro", action="store_false",
                    help="Disable macro-averaged |dt| bin metrics.")
+    p.add_argument("--cls_time_window_days", type=float, default=30.0,
+                   help="Signed classification time window in days: require 0 <= optical_time - GW_time <= window. Use <=0 to disable.")
+    p.add_argument("--cls_time_fallback", type=str, default="actual_then_synthetic",
+                   choices=["actual_then_synthetic"],
+                   help="Fallback policy for classification time-window sampling when actual candidates are unavailable.")
+    p.add_argument("--cls_time_seed", type=int, default=42,
+                   help="Random seed for synthetic classification time deltas.")
 
     return p.parse_args()
 
@@ -359,6 +366,286 @@ def _summarize_dt_distribution(dt_days, signed_quantiles=(0.05, 0.5, 0.95), abs_
         }
     out["abs"] = abs_out
     return out
+
+
+_CLS_TIME_PAIR_TYPES = ("positive", "optical_negative", "gw_negative", "hard_negative")
+
+
+def _init_cls_time_window_counts():
+    return {
+        key: {"actual_count": 0, "synthetic_count": 0, "out_of_window_count": 0}
+        for key in _CLS_TIME_PAIR_TYPES
+    }
+
+
+def _count_mask(mask) -> int:
+    if mask is None:
+        return 0
+    if isinstance(mask, torch.Tensor):
+        return int(mask.to(torch.bool).sum().item())
+    return int(np.asarray(mask, dtype=bool).sum())
+
+
+def _record_cls_time_window_counts(
+    counts,
+    pair_type: str,
+    *,
+    actual_mask=None,
+    synthetic_mask=None,
+    out_of_window_mask=None,
+):
+    if counts is None:
+        return
+    entry = counts.setdefault(
+        str(pair_type),
+        {"actual_count": 0, "synthetic_count": 0, "out_of_window_count": 0},
+    )
+    entry["actual_count"] += _count_mask(actual_mask)
+    entry["synthetic_count"] += _count_mask(synthetic_mask)
+    entry["out_of_window_count"] += _count_mask(out_of_window_mask)
+
+
+def _finalize_cls_time_window_counts(counts):
+    out = {}
+    for key in _CLS_TIME_PAIR_TYPES:
+        entry = dict((counts or {}).get(key, {}))
+        actual = int(entry.get("actual_count", 0))
+        synthetic = int(entry.get("synthetic_count", 0))
+        out_of_window = int(entry.get("out_of_window_count", 0))
+        total = actual + synthetic
+        out[key] = {
+            "actual_count": actual,
+            "synthetic_count": synthetic,
+            "out_of_window_count": out_of_window,
+            "total_count": total,
+            "actual_ratio": float(actual / total) if total > 0 else 0.0,
+            "synthetic_ratio": float(synthetic / total) if total > 0 else 0.0,
+        }
+    return out
+
+
+def _synthetic_dt_tensor(size: int, window_days: float, rng: np.random.Generator, *, device, dtype=torch.float32):
+    size = int(size)
+    if size <= 0:
+        return torch.empty((0,), device=device, dtype=dtype)
+    high = max(float(window_days), 0.0)
+    if high <= 0.0:
+        vals = np.zeros((size,), dtype=np.float32)
+    else:
+        vals = rng.uniform(0.0, high, size=size).astype(np.float32)
+    return torch.as_tensor(vals, device=device, dtype=dtype)
+
+
+def _numpy_1d(values, dtype=np.float64):
+    if isinstance(values, torch.Tensor):
+        values = values.detach().cpu().numpy()
+    return np.asarray(values, dtype=dtype).reshape(-1)
+
+
+def _sample_time_windowed_indices_after_anchor(
+    anchor_times,
+    candidate_times,
+    *,
+    window_days: float,
+    rng: np.random.Generator,
+    fallback_start: int = 0,
+):
+    """Sample candidate rows with candidate_time in [anchor, anchor + window]."""
+    device = anchor_times.device if isinstance(anchor_times, torch.Tensor) else torch.device("cpu")
+    anchor_np = _numpy_1d(anchor_times, dtype=np.float64)
+    cand_np = _numpy_1d(candidate_times, dtype=np.float64)
+    n_rows = int(anchor_np.shape[0])
+    total = int(cand_np.shape[0])
+    selected = np.zeros((n_rows,), dtype=np.int64)
+    dt_vals = np.zeros((n_rows,), dtype=np.float32)
+    actual = np.zeros((n_rows,), dtype=bool)
+    cursor = int(fallback_start)
+    if total <= 0:
+        dt = _synthetic_dt_tensor(n_rows, window_days, rng, device=device)
+        return torch.from_numpy(selected).to(device=device), dt, torch.from_numpy(actual).to(device=device), cursor
+
+    order = np.argsort(cand_np, kind="mergesort")
+    sorted_times = cand_np[order]
+    high = float(window_days)
+    for row, anchor in enumerate(anchor_np):
+        if np.isfinite(anchor) and high > 0.0:
+            left = int(np.searchsorted(sorted_times, anchor, side="left"))
+            right = int(np.searchsorted(sorted_times, anchor + high, side="right"))
+            if right > left:
+                window = order[left:right]
+                window = window[np.isfinite(cand_np[window])]
+                if window.size > 0:
+                    choice = int(window[int(rng.integers(0, window.size))])
+                    selected[row] = choice
+                    dt_vals[row] = float(cand_np[choice] - anchor)
+                    actual[row] = True
+                    continue
+        selected[row] = int(cursor % total)
+        cursor += 1
+        dt_vals[row] = float(_synthetic_dt_tensor(1, window_days, rng, device=torch.device("cpu")).item())
+    return (
+        torch.from_numpy(selected).to(device=device),
+        torch.from_numpy(dt_vals).to(device=device),
+        torch.from_numpy(actual).to(device=device),
+        cursor,
+    )
+
+
+def _sample_time_windowed_indices_before_event(
+    event_times,
+    candidate_times,
+    candidate_indices,
+    *,
+    window_days: float,
+    rng: np.random.Generator,
+):
+    """Sample candidate IDs with candidate_time in [event - window, event]."""
+    device = event_times.device if isinstance(event_times, torch.Tensor) else torch.device("cpu")
+    event_np = _numpy_1d(event_times, dtype=np.float64)
+    cand_np = _numpy_1d(candidate_times, dtype=np.float64)
+    cand_ids = np.asarray(candidate_indices, dtype=np.int64).reshape(-1)
+    n_rows = int(event_np.shape[0])
+    total = int(min(cand_np.shape[0], cand_ids.shape[0]))
+    selected = np.zeros((n_rows,), dtype=np.int64)
+    dt_vals = np.zeros((n_rows,), dtype=np.float32)
+    actual = np.zeros((n_rows,), dtype=bool)
+    if total <= 0:
+        dt = _synthetic_dt_tensor(n_rows, window_days, rng, device=device)
+        return torch.from_numpy(selected).to(device=device), dt, torch.from_numpy(actual).to(device=device)
+
+    cand_np = cand_np[:total]
+    cand_ids = cand_ids[:total]
+    order = np.argsort(cand_np, kind="mergesort")
+    sorted_times = cand_np[order]
+    high = float(window_days)
+    for row, event_time in enumerate(event_np):
+        if np.isfinite(event_time) and high > 0.0:
+            left = int(np.searchsorted(sorted_times, event_time - high, side="left"))
+            right = int(np.searchsorted(sorted_times, event_time, side="right"))
+            if right > left:
+                window = order[left:right]
+                window = window[np.isfinite(cand_np[window])]
+                if window.size > 0:
+                    choice = int(window[int(rng.integers(0, window.size))])
+                    selected[row] = int(cand_ids[choice])
+                    dt_vals[row] = float(event_time - cand_np[choice])
+                    actual[row] = True
+                    continue
+        fallback = int(rng.integers(0, total))
+        selected[row] = int(cand_ids[fallback])
+        dt_vals[row] = float(_synthetic_dt_tensor(1, window_days, rng, device=torch.device("cpu")).item())
+    return (
+        torch.from_numpy(selected).to(device=device),
+        torch.from_numpy(dt_vals).to(device=device),
+        torch.from_numpy(actual).to(device=device),
+    )
+
+
+def _select_hard_candidate_from_indices(sim_row, same_event_row, cand_idx, *, semi_hard: bool, margin: float, fallback_mode: str):
+    if cand_idx.numel() <= 0:
+        return None
+    use_semi_hard = bool(semi_hard) or str(fallback_mode).strip().lower() == "inbatch_semihard"
+    if not use_semi_hard:
+        return cand_idx[sim_row[cand_idx].argmax()]
+    pos_vals = sim_row[same_event_row]
+    if pos_vals.numel() == 0:
+        return cand_idx[sim_row[cand_idx].argmax()]
+    pos_med = torch.median(pos_vals)
+    cand_sims = sim_row[cand_idx]
+    lower = (1.0 - float(margin)) * pos_med
+    band_mask = (cand_sims >= lower) & (cand_sims <= pos_med)
+    band_idx = cand_idx[band_mask]
+    if band_idx.numel() > 0:
+        return band_idx[cand_sims[band_mask].argmax()]
+    return cand_idx[cand_sims.argmax()]
+
+
+def _sample_signed_time_window_hard_negatives(
+    sim_g2o,
+    gw_indices,
+    anchor_times,
+    candidate_times,
+    *,
+    window_days: float,
+    rng: np.random.Generator,
+    semi_hard: bool,
+    semi_hard_margin: float,
+    fallback_mode: str,
+):
+    """Sample in-batch optical negatives with signed dt in [0, window] when available."""
+    device = sim_g2o.device
+    batch_size = int(sim_g2o.size(0))
+    same_event = gw_indices.to(device).unsqueeze(0) == gw_indices.to(device).unsqueeze(1)
+    anchor = anchor_times.to(device=device, dtype=torch.float32).reshape(-1)
+    candidate = candidate_times.to(device=device, dtype=torch.float32).reshape(-1)
+    finite = torch.isfinite(anchor).unsqueeze(1) & torch.isfinite(candidate).unsqueeze(0)
+    dt_matrix = candidate.unsqueeze(0) - anchor.unsqueeze(1)
+    candidate_mask = (~same_event) & finite & (dt_matrix >= 0.0) & (dt_matrix <= float(window_days))
+
+    selected = torch.empty((batch_size,), dtype=torch.long, device=device)
+    dt_vals = torch.empty((batch_size,), dtype=torch.float32, device=device)
+    actual = torch.zeros((batch_size,), dtype=torch.bool, device=device)
+    synthetic_dt = _synthetic_dt_tensor(batch_size, window_days, rng, device=device)
+    all_negative_mask = ~same_event
+
+    for row in range(batch_size):
+        cand_idx = torch.nonzero(candidate_mask[row], as_tuple=False).squeeze(-1)
+        if cand_idx.numel() > 0:
+            chosen = _select_hard_candidate_from_indices(
+                sim_g2o[row],
+                same_event[row],
+                cand_idx,
+                semi_hard=semi_hard,
+                margin=semi_hard_margin,
+                fallback_mode=fallback_mode,
+            )
+            selected[row] = chosen if chosen is not None else cand_idx[0]
+            dt_vals[row] = dt_matrix[row, selected[row]].to(torch.float32)
+            actual[row] = True
+            continue
+
+        fallback_idx = torch.nonzero(all_negative_mask[row], as_tuple=False).squeeze(-1)
+        chosen = _select_hard_candidate_from_indices(
+            sim_g2o[row],
+            same_event[row],
+            fallback_idx,
+            semi_hard=semi_hard,
+            margin=semi_hard_margin,
+            fallback_mode=fallback_mode,
+        )
+        if chosen is None:
+            chosen = torch.as_tensor(row, device=device, dtype=torch.long)
+        selected[row] = chosen
+        dt_vals[row] = synthetic_dt[row]
+    return selected, dt_vals, actual
+
+
+def _apply_cls_time_window_to_dt(
+    dt_days,
+    *,
+    pair_type: str,
+    window_days: float,
+    rng: np.random.Generator,
+    counts,
+):
+    if dt_days is None or float(window_days) <= 0.0:
+        return dt_days
+    dt = dt_days.to(torch.float32)
+    finite = torch.isfinite(dt)
+    actual_mask = finite & (dt >= 0.0) & (dt <= float(window_days))
+    synthetic_mask = ~actual_mask
+    out_of_window_mask = finite & ~actual_mask
+    if synthetic_mask.any():
+        synthetic_dt = _synthetic_dt_tensor(dt.numel(), window_days, rng, device=dt.device, dtype=dt.dtype)
+        dt = torch.where(actual_mask, dt, synthetic_dt)
+    _record_cls_time_window_counts(
+        counts,
+        pair_type,
+        actual_mask=actual_mask,
+        synthetic_mask=synthetic_mask,
+        out_of_window_mask=out_of_window_mask,
+    )
+    return dt
 
 
 def compute_dt_bin_metrics(probs, labels, abs_dt_days, edges):
@@ -703,6 +990,89 @@ def build_ref_time(batch_size, n_ref, ref_start, ref_end, device, dtype):
     return ref.unsqueeze(0).repeat(batch_size, 1)
 
 
+def _normalize_negative_sample_strategy(strategy: str) -> str:
+    normalized = str(strategy or "block_random").strip().lower()
+    aliases = {
+        "block": "block_random",
+        "blocks": "block_random",
+        "chunk": "block_random",
+        "chunk_block_random": "block_random",
+        "block_random": "block_random",
+        "full": "full_read",
+        "full_read": "full_read",
+        "legacy": "full_read",
+    }
+    if normalized not in aliases:
+        raise ValueError("negative_sample_strategy must be one of {'block_random', 'full_read'}.")
+    return aliases[normalized]
+
+
+def _infer_negative_sample_block_rows(group, requested_block_rows: Optional[int]) -> int:
+    if requested_block_rows is not None:
+        block_rows = int(requested_block_rows)
+    else:
+        chunks = getattr(group["values"], "chunks", None)
+        block_rows = int(chunks[0]) if chunks else 1024
+    if block_rows <= 0:
+        raise ValueError("negative_sample_block_rows must be positive.")
+    return block_rows
+
+
+def _build_block_sample_intervals(
+    total_samples: int,
+    n_samples: int,
+    *,
+    rng: np.random.Generator,
+    block_rows: int,
+) -> Tuple[List[Tuple[int, int]], np.ndarray]:
+    if not 0 < int(n_samples) < int(total_samples):
+        raise ValueError("block sampling expects 0 < n_samples < total_samples.")
+    total_samples = int(total_samples)
+    n_samples = int(n_samples)
+    block_rows = int(block_rows)
+    n_blocks = int(np.ceil(total_samples / block_rows))
+    block_order = rng.permutation(n_blocks)
+    intervals: List[Tuple[int, int]] = []
+    remaining = n_samples
+
+    for block_id in block_order:
+        block_start = int(block_id) * block_rows
+        block_end = min(block_start + block_rows, total_samples)
+        block_len = int(block_end - block_start)
+        if block_len <= 0:
+            continue
+        take = min(remaining, block_len)
+        if take < block_len:
+            offset = int(rng.integers(0, block_len - take + 1))
+            start = block_start + offset
+        else:
+            start = block_start
+        end = start + take
+        intervals.append((int(start), int(end)))
+        remaining -= take
+        if remaining == 0:
+            break
+
+    if remaining != 0:
+        raise RuntimeError("Failed to build enough block-sampled intervals.")
+    intervals.sort(key=lambda item: item[0])
+    source_indices = np.concatenate(
+        [np.arange(start, end, dtype=np.int64) for start, end in intervals],
+        axis=0,
+    )
+    if source_indices.shape[0] != n_samples:
+        raise RuntimeError("Block-sampled interval count does not match n_samples.")
+    return intervals, source_indices
+
+
+def _read_h5_intervals(dataset, intervals: List[Tuple[int, int]]) -> np.ndarray:
+    if not intervals:
+        shape = (0, *dataset.shape[1:])
+        return np.empty(shape, dtype=dataset.dtype)
+    parts = [np.asarray(dataset[start:end]) for start, end in intervals]
+    return np.concatenate(parts, axis=0)
+
+
 def load_negative_optical_samples(
     neg_data_path,
     neg_group,
@@ -713,6 +1083,9 @@ def load_negative_optical_samples(
     nonkn_cls_base_field="zero_time_mjd_cls_base",
     runtime_input_window_start: Optional[float] = None,
     runtime_input_window_end: Optional[float] = None,
+    negative_sample_strategy: str = "block_random",
+    negative_sample_block_rows: Optional[int] = None,
+    negative_sample_shuffle: bool = True,
 ):
     """Load negative optical samples (non-KN transients) from external HDF5 file.
     
@@ -752,19 +1125,42 @@ def load_negative_optical_samples(
             n_samples = int(n_samples)
             if n_samples <= 0:
                 n_samples = total_samples
+        sample_strategy = _normalize_negative_sample_strategy(negative_sample_strategy)
         if n_samples >= total_samples:
             sample_indices = np.arange(total_samples, dtype=np.int64)
             n_samples = total_samples
             print(f"Loading all {n_samples} negative optical samples from {neg_data_path}")
         else:
-            sample_indices = rng.choice(total_samples, size=n_samples, replace=False)
-            sample_indices = np.sort(sample_indices)  # Sort for efficient HDF5 access
-            print(f"Loading {n_samples} negative optical samples from {neg_data_path}")
+            if sample_strategy == "block_random":
+                block_rows = _infer_negative_sample_block_rows(grp, negative_sample_block_rows)
+                sample_intervals, sample_indices = _build_block_sample_intervals(
+                    total_samples,
+                    n_samples,
+                    rng=rng,
+                    block_rows=block_rows,
+                )
+                print(
+                    f"Loading {n_samples} negative optical samples from {neg_data_path} "
+                    f"using block_random ({len(sample_intervals)} intervals, block_rows={block_rows})"
+                )
+            else:
+                sample_indices = rng.choice(total_samples, size=n_samples, replace=False)
+                sample_indices = np.sort(sample_indices)  # Sort for efficient HDF5 access
+                sample_intervals = None
+                print(
+                    f"Loading {n_samples} negative optical samples from {neg_data_path} "
+                    "using full_read"
+                )
         
-        # Load data.  When sampling a random subset, sequential full-array
-        # reads are faster than chunk-by-chunk fancy indexing because the
-        # random indices scatter across virtually every chunk anyway.
-        if n_samples < total_samples:
+        if n_samples < total_samples and sample_strategy == "block_random":
+            neg_data = {
+                'values': torch.from_numpy(_read_h5_intervals(grp['values'], sample_intervals)),
+                'times': torch.from_numpy(_read_h5_intervals(grp['times'], sample_intervals)),
+                'masks': torch.from_numpy(_read_h5_intervals(grp['masks'], sample_intervals)),
+                'errors': torch.from_numpy(_read_h5_intervals(grp['errors'], sample_intervals)),
+                'coordinates': torch.from_numpy(_read_h5_intervals(grp['coordinates'], sample_intervals)),
+            }
+        elif n_samples < total_samples:
             full_vals = np.asarray(grp['values'][:])
             neg_data = {'values': torch.from_numpy(full_vals[sample_indices])}
             del full_vals
@@ -786,15 +1182,38 @@ def load_negative_optical_samples(
                 'errors': torch.from_numpy(grp['errors'][:]),
                 'coordinates': torch.from_numpy(grp['coordinates'][:]),
             }
-        if has_zero_time_mjd_base:
-            neg_data['zero_time_mjd_base'] = torch.from_numpy(grp['zero_time_mjd_base'][sample_indices])
-        if has_zero_time_mjd_cls_base:
-            neg_data['zero_time_mjd_cls_base'] = torch.from_numpy(grp[str(nonkn_cls_base_field)][sample_indices])
+        if n_samples < total_samples and sample_strategy == "block_random":
+            if has_zero_time_mjd_base:
+                neg_data['zero_time_mjd_base'] = torch.from_numpy(
+                    _read_h5_intervals(grp['zero_time_mjd_base'], sample_intervals)
+                )
+            if has_zero_time_mjd_cls_base:
+                neg_data['zero_time_mjd_cls_base'] = torch.from_numpy(
+                    _read_h5_intervals(grp[str(nonkn_cls_base_field)], sample_intervals)
+                )
+        else:
+            if has_zero_time_mjd_base:
+                neg_data['zero_time_mjd_base'] = torch.from_numpy(grp['zero_time_mjd_base'][sample_indices])
+            if has_zero_time_mjd_cls_base:
+                neg_data['zero_time_mjd_cls_base'] = torch.from_numpy(grp[str(nonkn_cls_base_field)][sample_indices])
         
         # Load types if available (bulk read to avoid per-element HDF5 access)
         if 'types' in grp:
-            raw_types = np.asarray(grp['types'][sample_indices])
+            if n_samples < total_samples and sample_strategy == "block_random":
+                raw_types = _read_h5_intervals(grp['types'], sample_intervals)
+            else:
+                raw_types = np.asarray(grp['types'][sample_indices])
             neg_data['types'] = [t.decode() if isinstance(t, bytes) else t for t in raw_types]
+
+        if n_samples < total_samples and sample_strategy == "block_random" and bool(negative_sample_shuffle):
+            order = rng.permutation(int(n_samples)).astype(np.int64)
+            sample_indices = sample_indices[order]
+            for key, value in list(neg_data.items()):
+                if key == 'types':
+                    neg_data[key] = [value[int(i)] for i in order]
+                elif isinstance(value, torch.Tensor) and int(value.shape[0]) == int(n_samples):
+                    neg_data[key] = value[torch.from_numpy(order).to(torch.long)]
+        neg_data['source_indices'] = torch.from_numpy(sample_indices.astype(np.int64, copy=False))
 
     if runtime_input_window_start is not None and runtime_input_window_end is not None:
         cropped_time, cropped_val, cropped_mask, cropped_err, _ = apply_runtime_input_window_torch(
@@ -1293,7 +1712,10 @@ def extract_triplet_logits(model, loader, device, model_args, neg_optical_data,
                            hardneg_min_candidates: int = 1,
                            hardneg_semi_hard: bool = True,
                            hardneg_semi_hard_margin: float = 0.2,
-                           hardneg_fallback_mode: str = "inbatch_semihard"):
+                           hardneg_fallback_mode: str = "inbatch_semihard",
+                           cls_time_window_days: float = 30.0,
+                           cls_time_fallback: str = "actual_then_synthetic",
+                           cls_time_seed: int = 42):
     """Extract logits for four types of sample pairs.
     
     1. Positive pairs (GW, KN): matched GW-KN optical pairs
@@ -1335,6 +1757,13 @@ def extract_triplet_logits(model, loader, device, model_args, neg_optical_data,
     source_gw_neg = []      # source_type for GW negatives
     source_hard_neg = []    # source_type for semi-hard negatives
     dt_stats = _init_dt_stats()
+    cls_time_counts = _init_cls_time_window_counts()
+    cls_time_window_days = float(cls_time_window_days or 0.0)
+    cls_time_fallback = str(cls_time_fallback or "actual_then_synthetic").strip().lower()
+    if cls_time_fallback != "actual_then_synthetic":
+        raise ValueError("cls_time_fallback currently supports only 'actual_then_synthetic'.")
+    cls_time_window_enabled = cls_time_window_days > 0.0
+    cls_time_rng = np.random.default_rng(int(cls_time_seed) + (1000003 if shuffle_gw else 0))
     dt_positive_all = []
     dt_optical_all = []
     dt_gw_all = []
@@ -1371,6 +1800,7 @@ def extract_triplet_logits(model, loader, device, model_args, neg_optical_data,
     gw_file = None
     gw_scalars_ds = None
     gw_skymaps_ds = None
+    neg_gw_event_times_np = None
     if has_neg_gw:
         dataset_obj = getattr(loader, "dataset", None)
         test_h5_path = getattr(dataset_obj, "h5_path", None)
@@ -1385,6 +1815,14 @@ def extract_triplet_logits(model, loader, device, model_args, neg_optical_data,
             gw_file = h5py.File(test_h5_path, 'r')
             gw_scalars_ds = gw_file['events/gw_data/scalars']
             gw_skymaps_ds = gw_file['events/gw_data/skymaps']
+            if gw_event_time_mjd_table is not None:
+                table_np = np.asarray(gw_event_time_mjd_table.detach().cpu().numpy(), dtype=np.float32).reshape(-1)
+                valid_mask = (neg_gw_indices >= 0) & (neg_gw_indices < table_np.shape[0])
+                if valid_mask.any():
+                    neg_gw_indices = neg_gw_indices[valid_mask]
+                    neg_gw_event_times_np = table_np[neg_gw_indices]
+                else:
+                    neg_gw_event_times_np = None
 
     try:
         for batch_data in tqdm(loader, desc="Extracting triplet logits"):
@@ -1483,6 +1921,14 @@ def extract_triplet_logits(model, loader, device, model_args, neg_optical_data,
                 dt_pos = None
                 if opt_candidate_time_mjd is not None and batch_event_time_mjd_anchor is not None:
                     dt_pos = compute_time_delta_days(opt_candidate_time_mjd, batch_event_time_mjd_anchor)
+                    if cls_time_window_enabled:
+                        dt_pos = _apply_cls_time_window_to_dt(
+                            dt_pos,
+                            pair_type="positive",
+                            window_days=cls_time_window_days,
+                            rng=cls_time_rng,
+                            counts=cls_time_counts,
+                        )
                     _accumulate_dt_stats(dt_stats, "positive", dt_pos)
                     dt_positive_all.append(dt_pos.detach().cpu())
                 logits_pos = model.fusion_logits(
@@ -1506,7 +1952,27 @@ def extract_triplet_logits(model, loader, device, model_args, neg_optical_data,
                     opt_event_time_mjd=opt_candidate_time_mjd,
                 )
 
-                if batch_event_time_mjd_anchor is not None:
+                dt_hard = None
+                if cls_time_window_enabled and batch_event_time_mjd_anchor is not None and opt_candidate_time_mjd is not None:
+                    semi_hard_opt_idx, dt_hard, hard_actual_mask = _sample_signed_time_window_hard_negatives(
+                        sim_g2o,
+                        gw_indices_anchor,
+                        batch_event_time_mjd_anchor,
+                        opt_candidate_time_mjd,
+                        window_days=cls_time_window_days,
+                        rng=cls_time_rng,
+                        semi_hard=bool(hardneg_semi_hard),
+                        semi_hard_margin=float(hardneg_semi_hard_margin),
+                        fallback_mode=str(hardneg_fallback_mode),
+                    )
+                    _record_cls_time_window_counts(
+                        cls_time_counts,
+                        "hard_negative",
+                        actual_mask=hard_actual_mask,
+                        synthetic_mask=~hard_actual_mask,
+                        out_of_window_mask=~hard_actual_mask,
+                    )
+                elif batch_event_time_mjd_anchor is not None:
                     from ALBEF_train import sample_inbatch_hard_negatives_with_time
                     hard_window_days = (
                         [float(v) for v in hardneg_windows_days]
@@ -1536,13 +2002,14 @@ def extract_triplet_logits(model, loader, device, model_args, neg_optical_data,
                 # Use already-encoded features without time-shift re-encoding
                 z_l_hard = z_l[semi_hard_opt_idx].clone()
                 h_l_hard = h_l[semi_hard_opt_idx].clone()
-                if batch_event_time_mjd_anchor is not None:
-                    dt_hard = compute_time_delta_days(
-                        opt_candidate_time_mjd[semi_hard_opt_idx] if opt_candidate_time_mjd is not None else batch_event_time_mjd_anchor[semi_hard_opt_idx],
-                        batch_event_time_mjd_anchor,
-                    )
-                else:
-                    dt_hard = torch.zeros((batch_size,), device=device, dtype=torch.float32)
+                if dt_hard is None:
+                    if batch_event_time_mjd_anchor is not None:
+                        dt_hard = compute_time_delta_days(
+                            opt_candidate_time_mjd[semi_hard_opt_idx] if opt_candidate_time_mjd is not None else batch_event_time_mjd_anchor[semi_hard_opt_idx],
+                            batch_event_time_mjd_anchor,
+                        )
+                    else:
+                        dt_hard = torch.zeros((batch_size,), device=device, dtype=torch.float32)
                 _cred_hard = (
                     compute_credible_level(gw_m, coords_hard)
                     if need_cred else None
@@ -1569,7 +2036,30 @@ def extract_triplet_logits(model, loader, device, model_args, neg_optical_data,
 
                 # 3. GW negatives: has_kn=0 GW paired with KN optical
                 if has_neg_gw:
-                    sampled_neg_gw = gw_neg_rng.choice(neg_gw_indices, size=batch_size, replace=True)
+                    dt_gw_neg = None
+                    if (
+                        cls_time_window_enabled
+                        and opt_candidate_time_mjd is not None
+                        and neg_gw_event_times_np is not None
+                        and len(neg_gw_indices) > 0
+                    ):
+                        sampled_neg_gw_tensor, dt_gw_neg, gw_actual_mask = _sample_time_windowed_indices_before_event(
+                            opt_candidate_time_mjd,
+                            neg_gw_event_times_np,
+                            neg_gw_indices,
+                            window_days=cls_time_window_days,
+                            rng=cls_time_rng,
+                        )
+                        sampled_neg_gw = sampled_neg_gw_tensor.detach().cpu().numpy().astype(np.int64, copy=False)
+                        _record_cls_time_window_counts(
+                            cls_time_counts,
+                            "gw_negative",
+                            actual_mask=gw_actual_mask,
+                            synthetic_mask=~gw_actual_mask,
+                            out_of_window_mask=~gw_actual_mask,
+                        )
+                    else:
+                        sampled_neg_gw = gw_neg_rng.choice(neg_gw_indices, size=batch_size, replace=True)
                     gw_s_neg_np = np.stack([gw_scalars_ds[int(i)] for i in sampled_neg_gw], axis=0)
                     gw_m_neg_np = np.stack([gw_skymaps_ds[int(i)] for i in sampled_neg_gw], axis=0)
 
@@ -1583,11 +2073,11 @@ def extract_triplet_logits(model, loader, device, model_args, neg_optical_data,
                         compute_credible_level(gw_m_neg, opt_coords)
                         if need_cred else None
                     )
-                    dt_gw_neg = None
-                    if opt_candidate_time_mjd is not None and gw_event_time_mjd_table is not None:
+                    if dt_gw_neg is None and opt_candidate_time_mjd is not None and gw_event_time_mjd_table is not None:
                         sampled_neg_gw_tensor = torch.from_numpy(sampled_neg_gw).to(device=device, dtype=torch.long)
                         sampled_neg_gw_time = gw_event_time_mjd_table[sampled_neg_gw_tensor]
                         dt_gw_neg = compute_time_delta_days(opt_candidate_time_mjd, sampled_neg_gw_time)
+                    if dt_gw_neg is not None:
                         _accumulate_dt_stats(dt_stats, "gw_negative", dt_gw_neg)
                         dt_gw_all.append(dt_gw_neg.detach().cpu())
                     logits_gw = model.fusion_logits(
@@ -1606,11 +2096,33 @@ def extract_triplet_logits(model, loader, device, model_args, neg_optical_data,
 
                 # 4. Optical negatives: correct GW paired with non-KN transients
                 if has_neg_optical:
-                    batch_neg_indices = []
-                    for _ in range(batch_size):
-                        idx = neg_idx % total_neg
-                        batch_neg_indices.append(idx)
-                        neg_idx += 1
+                    dt_optical = None
+                    if (
+                        cls_time_window_enabled
+                        and neg_zero_time_mjd_cls_base is not None
+                        and batch_event_time_mjd_anchor is not None
+                    ):
+                        batch_neg_idx_tensor, dt_optical, optical_actual_mask, neg_idx = _sample_time_windowed_indices_after_anchor(
+                            batch_event_time_mjd_anchor,
+                            neg_zero_time_mjd_cls_base,
+                            window_days=cls_time_window_days,
+                            rng=cls_time_rng,
+                            fallback_start=neg_idx,
+                        )
+                        batch_neg_indices = batch_neg_idx_tensor.detach().cpu().numpy().astype(np.int64, copy=False).tolist()
+                        _record_cls_time_window_counts(
+                            cls_time_counts,
+                            "optical_negative",
+                            actual_mask=optical_actual_mask,
+                            synthetic_mask=~optical_actual_mask,
+                            out_of_window_mask=~optical_actual_mask,
+                        )
+                    else:
+                        batch_neg_indices = []
+                        for _ in range(batch_size):
+                            idx = neg_idx % total_neg
+                            batch_neg_indices.append(idx)
+                            neg_idx += 1
                     batch_neg_types = [neg_types_list[idx] for idx in batch_neg_indices]
 
                     neg_v_batch = neg_values[batch_neg_indices]
@@ -1631,11 +2143,11 @@ def extract_triplet_logits(model, loader, device, model_args, neg_optical_data,
                         gw_s, gw_m, neg_c_batch, neg_t_batch, neg_v_batch,
                         ref_time_neg, neg_m_batch, neg_e_batch
                     )
-                    dt_optical = None
-                    if neg_zero_time_mjd_cls_base is not None and batch_event_time_mjd_anchor is not None:
+                    if dt_optical is None and neg_zero_time_mjd_cls_base is not None and batch_event_time_mjd_anchor is not None:
                         dt_optical = compute_time_delta_days(
                             neg_zero_time_mjd_cls_base[batch_neg_indices], batch_event_time_mjd_anchor
                         )
+                    if dt_optical is not None:
                         _accumulate_dt_stats(dt_stats, "optical_negative", dt_optical)
                         dt_optical_all.append(dt_optical.detach().cpu())
                     logits_optical = model.fusion_logits(
@@ -1669,6 +2181,14 @@ def extract_triplet_logits(model, loader, device, model_args, neg_optical_data,
         "time_delta_meta": {
             "enabled": bool(dt_has_any),
             "stats": finalized_dt_stats,
+            "classification_time_window": {
+                "enabled": bool(cls_time_window_enabled),
+                "mode": "signed_after_gw",
+                "window_days": float(cls_time_window_days),
+                "fallback": cls_time_fallback,
+                "seed": int(cls_time_seed),
+                "pair_counts": _finalize_cls_time_window_counts(cls_time_counts),
+            },
             "note": "Computed from available time fields.",
         },
         "dt_positive_days": torch.cat(dt_positive_all) if dt_positive_all else None,
@@ -2896,6 +3416,26 @@ def print_summary(results):
 
     td_meta = results.get("meta", {}).get("time_delta", {})
     dt_dist = td_meta.get("distributions", {}) if isinstance(td_meta, dict) else {}
+    cls_tw = td_meta.get("classification_time_window", {}) if isinstance(td_meta, dict) else {}
+    if cls_tw:
+        print(
+            "\n--- Classification Time Window ---"
+            f"\n  enabled={cls_tw.get('enabled', False)} "
+            f"mode={cls_tw.get('mode', '?')} "
+            f"window_days={cls_tw.get('window_days', 0)} "
+            f"fallback={cls_tw.get('fallback', '?')} "
+            f"seed={cls_tw.get('seed', '?')}"
+        )
+        pair_counts = cls_tw.get("pair_counts", {})
+        for key in ("positive", "optical_negative", "gw_negative", "hard_negative"):
+            entry = pair_counts.get(key, {})
+            if entry:
+                print(
+                    f"  {key}: actual={entry.get('actual_count', 0)} "
+                    f"synthetic={entry.get('synthetic_count', 0)} "
+                    f"out_of_window={entry.get('out_of_window_count', 0)} "
+                    f"actual_ratio={entry.get('actual_ratio', 0.0):.3f}"
+                )
     if dt_dist:
         print("\n--- Time-Delta Distributions ---")
         for key in ("positive", "optical_negative", "gw_negative", "hard_negative"):
@@ -3054,6 +3594,9 @@ def main():
         )
     )
     dt_bin_edges = parse_dt_bin_edges(dt_bin_edges_text)
+    cls_time_window_days = float(args.cls_time_window_days)
+    cls_time_fallback = str(args.cls_time_fallback).strip().lower()
+    cls_time_seed = int(args.cls_time_seed)
     hardneg_semi_hard = bool(choose_value(None, saved_args, "semi_hard", default=True))
     hardneg_semi_hard_margin = float(choose_value(None, saved_args, "semi_hard_margin", default=0.2))
     hardneg_fallback_mode = str(
@@ -3081,6 +3624,11 @@ def main():
         f"semi_hard={hardneg_semi_hard}, margin={hardneg_semi_hard_margin}, "
         f"fallback_mode={hardneg_fallback_mode}, windows={hardneg_windows_days}, "
         f"min_candidates={hardneg_min_candidates}"
+    )
+    print(
+        "Classification time-window config: "
+        f"enabled={cls_time_window_days > 0.0}, mode=signed_after_gw, "
+        f"window_days={cls_time_window_days}, fallback={cls_time_fallback}, seed={cls_time_seed}"
     )
     gw_event_time_mjd_table = load_gw_event_time_mjd_table(
         args.test_data_path, device, required=False
@@ -3172,14 +3720,17 @@ def main():
     neg_optical_data = None
     if args.neg_data_path and os.path.exists(args.neg_data_path):
         neg_optical_data = load_negative_optical_samples(
-            args.neg_data_path, 
-            args.neg_group, 
+            args.neg_data_path,
+            args.neg_group,
             n_samples=args.n_neg_samples,
             require_zero_time_mjd_base=False,
             require_zero_time_mjd_cls_base=False,
             nonkn_cls_base_field=nonkn_cls_base_field,
             runtime_input_window_start=float(runtime_model_args.get("ref_start", -0.3)),
             runtime_input_window_end=float(runtime_model_args.get("ref_end", 0.6)),
+            negative_sample_strategy=getattr(args, "negative_sample_strategy", "block_random"),
+            negative_sample_block_rows=getattr(args, "negative_sample_block_rows", None),
+            negative_sample_shuffle=getattr(args, "negative_sample_shuffle", True),
         )
     neg_gw_indices = load_negative_gw_indices(args.test_data_path)
 
@@ -3200,6 +3751,9 @@ def main():
                 hardneg_semi_hard=hardneg_semi_hard,
                 hardneg_semi_hard_margin=hardneg_semi_hard_margin,
                 hardneg_fallback_mode=hardneg_fallback_mode,
+                cls_time_window_days=cls_time_window_days,
+                cls_time_fallback=cls_time_fallback,
+                cls_time_seed=cls_time_seed,
             )
         except PermissionError:
             if args.num_workers <= 0:
@@ -3221,6 +3775,9 @@ def main():
                 hardneg_semi_hard=hardneg_semi_hard,
                 hardneg_semi_hard_margin=hardneg_semi_hard_margin,
                 hardneg_fallback_mode=hardneg_fallback_mode,
+                cls_time_window_days=cls_time_window_days,
+                cls_time_fallback=cls_time_fallback,
+                cls_time_seed=cls_time_seed,
             )
 
     # Extract triplet logits for distribution analysis
@@ -3277,6 +3834,7 @@ def main():
                 "classification_by_source": shuffle_src if shuffle_src else {},
                 "distribution_summary": summarize_triplet_prob_distributions(triplet_logits_shuffle),
                 "delta_vs_baseline": _metric_delta(shuffle_cls or {}, triplet_cls or {}),
+                "time_delta_meta": triplet_logits_shuffle.get("time_delta_meta", {}),
             }
 
     # Save and display

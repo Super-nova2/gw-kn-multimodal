@@ -132,6 +132,16 @@ def normalize_config(raw_cfg: Mapping[str, Any], cfg_path: Path) -> Dict[str, An
         "gallery_include_undersized": bool(raw_cfg.get("gallery_include_undersized", True)),
         "max_kn_per_redshift_bin": int(raw_cfg.get("max_kn_per_redshift_bin", 0)) or None,
         "n_neg_samples": _parse_n_neg_samples(raw_cfg.get("n_neg_samples", -1)),
+        "negative_sample_strategy": str(raw_cfg.get("negative_sample_strategy", "block_random")),
+        "negative_sample_block_rows": (
+            None
+            if raw_cfg.get("negative_sample_block_rows") in (None, "", "null")
+            else int(raw_cfg.get("negative_sample_block_rows"))
+        ),
+        "negative_sample_shuffle": base_eval._as_bool(
+            raw_cfg.get("negative_sample_shuffle", True),
+            default=True,
+        ),
         "nonkn_cls_base_field": str(raw_cfg.get("nonkn_cls_base_field", "zero_time_mjd_cls_base")),
         "comparison_window": [float(v) for v in raw_cfg.get("comparison_window", [-0.1, 0.2])],
         "amp_dtype": str(raw_cfg.get("amp_dtype", "auto")),
@@ -372,6 +382,106 @@ def plot_redshift_coverage(rows: Sequence[Mapping[str, Any]], output_dir: Path |
         plt.close(fig)
 
 
+def aggregate_redshift_macro_metrics(rows: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+    """Aggregate redshift-binned metrics across gallery sizes with log10(G) weights."""
+    grouped: Dict[Tuple[str, int], List[Mapping[str, Any]]] = {}
+    for row in rows:
+        key = (str(row["method"]), int(row["redshift_bin"]))
+        grouped.setdefault(key, []).append(row)
+
+    macro_rows: List[Dict[str, Any]] = []
+    metric_pairs = [
+        ("recall_at_1", "macro_recall_at_1"),
+        ("recall_at_10", "macro_recall_at_10"),
+        ("mrr", "macro_mrr"),
+    ]
+    for (method, redshift_bin), group in grouped.items():
+        weighted_rows: List[Tuple[Mapping[str, Any], float]] = []
+        for row in group:
+            gallery_size = int(row["gallery_size"])
+            weight = float(np.log10(gallery_size)) if gallery_size > 1 else 0.0
+            if weight > 0.0 and np.isfinite(weight):
+                weighted_rows.append((row, weight))
+        if not weighted_rows:
+            continue
+        weight_sum = float(sum(weight for _, weight in weighted_rows))
+        out_row: Dict[str, Any] = {
+            "method": method,
+            "redshift_bin": int(redshift_bin),
+            "redshift": float(
+                sum(float(row["redshift"]) * weight for row, weight in weighted_rows) / weight_sum
+            ),
+            "weight_scheme": "log10(gallery_size)",
+            "n_gallery_sizes": int(len({int(row["gallery_size"]) for row, _ in weighted_rows})),
+            "gallery_weight_sum": weight_sum,
+            "n_queries_mean": float(
+                sum(float(row.get("n_queries", 0.0)) * weight for row, weight in weighted_rows) / weight_sum
+            ),
+        }
+        for source_key, target_key in metric_pairs:
+            out_row[target_key] = float(
+                sum(float(row[source_key]) * weight for row, weight in weighted_rows) / weight_sum
+            )
+        macro_rows.append(out_row)
+
+    return sorted(macro_rows, key=lambda row: (str(row["method"]), int(row["redshift_bin"])))
+
+
+def plot_redshift_macro_metrics(rows: Sequence[Mapping[str, Any]], output_dir: Path | str) -> None:
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception:
+        return
+    rows = list(rows)
+    if not rows:
+        return
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    methods = sorted({str(row["method"]) for row in rows})
+    metrics = [
+        ("macro_recall_at_1", "Macro R@1"),
+        ("macro_recall_at_10", "Macro R@10"),
+        ("macro_mrr", "Macro MRR"),
+    ]
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5.2), sharex=True)
+    for ax, (key, label) in zip(axes, metrics):
+        for method in methods:
+            method_rows = sorted(
+                [row for row in rows if str(row["method"]) == method],
+                key=lambda row: float(row["redshift"]),
+            )
+            if method_rows:
+                ax.plot(
+                    [float(row["redshift"]) for row in method_rows],
+                    [float(row[key]) for row in method_rows],
+                    marker="o",
+                    linewidth=2,
+                    label=_plot_method_label(method),
+                )
+        ax.set_xlabel("Redshift")
+        ax.set_ylabel(label)
+        ax.set_title(f"{label} vs Redshift", fontsize=11)
+        ax.grid(True, alpha=0.3)
+    handles, labels = axes[0].get_legend_handles_labels()
+    if handles:
+        fig.legend(
+            handles,
+            labels,
+            loc="upper center",
+            ncol=max(1, min(6, len(labels))),
+            frameon=False,
+            fontsize=8,
+            bbox_to_anchor=(0.5, 0.98),
+        )
+    fig.tight_layout(rect=(0, 0, 1, 0.84))
+    fig.savefig(out / "redshift_macro_metrics_log10_weighted.png", dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+
 def write_redshift_csv(rows: Sequence[Mapping[str, Any]], output_path: Path | str) -> None:
     import csv
 
@@ -392,6 +502,33 @@ def write_redshift_csv(rows: Sequence[Mapping[str, Any]], output_path: Path | st
         "fill_ratio_mean",
         "full_coverage",
         "effective_gallery_size_mean",
+    ]
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({key: row.get(key, "") for key in fieldnames})
+
+
+def write_redshift_macro_csv(rows: Sequence[Mapping[str, Any]], output_path: Path | str) -> None:
+    import csv
+
+    rows = list(rows)
+    if not rows:
+        return
+    fieldnames = [
+        "method",
+        "redshift_bin",
+        "redshift",
+        "weight_scheme",
+        "n_gallery_sizes",
+        "gallery_weight_sum",
+        "n_queries_mean",
+        "macro_recall_at_1",
+        "macro_recall_at_10",
+        "macro_mrr",
     ]
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -442,6 +579,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         nonkn_cls_base_field=cfg["nonkn_cls_base_field"],
         runtime_input_window_start=comparison_window[0],
         runtime_input_window_end=comparison_window[1],
+        negative_sample_strategy=cfg.get("negative_sample_strategy", "block_random"),
+        negative_sample_block_rows=cfg.get("negative_sample_block_rows", None),
+        negative_sample_shuffle=cfg.get("negative_sample_shuffle", True),
     )
     gallery_candidate_mode = str(cfg["gallery_candidate_mode"]).strip().lower()
     if gallery_candidate_mode == "time_sky_hard":
@@ -491,12 +631,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     gw_event_time_mjd_table = load_gw_event_time_mjd_table(cfg["test_data_path"], device, required=False)
 
     model_results: OrderedDict[str, Dict[str, Any]] = OrderedDict()
+    retrieval_rows: OrderedDict[str, Dict[str, float]] = OrderedDict()
     curve_rows: List[Dict[str, Any]] = []
     redshift_rows: List[Dict[str, Any]] = []
+    redshift_macro_rows: List[Dict[str, Any]] = []
+    model_names: List[str] = []
 
     for model_spec in model_specs:
         name = str(model_spec["name"])
         model_type = str(model_spec["type"])
+        model_names.append(name)
         print(f"Evaluating {name} ({model_type})")
         if model_type == "skymap":
             outcomes = score_all_galleries_skymap(
@@ -506,6 +650,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         elif model_type == "optical":
             model, ckpt_args = base_eval.load_optical_model(model_spec["resolved_checkpoint"], device)
+            original_window = [
+                float(ckpt_args.get("ref_start", comparison_window[0])),
+                float(ckpt_args.get("ref_end", comparison_window[1])),
+            ]
             ranks = base_eval.score_all_galleries_optical(
                 model,
                 positive_bank,
@@ -597,10 +745,25 @@ def main(argv: Sequence[str] | None = None) -> int:
             "scoring": str(model_spec.get("scoring")),
             "resolved_checkpoint": model_spec.get("resolved_checkpoint"),
             "resolved_config": model_spec.get("resolved_config"),
+            "comparison_window": list(comparison_window),
             "retrieval": retrieval_metrics,
             "retrieval_by_source": retrieval_by_source,
+            "coverage": {key: float(val.get("coverage", 0.0)) for key, val in coverage_stats.items()},
             "effective_gallery_size_stats": coverage_stats,
         }
+        if model_type == "optical":
+            model_results[name]["original_model_window"] = original_window
+        elif model_type == "multimodal":
+            model_results[name]["original_model_window"] = [
+                float(runtime_model_args.get("original_ref_start", comparison_window[0])),
+                float(runtime_model_args.get("original_ref_end", comparison_window[1])),
+            ]
+            model_results[name]["effective_input_window_metadata"] = runtime_model_args.get(
+                "effective_input_window_metadata"
+            )
+        else:
+            model_results[name]["original_model_window"] = None
+        retrieval_rows[name] = retrieval_metrics
         curve_rows.extend(
             build_curve_rows(
                 method_name=name,
@@ -622,6 +785,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         torch.cuda.empty_cache()
         gc.collect()
 
+    print(f"\n{'=' * 60}")
+    print("Results: Overall Retrieval")
+    print("=" * 60)
+    base_eval.print_unified_table(retrieval_rows, gallery_sizes, model_names)
+
     output_dir = Path(cfg["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
     plot_retrieval_curves(curve_rows, output_dir)
@@ -629,11 +797,34 @@ def main(argv: Sequence[str] | None = None) -> int:
     plot_redshift_metrics(redshift_rows, output_dir)
     plot_redshift_coverage(redshift_rows, output_dir)
     write_redshift_csv(redshift_rows, output_dir / "redshift_metrics.csv")
+    redshift_macro_rows = aggregate_redshift_macro_metrics(redshift_rows)
+    write_redshift_macro_csv(redshift_macro_rows, output_dir / "redshift_macro_metrics_log10_weighted.csv")
+    plot_redshift_macro_metrics(redshift_macro_rows, output_dir)
     output = {
+        "table": {
+            "gallery_sizes": gallery_sizes,
+            "metric_labels": TABLE_METRIC_LABELS,
+            "rows": base_eval.build_table_rows(retrieval_rows, gallery_sizes, model_names),
+        },
         "curve_rows": curve_rows,
         "redshift_rows": redshift_rows,
+        "redshift_macro_rows": redshift_macro_rows,
         "models": dict(model_results),
-        "config": cfg,
+        "config": {
+            **cfg,
+            "models": [
+                {
+                    "name": spec["name"],
+                    "type": spec["type"],
+                    "scoring": spec.get("scoring"),
+                    "checkpoint": spec.get("checkpoint"),
+                    "config": spec.get("config"),
+                    "resolved_checkpoint": spec.get("resolved_checkpoint"),
+                    "resolved_config": spec.get("resolved_config"),
+                }
+                for spec in model_specs
+            ],
+        },
     }
     with (output_dir / "gw170817a_retrieval.json").open("w", encoding="utf-8") as f:
         json.dump(_json_safe(output), f, indent=2, ensure_ascii=False)
