@@ -38,6 +38,7 @@ Model/args/eval/retrieval_gw170817a_lsst_balanced.json
 
 # Generated exports
 *.html
+docs/
 
 # Deprecated / internal
 PRD/

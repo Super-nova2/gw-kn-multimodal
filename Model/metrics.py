@@ -136,24 +136,31 @@ def compute_classification_metrics(all_probs, all_labels, all_sources=None,
     """
     results = {}
 
-    probs = all_probs.float()
-    labels = all_labels.long()
+    probs_raw = all_probs.float()
+    labels_raw = all_labels
+    finite = torch.isfinite(probs_raw) & torch.isfinite(labels_raw.float())
+    n_dropped = int((~finite).sum().item())
+
+    probs = probs_raw[finite]
+    labels = labels_raw[finite].long()
+    if all_sources is not None:
+        keep = finite.detach().cpu().tolist()
+        all_sources = [src for src, is_finite in zip(all_sources, keep) if is_finite]
+
     N = len(probs)
 
     if N == 0:
         return {"auroc": 0.0, "auprc": 0.0, "f1_optimal": 0.0,
-                "f1_threshold": 0.5, "ece": 0.0}
+                "f1_threshold": 0.5, "ece": 0.0,
+                "n_dropped_nonfinite": n_dropped}
 
-    # Sort by predicted probability (descending) for curve computation
-    sorted_indices = probs.argsort(descending=True)
-    sorted_probs = probs[sorted_indices]
-    sorted_labels = labels[sorted_indices]
+    results["n_dropped_nonfinite"] = n_dropped
 
     # --- AUROC ---
     results["auroc"] = _auroc(probs, labels)
 
     # --- AUPRC ---
-    results["auprc"] = _auprc(sorted_labels)
+    results["auprc"] = _auprc(probs, labels)
 
     # --- F1 at optimal threshold ---
     f1, threshold = _optimal_f1(probs, labels)
@@ -185,7 +192,7 @@ def compute_classification_metrics(all_probs, all_labels, all_sources=None,
     if all_sources is not None:
         for src in set(all_sources):
             mask = [s == src for s in all_sources]
-            mask = torch.tensor(mask, dtype=torch.bool)
+            mask = torch.tensor(mask, dtype=torch.bool, device=probs.device)
             if mask.sum() > 0:
                 src_preds = (probs[mask] >= 0.5).long()
                 src_labels = labels[mask]
@@ -198,42 +205,51 @@ def compute_classification_metrics(all_probs, all_labels, all_sources=None,
     return results
 
 
-def _auroc(probs, labels):
-    """Compute AUROC using the trapezoidal rule."""
-    n_pos = labels.sum().item()
-    n_neg = len(labels) - n_pos
-    if n_pos == 0 or n_neg == 0:
-        return 0.0
-
+def _grouped_binary_counts(probs, labels):
+    """Return positive/negative counts per distinct score, sorted descending."""
     sorted_indices = probs.argsort(descending=True)
+    sorted_scores = probs[sorted_indices]
     sorted_labels = labels[sorted_indices].float()
 
-    tpr = sorted_labels.cumsum(0) / n_pos
-    fpr = (1 - sorted_labels).cumsum(0) / n_neg
+    _, counts = torch.unique_consecutive(sorted_scores, return_counts=True)
+    ends = counts.cumsum(0)
+    starts = torch.cat([torch.zeros(1, dtype=ends.dtype, device=ends.device), ends[:-1]])
 
-    # Prepend (0, 0)
-    tpr = torch.cat([torch.zeros(1, device=tpr.device), tpr])
-    fpr = torch.cat([torch.zeros(1, device=fpr.device), fpr])
-
-    # Trapezoidal integration
-    auroc = torch.trapezoid(tpr, fpr).item()
-    return auroc
+    pos_counts = torch.stack([sorted_labels[int(s.item()):int(e.item())].sum() for s, e in zip(starts, ends)])
+    total_counts = counts.to(dtype=pos_counts.dtype)
+    neg_counts = total_counts - pos_counts
+    return pos_counts, neg_counts
 
 
-def _auprc(sorted_labels):
-    """Compute AUPRC from labels sorted by descending predicted probability."""
-    n_pos = sorted_labels.sum().item()
-    if n_pos == 0:
+def _auroc(probs, labels):
+    """Compute tie-aware AUROC using grouped score thresholds."""
+    n_pos = labels.sum().float()
+    n_neg = (labels == 0).sum().float()
+    if n_pos.item() == 0 or n_neg.item() == 0:
         return 0.0
 
-    tp_cumsum = sorted_labels.float().cumsum(0)
-    ranks = torch.arange(1, len(sorted_labels) + 1, device=sorted_labels.device).float()
-    precision = tp_cumsum / ranks
-    recall = tp_cumsum / n_pos
+    pos_counts, neg_counts = _grouped_binary_counts(probs, labels)
+    tpr = pos_counts.cumsum(0) / n_pos
+    fpr = neg_counts.cumsum(0) / n_neg
 
-    # Only count positions where item is positive
-    ap = (precision * sorted_labels.float()).sum().item() / n_pos
-    return ap
+    tpr = torch.cat([torch.zeros(1, device=tpr.device), tpr])
+    fpr = torch.cat([torch.zeros(1, device=fpr.device), fpr])
+    return torch.trapezoid(tpr, fpr).item()
+
+
+def _auprc(probs, labels):
+    """Compute tie-aware average precision using grouped score thresholds."""
+    n_pos = labels.sum().float()
+    if n_pos.item() == 0:
+        return 0.0
+
+    pos_counts, neg_counts = _grouped_binary_counts(probs, labels)
+    cum_pos = pos_counts.cumsum(0)
+    cum_total = (pos_counts + neg_counts).cumsum(0)
+    precision = cum_pos / cum_total.clamp_min(1.0)
+    recall = cum_pos / n_pos
+    prev_recall = torch.cat([torch.zeros(1, device=recall.device), recall[:-1]])
+    return ((recall - prev_recall) * precision).sum().item()
 
 
 def _optimal_f1(probs, labels):

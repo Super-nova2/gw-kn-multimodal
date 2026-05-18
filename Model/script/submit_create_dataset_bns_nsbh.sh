@@ -33,8 +33,8 @@ if [[ ! -f "${SCRIPT_PATH}" ]]; then
     exit 1
 fi
 
-PROFILE="${PROFILE:-final_train}"          # test_aug | final_train
-DATASET_MODE="${DATASET_MODE:-train}"   # train | test
+PROFILE="${PROFILE:-astro_test}"       # test_aug | final_train | astro_test
+DATASET_MODE="${DATASET_MODE:-}"        # train | test
 
 BUFFER_LIMIT="${BUFFER_LIMIT:-2000}"
 NUM_WORKERS="${NUM_WORKERS:-8}"
@@ -60,6 +60,7 @@ LUPT_M5_MAG="${LUPT_M5_MAG:-23.9,25.0,24.7,24.0,23.3,22.1}"
 set_profile_defaults() {
     case "$PROFILE" in
         test_aug)
+            DATASET_MODE="${DATASET_MODE:-test}"
             BNS_FULL_CATALOG_PATH="${BNS_FULL_CATALOG_PATH:-${REPO_ROOT}/dataset/O5_sim_bns/injections_final.csv}"
             BNS_SKYMAP_DIR="${BNS_SKYMAP_DIR:-${BASE_DIR}/data/skymap/bns_skymap_v0}"
             BNS_SIM_ROOT="${BNS_SIM_ROOT:-${BASE_DIR}/SNANA/SNDATA_ROOT/SIM/LSST_KN_BNS}"
@@ -75,6 +76,7 @@ set_profile_defaults() {
             OUTPUT_H5_PATH="${OUTPUT_H5_PATH:-${BASE_DIR}/data/ALBEF_dataset/combined_dataset_${DATASET_MODE}.h5}"
             ;;
         final_train)
+            DATASET_MODE="${DATASET_MODE:-train}"
             BNS_FULL_CATALOG_PATH="${BNS_FULL_CATALOG_PATH:-${REPO_ROOT}/dataset/O5_sim_bns_aug/injections_final.csv}"
             BNS_SKYMAP_DIR="${BNS_SKYMAP_DIR:-${BASE_DIR}/data/skymap/bns_skymap}"
             # Keep overridable because BNS_AUG raw SNANA outputs may be compressed/offline.
@@ -90,8 +92,24 @@ set_profile_defaults() {
 
             OUTPUT_H5_PATH="${OUTPUT_H5_PATH:-${BASE_DIR}/data/ALBEF_dataset/combined_dataset_${DATASET_MODE}.h5}"
             ;;
+        astro_test)
+            DATASET_MODE="${DATASET_MODE:-test}"
+            BNS_FULL_CATALOG_PATH="${BNS_FULL_CATALOG_PATH:-${REPO_ROOT}/dataset/test/bns_test/injections_final.csv}"
+            BNS_SKYMAP_DIR="${BNS_SKYMAP_DIR:-${BASE_DIR}/data_zjq/skymap/bns_test}"
+            BNS_SIM_ROOT="${BNS_SIM_ROOT:-${BASE_DIR}/SNANA/SNDATA_ROOT/SIM/LSST_KN_BNS_Test}"
+            BNS_SIM_NAME="${BNS_SIM_NAME:-LSST_KN_BNS_Test}"
+            BNS_SUCCESS_IDS_PATH="${BNS_SUCCESS_IDS_PATH:-${BASE_DIR}/data_zjq/LSST_KN_BNS_Test/success_sim_ids.txt}"
+
+            NSBH_FULL_CATALOG_PATH="${NSBH_FULL_CATALOG_PATH:-${REPO_ROOT}/dataset/test/nsbh_test/injections_full.csv}"
+            NSBH_SKYMAP_DIR="${NSBH_SKYMAP_DIR:-${BASE_DIR}/data_zjq/skymap/nsbh_test}"
+            NSBH_SIM_ROOT="${NSBH_SIM_ROOT:-${BASE_DIR}/SNANA/SNDATA_ROOT/SIM/LSST_KN_NSBH_TEST}"
+            NSBH_SIM_NAME="${NSBH_SIM_NAME:-LSST_KN_NSBH_TEST}"
+            NSBH_SUCCESS_IDS_PATH="${NSBH_SUCCESS_IDS_PATH:-${BASE_DIR}/data_zjq/LSST_KN_NSBH_TEST/success_sim_ids.txt}"
+
+            OUTPUT_H5_PATH="${OUTPUT_H5_PATH:-${BASE_DIR}/data_zjq/ALBEF_dataset/combined_dataset_astro_${DATASET_MODE}.h5}"
+            ;;
         *)
-            echo "Unsupported PROFILE='$PROFILE'. Use PROFILE=test_aug or PROFILE=final_train."
+            echo "Unsupported PROFILE=$PROFILE. Use PROFILE=test_aug, PROFILE=final_train, or PROFILE=astro_test."
             exit 1
             ;;
     esac

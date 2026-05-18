@@ -3064,14 +3064,43 @@ def generate_plots(embeddings, results, output_dir, triplet_logits=None):
     print(f"Plots saved to {output_dir}/")
 
 
-def generate_logits_distribution_plot(triplet_logits, output_dir):
-    """Generate logits distribution plots for four pair types.
+def _logit_margin_numpy(logits):
+    """Return finite class-1 minus class-0 logit margins as a NumPy array."""
+    if logits is None:
+        return None
+    values = (logits.detach().float()[:, 1] - logits.detach().float()[:, 0]).cpu().numpy()
+    return values[np.isfinite(values)]
 
-    Plot types:
-    1. Positive (GW, KN)
-    2. Optical negatives (GW, nonKN)
-    3. GW negatives (GW_has_kn0, KN)
-    4. Semi-hard negatives (GW_wrong, KN)
+
+def _logit_margin_bins(series, n_bins=51):
+    values = np.concatenate([x for x in series if x is not None and len(x) > 0])
+    lo = float(np.min(values))
+    hi = float(np.max(values))
+    lo = min(lo, 0.0)
+    hi = max(hi, 0.0)
+    if not np.isfinite(lo) or not np.isfinite(hi) or lo == hi:
+        lo, hi = -1.0, 1.0
+    pad = max((hi - lo) * 0.05, 1e-3)
+    return np.linspace(lo - pad, hi + pad, n_bins)
+
+
+def _plot_logit_margin_kde(ax, values, x_range, *, color, label):
+    if values is None or len(values) < 2 or float(np.std(values)) == 0.0:
+        return
+    try:
+        from scipy import stats
+        kde = stats.gaussian_kde(values, bw_method=0.05)
+        ax.plot(x_range, kde(x_range), color=color, linewidth=2.5, label=label)
+    except Exception as exc:
+        print(f"WARNING: Skipping KDE for {label}: {exc}")
+
+
+def generate_logits_distribution_plot(triplet_logits, output_dir):
+    """Generate class-logit-margin distribution plots for four pair types.
+
+    The score is logits[:, 1] - logits[:, 0], matching the retrieval-comparison
+    fusion-logit ranking convention. Softmax probabilities are intentionally not
+    used here because poorly calibrated heads can hide useful margin structure.
     """
     try:
         import matplotlib
@@ -3081,119 +3110,80 @@ def generate_logits_distribution_plot(triplet_logits, output_dir):
     except ImportError:
         print("matplotlib not available, skipping logits distribution plot")
         return
-    
+
     os.makedirs(output_dir, exist_ok=True)
-    
-    # Extract probabilities (class 1 = match probability)
-    probs_pos = None
-    probs_optical = None
-    probs_gw = None
-    probs_hard = None
-    
-    if triplet_logits.get("logits_positive") is not None:
-        probs_pos = torch.softmax(triplet_logits["logits_positive"].float(), dim=1)[:, 1].numpy()
+
+    margins_pos = _logit_margin_numpy(triplet_logits.get("logits_positive"))
     optical_logits = triplet_logits.get("logits_optical_neg")
-    if optical_logits is not None:
-        probs_optical = torch.softmax(optical_logits.float(), dim=1)[:, 1].numpy()
-    if triplet_logits.get("logits_gw_neg") is not None:
-        probs_gw = torch.softmax(triplet_logits["logits_gw_neg"].float(), dim=1)[:, 1].numpy()
-    if triplet_logits.get("logits_hard_neg") is not None:
-        probs_hard = torch.softmax(triplet_logits["logits_hard_neg"].float(), dim=1)[:, 1].numpy()
-    
-    # --- 1. Main distribution plot ---
-    fig, ax = plt.subplots(figsize=(10, 6))
-    
-    bins = np.linspace(0, 1, 51)
+    margins_optical = _logit_margin_numpy(optical_logits)
+    margins_gw = _logit_margin_numpy(triplet_logits.get("logits_gw_neg"))
+    margins_hard = _logit_margin_numpy(triplet_logits.get("logits_hard_neg"))
+
+    series = [margins_pos, margins_optical, margins_gw, margins_hard]
+    if not any(x is not None and len(x) > 0 for x in series):
+        print("WARNING: No finite logit margins available. Skipping logits distribution plot.")
+        return
+
+    bins = _logit_margin_bins(series)
     alpha = 0.6
-    
-    if probs_pos is not None:
-        ax.hist(probs_pos, bins=bins, alpha=alpha, label=f'Positive (GW, KN) n={len(probs_pos)}', 
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    if margins_pos is not None:
+        ax.hist(margins_pos, bins=bins, alpha=alpha, label=f'Positive (GW, KN) n={len(margins_pos)}',
                 edgecolor='#2ecc71', linewidth=3, histtype='step')
-    if probs_optical is not None:
-        ax.hist(probs_optical, bins=bins, alpha=alpha, label=f'Optical Negatives (GW, nonKN) n={len(probs_optical)}',
+    if margins_optical is not None:
+        ax.hist(margins_optical, bins=bins, alpha=alpha, label=f'Optical Negatives (GW, nonKN) n={len(margins_optical)}',
                 edgecolor='#3498db', linewidth=3, histtype='step')
-    if probs_gw is not None:
-        ax.hist(probs_gw, bins=bins, alpha=alpha, label=f'GW Negatives (GW_has_kn0, KN) n={len(probs_gw)}',
+    if margins_gw is not None:
+        ax.hist(margins_gw, bins=bins, alpha=alpha, label=f'GW Negatives (GW_has_kn0, KN) n={len(margins_gw)}',
                 edgecolor='#f39c12', linewidth=3, histtype='step')
-    if probs_hard is not None:
-        ax.hist(probs_hard, bins=bins, alpha=alpha, label=f'Semi-Hard Negatives (GW_wrong, KN) n={len(probs_hard)}',
+    if margins_hard is not None:
+        ax.hist(margins_hard, bins=bins, alpha=alpha, label=f'Semi-Hard Negatives (GW_wrong, KN) n={len(margins_hard)}',
                 edgecolor='#e74c3c', linewidth=3, histtype='step')
-    
-    ax.set_xlabel('Match Probability (Softmax Output)', fontsize=12)
+
+    ax.set_xlabel('Logit margin (class 1 - class 0)', fontsize=12)
     ax.set_ylabel('Count', fontsize=12)
-    ax.set_title('Classification Head Logits Distribution\nby Sample Pair Type', fontsize=14)
+    ax.set_title('Classification Head Logit-Margin Distribution\nby Sample Pair Type', fontsize=14)
     ax.legend(loc='upper center', fontsize=10)
-    ax.set_xlim(0, 1)
     ax.grid(True, alpha=0.3, linestyle='--')
     ax.yaxis.set_major_locator(MaxNLocator(integer=True))
-    
-    # Add vertical line at 0.5 threshold
-    ax.axvline(x=0.5, color='black', linestyle='--', linewidth=1.5, alpha=0.7, label='Threshold=0.5')
-    
+
     fig.tight_layout()
     fig.savefig(os.path.join(output_dir, "logits_distribution_triplet.png"), dpi=200,
                 bbox_inches="tight")
     plt.close(fig)
-    
-    # --- 2. KDE density plot for better visualization ---
-    try:
-        from scipy import stats
-        
-        fig, ax = plt.subplots(figsize=(10, 6))
-        
-        x_range = np.linspace(0, 1, 200)
-        
-        if probs_pos is not None and len(probs_pos) > 1:
-            kde_pos = stats.gaussian_kde(probs_pos, bw_method=0.05)
-            ax.plot(x_range, kde_pos(x_range), color='#27ae60', linewidth=2.5,
-                   label=f'Positive (GW, KN)')
-            
-        if probs_optical is not None and len(probs_optical) > 1:
-            kde_optical = stats.gaussian_kde(probs_optical, bw_method=0.05)
-            ax.plot(x_range, kde_optical(x_range), color='#2980b9', linewidth=2.5,
-                   label='Optical Negatives (GW, nonKN)')
 
-        if probs_gw is not None and len(probs_gw) > 1:
-            kde_gw = stats.gaussian_kde(probs_gw, bw_method=0.05)
-            ax.plot(x_range, kde_gw(x_range), color='#d68910', linewidth=2.5,
-                   label='GW Negatives (GW_has_kn0, KN)')
-            
-        if probs_hard is not None and len(probs_hard) > 1:
-            kde_hard = stats.gaussian_kde(probs_hard, bw_method=0.05)
-            ax.plot(x_range, kde_hard(x_range), color='#c0392b', linewidth=2.5,
-                   label='Semi-Hard Negatives (GW_wrong, KN)')
-        
-        ax.set_xlabel('Match Probability (Softmax Output)', fontsize=12)
-        ax.set_ylabel('Density', fontsize=12)
-        ax.set_title('Classification Head Output Distribution (KDE)\nby Sample Pair Type', fontsize=14)
-        ax.legend(loc='upper center', fontsize=10)
-        ax.set_xlim(0, 1)
-        ax.axvline(x=0.5, color='black', linestyle='--', linewidth=1.5, alpha=0.7)
-        ax.grid(True, alpha=0.3, linestyle='--')
-        
-        fig.tight_layout()
-        fig.savefig(os.path.join(output_dir, "logits_distribution_kde.png"), dpi=200,
-                    bbox_inches="tight")
-        plt.close(fig)
-    except ImportError:
-        print("scipy not available, skipping KDE plot")
-    
-    # Print summary statistics
-    print("\n--- Logits Distribution Summary ---")
-    if probs_pos is not None:
-        print(f"  Positive (GW, KN):     mean={np.mean(probs_pos):.4f}  std={np.std(probs_pos):.4f}  "
-              f"median={np.median(probs_pos):.4f}  n={len(probs_pos)}")
-    if probs_optical is not None:
-        print(f"  Optical Negatives (GW, nonKN): mean={np.mean(probs_optical):.4f}  std={np.std(probs_optical):.4f}  "
-              f"median={np.median(probs_optical):.4f}  n={len(probs_optical)}")
-    if probs_gw is not None:
-        print(f"  GW Negatives (GW_has_kn0, KN): mean={np.mean(probs_gw):.4f}  std={np.std(probs_gw):.4f}  "
-              f"median={np.median(probs_gw):.4f}  n={len(probs_gw)}")
-    if probs_hard is not None:
-        print(f"  Semi-Hard Negatives (GW_wrong, KN): mean={np.mean(probs_hard):.4f}  std={np.std(probs_hard):.4f}  "
-              f"median={np.median(probs_hard):.4f}  n={len(probs_hard)}")
-    
-    print(f"Logits distribution plots saved to {output_dir}/")
+    fig, ax = plt.subplots(figsize=(10, 6))
+    x_range = np.linspace(float(bins[0]), float(bins[-1]), 300)
+    _plot_logit_margin_kde(ax, margins_pos, x_range, color='#27ae60', label='Positive (GW, KN)')
+    _plot_logit_margin_kde(ax, margins_optical, x_range, color='#2980b9', label='Optical Negatives (GW, nonKN)')
+    _plot_logit_margin_kde(ax, margins_gw, x_range, color='#d68910', label='GW Negatives (GW_has_kn0, KN)')
+    _plot_logit_margin_kde(ax, margins_hard, x_range, color='#c0392b', label='Semi-Hard Negatives (GW_wrong, KN)')
+    ax.set_xlabel('Logit margin (class 1 - class 0)', fontsize=12)
+    ax.set_ylabel('Density', fontsize=12)
+    ax.set_title('Classification Head Logit-Margin Distribution (KDE)\nby Sample Pair Type', fontsize=14)
+    ax.legend(loc='upper center', fontsize=10)
+    ax.grid(True, alpha=0.3, linestyle='--')
+    fig.tight_layout()
+    fig.savefig(os.path.join(output_dir, "logits_distribution_kde.png"), dpi=200,
+                bbox_inches="tight")
+    plt.close(fig)
+
+    print("\n--- Logit Margin Distribution Summary ---")
+    if margins_pos is not None:
+        print(f"  Positive (GW, KN):     mean={np.mean(margins_pos):.4f}  std={np.std(margins_pos):.4f}  "
+              f"median={np.median(margins_pos):.4f}  n={len(margins_pos)}")
+    if margins_optical is not None:
+        print(f"  Optical Negatives (GW, nonKN): mean={np.mean(margins_optical):.4f}  std={np.std(margins_optical):.4f}  "
+              f"median={np.median(margins_optical):.4f}  n={len(margins_optical)}")
+    if margins_gw is not None:
+        print(f"  GW Negatives (GW_has_kn0, KN): mean={np.mean(margins_gw):.4f}  std={np.std(margins_gw):.4f}  "
+              f"median={np.median(margins_gw):.4f}  n={len(margins_gw)}")
+    if margins_hard is not None:
+        print(f"  Semi-Hard Negatives (GW_wrong, KN): mean={np.mean(margins_hard):.4f}  std={np.std(margins_hard):.4f}  "
+              f"median={np.median(margins_hard):.4f}  n={len(margins_hard)}")
+
+    print(f"Logit margin distribution plots saved to {output_dir}/")
 
 
 def generate_gw_shuffle_comparison_plot(triplet_logits_normal, triplet_logits_shuffle, output_dir):
