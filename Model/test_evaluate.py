@@ -14,7 +14,7 @@ New Features:
       * Positive pairs (GW, KN): matched GW-KN optical pairs
       * Optical negatives (GW, nonKN): GW paired with non-KN transients
       * GW negatives (GW_has_kn0, KN): negative-GW paired with KN optical
-      * Semi-hard negatives (GW_wrong, KN): mismatched GW paired with KN optical
+      * Mismatched Negatives (GW, KN_mismatch): GW paired with a randomly rolled in-batch KN optical sample
 
 Usage:
     python test_evaluate.py \\
@@ -60,6 +60,11 @@ from metrics import (
 
 
 _BASE_DIR = os.environ.get('BASE_DIR', '/fred/oz016/bgao_kn')
+
+MISMATCH_NEGATIVE_LABEL = "Mismatched Negatives"
+MISMATCH_NEGATIVE_PAIR_LABEL = f"{MISMATCH_NEGATIVE_LABEL} (GW, KN_mismatch)"
+LOGIT_DISTRIBUTION_TITLE = "Classification Logit Distribution by Sample Pairs"
+LOGIT_AXIS_LABEL = "Logit"
 
 
 def parse_args():
@@ -235,6 +240,18 @@ def compute_time_delta_days(opt_zero_time_mjd, gw_anchor_time_mjd):
     dt = opt_zero_time_mjd.to(torch.float32) - gw_anchor_time_mjd.to(torch.float32)
     dt = torch.where(torch.isfinite(dt), dt, torch.zeros_like(dt))
     return dt
+
+
+def sample_easy_mismatch_negatives(batch_size, device, generator=None):
+    """Sample v11-style easy in-batch mismatched negatives via one random roll."""
+    batch_size = int(batch_size)
+    if batch_size < 2:
+        return None
+    kwargs = {"device": device}
+    if generator is not None:
+        kwargs["generator"] = generator
+    shift = int(torch.randint(1, batch_size, (1,), **kwargs).item())
+    return (torch.arange(batch_size, device=device) + shift) % batch_size
 
 
 def compute_g2o_similarity_with_time_compat(
@@ -1721,10 +1738,8 @@ def extract_triplet_logits(model, loader, device, model_args, neg_optical_data,
     1. Positive pairs (GW, KN): matched GW-KN optical pairs
     2. Optical negatives (GW, nonKN): GW paired with non-KN transients
     3. GW negatives (GW_has_kn0, KN): negative-GW paired with KN optical
-    4. Semi-hard negatives (GW_wrong, KN): mismatched GW paired with KN optical
-       - Uses similarity-based semi-hard negative mining: for each optical,
-         select the most similar wrong GW that is still less similar than
-         the correct GW (below positive similarity).
+    4. Mismatched Negatives (GW, KN_mismatch): GW paired with a randomly rolled in-batch KN optical sample
+       - Uses v11-style easy negative sampling, not similarity-based mining.
     
     Args:
         model: Trained ALBEF model
@@ -1736,8 +1751,8 @@ def extract_triplet_logits(model, loader, device, model_args, neg_optical_data,
         gw_source_types: Optional list of source_type labels indexed by GW ID
         shuffle_gw: If True, randomly shuffle GW within each batch (ablation test)
         shuffle_seed: Random seed for GW shuffling
-        hardneg_semi_hard: Whether to select semi-hard negatives
-        hardneg_semi_hard_margin: Semi-hard margin
+        hardneg_semi_hard: Legacy argument retained for config compatibility; ignored for mismatched negatives
+        hardneg_semi_hard_margin: Legacy argument retained for config compatibility; ignored for mismatched negatives
         hardneg_fallback_mode: Fallback mode when windowed mining has insufficient candidates
         
     Returns:
@@ -1746,7 +1761,7 @@ def extract_triplet_logits(model, loader, device, model_args, neg_optical_data,
     logits_positive = []    # (GW, matched KN)
     logits_optical_neg = [] # (GW, non-KN transient)
     logits_gw_neg = []      # (GW_has_kn0, KN)
-    logits_hard_neg = []    # (wrong GW, KN) - semi-hard
+    logits_hard_neg = []    # (GW, mismatched KN optical) - easy mismatch
     cred_positive = []
     cred_optical_neg = []
     cred_gw_neg = []
@@ -1755,7 +1770,7 @@ def extract_triplet_logits(model, loader, device, model_args, neg_optical_data,
     source_positive = []    # source_type for positive pairs
     source_optical_neg = [] # source_type for optical negatives
     source_gw_neg = []      # source_type for GW negatives
-    source_hard_neg = []    # source_type for semi-hard negatives
+    source_hard_neg = []    # source_type for mismatched negatives
     dt_stats = _init_dt_stats()
     cls_time_counts = _init_cls_time_window_counts()
     cls_time_window_days = float(cls_time_window_days or 0.0)
@@ -1942,74 +1957,22 @@ def extract_triplet_logits(model, loader, device, model_args, neg_optical_data,
                 if batch_sources is not None:
                     source_positive.extend(batch_sources)
 
-                # 2. Semi-hard negatives: use similarity-based semi-hard negative mining
-                feat_g, feat_o = model.get_contrastive_embeddings(g, z_l)
-                sim_g2o = compute_g2o_similarity_with_time_compat(
-                    model,
-                    feat_g,
-                    feat_o,
-                    gw_event_time_mjd=batch_event_time_mjd_anchor,
-                    opt_event_time_mjd=opt_candidate_time_mjd,
-                )
+                # 2. Mismatched negatives: v11-style easy in-batch wrong optical pairs
+                mismatch_opt_idx = sample_easy_mismatch_negatives(batch_size, device)
+                if mismatch_opt_idx is None:
+                    mismatch_opt_idx = torch.arange(batch_size, device=device)
 
-                dt_hard = None
-                if cls_time_window_enabled and batch_event_time_mjd_anchor is not None and opt_candidate_time_mjd is not None:
-                    semi_hard_opt_idx, dt_hard, hard_actual_mask = _sample_signed_time_window_hard_negatives(
-                        sim_g2o,
-                        gw_indices_anchor,
+                coords_hard = opt_coords[mismatch_opt_idx]
+                # Use already-encoded features from a randomly rolled in-batch optical sample.
+                z_l_hard = z_l[mismatch_opt_idx].clone()
+                h_l_hard = h_l[mismatch_opt_idx].clone()
+                if batch_event_time_mjd_anchor is not None:
+                    dt_hard = compute_time_delta_days(
+                        opt_candidate_time_mjd[mismatch_opt_idx] if opt_candidate_time_mjd is not None else batch_event_time_mjd_anchor[mismatch_opt_idx],
                         batch_event_time_mjd_anchor,
-                        opt_candidate_time_mjd,
-                        window_days=cls_time_window_days,
-                        rng=cls_time_rng,
-                        semi_hard=bool(hardneg_semi_hard),
-                        semi_hard_margin=float(hardneg_semi_hard_margin),
-                        fallback_mode=str(hardneg_fallback_mode),
-                    )
-                    _record_cls_time_window_counts(
-                        cls_time_counts,
-                        "hard_negative",
-                        actual_mask=hard_actual_mask,
-                        synthetic_mask=~hard_actual_mask,
-                        out_of_window_mask=~hard_actual_mask,
-                    )
-                elif batch_event_time_mjd_anchor is not None:
-                    from ALBEF_train import sample_inbatch_hard_negatives_with_time
-                    hard_window_days = (
-                        [float(v) for v in hardneg_windows_days]
-                        if hardneg_windows_days
-                        else [30.0, 60.0, 120.0]
-                    )
-                    semi_hard_opt_idx, _, _ = sample_inbatch_hard_negatives_with_time(
-                        sim_g2o=sim_g2o,
-                        gw_indices=gw_indices_anchor,
-                        batch_event_time_mjd=batch_event_time_mjd_anchor,
-                        candidate_time_mjd=opt_candidate_time_mjd,
-                        window_days=hard_window_days,
-                        min_candidates=int(hardneg_min_candidates),
-                        semi_hard=bool(hardneg_semi_hard),
-                        semi_hard_margin=float(hardneg_semi_hard_margin),
-                        fallback_mode=str(hardneg_fallback_mode),
                     )
                 else:
-                    if hardneg_semi_hard:
-                        semi_hard_opt_idx = model.sample_semi_hard_negatives(
-                            sim_g2o, gw_indices_anchor, margin=float(hardneg_semi_hard_margin)
-                        )
-                    else:
-                        semi_hard_opt_idx = model.sample_hard_negatives(sim_g2o, gw_indices_anchor)
-
-                coords_hard = opt_coords[semi_hard_opt_idx]
-                # Use already-encoded features without time-shift re-encoding
-                z_l_hard = z_l[semi_hard_opt_idx].clone()
-                h_l_hard = h_l[semi_hard_opt_idx].clone()
-                if dt_hard is None:
-                    if batch_event_time_mjd_anchor is not None:
-                        dt_hard = compute_time_delta_days(
-                            opt_candidate_time_mjd[semi_hard_opt_idx] if opt_candidate_time_mjd is not None else batch_event_time_mjd_anchor[semi_hard_opt_idx],
-                            batch_event_time_mjd_anchor,
-                        )
-                    else:
-                        dt_hard = torch.zeros((batch_size,), device=device, dtype=torch.float32)
+                    dt_hard = torch.zeros((batch_size,), device=device, dtype=torch.float32)
                 _cred_hard = (
                     compute_credible_level(gw_m, coords_hard)
                     if need_cred else None
@@ -2026,11 +1989,11 @@ def extract_triplet_logits(model, loader, device, model_args, neg_optical_data,
                 if _cred_hard is not None:
                     cred_hard_neg.append(_cred_hard.detach().float().cpu())
                 if batch_sources is not None:
-                    semi_hard_idx_cpu = semi_hard_opt_idx.detach().cpu().numpy().tolist()
-                    for hard_idx in semi_hard_idx_cpu:
-                        hard_idx = int(hard_idx)
-                        if 0 <= hard_idx < len(batch_sources):
-                            source_hard_neg.append(batch_sources[hard_idx])
+                    mismatch_idx_cpu = mismatch_opt_idx.detach().cpu().numpy().tolist()
+                    for mismatch_idx in mismatch_idx_cpu:
+                        mismatch_idx = int(mismatch_idx)
+                        if 0 <= mismatch_idx < len(batch_sources):
+                            source_hard_neg.append(batch_sources[mismatch_idx])
                         else:
                             source_hard_neg.append("unknown")
 
@@ -2486,7 +2449,7 @@ def evaluate_classification_triplet(triplet_logits, report_dt_bins=False, dt_bin
     Negative:
       - optical negatives (GW, nonKN)
       - GW negatives (GW_has_kn0, KN)
-      - semi-hard negatives (GW_wrong, KN)
+      - mismatched negatives (GW, KN_mismatch)
       → label 0
     """
     all_probs = []
@@ -2529,7 +2492,7 @@ def evaluate_classification_triplet(triplet_logits, report_dt_bins=False, dt_bin
         dt_gw = triplet_logits.get("dt_gw_negative_days")
         _append_dt_or_nan(dt_gw, len(probs_gw))
 
-    # Semi-hard negatives (GW_wrong, KN)
+    # Mismatched negatives (GW, KN_mismatch)
     if triplet_logits.get("logits_hard_neg") is not None:
         probs_hard = torch.softmax(triplet_logits["logits_hard_neg"].float(), dim=1)[:, 1]
         all_probs.append(probs_hard)
@@ -2549,7 +2512,7 @@ def evaluate_classification_triplet(triplet_logits, report_dt_bins=False, dt_bin
     n_hard = len(probs_hard) if probs_hard is not None else 0
     print(
         "  Triplet classification: "
-        f"{n_pos} pos + {n_optical} optical_neg + {n_gw} gw_neg + {n_hard} semi_hard_neg = {len(probs)} total"
+        f"{n_pos} pos + {n_optical} optical_neg + {n_gw} gw_neg + {n_hard} mismatch_neg = {len(probs)} total"
     )
 
     metrics = compute_classification_metrics(probs, labels)
@@ -3129,22 +3092,22 @@ def generate_logits_distribution_plot(triplet_logits, output_dir):
 
     fig, ax = plt.subplots(figsize=(10, 6))
     if margins_pos is not None:
-        ax.hist(margins_pos, bins=bins, alpha=alpha, label=f'Positive (GW, KN) n={len(margins_pos)}',
+        ax.hist(margins_pos, bins=bins, alpha=alpha, label=f'Positive n={len(margins_pos)}',
                 edgecolor='#2ecc71', linewidth=3, histtype='step')
     if margins_optical is not None:
-        ax.hist(margins_optical, bins=bins, alpha=alpha, label=f'Optical Negatives (GW, nonKN) n={len(margins_optical)}',
+        ax.hist(margins_optical, bins=bins, alpha=alpha, label=f'Optical Negatives n={len(margins_optical)}',
                 edgecolor='#3498db', linewidth=3, histtype='step')
     if margins_gw is not None:
-        ax.hist(margins_gw, bins=bins, alpha=alpha, label=f'GW Negatives (GW_has_kn0, KN) n={len(margins_gw)}',
+        ax.hist(margins_gw, bins=bins, alpha=alpha, label=f'GW Negatives n={len(margins_gw)}',
                 edgecolor='#f39c12', linewidth=3, histtype='step')
     if margins_hard is not None:
-        ax.hist(margins_hard, bins=bins, alpha=alpha, label=f'Semi-Hard Negatives (GW_wrong, KN) n={len(margins_hard)}',
+        ax.hist(margins_hard, bins=bins, alpha=alpha, label=f'{MISMATCH_NEGATIVE_LABEL} n={len(margins_hard)}',
                 edgecolor='#e74c3c', linewidth=3, histtype='step')
 
-    ax.set_xlabel('Logit margin (class 1 - class 0)', fontsize=12)
+    ax.set_xlabel(LOGIT_AXIS_LABEL, fontsize=12)
     ax.set_ylabel('Count', fontsize=12)
-    ax.set_title('Classification Head Logit-Margin Distribution\nby Sample Pair Type', fontsize=14)
-    ax.legend(loc='upper center', fontsize=10)
+    ax.set_title(LOGIT_DISTRIBUTION_TITLE, fontsize=14)
+    ax.legend(loc='upper left', fontsize=10)
     ax.grid(True, alpha=0.3, linestyle='--')
     ax.yaxis.set_major_locator(MaxNLocator(integer=True))
 
@@ -3155,35 +3118,35 @@ def generate_logits_distribution_plot(triplet_logits, output_dir):
 
     fig, ax = plt.subplots(figsize=(10, 6))
     x_range = np.linspace(float(bins[0]), float(bins[-1]), 300)
-    _plot_logit_margin_kde(ax, margins_pos, x_range, color='#27ae60', label='Positive (GW, KN)')
-    _plot_logit_margin_kde(ax, margins_optical, x_range, color='#2980b9', label='Optical Negatives (GW, nonKN)')
-    _plot_logit_margin_kde(ax, margins_gw, x_range, color='#d68910', label='GW Negatives (GW_has_kn0, KN)')
-    _plot_logit_margin_kde(ax, margins_hard, x_range, color='#c0392b', label='Semi-Hard Negatives (GW_wrong, KN)')
-    ax.set_xlabel('Logit margin (class 1 - class 0)', fontsize=12)
+    _plot_logit_margin_kde(ax, margins_pos, x_range, color='#27ae60', label='Positive')
+    _plot_logit_margin_kde(ax, margins_optical, x_range, color='#2980b9', label='Optical Negatives')
+    _plot_logit_margin_kde(ax, margins_gw, x_range, color='#d68910', label='GW Negatives')
+    _plot_logit_margin_kde(ax, margins_hard, x_range, color='#c0392b', label=MISMATCH_NEGATIVE_LABEL)
+    ax.set_xlabel(LOGIT_AXIS_LABEL, fontsize=12)
     ax.set_ylabel('Density', fontsize=12)
-    ax.set_title('Classification Head Logit-Margin Distribution (KDE)\nby Sample Pair Type', fontsize=14)
-    ax.legend(loc='upper center', fontsize=10)
+    ax.set_title(LOGIT_DISTRIBUTION_TITLE, fontsize=14)
+    ax.legend(loc='upper left', fontsize=10)
     ax.grid(True, alpha=0.3, linestyle='--')
     fig.tight_layout()
     fig.savefig(os.path.join(output_dir, "logits_distribution_kde.png"), dpi=200,
                 bbox_inches="tight")
     plt.close(fig)
 
-    print("\n--- Logit Margin Distribution Summary ---")
+    print("\n--- Logit Distribution Summary ---")
     if margins_pos is not None:
-        print(f"  Positive (GW, KN):     mean={np.mean(margins_pos):.4f}  std={np.std(margins_pos):.4f}  "
+        print(f"  Positive:     mean={np.mean(margins_pos):.4f}  std={np.std(margins_pos):.4f}  "
               f"median={np.median(margins_pos):.4f}  n={len(margins_pos)}")
     if margins_optical is not None:
-        print(f"  Optical Negatives (GW, nonKN): mean={np.mean(margins_optical):.4f}  std={np.std(margins_optical):.4f}  "
+        print(f"  Optical Negatives: mean={np.mean(margins_optical):.4f}  std={np.std(margins_optical):.4f}  "
               f"median={np.median(margins_optical):.4f}  n={len(margins_optical)}")
     if margins_gw is not None:
-        print(f"  GW Negatives (GW_has_kn0, KN): mean={np.mean(margins_gw):.4f}  std={np.std(margins_gw):.4f}  "
+        print(f"  GW Negatives: mean={np.mean(margins_gw):.4f}  std={np.std(margins_gw):.4f}  "
               f"median={np.median(margins_gw):.4f}  n={len(margins_gw)}")
     if margins_hard is not None:
-        print(f"  Semi-Hard Negatives (GW_wrong, KN): mean={np.mean(margins_hard):.4f}  std={np.std(margins_hard):.4f}  "
+        print(f"  Mismatched Negatives: mean={np.mean(margins_hard):.4f}  std={np.std(margins_hard):.4f}  "
               f"median={np.median(margins_hard):.4f}  n={len(margins_hard)}")
 
-    print(f"Logit margin distribution plots saved to {output_dir}/")
+    print(f"Logit distribution plots saved to {output_dir}/")
 
 
 def generate_gw_shuffle_comparison_plot(triplet_logits_normal, triplet_logits_shuffle, output_dir):
@@ -3235,10 +3198,10 @@ def generate_gw_shuffle_comparison_plot(triplet_logits_normal, triplet_logits_sh
     x_range = np.linspace(0, 1, 200)
     
     pair_types = [
-        ('Positive (GW, KN)', probs_pos_normal, probs_pos_shuffle, '#27ae60', '#2ecc71'),
-        ('Optical Negatives (GW, nonKN)', probs_optical_normal, probs_optical_shuffle, '#2980b9', '#3498db'),
-        ('GW Negatives (GW_has_kn0, KN)', probs_gw_normal, probs_gw_shuffle, '#d68910', '#f39c12'),
-        ('Semi-Hard Negatives (GW_wrong, KN)', probs_hard_normal, probs_hard_shuffle, '#c0392b', '#e74c3c'),
+        ('Positive', probs_pos_normal, probs_pos_shuffle, '#27ae60', '#2ecc71'),
+        ('Optical Negatives', probs_optical_normal, probs_optical_shuffle, '#2980b9', '#3498db'),
+        ('GW Negatives', probs_gw_normal, probs_gw_shuffle, '#d68910', '#f39c12'),
+        ('Mismatched Negatives', probs_hard_normal, probs_hard_shuffle, '#c0392b', '#e74c3c'),
     ]
     
     for ax, (title, probs_n, probs_s, color_n, color_s) in zip(axes, pair_types):
@@ -3299,11 +3262,11 @@ def generate_gw_shuffle_comparison_plot(triplet_logits_normal, triplet_logits_sh
     if probs_hard_normal is not None and len(probs_hard_normal) > 1:
         kde = stats.gaussian_kde(probs_hard_normal, bw_method=0.05)
         ax.plot(x_range, kde(x_range), color='#c0392b', linewidth=2.5,
-               label='Semi-Hard Negatives - Normal')
+               label='Mismatched Negatives - Normal')
     if probs_hard_shuffle is not None and len(probs_hard_shuffle) > 1:
         kde = stats.gaussian_kde(probs_hard_shuffle, bw_method=0.05)
         ax.plot(x_range, kde(x_range), color='#c0392b', linewidth=2.5, linestyle='--',
-               label='Semi-Hard Negatives - Shuffle')
+               label='Mismatched Negatives - Shuffle')
     
     ax.set_xlabel('Match Probability (Softmax Output)', fontsize=12)
     ax.set_ylabel('Density', fontsize=12)
@@ -3342,10 +3305,10 @@ def generate_gw_shuffle_comparison_plot(triplet_logits_normal, triplet_logits_sh
                 print(f"    → Distributions are NOT significantly different (p≥0.05)")
             print()
     
-    print_comparison("Positive (GW, KN)", probs_pos_normal, probs_pos_shuffle)
-    print_comparison("Optical Negatives (GW, nonKN)", probs_optical_normal, probs_optical_shuffle)
-    print_comparison("GW Negatives (GW_has_kn0, KN)", probs_gw_normal, probs_gw_shuffle)
-    print_comparison("Semi-Hard Negatives (GW_wrong, KN)", probs_hard_normal, probs_hard_shuffle)
+    print_comparison("Positive", probs_pos_normal, probs_pos_shuffle)
+    print_comparison("Optical Negatives", probs_optical_normal, probs_optical_shuffle)
+    print_comparison("GW Negatives", probs_gw_normal, probs_gw_shuffle)
+    print_comparison("Mismatched Negatives", probs_hard_normal, probs_hard_shuffle)
     
     print("=" * 70)
     print(f"GW-shuffle comparison plots saved to {output_dir}/")
@@ -3777,7 +3740,7 @@ def main():
     print("\nExtracting triplet logits with GW-SHUFFLE (ablation test)...")
     triplet_logits_shuffle = _extract_triplets_with_retry(shuffle_gw=True)
 
-    # Recompute classification from triplet logits (pos + optical_neg + gw_neg + semi_hard_neg)
+    # Recompute classification from triplet logits (pos + optical_neg + gw_neg + mismatch_neg)
     if triplet_logits is not None:
         td_meta = triplet_logits.get("time_delta_meta")
         if td_meta is not None:
