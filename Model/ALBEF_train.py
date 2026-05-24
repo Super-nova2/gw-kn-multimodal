@@ -971,6 +971,21 @@ def is_gallery_enabled(args):
     return float(getattr(args, "gallery_loss_weight", 0.0)) > 0.0
 
 
+def compute_gallery_loss_weight(args, epoch):
+    target = float(getattr(args, "gallery_loss_weight", 0.0))
+    if target <= 0.0:
+        return 0.0
+    start = int(getattr(args, "retrieval_start_epoch", 0))
+    epoch = int(epoch)
+    if epoch < start:
+        return 0.0
+    ramp = int(getattr(args, "gallery_loss_ramp_epochs", 0))
+    if ramp <= 0:
+        return target
+    progress = min(1.0, (epoch - start + 1) / float(ramp))
+    return target * progress
+
+
 CLS_BEST_CKPT_METRICS = {
     "auprc",
     "auroc",
@@ -1049,6 +1064,17 @@ def hard_neg_full_activation_reachable(args):
     return hard_neg_full_epoch < total_epochs
 
 
+def gallery_loss_full_activation_reachable(args):
+    if not is_gallery_enabled(args):
+        return False
+    total_epochs = max(1, int(getattr(args, "epochs", 1)))
+    full_epoch = compute_curriculum_full_epoch(
+        getattr(args, "retrieval_start_epoch", 0),
+        getattr(args, "gallery_loss_ramp_epochs", 0),
+    )
+    return full_epoch < total_epochs
+
+
 def is_best_ckpt_selection_eligible(args, epoch, hard_neg_ratio=None):
     """Gate best-checkpoint selection until the requested metric is meaningful."""
     metric_name = str(getattr(args, "best_ckpt_metric", "fusion_gallery_mrr"))
@@ -1070,6 +1096,11 @@ def is_best_ckpt_selection_eligible(args, epoch, hard_neg_ratio=None):
             metric_ready = should_compute_fusion_gallery_metrics(args, epoch)
         if not metric_ready:
             return False
+        if gallery_loss_full_activation_reachable(args):
+            gallery_weight = compute_gallery_loss_weight(args, epoch)
+            full_weight = float(getattr(args, "gallery_loss_weight", 0.0))
+            if full_weight > 0.0 and gallery_weight < (full_weight - 1e-8):
+                return False
         if is_cls_branch_enabled(args) and hard_neg_full_activation_reachable(args):
             ratio = compute_hard_neg_ratio(args, epoch) if hard_neg_ratio is None else float(hard_neg_ratio)
             return ratio >= (1.0 - 1e-8)
@@ -1105,6 +1136,11 @@ def describe_best_ckpt_selection_pending(args, epoch, hard_neg_ratio=None):
             return f"waiting for fusion-gallery training start (epoch {start + 1})."
         if (not is_gallery_enabled(args)) and not should_compute_fusion_gallery_metrics(args, epoch):
             return "waiting for fusion-gallery metrics to be enabled."
+        if gallery_loss_full_activation_reachable(args):
+            gallery_weight = compute_gallery_loss_weight(args, epoch)
+            full_weight = float(getattr(args, "gallery_loss_weight", 0.0))
+            if full_weight > 0.0 and gallery_weight < (full_weight - 1e-8):
+                return f"waiting for fusion-gallery loss ramp (current={gallery_weight:.3f}, required={full_weight:.3f})."
         if is_cls_branch_enabled(args) and hard_neg_full_activation_reachable(args) and ratio < (1.0 - 1e-8):
             return f"waiting for full hard-negative ratio (current={ratio:.3f}, required=1.000)."
         if gallery_hard_neg_full_activation_reachable(args):
@@ -1184,11 +1220,13 @@ def gallery_hard_neg_full_activation_reachable(args):
         return False
     if not is_gallery_enabled(args):
         return False
-    full_epoch = (
+    hard_start = (
         int(getattr(args, "retrieval_start_epoch", 0))
         + int(getattr(args, "gallery_hard_neg_start_after_retrieval_epochs", 2))
-        + max(0, int(getattr(args, "gallery_hard_neg_ramp_epochs", 2)))
-        - 1
+    )
+    full_epoch = compute_curriculum_full_epoch(
+        hard_start,
+        getattr(args, "gallery_hard_neg_ramp_epochs", 2),
     )
     return full_epoch < int(getattr(args, "epochs", 0))
 
@@ -1232,24 +1270,36 @@ def compute_fusion_gallery_hard_nce_loss(scores, positive_mask, topk):
 
 
 def compute_fusion_gallery_metrics(scores, positive_mask, ks=(1, 5)):
-    """Compute retrieval metrics for fusion-head mini-gallery scores."""
+    """Compute retrieval metrics for fusion-head mini-gallery scores.
+
+    Rows without any positive candidate are counted as zero for aggregate
+    metrics. Conditional metrics report performance over valid rows only.
+    """
     if scores.ndim != 2 or positive_mask.shape != scores.shape:
         raise ValueError("scores and positive_mask must have matching shape [n_query, n_candidate].")
     positive_mask = positive_mask.to(device=scores.device, dtype=torch.bool)
     valid_rows = positive_mask.any(dim=1)
     out = {f"fusion_gallery_recall_at_{int(k)}": 0.0 for k in ks}
+    out.update({f"fusion_gallery_conditional_recall_at_{int(k)}": 0.0 for k in ks})
     out["fusion_gallery_mrr"] = 0.0
-    if not valid_rows.any():
+    out["fusion_gallery_conditional_mrr"] = 0.0
+    out["fusion_gallery_valid_query_fraction"] = float(valid_rows.float().mean().item()) if scores.size(0) else 0.0
+    out["fusion_gallery_candidate_recall_at_topk"] = 0.0
+    if scores.size(0) == 0 or scores.size(1) == 0:
         return out
 
-    scores_valid = scores[valid_rows]
-    pos_valid = positive_mask[valid_rows]
-    order = scores_valid.argsort(dim=1, descending=True)
-    sorted_pos = pos_valid.gather(1, order)
+    order = scores.argsort(dim=1, descending=True)
+    sorted_pos = positive_mask.gather(1, order)
     n_candidate = int(scores.size(1))
     for k in ks:
         actual_k = min(int(k), n_candidate)
-        out[f"fusion_gallery_recall_at_{int(k)}"] = float(sorted_pos[:, :actual_k].any(dim=1).float().mean().item())
+        hit = sorted_pos[:, :actual_k].any(dim=1).float()
+        out[f"fusion_gallery_recall_at_{int(k)}"] = float(hit.mean().item())
+        if valid_rows.any():
+            out[f"fusion_gallery_conditional_recall_at_{int(k)}"] = float(hit[valid_rows].mean().item())
+
+    topk = min(max([int(k) for k in ks] or [1]), n_candidate)
+    out["fusion_gallery_candidate_recall_at_topk"] = float(sorted_pos[:, :topk].any(dim=1).float().mean().item())
 
     ranks = torch.arange(1, n_candidate + 1, device=scores.device, dtype=torch.float32).unsqueeze(0)
     first_pos_rank = torch.where(
@@ -1257,8 +1307,64 @@ def compute_fusion_gallery_metrics(scores, positive_mask, ks=(1, 5)):
         ranks.expand_as(sorted_pos),
         torch.full_like(ranks.expand_as(sorted_pos), float("inf")),
     ).min(dim=1).values
-    out["fusion_gallery_mrr"] = float((1.0 / first_pos_rank).mean().item())
+    reciprocal_rank = torch.where(
+        torch.isfinite(first_pos_rank),
+        1.0 / first_pos_rank,
+        torch.zeros_like(first_pos_rank),
+    )
+    out["fusion_gallery_mrr"] = float(reciprocal_rank.mean().item())
+    if valid_rows.any():
+        out["fusion_gallery_conditional_mrr"] = float(reciprocal_rank[valid_rows].mean().item())
     return out
+
+
+def select_gallery_topk(scores, positive_mask, topk, force_include_positives=False):
+    if scores.ndim != 2 or positive_mask.shape != scores.shape:
+        raise ValueError("scores and positive_mask must have matching shape [n_query, n_candidate].")
+    positive_mask = positive_mask.to(device=scores.device, dtype=torch.bool)
+    k = min(max(1, int(topk)), int(scores.size(1)))
+    topk_indices = scores.topk(k, dim=1).indices
+
+    if force_include_positives:
+        adjusted = topk_indices.clone()
+        for row in range(scores.size(0)):
+            selected = adjusted[row]
+            row_pos = torch.nonzero(positive_mask[row], as_tuple=False).flatten()
+            if row_pos.numel() == 0 or positive_mask[row, selected].any():
+                continue
+            pos_scores = scores[row, row_pos]
+            best_pos = row_pos[pos_scores.argmax()]
+            selected_pos = positive_mask[row, selected]
+            replaceable = torch.nonzero(~selected_pos, as_tuple=False).flatten()
+            if replaceable.numel() == 0:
+                replace_slot = torch.tensor(k - 1, device=scores.device, dtype=torch.long)
+            else:
+                selected_scores = scores[row, selected[replaceable]]
+                replace_slot = replaceable[selected_scores.argmin()]
+            adjusted[row, replace_slot] = best_pos
+        topk_indices = adjusted
+
+    topk_positive_mask = positive_mask.gather(1, topk_indices)
+    candidate_recall_mask = topk_positive_mask.any(dim=1)
+    return topk_indices, topk_positive_mask, candidate_recall_mask
+
+
+def _row_standardize_scores(scores):
+    centered = scores - scores.mean(dim=1, keepdim=True)
+    scale = centered.std(dim=1, keepdim=True, unbiased=False).clamp_min(1e-6)
+    return centered / scale
+
+
+def compute_residual_rerank_loss(s_itc, s_fusion, positive_mask, lambda_=0.5):
+    """NCE loss over row-normalized ITC and fusion scores for reranking."""
+    if s_itc.shape != s_fusion.shape or positive_mask.shape != s_itc.shape:
+        raise ValueError("s_itc, s_fusion, and positive_mask must have matching shape [n_query, n_candidate].")
+    positive_mask = positive_mask.to(device=s_itc.device, dtype=torch.bool)
+    valid_rows = positive_mask.any(dim=1)
+    if not valid_rows.any():
+        return (s_itc.sum() + s_fusion.sum()) * 0.0
+    combined = _row_standardize_scores(s_itc[valid_rows]) + float(lambda_) * _row_standardize_scores(s_fusion[valid_rows])
+    return compute_fusion_gallery_nce_loss(combined, positive_mask[valid_rows])
 
 
 def build_gallery_time_delta_matrix(
@@ -1501,6 +1607,7 @@ def evaluate(
     cls_active = cls_weight > 0.0
     itc_weight = compute_itc_weight(args, epoch)
     hard_neg_ratio = compute_hard_neg_ratio(args, epoch)
+    gallery_loss_weight = compute_gallery_loss_weight(args, epoch)
     cls_metrics_enabled = should_compute_cls_metrics(args)
     fusion_gallery_metrics_enabled = should_compute_fusion_gallery_metrics(args, epoch)
     gallery_loss_active = is_retrieval_active(args, epoch)
@@ -1904,8 +2011,8 @@ def evaluate(
                         fusion_gallery_metrics_accum.append(
                             compute_fusion_gallery_metrics(gallery_scores.detach(), gallery_positive_mask, ks=(1, 5))
                         )
-                    if gallery_loss_active:
-                        total_loss = total_loss + float(args.gallery_loss_weight) * gallery_loss
+                    if gallery_loss_active and gallery_loss_weight > 0.0:
+                        total_loss = total_loss + gallery_loss_weight * gallery_loss
                     gallery_hard_weight = compute_gallery_hard_neg_weight(args, epoch)
                     if gallery_hard_weight > 0.0:
                         gallery_hard_loss = compute_fusion_gallery_hard_nce_loss(
@@ -1913,7 +2020,7 @@ def evaluate(
                             topk=int(args.gallery_hard_neg_topk),
                         )
                         total_loss = total_loss + (
-                            float(args.gallery_loss_weight)
+                            gallery_loss_weight
                             * gallery_hard_weight
                             * gallery_hard_loss
                         )
@@ -2145,6 +2252,8 @@ def train(args):
         raise ValueError("gallery_hard_neg_ramp_epochs must be >= 0.")
     if args.gallery_loss_weight < 0:
         raise ValueError("gallery_loss_weight must be >= 0.")
+    if args.gallery_loss_ramp_epochs < 0:
+        raise ValueError("gallery_loss_ramp_epochs must be >= 0.")
     if args.gallery_score_chunk_size < 1:
         raise ValueError("gallery_score_chunk_size must be >= 1.")
     args.gallery_distractor_time_mode = str(args.gallery_distractor_time_mode).strip().lower()
@@ -2507,6 +2616,7 @@ def train(args):
         cls_weight = compute_cls_weight(args, epoch)
         itc_weight = compute_itc_weight(args, epoch)
         hard_neg_ratio = compute_hard_neg_ratio(args, epoch)
+        gallery_loss_weight = compute_gallery_loss_weight(args, epoch)
         best_selection_eligible = is_best_ckpt_selection_eligible(
             args, epoch, hard_neg_ratio=hard_neg_ratio
         )
@@ -3048,7 +3158,8 @@ def train(args):
                         chunk_size=args.gallery_score_chunk_size,
                     )
                     gallery_loss = compute_fusion_gallery_nce_loss(gallery_scores, gallery_pos_mask)
-                    total_loss = total_loss + float(args.gallery_loss_weight) * gallery_loss
+                    if gallery_loss_weight > 0.0:
+                        total_loss = total_loss + gallery_loss_weight * gallery_loss
                     gallery_hard_weight = compute_gallery_hard_neg_weight(args, epoch)
                     if gallery_hard_weight > 0.0:
                         gallery_hard_loss = compute_fusion_gallery_hard_nce_loss(
@@ -3056,7 +3167,7 @@ def train(args):
                             topk=int(args.gallery_hard_neg_topk),
                         )
                         total_loss = total_loss + (
-                            float(args.gallery_loss_weight)
+                            gallery_loss_weight
                             * gallery_hard_weight
                             * gallery_hard_loss
                         )
@@ -3611,6 +3722,8 @@ if __name__ == "__main__":
                         help="Epoch to start retrieval/gallery training (0 = start from epoch 0).")
     parser.add_argument("--gallery_loss_weight", type=float, default=0.0,
                         help="Weight for batch-level fusion mini-gallery retrieval loss (0 to disable).")
+    parser.add_argument("--gallery_loss_ramp_epochs", type=int, default=0,
+                        help="Epochs to ramp gallery loss from 0 to gallery_loss_weight after retrieval_start_epoch.")
     parser.add_argument("--compute_cls_metrics", action=argparse.BooleanOptionalAction, default=True,
                         help="Compute validation pair/triplet classification metrics even when CLS loss is disabled.")
     parser.add_argument("--compute_fusion_gallery_metrics", action=argparse.BooleanOptionalAction, default=True,

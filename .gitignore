@@ -47,7 +47,6 @@ docs/superpowers/
 # test 
 tmp/
 tests/
-optical_only/submit_create_elasticc_test_negative_h5.sh
 
 # dataset
 dataset/test/

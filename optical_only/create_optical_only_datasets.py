@@ -759,9 +759,17 @@ def _parse_kn_event_worker(
     return event_dir.name, lcs, stats
 
 
+def sanitize_transient_type(folder_name: str) -> str:
+    label = re.sub(r"[^A-Za-z0-9._+-]+", "_", str(folder_name).strip())
+    label = label.strip("._+-")
+    return label or "unknown"
+
+
 def infer_transient_type(folder_name: str) -> Optional[str]:
-    name = folder_name.lower()
-    if "kn" in name:
+    raw_name = str(folder_name).strip()
+    name = raw_name.lower()
+    tokens = {tok for tok in re.split(r"[^a-z0-9]+", name) if tok}
+    if tokens.intersection({"kn", "bns", "nsbh"}):
         return None
     if "agn" in name:
         return "AGN"
@@ -773,7 +781,7 @@ def infer_transient_type(folder_name: str) -> Optional[str]:
         return "dwarf-nova"
     if "sn" in name or "slsn" in name or "pisn" in name:
         return "SN"
-    return None
+    return sanitize_transient_type(raw_name)
 
 
 def iter_negative_head_files(sim_root: Path) -> List[Path]:

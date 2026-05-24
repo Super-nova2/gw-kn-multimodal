@@ -106,8 +106,8 @@ BUILD_SCRIPT="${SCRIPT_DIR}/create_optical_only_datasets.py"
 
 case "${DATASET_MODE}" in
     train)
-        BNS_SIM_ROOT="${BASE_DIR}/SNANA/SNDATA_ROOT/SIM/LSST_KN_BNS_AUG"
-        BNS_SIM_NAME="LSST_KN_BNS_AUG"
+        BNS_SIM_ROOT="${BASE_DIR}/SNANA/SNDATA_ROOT/SIM/LSST_KN_BNS_TRAIN"
+        BNS_SIM_NAME="LSST_KN_BNS_TRAIN"
 
         NSBH_SIM_ROOT="${BASE_DIR}/SNANA/SNDATA_ROOT/SIM/LSST_KN_NSBH_TRAIN"
         NSBH_SIM_NAME="LSST_KN_NSBH_TRAIN"
@@ -124,21 +124,21 @@ case "${DATASET_MODE}" in
         fi
         ;;
     test)
-        BNS_SIM_ROOT="${BASE_DIR}/SNANA/SNDATA_ROOT/SIM/LSST_KN_BNS"
-        BNS_SIM_NAME="LSST_KN_BNS"
+        BNS_SIM_ROOT="${BASE_DIR}/SNANA/SNDATA_ROOT/SIM/LSST_KN_BNS_TEST"
+        BNS_SIM_NAME="LSST_KN_BNS_TEST"
 
-        NSBH_SIM_ROOT="${BASE_DIR}/SNANA/SNDATA_ROOT/SIM/LSST_KN_NSBH_AUG"
-        NSBH_SIM_NAME="LSST_KN_NSBH_AUG"
+        NSBH_SIM_ROOT="${BASE_DIR}/SNANA/SNDATA_ROOT/SIM/LSST_KN_NSBH_TEST"
+        NSBH_SIM_NAME="LSST_KN_NSBH_TEST"
 
-        NEG_SIM_ROOT="${BASE_DIR}/data/Tutorial_LSST_sims_2025"
-        NEG_GROUP="Tutorial/optical_data"
+        NEG_SIM_ROOT="${BASE_DIR}/data/ELASTICC_TEST"
+        NEG_GROUP="ELASTICC/optical_data"
 
         if [[ "${PREFIX_TASK_ENABLE}" == "true" ]]; then
             OUTPUT_POS_H5_DEFAULT="${BASE_DIR}/data/Optical_Only_dataset/combined_dataset_test_${DATASET_TAG_SLUG}.h5"
-            OUTPUT_NEG_H5_DEFAULT="${BASE_DIR}/data/Optical_Only_dataset/Tutorial_negative_dataset_${DATASET_TAG_SLUG}.h5"
+            OUTPUT_NEG_H5_DEFAULT="${BASE_DIR}/data/Optical_Only_dataset/ELASTICC_negative_dataset_${DATASET_TAG_SLUG}.h5"
         else
             OUTPUT_POS_H5_DEFAULT="${BASE_DIR}/data/Optical_Only_dataset/combined_dataset_test.h5"
-            OUTPUT_NEG_H5_DEFAULT="${BASE_DIR}/data/Optical_Only_dataset/Tutorial_negative_dataset.h5"
+            OUTPUT_NEG_H5_DEFAULT="${BASE_DIR}/data/Optical_Only_dataset/ELASTICC_negative_dataset.h5"
         fi
         ;;
     *)
