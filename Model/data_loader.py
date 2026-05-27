@@ -553,11 +553,15 @@ class RelationalHDF5Dataset(Dataset):
                     f["events/gw_data/event_time_mjd"][:], dtype=np.float64
                 ).reshape(-1)
 
-            if self.return_zero_time_mjd and (not self.has_opt_zero_time_mjd_base) and (not self.has_gw_event_time_mjd):
+            if self.return_zero_time_mjd and not self.has_opt_first_detection_mjd:
                 raise KeyError(
-                    "return_zero_time_mjd=True requires either "
-                    "'events/optical_data/zero_time_mjd_base' or "
-                    "'events/gw_data/event_time_mjd' in positive dataset."
+                    "return_zero_time_mjd=True requires 'events/optical_data/first_detection_mjd' "
+                    "in positive dataset; do not substitute GW event time or zero_time metadata."
+                )
+            if self.return_zero_time_mjd and not self.has_opt_zero_time_mjd_base:
+                raise KeyError(
+                    "return_zero_time_mjd=True requires 'events/optical_data/zero_time_mjd_base' "
+                    "in positive dataset; do not substitute GW event time as positive optical metadata."
                 )
             if self.cache_in_memory:
                 print(f"Caching positive dataset in memory from {h5_path} (as tensors)...")
@@ -797,6 +801,7 @@ class RelationalHDF5Dataset(Dataset):
             opt_idx = idx
 
         opt_zero_time_mjd_base = None
+        opt_first_detection_mjd = None
         if self.data_cache is None:
             # Lazy loading: Open file only when needed (crucial for num_workers > 0)
             if self.h5_file is None:
@@ -822,20 +827,19 @@ class RelationalHDF5Dataset(Dataset):
                     opt_zero_time_mjd_base = torch.as_tensor(
                         self.h5_file["events/optical_data/zero_time_mjd_base"][opt_idx], dtype=torch.float32
                     )
-                elif self.has_gw_event_time_mjd:
-                    opt_zero_time_mjd_base = torch.as_tensor(
-                        self.h5_file["events/gw_data/event_time_mjd"][gw_idx], dtype=torch.float32
+                else:
+                    raise KeyError(
+                        "Missing 'events/optical_data/zero_time_mjd_base' while "
+                        "return_zero_time_mjd=True."
                     )
                 if self.has_opt_first_detection_mjd:
                     opt_first_detection_mjd = torch.as_tensor(
                         self.h5_file["events/optical_data/first_detection_mjd"][opt_idx], dtype=torch.float32
                     )
-                elif self.has_opt_zero_time_mjd_base:
-                    opt_first_detection_mjd = opt_zero_time_mjd_base.clone()
                 else:
                     raise KeyError(
-                        "Missing both 'events/optical_data/zero_time_mjd_base' and "
-                        "'events/gw_data/event_time_mjd' while return_zero_time_mjd=True."
+                        "Missing 'events/optical_data/first_detection_mjd' while "
+                        "return_zero_time_mjd=True."
                     )
         else:
             # Data is already cached as tensors - direct indexing, no conversion needed
@@ -850,17 +854,16 @@ class RelationalHDF5Dataset(Dataset):
             if self.return_zero_time_mjd:
                 if "opt_zero_time_mjd_base" in self.data_cache:
                     opt_zero_time_mjd_base = self.data_cache["opt_zero_time_mjd_base"][opt_idx].to(torch.float32)
-                elif "gw_event_time_mjd" in self.data_cache:
-                    opt_zero_time_mjd_base = self.data_cache["gw_event_time_mjd"][gw_idx].to(torch.float32)
                 else:
                     raise KeyError(
-                        "Missing both cached opt_zero_time_mjd_base and gw_event_time_mjd while "
-                        "return_zero_time_mjd=True."
+                        "Missing cached opt_zero_time_mjd_base while return_zero_time_mjd=True."
                     )
                 if "opt_first_detection_mjd" in self.data_cache:
                     opt_first_detection_mjd = self.data_cache["opt_first_detection_mjd"][opt_idx].to(torch.float32)
-                elif "opt_zero_time_mjd_base" in self.data_cache:
-                    opt_first_detection_mjd = opt_zero_time_mjd_base.clone()
+                else:
+                    raise KeyError(
+                        "Missing cached opt_first_detection_mjd while return_zero_time_mjd=True."
+                    )
 
         if self.opt_input_window_active:
             opt_time, opt_val, opt_mask, opt_err, _ = apply_runtime_input_window_torch(

@@ -33,7 +33,7 @@ if [[ ! -f "${SCRIPT_PATH}" ]]; then
     exit 1
 fi
 
-PROFILE="${PROFILE:-final_train}"       # test_aug | final_train | astro_test
+PROFILE="${PROFILE:-astro_test}"       # test_aug | final_train | astro_test
 DATASET_MODE="${DATASET_MODE:-}"        # train | test
 
 BUFFER_LIMIT="${BUFFER_LIMIT:-2000}"
@@ -186,6 +186,8 @@ if [[ "$DATASET_MODE" != "train" && "$DATASET_MODE" != "test" ]]; then
     exit 1
 fi
 
+echo "PROFILE=$PROFILE DATASET_MODE=$DATASET_MODE"
+
 if [[ -z "${SLURM_JOB_ID:-}" ]]; then
     if ! command -v sbatch >/dev/null 2>&1; then
         echo "sbatch not found; run inside a Slurm allocation or install Slurm tools."
@@ -225,6 +227,18 @@ if [[ -z "${SLURM_JOB_ID:-}" ]]; then
     if [[ -n "${CHDIR:-}" ]]; then
         sbatch_opts+=(--chdir="${CHDIR}")
     fi
+
+    export BASE_DIR PROFILE DATASET_MODE
+    export BUFFER_LIMIT NUM_WORKERS SEED
+    export BNS_MAX_LC_PER_GW NSBH_MAX_LC_PER_GW
+    export BNS_MAX_NEG_GW NSBH_MAX_NEG_GW BNS_MAX_POS_GW NSBH_MAX_POS_GW
+    export NSBH_MAX_NEG_TYPE1_GW NSBH_MAX_NEG_TYPE2_GW
+    export NSBH_MEJ_COL NSBH_TYPE1_THRESHOLD NSBH_REQUIRE_SUCCESS_FOR_MEJ_POS
+    export FLUXCAL_ZP PSFFLUX_ZP LUPT_K LUPT_M5_MAG
+    export BNS_FULL_CATALOG_PATH BNS_SKYMAP_DIR BNS_SIM_ROOT BNS_SIM_NAME BNS_SUCCESS_IDS_PATH
+    export NSBH_FULL_CATALOG_PATH NSBH_SKYMAP_DIR NSBH_SIM_ROOT NSBH_SIM_NAME NSBH_SUCCESS_IDS_PATH
+    export OUTPUT_H5_PATH
+    sbatch_opts+=(--export=ALL)
 
     echo "Submitting job with: sbatch ${sbatch_opts[*]} ${script_path}"
     (
@@ -308,7 +322,6 @@ append_optional_arg --nsbh_max_pos_gw "${NSBH_MAX_POS_GW:-}"
 append_optional_arg --nsbh_max_neg_type1_gw "${NSBH_MAX_NEG_TYPE1_GW:-}"
 append_optional_arg --nsbh_max_neg_type2_gw "${NSBH_MAX_NEG_TYPE2_GW:-}"
 
-echo "PROFILE=$PROFILE DATASET_MODE=$DATASET_MODE"
 echo "Output H5: $OUTPUT_H5_PATH"
 echo "Luptitude params: FLUXCAL_ZP=$FLUXCAL_ZP PSFFLUX_ZP=$PSFFLUX_ZP LUPT_K=$LUPT_K LUPT_M5_MAG=$LUPT_M5_MAG"
 echo "Parallel preprocessing workers: $NUM_WORKERS"

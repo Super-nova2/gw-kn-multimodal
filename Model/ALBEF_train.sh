@@ -121,7 +121,6 @@ DATA_PATH=$(jq -r -s '.[0] * .[1] | .data_path' "$default_file" "$args_file")
 NEG_DATA_PATH=$(jq -r -s '.[0] * .[1] | .neg_data_path // empty' "$default_file" "$args_file")
 CKPT_PATH=$(jq -r -s '.[0] * .[1] | .ckpt_path' "$default_file" "$args_file")
 STAGE_TO_JOBFS=$(jq -r -s '.[0] * .[1] | .stage_to_jobfs // false' "$default_file" "$args_file")
-TEST_DATA_PATH=$(jq -r -s '.[0] * .[1] | .test_data_path // empty' "$default_file" "$args_file")
 mkdir -p "$CKPT_PATH"
 
 echo "========================================"
@@ -152,11 +151,6 @@ if [ "$STAGE_TO_JOBFS" = "true" ]; then
             cp -f "$NEG_DATA_PATH" "$JOBFS_DIR"/
             NEG_DATA_PATH="$JOBFS_DIR/$(basename "$NEG_DATA_PATH")"
         fi
-        if [[ -n "$TEST_DATA_PATH" && "$TEST_DATA_PATH" != "null" ]]; then
-            TEST_STAGED_NAME="test_$(basename "$TEST_DATA_PATH")"
-            cp -f "$TEST_DATA_PATH" "$JOBFS_DIR/$TEST_STAGED_NAME"
-            TEST_DATA_PATH="$JOBFS_DIR/$TEST_STAGED_NAME"
-        fi
     else
         echo "No local tmp dir found; skip staging."
     fi
@@ -172,9 +166,6 @@ cmd=(
 
 if [[ -n "$NEG_DATA_PATH" && "$NEG_DATA_PATH" != "null" ]]; then
     cmd+=(--neg_data_path "$NEG_DATA_PATH")
-fi
-if [[ -n "$TEST_DATA_PATH" && "$TEST_DATA_PATH" != "null" ]]; then
-    cmd+=(--test_data_path "$TEST_DATA_PATH")
 fi
 echo "Command: ${cmd[*]}"
 "${cmd[@]}"
