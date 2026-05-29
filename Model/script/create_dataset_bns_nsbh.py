@@ -507,6 +507,15 @@ def _sample_event_ids(
     return np.sort(chosen.astype(np.int64))
 
 
+def _shuffle_event_ids(
+    event_ids: np.ndarray,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    if len(event_ids) <= 1:
+        return event_ids
+    return rng.permutation(event_ids).astype(np.int64, copy=False)
+
+
 def _cap_nsbh_neg_total(
     type1_ids: np.ndarray,
     type2_ids: np.ndarray,
@@ -565,10 +574,8 @@ def _prepare_bns_source(
         scan_desc=f"Scanning {cfg.tag.upper()} events",
     )
 
-    max_pos = _normalize_max_count(cfg.max_pos_gw)
     max_neg = _normalize_max_count(cfg.max_neg_gw)
 
-    pos_ids = _sample_event_ids(pos_ids, max_pos, rng)
     if dataset_mode == "test":
         neg_ids = _sample_event_ids(neg_ids, max_neg, rng)
     else:
@@ -585,7 +592,7 @@ def _prepare_bns_source(
         f"event_time_from_gps={int(event_time_from_gps)} "
         f"invalid_event_time={n_invalid_event_time} "
         f"missing_skymap={missing_skymap} "
-        f"selected_pos={len(pos_ids)} selected_neg={len(neg_ids)}"
+        f"positive_candidates={len(pos_ids)} selected_neg={len(neg_ids)}"
     )
 
     return SourcePrepared(
@@ -677,9 +684,6 @@ def _prepare_nsbh_source(
             scan_desc="Scanning NSBH type1 negative candidates (mej<=threshold)",
         )
 
-    max_pos = _normalize_max_count(cfg.max_pos_gw)
-    pos_ids = _sample_event_ids(pos_ids, max_pos, rng)
-
     sampled_type1 = np.empty((0,), dtype=np.int64)
     sampled_type2 = np.empty((0,), dtype=np.int64)
     if dataset_mode == "test":
@@ -713,7 +717,7 @@ def _prepare_nsbh_source(
         f"type1_candidates={len(type1_ids_all)} "
         f"mej_pos_candidates={len(mej_pos_ids_all)} "
         f"filtered_non_success_mej_pos={n_filtered_non_success} "
-        f"selected_pos={len(pos_ids)} "
+        f"positive_candidates={len(pos_ids)} "
         f"selected_neg_type1={len(sampled_type1)} "
         f"selected_neg_type2={len(sampled_type2)} "
         f"missing_skymap={missing_skymap_mej_pos + missing_skymap_type1}"
@@ -775,16 +779,32 @@ def create_dataset_with_neg_gw_bns_nsbh_fast(
     rng = np.random.default_rng(seed)
     bns_rng = np.random.default_rng(int(rng.integers(0, 2**31 - 1)))
     nsbh_rng = np.random.default_rng(int(rng.integers(0, 2**31 - 1)))
+    bns_pos_rng = np.random.default_rng(int(rng.integers(0, 2**31 - 1)))
+    nsbh_pos_rng = np.random.default_rng(int(rng.integers(0, 2**31 - 1)))
+    lc_rng = np.random.default_rng(int(rng.integers(0, 2**31 - 1)))
 
     prepared: Dict[str, SourcePrepared] = {
         "bns": _prepare_bns_source(bns_cfg, dataset_mode, bns_rng),
         "nsbh": _prepare_nsbh_source(nsbh_cfg, dataset_mode, nsbh_rng),
     }
 
-    pos_events: List[Tuple[str, int]] = (
-        [("bns", int(eid)) for eid in prepared["bns"].pos_event_ids.tolist()]
-        + [("nsbh", int(eid)) for eid in prepared["nsbh"].pos_event_ids.tolist()]
-    )
+    pos_limits = {
+        "bns": _normalize_max_count(bns_cfg.max_pos_gw),
+        "nsbh": _normalize_max_count(nsbh_cfg.max_pos_gw),
+    }
+    pos_order_rngs = {"bns": bns_pos_rng, "nsbh": nsbh_pos_rng}
+    pos_candidate_counts = {
+        "bns": int(len(prepared["bns"].pos_event_ids)),
+        "nsbh": int(len(prepared["nsbh"].pos_event_ids)),
+    }
+    target_pos_counts = {
+        tag: (
+            pos_candidate_counts[tag]
+            if pos_limits[tag] is None
+            else min(pos_candidate_counts[tag], int(pos_limits[tag]))
+        )
+        for tag in ("bns", "nsbh")
+    }
     neg_events: List[Tuple[str, int]] = []
     if dataset_mode == "test":
         neg_events = (
@@ -792,10 +812,13 @@ def create_dataset_with_neg_gw_bns_nsbh_fast(
             + [("nsbh", int(eid)) for eid in prepared["nsbh"].neg_event_ids.tolist()]
         )
 
-    n_expected_gw = len(pos_events) + len(neg_events)
+    n_positive_candidates = int(pos_candidate_counts["bns"] + pos_candidate_counts["nsbh"])
+    n_target_pos = int(target_pos_counts["bns"] + target_pos_counts["nsbh"])
+    n_expected_gw = n_target_pos + len(neg_events)
     print(
         f"\nCreating combined dataset ({dataset_mode} mode): "
-        f"expected_pos={len(pos_events)} expected_neg={len(neg_events)} "
+        f"positive_candidates={n_positive_candidates} "
+        f"target_pos={n_target_pos} expected_neg={len(neg_events)} "
         f"expected_total={n_expected_gw} num_workers={int(num_workers)}"
     )
 
@@ -1030,99 +1053,118 @@ def create_dataset_with_neg_gw_bns_nsbh_fast(
             opt_buffer_coordinates.clear()
             opt_buffer_parent_idx.clear()
 
-        pos_event_records: List[Tuple[str, int, int]] = []
-        pos_tasks: List[EventProcessTask] = []
-        for tag, event_id in pos_events:
-            src = prepared[tag]
-            row_idx = src.event_to_row.get(event_id)
-            if row_idx is None:
-                continue
-            pos_event_records.append((tag, int(event_id), int(row_idx)))
-            pos_tasks.append(
-                _build_event_process_task(
-                    src=src,
-                    event_id=int(event_id),
-                    include_lightcurves=True,
-                    fluxcal_to_psfflux_factor=float(fluxcal_to_psfflux_factor),
-                    psfflux_zp=float(psfflux_zp),
-                    lupt_b_njy=np.asarray(lupt_b_njy, dtype=np.float64),
-                )
-            )
-
         print("\nWriting positive GW events...")
-        for (tag, event_id, row_idx), task_result in zip(
-            pos_event_records,
-            _iter_event_task_results(pos_tasks, num_workers=int(num_workers), desc="Positive GW"),
-        ):
-            if task_result.tag != tag or int(task_result.event_id) != int(event_id):
-                raise RuntimeError(
-                    f"Mismatched positive task result ordering: expected {tag}_{event_id}, got {task_result.tag}_{task_result.event_id}"
-                )
-
+        pos_task_batch_size = max(1, int(num_workers) * 20)
+        for tag in ("bns", "nsbh"):
             src = prepared[tag]
-            lcs = list(task_result.lcs or [])
-            max_lc = _normalize_max_count(src.cfg.max_lc_per_gw)
-            if max_lc is not None and len(lcs) > max_lc:
-                keep_idx = rng.choice(len(lcs), size=max_lc, replace=False)
-                lcs = [lcs[int(i)] for i in keep_idx]
+            limit = pos_limits[tag]
+            candidate_ids = np.asarray(src.pos_event_ids, dtype=np.int64)
+            if limit is not None:
+                candidate_ids = _shuffle_event_ids(candidate_ids, pos_order_rngs[tag])
+            task_batch_size = pos_task_batch_size if limit is not None else max(1, len(candidate_ids))
 
-            if len(lcs) == 0:
-                source_counts[tag]["drop_empty_lc"] += 1
-                continue
-            if task_result.status == "missing_skymap" or task_result.skymap is None:
-                source_counts[tag]["drop_skymap"] += 1
-                continue
-            if task_result.status != "ok":
-                raise RuntimeError(
-                    f"Unexpected positive task status for {tag}_{event_id}: {task_result.status}"
-                )
+            for batch_start in range(0, len(candidate_ids), task_batch_size):
+                if limit is not None and source_counts[tag]["pos"] >= limit:
+                    break
 
-            skymap = np.asarray(task_result.skymap, dtype=np.float32)
-            gw_id = f"{tag}_{event_id}"
-            if gw_id in written_id_set:
-                continue
-            written_id_set.add(gw_id)
+                batch_records: List[Tuple[str, int, int]] = []
+                batch_tasks: List[EventProcessTask] = []
+                for event_id_np in candidate_ids[batch_start: batch_start + task_batch_size]:
+                    event_id = int(event_id_np)
+                    row_idx = src.event_to_row.get(event_id)
+                    if row_idx is None:
+                        continue
+                    batch_records.append((tag, event_id, int(row_idx)))
+                    batch_tasks.append(
+                        _build_event_process_task(
+                            src=src,
+                            event_id=event_id,
+                            include_lightcurves=True,
+                            fluxcal_to_psfflux_factor=float(fluxcal_to_psfflux_factor),
+                            psfflux_zp=float(psfflux_zp),
+                            lupt_b_njy=np.asarray(lupt_b_njy, dtype=np.float64),
+                        )
+                    )
 
-            mej_val = float(src.mej_by_event.get(event_id, np.nan))
-            event_time_val = float(src.event_time_mjd[row_idx])
-            if (
-                tag == "nsbh"
-                and nsbh_cfg.require_success_for_mej_pos
-                and np.isfinite(mej_val)
-                and mej_val > nsbh_cfg.type1_threshold
-                and src.success_ids_mej_pos is not None
-                and event_id not in src.success_ids_mej_pos
-            ):
-                raise RuntimeError(
-                    f"NSBH mej>threshold event {event_id} passed into output but not in success ids."
-                )
+                for (rec_tag, event_id, row_idx), task_result in zip(
+                    batch_records,
+                    _iter_event_task_results(
+                        batch_tasks,
+                        num_workers=int(num_workers),
+                        desc=f"Positive GW {tag.upper()}",
+                    ),
+                ):
+                    if task_result.tag != rec_tag or int(task_result.event_id) != int(event_id):
+                        raise RuntimeError(
+                            f"Mismatched positive task result ordering: expected {rec_tag}_{event_id}, got {task_result.tag}_{task_result.event_id}"
+                        )
 
-            gw_idx = append_gw(
-                scalar=src.gw_params[row_idx],
-                skymap=skymap,
-                gw_id=gw_id,
-                has_kn=1,
-                neg_type=0,
-                mej_tot=mej_val,
-                event_time_mjd=event_time_val,
-                source_type=tag,
-            )
-            source_counts[tag]["pos"] += 1
-            if not np.isfinite(event_time_val):
-                source_counts[tag]["invalid_event_time_written"] += 1
+                    if limit is not None and source_counts[tag]["pos"] >= limit:
+                        continue
 
-            for vals, errs, masks, times, coordinates, first_detection_mjd in lcs:
-                opt_buffer_vals.append(vals)
-                opt_buffer_errs.append(errs)
-                opt_buffer_masks.append(masks)
-                opt_buffer_times.append(times)
-                opt_buffer_zero_time_mjd_base.append(float(first_detection_mjd))
-                opt_buffer_first_detection_mjd.append(float(first_detection_mjd))
-                opt_buffer_coordinates.append(coordinates)
-                opt_buffer_parent_idx.append(gw_idx)
+                    lcs = list(task_result.lcs or [])
+                    max_lc = _normalize_max_count(src.cfg.max_lc_per_gw)
+                    if max_lc is not None and len(lcs) > max_lc:
+                        keep_idx = lc_rng.choice(len(lcs), size=max_lc, replace=False)
+                        lcs = [lcs[int(i)] for i in keep_idx]
 
-            if len(opt_buffer_vals) >= buffer_limit:
-                flush_opt_buffer()
+                    if len(lcs) == 0:
+                        source_counts[tag]["drop_empty_lc"] += 1
+                        continue
+                    if task_result.status == "missing_skymap" or task_result.skymap is None:
+                        source_counts[tag]["drop_skymap"] += 1
+                        continue
+                    if task_result.status != "ok":
+                        raise RuntimeError(
+                            f"Unexpected positive task status for {tag}_{event_id}: {task_result.status}"
+                        )
+
+                    skymap = np.asarray(task_result.skymap, dtype=np.float32)
+                    gw_id = f"{tag}_{event_id}"
+                    if gw_id in written_id_set:
+                        continue
+                    written_id_set.add(gw_id)
+
+                    mej_val = float(src.mej_by_event.get(event_id, np.nan))
+                    event_time_val = float(src.event_time_mjd[row_idx])
+                    if (
+                        tag == "nsbh"
+                        and nsbh_cfg.require_success_for_mej_pos
+                        and np.isfinite(mej_val)
+                        and mej_val > nsbh_cfg.type1_threshold
+                        and src.success_ids_mej_pos is not None
+                        and event_id not in src.success_ids_mej_pos
+                    ):
+                        raise RuntimeError(
+                            f"NSBH mej>threshold event {event_id} passed into output but not in success ids."
+                        )
+
+                    gw_idx = append_gw(
+                        scalar=src.gw_params[row_idx],
+                        skymap=skymap,
+                        gw_id=gw_id,
+                        has_kn=1,
+                        neg_type=0,
+                        mej_tot=mej_val,
+                        event_time_mjd=event_time_val,
+                        source_type=tag,
+                    )
+                    source_counts[tag]["pos"] += 1
+                    if not np.isfinite(event_time_val):
+                        source_counts[tag]["invalid_event_time_written"] += 1
+
+                    for vals, errs, masks, times, coordinates, first_detection_mjd in lcs:
+                        opt_buffer_vals.append(vals)
+                        opt_buffer_errs.append(errs)
+                        opt_buffer_masks.append(masks)
+                        opt_buffer_times.append(times)
+                        opt_buffer_zero_time_mjd_base.append(float(first_detection_mjd))
+                        opt_buffer_first_detection_mjd.append(float(first_detection_mjd))
+                        opt_buffer_coordinates.append(coordinates)
+                        opt_buffer_parent_idx.append(gw_idx)
+
+                    if len(opt_buffer_vals) >= buffer_limit:
+                        flush_opt_buffer()
 
         flush_opt_buffer()
 
@@ -1254,6 +1296,10 @@ def create_dataset_with_neg_gw_bns_nsbh_fast(
             source_counts["bns"]["invalid_event_time_written"]
             + source_counts["nsbh"]["invalid_event_time_written"]
         )
+        f.attrs["requested_max_pos_gw_bns"] = int(pos_limits["bns"] or 0)
+        f.attrs["requested_max_pos_gw_nsbh"] = int(pos_limits["nsbh"] or 0)
+        f.attrs["positive_candidates_bns"] = int(pos_candidate_counts["bns"])
+        f.attrs["positive_candidates_nsbh"] = int(pos_candidate_counts["nsbh"])
         f.attrs["time_zero_base_semantics"] = "optical zero_time_mjd_base stores first_detection_mjd"
         f.attrs["first_detection_policy"] = FIRST_DETECTION_POLICY
         f.attrs["first_detection_snr_domain"] = FIRST_DETECTION_SNR_DOMAIN
@@ -1310,6 +1356,14 @@ def create_dataset_with_neg_gw_bns_nsbh_fast(
             f"bns={source_counts['bns']['drop_empty_lc']}, "
             f"nsbh={source_counts['nsbh']['drop_empty_lc']}"
         )
+        for tag in ("bns", "nsbh"):
+            limit = pos_limits[tag]
+            if limit is not None and source_counts[tag]["pos"] < limit:
+                print(
+                    f"  WARNING: requested {limit} {tag.upper()} positive GW, "
+                    f"but only wrote {source_counts[tag]['pos']} after filtering all "
+                    f"{pos_candidate_counts[tag]} candidates."
+                )
         print(f"  Saved to: {output_h5_path}")
 
 

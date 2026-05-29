@@ -453,6 +453,80 @@ def _synthetic_dt_tensor(size: int, window_days: float, rng: np.random.Generator
     return torch.as_tensor(vals, device=device, dtype=dtype)
 
 
+def sample_time_windowed_mismatch_negatives(
+    gw_indices_anchor,
+    candidate_gw_indices,
+    anchor_times,
+    candidate_times,
+    *,
+    window_days: float,
+    rng: np.random.Generator,
+    fallback_indices=None,
+    device=None,
+):
+    """Sample in-batch mismatched KN candidates with signed dt in [0, window].
+
+    When no actual in-window mismatch exists for a row, keep a mismatched optical
+    candidate when possible and redefine its dt with a synthetic value in the
+    requested window. This mirrors the training-side synthetic distractor policy.
+    """
+    if device is None:
+        device = (
+            gw_indices_anchor.device
+            if isinstance(gw_indices_anchor, torch.Tensor)
+            else torch.device("cpu")
+        )
+    anchor_ids = torch.as_tensor(gw_indices_anchor, device=device, dtype=torch.long).reshape(-1)
+    cand_ids = torch.as_tensor(candidate_gw_indices, device=device, dtype=torch.long).reshape(-1)
+    n_rows = int(anchor_ids.numel())
+    n_cands = int(cand_ids.numel())
+    selected = torch.zeros((n_rows,), dtype=torch.long, device=device)
+    dt_vals = _synthetic_dt_tensor(n_rows, window_days, rng, device=device)
+    actual = torch.zeros((n_rows,), dtype=torch.bool, device=device)
+    if n_rows <= 0 or n_cands <= 0:
+        return selected, dt_vals, actual
+
+    fallback = None
+    if fallback_indices is not None:
+        fallback = torch.as_tensor(fallback_indices, device=device, dtype=torch.long).reshape(-1)
+        if int(fallback.numel()) != n_rows:
+            fallback = None
+
+    negative_mask = cand_ids.unsqueeze(0) != anchor_ids.unsqueeze(1)
+    candidate_mask = torch.zeros((n_rows, n_cands), dtype=torch.bool, device=device)
+    dt_matrix = None
+    if anchor_times is not None and candidate_times is not None and float(window_days) > 0.0:
+        anchor = torch.as_tensor(anchor_times, device=device, dtype=torch.float32).reshape(-1)
+        candidate = torch.as_tensor(candidate_times, device=device, dtype=torch.float32).reshape(-1)
+        if int(anchor.numel()) == n_rows and int(candidate.numel()) == n_cands:
+            dt_matrix = candidate.unsqueeze(0) - anchor.unsqueeze(1)
+            finite = torch.isfinite(anchor).unsqueeze(1) & torch.isfinite(candidate).unsqueeze(0)
+            candidate_mask = negative_mask & finite & (dt_matrix >= 0.0) & (dt_matrix <= float(window_days))
+
+    for row in range(n_rows):
+        cand_idx = torch.nonzero(candidate_mask[row], as_tuple=False).squeeze(-1)
+        if cand_idx.numel() > 0:
+            chosen = cand_idx[int(rng.integers(0, int(cand_idx.numel())))]
+            selected[row] = chosen
+            dt_vals[row] = dt_matrix[row, chosen].to(dtype=dt_vals.dtype)
+            actual[row] = True
+            continue
+
+        chosen = None
+        if fallback is not None:
+            fallback_idx = int(fallback[row].item())
+            if 0 <= fallback_idx < n_cands and bool(negative_mask[row, fallback_idx].item()):
+                chosen = torch.as_tensor(fallback_idx, device=device, dtype=torch.long)
+        if chosen is None:
+            fallback_idx = torch.nonzero(negative_mask[row], as_tuple=False).squeeze(-1)
+            if fallback_idx.numel() > 0:
+                chosen = fallback_idx[int(rng.integers(0, int(fallback_idx.numel())))]
+            else:
+                chosen = torch.as_tensor(min(row, n_cands - 1), device=device, dtype=torch.long)
+        selected[row] = chosen
+    return selected, dt_vals, actual
+
+
 def _numpy_1d(values, dtype=np.float64):
     if isinstance(values, torch.Tensor):
         values = values.detach().cpu().numpy()
@@ -963,9 +1037,11 @@ def build_test_dataloader(
 
     runtime_window_start = float(choose_value(None, saved_args, "ref_start", default=-0.3))
     runtime_window_end = float(choose_value(None, saved_args, "ref_end", default=0.6))
+    # External optical negatives are sampled separately by load_negative_optical_samples;
+    # this loader only needs positive GW-KN pairs for embedding and triplet passes.
     dataset = RelationalHDF5Dataset(
         args.test_data_path,
-        negative_h5_path=args.neg_data_path,
+        negative_h5_path=None,
         negative_group=args.neg_group,
         return_zero_time_mjd=bool(return_zero_time_mjd),
         nonkn_cls_base_field=str(nonkn_cls_base_field),
@@ -1957,27 +2033,59 @@ def extract_triplet_logits(model, loader, device, model_args, neg_optical_data,
                 if batch_sources is not None:
                     source_positive.extend(batch_sources)
 
-                # 2. Mismatched negatives: v11-style easy in-batch wrong optical pairs
-                mismatch_opt_idx = sample_easy_mismatch_negatives(batch_size, device)
-                if mismatch_opt_idx is None:
-                    mismatch_opt_idx = torch.arange(batch_size, device=device)
+                # 2. Mismatched negatives: in-batch wrong optical pairs with time-compatible dt.
+                fallback_mismatch_idx = sample_easy_mismatch_negatives(batch_size, device)
+                if fallback_mismatch_idx is None:
+                    fallback_mismatch_idx = torch.arange(batch_size, device=device)
 
-                coords_hard = opt_coords[mismatch_opt_idx]
-                # Use already-encoded features from a randomly rolled in-batch optical sample.
-                z_l_hard = z_l[mismatch_opt_idx].clone()
-                h_l_hard = h_l[mismatch_opt_idx].clone()
-                if batch_event_time_mjd_anchor is not None:
-                    dt_hard = compute_time_delta_days(
-                        opt_candidate_time_mjd[mismatch_opt_idx] if opt_candidate_time_mjd is not None else batch_event_time_mjd_anchor[mismatch_opt_idx],
+                mismatch_actual_mask = None
+                if cls_time_window_enabled:
+                    candidate_mismatch_time = (
+                        opt_candidate_time_mjd
+                        if opt_candidate_time_mjd is not None
+                        else batch_event_time_mjd
+                    )
+                    mismatch_opt_idx, dt_hard, mismatch_actual_mask = sample_time_windowed_mismatch_negatives(
+                        gw_indices_anchor,
+                        gw_indices_dev,
                         batch_event_time_mjd_anchor,
+                        candidate_mismatch_time,
+                        window_days=cls_time_window_days,
+                        rng=cls_time_rng,
+                        fallback_indices=fallback_mismatch_idx,
+                        device=device,
+                    )
+                    _record_cls_time_window_counts(
+                        cls_time_counts,
+                        "hard_negative",
+                        actual_mask=mismatch_actual_mask,
+                        synthetic_mask=~mismatch_actual_mask,
+                        out_of_window_mask=~mismatch_actual_mask,
                     )
                 else:
-                    dt_hard = torch.zeros((batch_size,), device=device, dtype=torch.float32)
+                    mismatch_opt_idx = fallback_mismatch_idx
+                    if batch_event_time_mjd_anchor is not None:
+                        mismatch_time_for_dt = (
+                            opt_candidate_time_mjd[mismatch_opt_idx]
+                            if opt_candidate_time_mjd is not None
+                            else batch_event_time_mjd[mismatch_opt_idx]
+                        )
+                        dt_hard = compute_time_delta_days(
+                            mismatch_time_for_dt,
+                            batch_event_time_mjd_anchor,
+                        )
+                    else:
+                        dt_hard = torch.zeros((batch_size,), device=device, dtype=torch.float32)
+
+                coords_hard = opt_coords[mismatch_opt_idx]
+                # Use already-encoded features from the selected in-batch optical sample.
+                z_l_hard = z_l[mismatch_opt_idx].clone()
+                h_l_hard = h_l[mismatch_opt_idx].clone()
                 _cred_hard = (
                     compute_credible_level(gw_m, coords_hard)
                     if need_cred else None
                 )
-                if batch_event_time_mjd_anchor is not None:
+                if dt_hard is not None:
                     _accumulate_dt_stats(dt_stats, "hard_negative", dt_hard)
                     dt_hard_all.append(dt_hard.detach().cpu())
                 logits_hard = model.fusion_logits(

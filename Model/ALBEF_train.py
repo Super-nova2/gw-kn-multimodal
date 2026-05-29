@@ -413,11 +413,43 @@ def summarize_abs_time_delta_quantiles(dt_days, quantiles=(0.5, 0.9, 0.95)):
 
 
 
-def sample_easy_negatives(batch_size, device):
+def sample_mismatched_negatives(batch_size, device, samples_per_gw=1):
+    """
+    Each optical curve independently selects a curve from a different GW event
+    as a mismatched negative sample.
+
+    samples_per_gw=1: each curve selects a different curve (random derangement)
+    samples_per_gw>1: group by GW, exclude self-group, pick random curve from other group
+    """
     if batch_size < 2:
         return None
-    shift = int(torch.randint(1, batch_size, (1,), device=device).item())
-    return (torch.arange(batch_size, device=device) + shift) % batch_size
+
+    n_gw = batch_size // samples_per_gw
+    if n_gw < 2:
+        return None
+
+    mis_idx = torch.empty(batch_size, dtype=torch.long, device=device)
+
+    if samples_per_gw == 1:
+        # n_gw == batch_size; exclude self
+        mis_idx = torch.randint(0, batch_size - 1, (batch_size,), device=device)
+        mis_idx = mis_idx + (mis_idx >= torch.arange(batch_size, device=device)).long()
+    else:
+        for i in range(batch_size):
+            my_group = i // samples_per_gw
+            candidates = [g for g in range(n_gw) if g != my_group]
+            chosen_group = candidates[torch.randint(
+                0, len(candidates), (1,), device=device
+            ).item()]
+            offset = torch.randint(0, samples_per_gw, (1,), device=device).item()
+            mis_idx[i] = chosen_group * samples_per_gw + offset
+
+    return mis_idx
+
+
+def sample_mis_neg_dt_days(batch_size, device, window_days=30.0):
+    """Synthetic time delta for mismatched negatives: Uniform(0, window_days) days."""
+    return torch.rand(batch_size, device=device, dtype=torch.float32) * window_days
 
 def augment_gw_data(gw_s, gw_m, training=True,
                     noise_std=0.05, scalar_jitter=0.02, channel_dropout_prob=0.1):
@@ -1386,32 +1418,25 @@ def evaluate(
                     )
                     pos_loss = model.cls_criterion(logits_pos, labels_pos)
 
-                    easy_idx = sample_easy_negatives(batch_size, device)
-                    neg_idx = easy_idx
+                    mis_idx = sample_mismatched_negatives(
+                        batch_size, device, samples_per_gw=args.samples_per_gw
+                    )
 
-                    if neg_idx is None:
+                    if mis_idx is None:
                         hard_loss = torch.zeros((), device=device)
                         logits_hard = torch.zeros((batch_size, 2), device=device, dtype=g.dtype)
                     else:
-                        h_l_hard = h_l[neg_idx].clone()
-                        z_l_hard = z_l[neg_idx].clone()
-                        coords_hard = opt_coords[neg_idx].clone()
-                        if batch_event_time_mjd is not None:
-                            dt_hard = compute_time_delta_days(
-                                gather_candidate_optical_time_mjd(
-                                    _opt_first_detection_mjd, batch_event_time_mjd, neg_idx
-                                ),
-                                batch_event_time_mjd,
-                            )
-                        else:
-                            dt_hard = torch.zeros((batch_size,), device=device, dtype=torch.float32)
-                        # NOTE: encode_hard_negative_with_time_shift removed.
-                        # Features already correctly encoded at h_l_hard/z_l_hard above.
-                        cred_level_hard = compute_credible_level(gw_m, coords_hard) if need_cred_level else None
+                        h_l_mis = h_l[mis_idx].clone()
+                        z_l_mis = z_l[mis_idx].clone()
+                        coords_mis = opt_coords[mis_idx].clone()
+                        dt_mis = sample_mis_neg_dt_days(
+                            batch_size, device, window_days=args.mis_neg_dt_window_days
+                        )
+                        cred_level_mis = compute_credible_level(gw_m, coords_mis) if need_cred_level else None
                         logits_hard = model.fusion_logits(
-                            g, h_l_hard, z_l=z_l_hard, H_gw=H_gw, cred_level=cred_level_hard,
-                            gw_s=gw_s, gw_m=gw_m, opt_coords=coords_hard,
-                            dt_days=dt_hard,
+                            g, h_l_mis, z_l=z_l_mis, H_gw=H_gw, cred_level=cred_level_mis,
+                            gw_s=gw_s, gw_m=gw_m, opt_coords=coords_mis,
+                            dt_days=dt_mis,
                         )
                         hard_loss = model.cls_criterion(logits_hard, labels_neg)
 
@@ -1600,25 +1625,21 @@ def evaluate(
                     )
                     cls_logits_available = True
 
-                    metric_neg_idx = sample_easy_negatives(batch_size, device)
+                    metric_neg_idx = sample_mismatched_negatives(
+                        batch_size, device, samples_per_gw=args.samples_per_gw
+                    )
                     if metric_neg_idx is not None:
-                        h_l_metric_hard = h_l[metric_neg_idx].clone()
-                        z_l_metric_hard = z_l[metric_neg_idx].clone()
-                        coords_metric_hard = opt_coords[metric_neg_idx].clone()
-                        if batch_event_time_mjd is not None:
-                            dt_metric_hard = compute_time_delta_days(
-                                gather_candidate_optical_time_mjd(
-                                    _opt_first_detection_mjd, batch_event_time_mjd, metric_neg_idx
-                                ),
-                                batch_event_time_mjd,
-                            )
-                        else:
-                            dt_metric_hard = torch.zeros((batch_size,), device=device, dtype=torch.float32)
-                        cred_level_hard = compute_credible_level(gw_m, coords_metric_hard) if need_cred_level else None
+                        h_l_mis = h_l[metric_neg_idx].clone()
+                        z_l_mis = z_l[metric_neg_idx].clone()
+                        coords_mis = opt_coords[metric_neg_idx].clone()
+                        dt_metric_mis = sample_mis_neg_dt_days(
+                            batch_size, device, window_days=args.mis_neg_dt_window_days
+                        )
+                        cred_level_mis = compute_credible_level(gw_m, coords_mis) if need_cred_level else None
                         logits_hard = model.fusion_logits(
-                            g, h_l_metric_hard, z_l=z_l_metric_hard, H_gw=H_gw, cred_level=cred_level_hard,
-                            gw_s=gw_s, gw_m=gw_m, opt_coords=coords_metric_hard,
-                            dt_days=dt_metric_hard,
+                            g, h_l_mis, z_l=z_l_mis, H_gw=H_gw, cred_level=cred_level_mis,
+                            gw_s=gw_s, gw_m=gw_m, opt_coords=coords_mis,
+                            dt_days=dt_metric_mis,
                         )
                         cls_hard_logits_available = True
 
@@ -1816,6 +1837,8 @@ def train(args):
         raise ValueError("time_delta_cls_scale_days must be > 0.")
     if args.time_delta_cls_clip < 0:
         raise ValueError("time_delta_cls_clip must be >= 0.")
+    if args.mis_neg_dt_window_days <= 0:
+        raise ValueError("mis_neg_dt_window_days must be > 0.")
     args.fusion_mode = normalize_fusion_mode(getattr(args, "fusion_mode", None), dual_fusion=args.dual_fusion)
     args.dual_fusion = args.fusion_mode != "legacy_g2o"
     args._hardneg_window_days = parse_day_windows(args.hardneg_time_window_days)
@@ -2282,35 +2305,27 @@ def train(args):
                     )
                     pos_loss = model.cls_criterion(logits_pos, labels_pos)
 
-                    easy_idx = sample_easy_negatives(batch_size, device)
-                    neg_idx = easy_idx
+                    mis_idx = sample_mismatched_negatives(
+                        batch_size, device, samples_per_gw=args.samples_per_gw
+                    )
 
-                    if neg_idx is None:
+                    if mis_idx is None:
                         hard_loss = torch.zeros((), device=device)
                         logits_hard = torch.zeros((batch_size, 2), device=device, dtype=g.dtype)
-                        dt_hard = None
+                        dt_mis = None
                     else:
-                        h_l_hard = h_l[neg_idx].clone()
-                        z_l_hard = z_l[neg_idx].clone()
-                        coords_hard = opt_coords[neg_idx].clone()
-                        if batch_event_time_mjd is not None:
-                            dt_hard = compute_time_delta_days(
-                                gather_candidate_optical_time_mjd(
-                                    _opt_first_detection_mjd, batch_event_time_mjd, neg_idx
-                                ),
-                                batch_event_time_mjd,
-                            )
-                        else:
-                            dt_hard = torch.zeros((batch_size,), device=device, dtype=torch.float32)
-                        # NOTE: encode_hard_negative_with_time_shift removed.
-                        # Hard negatives now use the first-detection-aligned features
-                        # already encoded in h_l[neg_idx], z_l[neg_idx] above.
+                        h_l_mis = h_l[mis_idx].clone()
+                        z_l_mis = z_l[mis_idx].clone()
+                        coords_mis = opt_coords[mis_idx].clone()
+                        dt_mis = sample_mis_neg_dt_days(
+                            batch_size, device, window_days=args.mis_neg_dt_window_days
+                        )
 
-                        cred_level_hard = compute_credible_level(gw_m, coords_hard) if need_cred_level else None
+                        cred_level_mis = compute_credible_level(gw_m, coords_mis) if need_cred_level else None
                         logits_hard = model.fusion_logits(
-                            g, h_l_hard, z_l=z_l_hard, H_gw=H_gw, cred_level=cred_level_hard,
-                            gw_s=gw_s, gw_m=gw_m, opt_coords=coords_hard,
-                            dt_days=dt_hard,
+                            g, h_l_mis, z_l=z_l_mis, H_gw=H_gw, cred_level=cred_level_mis,
+                            gw_s=gw_s, gw_m=gw_m, opt_coords=coords_mis,
+                            dt_days=dt_mis,
                         )
                         hard_loss = model.cls_criterion(logits_hard, labels_neg)
                     gallery_extra_h_l = None
@@ -2370,7 +2385,7 @@ def train(args):
                     gallery_loss = torch.zeros((), device=device)
                     gallery_hard_loss = torch.zeros((), device=device)
                     gallery_hard_weight = 0.0
-                    dt_hard = None
+                    dt_mis = None
                     if is_retrieval_active(args, epoch) and has_negatives:
                         z_l_neg, h_l_neg = model.encode_optical(
                             neg_coords, neg_t, neg_v, opt_ref_t, neg_mask, neg_err
@@ -2555,14 +2570,14 @@ def train(args):
                 writer.add_scalar('Train/Cls_Weight', cls_weight, global_step)
                 writer.add_scalar('Train/Temperature', current_temp, global_step)
                 writer.add_scalar('Train/Learning_Rate', optimizer.param_groups[0]['lr'], global_step)
-                if dt_hard is not None and batch_event_time_mjd is not None:
-                    dt_hard_mean, dt_hard_std = summarize_time_delta(dt_hard)
-                    writer.add_scalar('Train/TimeShift/hard_delta_days_mean', dt_hard_mean, global_step)
-                    writer.add_scalar('Train/TimeShift/hard_delta_days_std', dt_hard_std, global_step)
-                    hard_q = summarize_abs_time_delta_quantiles(dt_hard, quantiles=(0.5, 0.9, 0.95))
-                    writer.add_scalar('Train/TimeShift/hard_delta_abs_p50', hard_q["p50"], global_step)
-                    writer.add_scalar('Train/TimeShift/hard_delta_abs_p90', hard_q["p90"], global_step)
-                    writer.add_scalar('Train/TimeShift/hard_delta_abs_p95', hard_q["p95"], global_step)
+                if dt_mis is not None and batch_event_time_mjd is not None:
+                    dt_mis_mean, dt_mis_std = summarize_time_delta(dt_mis)
+                    writer.add_scalar('Train/TimeShift/mis_delta_days_mean', dt_mis_mean, global_step)
+                    writer.add_scalar('Train/TimeShift/mis_delta_days_std', dt_mis_std, global_step)
+                    mis_q = summarize_abs_time_delta_quantiles(dt_mis, quantiles=(0.5, 0.9, 0.95))
+                    writer.add_scalar('Train/TimeShift/mis_delta_abs_p50', mis_q["p50"], global_step)
+                    writer.add_scalar('Train/TimeShift/mis_delta_abs_p90', mis_q["p90"], global_step)
+                    writer.add_scalar('Train/TimeShift/mis_delta_abs_p95', mis_q["p95"], global_step)
                 writer.add_scalar('Train/Perf/step_time_ms', step_time_ms, global_step)
 
             if batch_idx % 100 == 0:
@@ -2572,9 +2587,9 @@ def train(args):
                     'CLS': f"{cls_val:.4f}",
                     'ITC_Acc': f"{itc_acc:.2f}"
                 }
-                if dt_hard is not None and batch_event_time_mjd is not None:
-                    dt_hard_mean, _ = summarize_time_delta(dt_hard)
-                    postfix['hard_dt'] = f"{dt_hard_mean:.2f}"
+                if dt_mis is not None and batch_event_time_mjd is not None:
+                    dt_mis_mean, _ = summarize_time_delta(dt_mis)
+                    postfix['mis_dt'] = f"{dt_mis_mean:.2f}"
                 if args.gallery_loss_weight > 0:
                     postfix['Gallery'] = f"{gallery_loss_val:.4f}"
                     if gallery_hard_weight > 0:
@@ -2975,6 +2990,9 @@ if __name__ == "__main__":
                         help="Number of optical samples per GW event for SupCon (default: 4)")
     parser.add_argument("--min_lc_per_gw", type=int, default=2,
                         help="Minimum light curves required for a GW to be eligible for SupCon")
+    parser.add_argument("--mis_neg_dt_window_days", type=float, default=30.0,
+                        help="Synthetic time delta for in-batch mismatched negatives: Uniform(0, window_days) days. "
+                             "Models the realistic scenario where optical first detection follows GW by 0–window days.")
     parser.add_argument("--hardneg_time_window_days", type=str, default="30,60,120",
                         help="Comma-separated adaptive windows (days) for hard-negative mining.")
     parser.add_argument("--hardneg_min_candidates", type=int, default=4,

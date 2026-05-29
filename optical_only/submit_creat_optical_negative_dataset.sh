@@ -16,12 +16,11 @@ SCRIPT_SUBDIR="optical_only"
 SCRIPT_REL_PATH="optical_only/submit_creat_optical_negative_dataset.sh"
 REPO_NAME="gw-kn-multimodal"
 
-# Required manual parameters. Define these before running, either by editing this
-# block or exporting the same variable names in your shell.
-NEG_SIM_ROOT="${NEG_SIM_ROOT:-/fred/oz016/bgao_kn/data/ELASTICC2_TRAIN_02}"
+# Profile selects the default negative source and output naming. Individual
+# values can still be overridden by exporting NEG_SIM_ROOT, OUTPUT_NEG_FILENAME,
+# or NEG_GROUP before running.
+PROFILE="${PROFILE:-${NEG_PROFILE:-train}}"
 OUTPUT_NEG_DIR="${OUTPUT_NEG_DIR:-/fred/oz016/bgao_kn/data/Optical_Negative_dataset}"
-OUTPUT_NEG_FILENAME="${OUTPUT_NEG_FILENAME:-ELASTICC2_negative_dataset.h5}"
-NEG_GROUP="${NEG_GROUP:-ELASTICC2/optical_data}"
 NEG_MATCH_POS_DENSITY="${NEG_MATCH_POS_DENSITY:-false}"
 DENSITY_MATCH_POS_H5="${DENSITY_MATCH_POS_H5:-}"
 BUFFER_LIMIT="${BUFFER_LIMIT:-3000}"
@@ -46,6 +45,11 @@ BUILD_SCRIPT="${SCRIPT_DIR}/create_optical_only_datasets.py"
 usage() {
     cat <<'USAGE'
 Usage:
+  bash gw-kn-multimodal/optical_only/submit_creat_optical_negative_dataset.sh [train|test]
+
+  PROFILE=train \
+  bash gw-kn-multimodal/optical_only/submit_creat_optical_negative_dataset.sh
+
   NEG_SIM_ROOT=/path/to/negative/root \
   OUTPUT_NEG_DIR=/path/to/output/dir \
   OUTPUT_NEG_FILENAME=negative_dataset.h5 \
@@ -53,7 +57,12 @@ Usage:
   NEG_MATCH_POS_DENSITY=false \
   bash gw-kn-multimodal/optical_only/submit_creat_optical_negative_dataset.sh
 
-Required manual parameters:
+Profiles:
+  train                   Defaults to ELASTICC2_TRAIN_02 -> ELASTICC2_negative_dataset.h5
+  test                    Defaults to ELASTICC_TEST -> ELASTICC_negative_dataset.h5
+
+Override parameters:
+  PROFILE                 Profile name. Defaults to train. Also accepts NEG_PROFILE.
   NEG_SIM_ROOT            Negative optical sample root directory.
   OUTPUT_NEG_DIR          Directory where the negative H5 will be written.
   OUTPUT_NEG_FILENAME     Output H5 file name, for example ELASTICC_negative.h5.
@@ -75,10 +84,13 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
     exit 0
 fi
 
-if [[ "$#" -ne 0 ]]; then
-    echo "This script does not accept positional arguments. Define variables before running." >&2
+if [[ "$#" -gt 1 ]]; then
+    echo "Usage error: expected at most one positional profile argument." >&2
     usage >&2
     exit 2
+fi
+if [[ "$#" -eq 1 ]]; then
+    PROFILE="$1"
 fi
 
 require_var() {
@@ -104,6 +116,34 @@ normalize_bool() {
             ;;
     esac
 }
+resolve_profile_defaults() {
+    local profile_key
+    profile_key="$(echo "${PROFILE}" | tr '[:upper:]' '[:lower:]')"
+    case "${profile_key}" in
+        train)
+            PROFILE="train"
+            PROFILE_NEG_SIM_ROOT="${BASE_DIR}/data/ELASTICC2_TRAIN_02"
+            PROFILE_OUTPUT_NEG_FILENAME="ELASTICC2_negative_dataset.h5"
+            PROFILE_NEG_GROUP="ELASTICC2/optical_data"
+            ;;
+        test)
+            PROFILE="test"
+            PROFILE_NEG_SIM_ROOT="${BASE_DIR}/data/ELASTICC_TEST"
+            PROFILE_OUTPUT_NEG_FILENAME="ELASTICC_negative_dataset.h5"
+            PROFILE_NEG_GROUP="ELASTICC/optical_data"
+            ;;
+        *)
+            echo "Unsupported PROFILE='${PROFILE}'. Use train or test." >&2
+            usage >&2
+            exit 2
+            ;;
+    esac
+
+    NEG_SIM_ROOT="${NEG_SIM_ROOT:-${PROFILE_NEG_SIM_ROOT}}"
+    OUTPUT_NEG_FILENAME="${OUTPUT_NEG_FILENAME:-${PROFILE_OUTPUT_NEG_FILENAME}}"
+    NEG_GROUP="${NEG_GROUP:-${PROFILE_NEG_GROUP}}"
+}
+
 
 if [[ ! -f "${SCRIPT_PATH}" ]]; then
     echo "Resolved script path not found: ${SCRIPT_PATH}" >&2
@@ -113,6 +153,8 @@ if [[ ! -f "${BUILD_SCRIPT}" ]]; then
     echo "Build script not found: ${BUILD_SCRIPT}" >&2
     exit 1
 fi
+
+resolve_profile_defaults
 
 require_var NEG_SIM_ROOT
 require_var OUTPUT_NEG_DIR
@@ -151,10 +193,10 @@ if [[ -z "${SLURM_JOB_ID:-}" ]]; then
         exit 1
     fi
     mkdir -p "${BASE_DIR}/logs/data" "${OUTPUT_NEG_DIR}"
-    echo "Submitting: sbatch --export=ALL ${SCRIPT_PATH}"
+    echo "Submitting: sbatch --export=ALL,PROFILE=${PROFILE} ${SCRIPT_PATH}"
     (
         cd "${REPO_ROOT}"
-        sbatch --export=ALL "${SCRIPT_PATH}"
+        sbatch --export=ALL,PROFILE="${PROFILE}" "${SCRIPT_PATH}"
     )
     exit 0
 fi
@@ -189,6 +231,7 @@ echo "Slurm Job: ${SLURM_JOB_ID}"
 echo "Node: ${SLURMD_NODENAME:-unknown}"
 echo "Start: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
 echo "Build script: ${BUILD_SCRIPT}"
+echo "Profile: ${PROFILE}"
 echo "Negative sim root: ${NEG_SIM_ROOT}"
 echo "Output NEG: ${OUTPUT_NEG_H5}"
 echo "Negative group: ${NEG_GROUP}"

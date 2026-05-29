@@ -2266,7 +2266,10 @@ def temporary_simple_hard_negative_sampling(model):
     if core_model is not None:
         patch_targets.append(core_model)
 
-    original_time_sampler = ALBEF_train.sample_inbatch_hard_negatives_with_time
+    missing_time_sampler = object()
+    original_time_sampler = getattr(
+        ALBEF_train, "sample_inbatch_hard_negatives_with_time", missing_time_sampler
+    )
     original_methods = []
 
     def _simple_sampler(sim_g2o, gw_indices=None, margin=0.2):
@@ -2285,7 +2288,14 @@ def temporary_simple_hard_negative_sampling(model):
     try:
         yield
     finally:
-        ALBEF_train.sample_inbatch_hard_negatives_with_time = original_time_sampler
+        current_time_sampler = getattr(
+            ALBEF_train, "sample_inbatch_hard_negatives_with_time", None
+        )
+        if original_time_sampler is missing_time_sampler:
+            if current_time_sampler is sample_simple_inbatch_hard_negatives_with_time:
+                delattr(ALBEF_train, "sample_inbatch_hard_negatives_with_time")
+        else:
+            ALBEF_train.sample_inbatch_hard_negatives_with_time = original_time_sampler
         for target, original_semi, original_hard in original_methods:
             if original_semi is not None:
                 target.sample_semi_hard_negatives = original_semi
