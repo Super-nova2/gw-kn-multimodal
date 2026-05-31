@@ -140,6 +140,18 @@ echo "Default Configuration File: $default_file"
 echo "Checkpoint Path: $CKPT_PATH"
 echo ""
 
+echo "========================================"
+echo "Experiment Config Contents ($(basename "$args_file"))"
+echo "========================================"
+cat "$args_file"
+echo ""
+
+echo "========================================"
+echo "Default Config Contents ($(basename "$default_file"))"
+echo "========================================"
+cat "$default_file"
+echo ""
+
 # Optional: stage large HDF5 to local disk to reduce Lustre I/O
 if [ "$STAGE_TO_JOBFS" = "true" ]; then
     JOBFS_DIR="${SLURM_TMPDIR:-${TMPDIR:-${JOBFS:-}}}"

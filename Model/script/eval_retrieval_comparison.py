@@ -57,7 +57,6 @@ from retrieval_gallery import (  # noqa: E402
     build_synthetic_time_sky_candidate_sequences,
     build_time_sky_candidate_sequences,
     extract_gallery_negative_abs_dt_days,
-    plot_retrieval_coverage,
     plot_retrieval_curves,
     score_all_galleries_skymap,
 )
@@ -773,7 +772,7 @@ def plot_redshift_macro_metrics(
             )
         ax.set_xlabel("Redshift")
         ax.set_ylabel(metric_label)
-        ax.set_title(f"{metric_label} vs Redshift", fontsize=11)
+        ax.set_title(f"{metric_label} vs Redshift")
         ax.grid(True, alpha=0.3)
 
     handles, labels = axes[0].get_legend_handles_labels()
@@ -784,11 +783,10 @@ def plot_redshift_macro_metrics(
             loc="upper center",
             ncol=max(1, min(6, len(labels))),
             frameon=False,
-            fontsize=8,
-            bbox_to_anchor=(0.5, 0.98),
         )
-    fig.tight_layout(rect=(0, 0, 1, 0.84))
+    fig.tight_layout(rect=(0, 0, 1, 0.92))
     fig.savefig(str(out / "redshift_macro_metrics_log10_weighted.png"), dpi=300, bbox_inches="tight")
+    fig.savefig(str(out / "redshift_macro_metrics_log10_weighted.pdf"), bbox_inches="tight")
     plt.close(fig)
 
 
@@ -3046,14 +3044,12 @@ def main():
     output_dir = Path(cfg["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
     plot_retrieval_curves(curve_rows, output_dir)
-    plot_retrieval_coverage(curve_rows, output_dir)
     if redshift_rows:
         write_redshift_csv(redshift_rows, output_dir / "redshift_metrics.csv")
         redshift_macro_rows = aggregate_redshift_macro_metrics(redshift_rows)
         write_redshift_macro_csv(redshift_macro_rows, output_dir / "redshift_macro_metrics_log10_weighted.csv")
         plot_redshift_metrics(redshift_rows, output_dir)
         plot_redshift_macro_metrics(redshift_macro_rows, output_dir)
-        plot_redshift_coverage(redshift_rows, output_dir)
         print(f"Wrote redshift-binned outputs to {output_dir}")
     output = {
         "table": {

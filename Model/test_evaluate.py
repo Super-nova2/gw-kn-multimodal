@@ -3200,7 +3200,7 @@ def generate_logits_distribution_plot(triplet_logits, output_dir):
 
     fig, ax = plt.subplots(figsize=(10, 6))
     if margins_pos is not None:
-        ax.hist(margins_pos, bins=bins, alpha=alpha, label=f'Positive n={len(margins_pos)}',
+        ax.hist(margins_pos, bins=bins, alpha=alpha, label=f'Positives n={len(margins_pos)}',
                 edgecolor='#2ecc71', linewidth=3, histtype='step')
     if margins_optical is not None:
         ax.hist(margins_optical, bins=bins, alpha=alpha, label=f'Optical Negatives n={len(margins_optical)}',
@@ -3222,11 +3222,13 @@ def generate_logits_distribution_plot(triplet_logits, output_dir):
     fig.tight_layout()
     fig.savefig(os.path.join(output_dir, "logits_distribution_triplet.png"), dpi=200,
                 bbox_inches="tight")
+    fig.savefig(os.path.join(output_dir, "logits_distribution_triplet.pdf"),
+                bbox_inches="tight")
     plt.close(fig)
 
     fig, ax = plt.subplots(figsize=(10, 6))
     x_range = np.linspace(float(bins[0]), float(bins[-1]), 300)
-    _plot_logit_margin_kde(ax, margins_pos, x_range, color='#27ae60', label='Positive')
+    _plot_logit_margin_kde(ax, margins_pos, x_range, color='#27ae60', label='Positives')
     _plot_logit_margin_kde(ax, margins_optical, x_range, color='#2980b9', label='Optical Negatives')
     _plot_logit_margin_kde(ax, margins_gw, x_range, color='#d68910', label='GW Negatives')
     _plot_logit_margin_kde(ax, margins_hard, x_range, color='#c0392b', label=MISMATCH_NEGATIVE_LABEL)

@@ -810,7 +810,7 @@ def plot_retrieval_curves(curve_rows: Sequence[Mapping[str, Any]], output_dir: P
         fig.legend(handles, labels, loc="upper center", ncol=max(1, min(4, len(labels))), frameon=False)
     fig.tight_layout(rect=(0, 0, 1, 0.92))
     fig.savefig(output_dir / "retrieval_curves.png", dpi=PLOT_DPI, bbox_inches="tight")
-    _remove_stale_pdf(output_dir / "retrieval_curves.pdf")
+    fig.savefig(output_dir / "retrieval_curves.pdf", bbox_inches="tight")
     plt.close(fig)
 
 
