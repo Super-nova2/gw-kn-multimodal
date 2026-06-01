@@ -2736,6 +2736,9 @@ def train(args):
                             "val_recall_at_1": val_metrics.get('retrieval', {}).get('g2o_recall_at_1', 0),
                             "val_recall_at_5": val_metrics.get('retrieval', {}).get('g2o_recall_at_5', 0),
                             "val_mrr": val_metrics.get('retrieval', {}).get('g2o_mrr', 0),
+                            "val_fusion_gallery_recall_at_1": val_metrics.get('retrieval', {}).get('fusion_gallery_recall_at_1', 0),
+                            "val_fusion_gallery_recall_at_5": val_metrics.get('retrieval', {}).get('fusion_gallery_recall_at_5', 0),
+                            "val_fusion_gallery_mrr": val_metrics.get('retrieval', {}).get('fusion_gallery_mrr', 0),
                             "val_auroc": val_metrics.get('classification', {}).get('auroc', 0),
                             "val_auprc": val_metrics.get('classification', {}).get('auprc', 0),
                         }
@@ -2775,18 +2778,19 @@ def train(args):
                     f"eligible={int(best_selection_eligible)}, is_best={int(is_best_epoch)}"
                 )
 
-        checkpoint_path = os.path.join(args.ckpt_path, "ALBEF", f"albef_epoch_{epoch+1}.pth")
-        os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
-        torch.save({
-            'epoch': epoch,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'scaler_state_dict': scaler.state_dict(),
-            'loss': avg_total,
-            'args': vars(args),
-            'dataset_window_metadata': getattr(args, "_dataset_window_metadata", None),
-            'effective_input_window_metadata': getattr(args, "_effective_input_window_metadata", None),
-        }, checkpoint_path)
+        if not bool(getattr(args, "skip_epoch_checkpoints", False)):
+            checkpoint_path = os.path.join(args.ckpt_path, "ALBEF", f"albef_epoch_{epoch+1}.pth")
+            os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scaler_state_dict': scaler.state_dict(),
+                'loss': avg_total,
+                'args': vars(args),
+                'dataset_window_metadata': getattr(args, "_dataset_window_metadata", None),
+                'effective_input_window_metadata': getattr(args, "_effective_input_window_metadata", None),
+            }, checkpoint_path)
         
         # End-of-epoch memory cleanup
         if device.type == 'cuda':
@@ -3027,6 +3031,8 @@ if __name__ == "__main__":
                         help="Optical band dropout probability (default: 0.0)")
     parser.add_argument("--hpo_trial_number", type=int, default=None,
                         help="Optuna trial number (set automatically by HPO, not for manual use)")
+    parser.add_argument("--skip_epoch_checkpoints", action=argparse.BooleanOptionalAction, default=False,
+                        help="Skip per-epoch checkpoint files while still writing best checkpoint and summaries.")
     parser.add_argument("--default_json_config", type=str, default=None,
                         help="Default JSON config file path. Loaded before --json_config.")
     parser.add_argument("--json_config", type=str, default=None,

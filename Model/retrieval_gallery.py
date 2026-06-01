@@ -12,19 +12,29 @@ import torch
 TABLE_METRIC_LABELS = ["R@1", "R@5", "R@10", "MRR"]
 TABLE_METRIC_KEYS = ["recall_at_1", "recall_at_5", "recall_at_10", "mrr"]
 PLOT_DPI = 300
+PLOT_FONT_BASE = 12
 PLOT_METHOD_LABELS = {
     "skymap-only": "Skymap-only",
     "optical-only": "Optical-only",
+    "full": "MAGIKS",
+    "Full": "MAGIKS",
     "w/o \u5bf9\u6bd4\u5b66\u4e60": "w/o Contrastive Learning",
     "w/o \u4ea4\u53c9\u6ce8\u610f\u529b": "w/o Cross-Attention",
     "w/o \u878d\u5408\u5206\u652f": "w/o Fusion Branch",
-    "\u5168\u6a21\u6001": "Full Multimodal",
-    "\u5168\u6a21\u6001 + \u56f0\u96be\u6837\u672c\u6316\u6398": "Full Multimodal + Hard Mining",
+    "\u5168\u6a21\u6001": "MAGIKS",
+    "\u5168\u6a21\u6001 + \u56f0\u96be\u6837\u672c\u6316\u6398": "MAGIKS + Hard Mining",
 }
 
 
 def _plot_method_label(method: str) -> str:
     return PLOT_METHOD_LABELS.get(str(method), str(method))
+
+
+def _plot_method_draw_order(method: str) -> tuple:
+    """Sort key: 'full' variants draw last (on top of other curves)."""
+    s = str(method)
+    is_full = "全模态" in s or "Full" in s
+    return (int(is_full), s)
 
 
 def _remove_stale_pdf(path: Path) -> None:
@@ -767,6 +777,7 @@ def plot_retrieval_curves(curve_rows: Sequence[Mapping[str, Any]], output_dir: P
 
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
+        plt.rcParams.update({"font.size": PLOT_FONT_BASE})
     except Exception:
         return
 
@@ -777,7 +788,7 @@ def plot_retrieval_curves(curve_rows: Sequence[Mapping[str, Any]], output_dir: P
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    methods = sorted({str(row["method"]) for row in rows})
+    methods = sorted({str(row["method"]) for row in rows}, key=_plot_method_draw_order)
     metrics = ["R@1", "R@10", "MRR"]
     fig, axes = plt.subplots(1, len(metrics), figsize=(15, 4.8), sharex=False, sharey=False)
     if len(metrics) == 1:
@@ -808,7 +819,7 @@ def plot_retrieval_curves(curve_rows: Sequence[Mapping[str, Any]], output_dir: P
     handles, labels = axes[0].get_legend_handles_labels()
     if handles:
         fig.legend(handles, labels, loc="upper center", ncol=max(1, min(4, len(labels))), frameon=False)
-    fig.tight_layout(rect=(0, 0, 1, 0.92))
+    fig.tight_layout(rect=(0, 0, 1, 0.88))
     fig.savefig(output_dir / "retrieval_curves.png", dpi=PLOT_DPI, bbox_inches="tight")
     fig.savefig(output_dir / "retrieval_curves.pdf", bbox_inches="tight")
     plt.close(fig)
@@ -820,6 +831,7 @@ def plot_retrieval_coverage(curve_rows: Sequence[Mapping[str, Any]], output_dir:
 
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
+        plt.rcParams.update({"font.size": PLOT_FONT_BASE})
     except Exception:
         return
 
@@ -841,7 +853,7 @@ def plot_retrieval_coverage(curve_rows: Sequence[Mapping[str, Any]], output_dir:
         }
 
     fig, ax = plt.subplots(figsize=(7, 5))
-    for method in sorted(by_method):
+    for method in sorted(by_method, key=_plot_method_draw_order):
         ordered = sorted(by_method[method].items(), key=lambda item: int(item[0]))
         ax.plot(
             [gallery_size for gallery_size, _ in ordered],

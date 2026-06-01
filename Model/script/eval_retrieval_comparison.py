@@ -57,6 +57,9 @@ from retrieval_gallery import (  # noqa: E402
     build_synthetic_time_sky_candidate_sequences,
     build_time_sky_candidate_sequences,
     extract_gallery_negative_abs_dt_days,
+    PLOT_FONT_BASE,
+    _plot_method_draw_order,
+    _plot_method_label,
     plot_retrieval_curves,
     score_all_galleries_skymap,
 )
@@ -671,7 +674,7 @@ def plot_redshift_metrics(
     rows: Sequence[Mapping[str, Any]],
     output_dir: Path,
     *,
-    _plot_method_label_fn=None,
+    _plot_method_label_fn=_plot_method_label,
 ) -> None:
     """Plot R@1, R@10, MRR vs redshift per gallery size.
 
@@ -682,6 +685,7 @@ def plot_redshift_metrics(
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
+        plt.rcParams.update({"font.size": PLOT_FONT_BASE})
     except Exception:
         return
     rows = list(rows)
@@ -689,7 +693,7 @@ def plot_redshift_metrics(
         return
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
-    methods = sorted({str(row["method"]) for row in rows})
+    methods = sorted({str(row["method"]) for row in rows}, key=_plot_method_draw_order)
     metrics = [("recall_at_1", "R@1"), ("recall_at_10", "R@10"), ("mrr", "MRR")]
     all_gallery_sizes = sorted({int(row["gallery_size"]) for row in rows})
 
@@ -723,7 +727,7 @@ def plot_redshift_metrics(
         handles, labels = axes[0].get_legend_handles_labels()
         if handles:
             fig.legend(handles, labels, loc="upper center", ncol=min(4, len(labels)), frameon=False)
-        fig.tight_layout(rect=(0, 0, 1, 0.90))
+        fig.tight_layout(rect=(0, 0, 1, 0.86))
         fig.savefig(str(out / f"redshift_retrieval_metrics_g{gallery_size}.png"), dpi=300, bbox_inches="tight")
         plt.close(fig)
 
@@ -732,13 +736,14 @@ def plot_redshift_macro_metrics(
     rows: Sequence[Mapping[str, Any]],
     output_dir: Path,
     *,
-    _plot_method_label_fn=None,
+    _plot_method_label_fn=_plot_method_label,
 ) -> None:
     """Plot log10(G)-weighted Macro R@1, R@10, and MRR vs redshift."""
     try:
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
+        plt.rcParams.update({"font.size": PLOT_FONT_BASE})
     except Exception:
         return
     rows = list(rows)
@@ -746,7 +751,7 @@ def plot_redshift_macro_metrics(
         return
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
-    methods = sorted({str(row["method"]) for row in rows})
+    methods = sorted({str(row["method"]) for row in rows}, key=_plot_method_draw_order)
     metrics = [
         ("macro_recall_at_1", "Macro R@1"),
         ("macro_recall_at_10", "Macro R@10"),
@@ -781,10 +786,10 @@ def plot_redshift_macro_metrics(
             handles,
             labels,
             loc="upper center",
-            ncol=max(1, min(6, len(labels))),
+            ncol=4,
             frameon=False,
         )
-    fig.tight_layout(rect=(0, 0, 1, 0.92))
+    fig.tight_layout(rect=(0, 0, 1, 0.88))
     fig.savefig(str(out / "redshift_macro_metrics_log10_weighted.png"), dpi=300, bbox_inches="tight")
     fig.savefig(str(out / "redshift_macro_metrics_log10_weighted.pdf"), bbox_inches="tight")
     plt.close(fig)
@@ -796,6 +801,7 @@ def plot_redshift_coverage(rows: Sequence[Mapping[str, Any]], output_dir: Path) 
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
+        plt.rcParams.update({"font.size": PLOT_FONT_BASE})
     except Exception:
         return
     rows = list(rows)
@@ -803,7 +809,7 @@ def plot_redshift_coverage(rows: Sequence[Mapping[str, Any]], output_dir: Path) 
         return
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
-    methods = sorted({str(row["method"]) for row in rows})
+    methods = sorted({str(row["method"]) for row in rows}, key=_plot_method_draw_order)
     all_gallery_sizes = sorted({int(row["gallery_size"]) for row in rows})
 
     for gallery_size in all_gallery_sizes:

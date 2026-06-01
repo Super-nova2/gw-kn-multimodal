@@ -3200,22 +3200,22 @@ def generate_logits_distribution_plot(triplet_logits, output_dir):
 
     fig, ax = plt.subplots(figsize=(10, 6))
     if margins_pos is not None:
-        ax.hist(margins_pos, bins=bins, alpha=alpha, label=f'Positives n={len(margins_pos)}',
-                edgecolor='#2ecc71', linewidth=3, histtype='step')
+        ax.hist(margins_pos, bins=bins, alpha=alpha, label='Positives',
+                edgecolor='#2ecc71', linewidth=2, histtype='step')
     if margins_optical is not None:
-        ax.hist(margins_optical, bins=bins, alpha=alpha, label=f'Optical Negatives n={len(margins_optical)}',
-                edgecolor='#3498db', linewidth=3, histtype='step')
+        ax.hist(margins_optical, bins=bins, alpha=alpha, label='Optical Negatives',
+                edgecolor='#3498db', linewidth=2, histtype='step')
     if margins_gw is not None:
-        ax.hist(margins_gw, bins=bins, alpha=alpha, label=f'GW Negatives n={len(margins_gw)}',
-                edgecolor='#f39c12', linewidth=3, histtype='step')
+        ax.hist(margins_gw, bins=bins, alpha=alpha, label='GW Negatives',
+                edgecolor='#f39c12', linewidth=2, histtype='step')
     if margins_hard is not None:
-        ax.hist(margins_hard, bins=bins, alpha=alpha, label=f'{MISMATCH_NEGATIVE_LABEL} n={len(margins_hard)}',
-                edgecolor='#e74c3c', linewidth=3, histtype='step')
+        ax.hist(margins_hard, bins=bins, alpha=alpha, label=MISMATCH_NEGATIVE_LABEL,
+                edgecolor='#e74c3c', linewidth=2, histtype='step')
 
-    ax.set_xlabel(LOGIT_AXIS_LABEL, fontsize=12)
-    ax.set_ylabel('Count', fontsize=12)
+    ax.set_xlabel(LOGIT_AXIS_LABEL, fontsize=13)
+    ax.set_ylabel('Count', fontsize=13)
     ax.set_title(LOGIT_DISTRIBUTION_TITLE, fontsize=14)
-    ax.legend(loc='upper left', fontsize=10)
+    ax.legend(loc='upper left', fontsize=11)
     ax.grid(True, alpha=0.3, linestyle='--')
     ax.yaxis.set_major_locator(MaxNLocator(integer=True))
 
@@ -3232,10 +3232,10 @@ def generate_logits_distribution_plot(triplet_logits, output_dir):
     _plot_logit_margin_kde(ax, margins_optical, x_range, color='#2980b9', label='Optical Negatives')
     _plot_logit_margin_kde(ax, margins_gw, x_range, color='#d68910', label='GW Negatives')
     _plot_logit_margin_kde(ax, margins_hard, x_range, color='#c0392b', label=MISMATCH_NEGATIVE_LABEL)
-    ax.set_xlabel(LOGIT_AXIS_LABEL, fontsize=12)
-    ax.set_ylabel('Density', fontsize=12)
+    ax.set_xlabel(LOGIT_AXIS_LABEL, fontsize=13)
+    ax.set_ylabel('Density', fontsize=13)
     ax.set_title(LOGIT_DISTRIBUTION_TITLE, fontsize=14)
-    ax.legend(loc='upper left', fontsize=10)
+    ax.legend(loc='upper left', fontsize=11)
     ax.grid(True, alpha=0.3, linestyle='--')
     fig.tight_layout()
     fig.savefig(os.path.join(output_dir, "logits_distribution_kde.png"), dpi=200,
