@@ -12,7 +12,7 @@ import torch
 TABLE_METRIC_LABELS = ["R@1", "R@5", "R@10", "MRR"]
 TABLE_METRIC_KEYS = ["recall_at_1", "recall_at_5", "recall_at_10", "mrr"]
 PLOT_DPI = 300
-PLOT_FONT_BASE = 13
+PLOT_FONT_BASE = 14
 RETRIEVAL_CURVES_FIGSIZE = (15, 4.8)
 PLOT_METHOD_LABELS = {
     "skymap-only": "Skymap-only",
