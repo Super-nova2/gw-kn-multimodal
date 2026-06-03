@@ -2855,6 +2855,7 @@ def generate_plots(embeddings, results, output_dir, triplet_logits=None):
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
+        plt.rcParams.update({"font.family": "serif", "font.serif": ["Times New Roman"]})
     except ImportError:
         print("matplotlib not available, skipping plots")
         return
@@ -3120,7 +3121,7 @@ def generate_plots(embeddings, results, output_dir, triplet_logits=None):
                 ax.set_title("t-SNE of GW Embeddings by Source Type")
                 ax.set_xlabel("t-SNE 1")
                 ax.set_ylabel("t-SNE 2")
-                ax.legend(loc="best", fontsize=10)
+                ax.legend(loc="best", fontsize=11)
                 ax.grid(True, alpha=0.2)
                 fig.savefig(os.path.join(output_dir, "tsne_gw_by_source.png"),
                             dpi=150, bbox_inches="tight")
@@ -3177,6 +3178,7 @@ def generate_logits_distribution_plot(triplet_logits, output_dir):
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
+        plt.rcParams.update({"font.family": "serif", "font.serif": ["Times New Roman"]})
         from matplotlib.ticker import MaxNLocator
     except ImportError:
         print("matplotlib not available, skipping logits distribution plot")
@@ -3212,10 +3214,10 @@ def generate_logits_distribution_plot(triplet_logits, output_dir):
         ax.hist(margins_hard, bins=bins, alpha=alpha, label=MISMATCH_NEGATIVE_LABEL,
                 edgecolor='#e74c3c', linewidth=2, histtype='step')
 
-    ax.set_xlabel(LOGIT_AXIS_LABEL, fontsize=13)
-    ax.set_ylabel('Count', fontsize=13)
-    ax.set_title(LOGIT_DISTRIBUTION_TITLE, fontsize=14)
-    ax.legend(loc='upper left', fontsize=11)
+    ax.set_xlabel(LOGIT_AXIS_LABEL, fontsize=14)
+    ax.set_ylabel('Count', fontsize=14)
+    ax.set_title(LOGIT_DISTRIBUTION_TITLE, fontsize=15)
+    ax.legend(loc='upper left', fontsize=12)
     ax.grid(True, alpha=0.3, linestyle='--')
     ax.yaxis.set_major_locator(MaxNLocator(integer=True))
 
@@ -3232,10 +3234,10 @@ def generate_logits_distribution_plot(triplet_logits, output_dir):
     _plot_logit_margin_kde(ax, margins_optical, x_range, color='#2980b9', label='Optical Negatives')
     _plot_logit_margin_kde(ax, margins_gw, x_range, color='#d68910', label='GW Negatives')
     _plot_logit_margin_kde(ax, margins_hard, x_range, color='#c0392b', label=MISMATCH_NEGATIVE_LABEL)
-    ax.set_xlabel(LOGIT_AXIS_LABEL, fontsize=13)
-    ax.set_ylabel('Density', fontsize=13)
-    ax.set_title(LOGIT_DISTRIBUTION_TITLE, fontsize=14)
-    ax.legend(loc='upper left', fontsize=11)
+    ax.set_xlabel(LOGIT_AXIS_LABEL, fontsize=14)
+    ax.set_ylabel('Density', fontsize=14)
+    ax.set_title(LOGIT_DISTRIBUTION_TITLE, fontsize=15)
+    ax.legend(loc='upper left', fontsize=12)
     ax.grid(True, alpha=0.3, linestyle='--')
     fig.tight_layout()
     fig.savefig(os.path.join(output_dir, "logits_distribution_kde.png"), dpi=200,
@@ -3274,6 +3276,7 @@ def generate_gw_shuffle_comparison_plot(triplet_logits_normal, triplet_logits_sh
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
+        plt.rcParams.update({"font.family": "serif", "font.serif": ["Times New Roman"]})
         from scipy import stats
     except ImportError:
         print("matplotlib/scipy not available, skipping GW-shuffle comparison plot")
@@ -3325,15 +3328,15 @@ def generate_gw_shuffle_comparison_plot(triplet_logits_normal, triplet_logits_sh
             ax.plot(x_range, kde_s(x_range), color=color_s, linewidth=2.5, linestyle='--',
                    label=f'GW-Shuffle (μ={np.mean(probs_s):.3f})')
         
-        ax.set_xlabel('Match Probability', fontsize=11)
-        ax.set_ylabel('Density', fontsize=11)
-        ax.set_title(title, fontsize=12)
-        ax.legend(loc='upper right', fontsize=9)
+        ax.set_xlabel('Match Probability', fontsize=12)
+        ax.set_ylabel('Density', fontsize=12)
+        ax.set_title(title, fontsize=13)
+        ax.legend(loc='upper right', fontsize=10)
         ax.set_xlim(0, 1)
         ax.axvline(x=0.5, color='black', linestyle=':', linewidth=1, alpha=0.5)
         ax.grid(True, alpha=0.3, linestyle='--')
     
-    fig.suptitle('GW-Shuffle Ablation Test: Effect of Randomizing GW Input', fontsize=14, y=1.02)
+    fig.suptitle('GW-Shuffle Ablation Test: Effect of Randomizing GW Input', fontsize=15, y=1.02)
     fig.tight_layout()
     fig.savefig(os.path.join(output_dir, "gw_shuffle_comparison.png"), dpi=200,
                 bbox_inches="tight")
@@ -3378,10 +3381,10 @@ def generate_gw_shuffle_comparison_plot(triplet_logits_normal, triplet_logits_sh
         ax.plot(x_range, kde(x_range), color='#c0392b', linewidth=2.5, linestyle='--',
                label='Mismatched Negatives - Shuffle')
     
-    ax.set_xlabel('Match Probability (Softmax Output)', fontsize=12)
-    ax.set_ylabel('Density', fontsize=12)
-    ax.set_title('GW-Shuffle Ablation: All Distributions Comparison\n(Solid=Normal, Dashed=GW-Shuffled)', fontsize=14)
-    ax.legend(loc='upper right', fontsize=10, ncol=2)
+    ax.set_xlabel('Match Probability (Softmax Output)', fontsize=13)
+    ax.set_ylabel('Density', fontsize=13)
+    ax.set_title('GW-Shuffle Ablation: All Distributions Comparison\n(Solid=Normal, Dashed=GW-Shuffled)', fontsize=15)
+    ax.legend(loc='upper right', fontsize=11, ncol=2)
     ax.set_xlim(0, 1)
     ax.axvline(x=0.5, color='black', linestyle=':', linewidth=1.5, alpha=0.7)
     ax.grid(True, alpha=0.3, linestyle='--')

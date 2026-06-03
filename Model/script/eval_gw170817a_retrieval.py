@@ -39,6 +39,7 @@ from retrieval_gallery import (  # noqa: E402
     build_synthetic_time_sky_candidate_sequences,
     build_time_sky_candidate_sequences,
     PLOT_FONT_BASE,
+    RETRIEVAL_CURVES_FIGSIZE,
     _plot_method_draw_order,
     plot_retrieval_curves,
     score_all_galleries_skymap,
@@ -302,7 +303,7 @@ def plot_redshift_metrics(rows: Sequence[Mapping[str, Any]], output_dir: Path | 
 
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
-        plt.rcParams.update({"font.size": PLOT_FONT_BASE})
+        plt.rcParams.update({"font.size": PLOT_FONT_BASE, "font.family": "serif", "font.serif": ["Times New Roman"]})
     except Exception:
         return
     rows = list(rows)
@@ -348,7 +349,7 @@ def plot_redshift_coverage(rows: Sequence[Mapping[str, Any]], output_dir: Path |
 
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
-        plt.rcParams.update({"font.size": PLOT_FONT_BASE})
+        plt.rcParams.update({"font.size": PLOT_FONT_BASE, "font.family": "serif", "font.serif": ["Times New Roman"]})
     except Exception:
         return
     rows = list(rows)
@@ -436,7 +437,7 @@ def plot_redshift_macro_metrics(rows: Sequence[Mapping[str, Any]], output_dir: P
 
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
-        plt.rcParams.update({"font.size": PLOT_FONT_BASE})
+        plt.rcParams.update({"font.size": PLOT_FONT_BASE, "font.family": "serif", "font.serif": ["Times New Roman"]})
     except Exception:
         return
     rows = list(rows)
@@ -451,7 +452,7 @@ def plot_redshift_macro_metrics(rows: Sequence[Mapping[str, Any]], output_dir: P
         ("macro_mrr", "Macro MRR"),
     ]
 
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5.2), sharex=True)
+    fig, axes = plt.subplots(1, 3, figsize=RETRIEVAL_CURVES_FIGSIZE, sharex=True)
     for ax, (key, label) in zip(axes, metrics):
         for method in methods:
             method_rows = sorted(

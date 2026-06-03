@@ -12,7 +12,8 @@ import torch
 TABLE_METRIC_LABELS = ["R@1", "R@5", "R@10", "MRR"]
 TABLE_METRIC_KEYS = ["recall_at_1", "recall_at_5", "recall_at_10", "mrr"]
 PLOT_DPI = 300
-PLOT_FONT_BASE = 12
+PLOT_FONT_BASE = 13
+RETRIEVAL_CURVES_FIGSIZE = (15, 4.8)
 PLOT_METHOD_LABELS = {
     "skymap-only": "Skymap-only",
     "optical-only": "Optical-only",
@@ -777,7 +778,7 @@ def plot_retrieval_curves(curve_rows: Sequence[Mapping[str, Any]], output_dir: P
 
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
-        plt.rcParams.update({"font.size": PLOT_FONT_BASE})
+        plt.rcParams.update({"font.size": PLOT_FONT_BASE, "font.family": "serif", "font.serif": ["Times New Roman", "STIXGeneral", "DejaVu Serif"]})
     except Exception:
         return
 
@@ -790,7 +791,7 @@ def plot_retrieval_curves(curve_rows: Sequence[Mapping[str, Any]], output_dir: P
 
     methods = sorted({str(row["method"]) for row in rows}, key=_plot_method_draw_order)
     metrics = ["R@1", "R@10", "MRR"]
-    fig, axes = plt.subplots(1, len(metrics), figsize=(15, 4.8), sharex=False, sharey=False)
+    fig, axes = plt.subplots(1, len(metrics), figsize=RETRIEVAL_CURVES_FIGSIZE, sharex=False, sharey=False)
     if len(metrics) == 1:
         axes = [axes]
 
@@ -831,7 +832,7 @@ def plot_retrieval_coverage(curve_rows: Sequence[Mapping[str, Any]], output_dir:
 
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
-        plt.rcParams.update({"font.size": PLOT_FONT_BASE})
+        plt.rcParams.update({"font.size": PLOT_FONT_BASE, "font.family": "serif", "font.serif": ["Times New Roman", "STIXGeneral", "DejaVu Serif"]})
     except Exception:
         return
 

@@ -58,6 +58,7 @@ from retrieval_gallery import (  # noqa: E402
     build_time_sky_candidate_sequences,
     extract_gallery_negative_abs_dt_days,
     PLOT_FONT_BASE,
+    RETRIEVAL_CURVES_FIGSIZE,
     _plot_method_draw_order,
     _plot_method_label,
     plot_retrieval_curves,
@@ -685,7 +686,7 @@ def plot_redshift_metrics(
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
-        plt.rcParams.update({"font.size": PLOT_FONT_BASE})
+        plt.rcParams.update({"font.size": PLOT_FONT_BASE, "font.family": "serif", "font.serif": ["Times New Roman"]})
     except Exception:
         return
     rows = list(rows)
@@ -743,7 +744,7 @@ def plot_redshift_macro_metrics(
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
-        plt.rcParams.update({"font.size": PLOT_FONT_BASE})
+        plt.rcParams.update({"font.size": PLOT_FONT_BASE, "font.family": "serif", "font.serif": ["Times New Roman"]})
     except Exception:
         return
     rows = list(rows)
@@ -759,7 +760,7 @@ def plot_redshift_macro_metrics(
     ]
     label_fn = _plot_method_label_fn or (lambda x: x)
 
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5.2), sharex=False, sharey=False)
+    fig, axes = plt.subplots(1, 3, figsize=RETRIEVAL_CURVES_FIGSIZE, sharex=False, sharey=False)
     for ax, (key, metric_label) in zip(axes, metrics):
         for method in methods:
             method_rows = sorted(
@@ -801,7 +802,7 @@ def plot_redshift_coverage(rows: Sequence[Mapping[str, Any]], output_dir: Path) 
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
-        plt.rcParams.update({"font.size": PLOT_FONT_BASE})
+        plt.rcParams.update({"font.size": PLOT_FONT_BASE, "font.family": "serif", "font.serif": ["Times New Roman"]})
     except Exception:
         return
     rows = list(rows)
