@@ -23,6 +23,8 @@ from optuna.samplers import TPESampler
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_DIR = os.path.dirname(SCRIPT_DIR)
+REPO_ROOT = os.path.dirname(MODEL_DIR)
+WORKSPACE_ROOT = os.path.dirname(REPO_ROOT)
 TRAIN_SCRIPT = os.path.join(MODEL_DIR, "ALBEF_train.py")
 DEFAULT_BASE_TRAIN_CONFIG = os.path.join(MODEL_DIR, "args", "ALBEF_BNS_NSBH.json")
 
@@ -34,6 +36,13 @@ ALBEF_BOOL_KEYS = {
     "hardneg_memory_bank_enable",
     "use_lightweight_gw",
     "dual_fusion",
+    "use_time_delta_cls_feature",
+    "use_similarity_as_cls_input",
+    "use_cred_level_feature",
+    "compute_cls_metrics",
+    "compute_fusion_gallery_metrics",
+    "gallery_include_extra_negatives",
+    "gallery_hard_neg_enable",
     "skip_epoch_checkpoints",
 }
 
@@ -74,6 +83,10 @@ ALBEF_ARG_KEYS = {
     "ref_dim",
     "enc_dim",
     "proj_dim",
+    "optical_curve_dim",
+    "optical_coord_dim",
+    "optical_curve_hidden_dim",
+    "contrastive_hidden_dim",
     "fusion_attn_dim",
     "fusion_hidden_dim",
     "fusion_dropout",
@@ -87,6 +100,19 @@ ALBEF_ARG_KEYS = {
     "time_compat_tau_days",
     "time_compat_power",
     "time_compat_max_penalty",
+    "use_time_delta_cls_feature",
+    "time_delta_cls_scale_days",
+    "time_delta_cls_clip",
+    "fusion_physical_weight",
+    "fusion_spatial_weight",
+    "mtan_snr_s0",
+    "mtan_snr_beta",
+    "mtan_snr_clip_min",
+    "mtan_snr_clip_max",
+    "mtan_snr_eps",
+    "mtan_lupt_psfflux_zp",
+    "mtan_lupt_k",
+    "mtan_lupt_m5_mag",
     "nonkn_cls_base_field",
     "gw_dropout",
     "opt_dropout",
@@ -98,6 +124,22 @@ ALBEF_ARG_KEYS = {
     "cls_neg_weight",
     "cls_extra_neg_weight",
     "cls_ramp_epochs",
+    "retrieval_start_epoch",
+    "gallery_loss_weight",
+    "gallery_loss_ramp_epochs",
+    "compute_cls_metrics",
+    "compute_fusion_gallery_metrics",
+    "fusion_gallery_metrics_start_epoch",
+    "gallery_score_chunk_size",
+    "max_gallery_queries",
+    "gallery_include_extra_negatives",
+    "gallery_distractor_time_mode",
+    "gallery_distractor_time_window_days",
+    "gallery_hard_neg_enable",
+    "gallery_hard_neg_topk",
+    "gallery_hard_neg_weight",
+    "gallery_hard_neg_start_after_retrieval_epochs",
+    "gallery_hard_neg_ramp_epochs",
     "itc_decay_start_epoch",
     "itc_decay_epochs",
     "itc_decay_ratio",
@@ -106,6 +148,7 @@ ALBEF_ARG_KEYS = {
     "supcon_margin",
     "samples_per_gw",
     "min_lc_per_gw",
+    "mis_neg_dt_window_days",
     "mask_itc",
     "hard_neg_start_epoch",
     "hard_neg_ramp_epochs",
@@ -123,6 +166,9 @@ ALBEF_ARG_KEYS = {
     "cls_start_epoch",
     "use_lightweight_gw",
     "dual_fusion",
+    "fusion_mode",
+    "use_similarity_as_cls_input",
+    "use_cred_level_feature",
     "gw_aug_noise",
     "gw_aug_jitter",
     "gw_aug_dropout",
@@ -145,21 +191,35 @@ STALE_KEYS = {
     "use_neg_gw",
     "neg_gw_ratio",
     "hard_neg_top_k",
+    "gallery_force_include_positives",
+    "gallery_detach_encoder_inputs",
+    "fusion_rerank_topk",
+    "fusion_rerank_lambda",
+    "_hardneg_window_days",
+    "_dataset_window_metadata",
+    "_effective_input_window_metadata",
 }
 
 DEFAULT_TUNABLE_PARAMS = [
     "lr",
     "weight_decay",
     "warmup_epochs",
-    "enc_dim",
-    "proj_dim",
-    "ref_shared_dim",
     "cls_start_epoch",
+    "cls_ramp_epochs",
+    "retrieval_start_after_cls_epochs",
+    "gallery_loss_ramp_epochs",
+    "gallery_hard_neg_start_after_retrieval_epochs",
+    "gallery_hard_neg_ramp_epochs",
+    "gallery_hard_neg_weight",
+    "gallery_hard_neg_topk",
     "time_compat_weight",
-    "semi_hard_margin",
-    "hardneg_min_candidates",
-    "augment_enable",
 ]
+
+DERIVED_PARAM_KEYS = {
+    "ref_shared_dim",
+    "augment_enable",
+    "retrieval_start_after_cls_epochs",
+}
 
 AUGMENT_PRESET_KEYS = (
     "gw_aug_noise",
@@ -178,6 +238,13 @@ OBJECTIVE_PRESETS = {
     "cls_auroc_auprc": {"val_auroc": 0.5, "val_auprc": 0.5},
     # Classification-priority objective with retrieval as a soft guard.
     "cls_priority_auprc_auroc_r5": {"val_auprc": 0.45, "val_auroc": 0.35, "val_recall_at_5": 0.20},
+    # Fusion-gallery retrieval priority for current three-stage training.
+    "fusion_gallery_priority": {
+        "val_fusion_gallery_mrr": 0.70,
+        "val_fusion_gallery_recall_at_1": 0.15,
+        "val_auprc": 0.10,
+        "val_auroc": 0.05,
+    },
     # Fully user-defined weighted sum via `objective_weights`.
     "weighted_sum": None,
 }
@@ -188,6 +255,9 @@ SUPPORTED_OBJECTIVE_COMPONENTS = {
     "val_recall_at_1",
     "val_recall_at_5",
     "val_mrr",
+    "val_fusion_gallery_recall_at_1",
+    "val_fusion_gallery_recall_at_5",
+    "val_fusion_gallery_mrr",
     "val_itc_acc",
 }
 
@@ -197,12 +267,25 @@ METRIC_SHORT_NAMES = {
     "val_recall_at_1": "R@1",
     "val_recall_at_5": "R@5",
     "val_mrr": "MRR",
+    "val_fusion_gallery_recall_at_1": "FG_R@1",
+    "val_fusion_gallery_recall_at_5": "FG_R@5",
+    "val_fusion_gallery_mrr": "FG_MRR",
     "val_itc_acc": "ITC_ACC",
 }
 
-
 def _resolve_path(path: str) -> str:
+    path = str(path)
+    path = path.replace("<REPO_ROOT>", REPO_ROOT).replace("<BASE_DIR>", WORKSPACE_ROOT)
     return os.path.abspath(os.path.expanduser(path))
+
+
+def _resolve_config_path(path: str, config_dir: str) -> str:
+    path = str(path)
+    path = path.replace("<REPO_ROOT>", REPO_ROOT).replace("<BASE_DIR>", WORKSPACE_ROOT)
+    path = os.path.expanduser(path)
+    if not os.path.isabs(path):
+        path = os.path.join(config_dir, path)
+    return os.path.abspath(path)
 
 
 def _load_json(path: str) -> Dict[str, Any]:
@@ -326,11 +409,22 @@ def load_hpo_config(config_path: str) -> Dict[str, Any]:
         raise ValueError(f"Missing required config keys: {missing}")
 
     cfg["config_path"] = _resolve_path(config_path)
+    config_dir = os.path.dirname(cfg["config_path"])
     cfg["output_dir"] = _resolve_path(cfg["output_dir"])
-    cfg["base_train_config"] = _resolve_path(cfg.get("base_train_config", DEFAULT_BASE_TRAIN_CONFIG))
+    cfg["base_train_config"] = _resolve_config_path(
+        cfg.get("base_train_config", DEFAULT_BASE_TRAIN_CONFIG), config_dir
+    )
+    default_train_config = cfg.get("default_train_config")
+    cfg["default_train_config"] = (
+        _resolve_config_path(default_train_config, config_dir)
+        if default_train_config not in (None, "")
+        else None
+    )
 
     if not os.path.exists(cfg["base_train_config"]):
         raise FileNotFoundError(f"base_train_config not found: {cfg['base_train_config']}")
+    if cfg["default_train_config"] and not os.path.exists(cfg["default_train_config"]):
+        raise FileNotFoundError(f"default_train_config not found: {cfg['default_train_config']}")
 
     cfg.setdefault("n_startup_trials", 10)
     cfg.setdefault("storage", None)
@@ -340,6 +434,7 @@ def load_hpo_config(config_path: str) -> Dict[str, Any]:
     cfg.setdefault("objective_min_metrics", {})
     cfg.setdefault("tunable_params", list(DEFAULT_TUNABLE_PARAMS))
     cfg.setdefault("fixed_overrides", {})
+    cfg.setdefault("retrain_overrides", {})
     cfg.setdefault("num_workers", 4)
 
     if cfg["objective_direction"] not in {"maximize", "minimize"}:
@@ -357,16 +452,25 @@ def load_hpo_config(config_path: str) -> Dict[str, Any]:
 
     if not isinstance(cfg["tunable_params"], list) or not cfg["tunable_params"]:
         raise ValueError("tunable_params must be a non-empty list")
+    if not isinstance(cfg["fixed_overrides"], dict):
+        raise ValueError("fixed_overrides must be an object")
+    if not isinstance(cfg["retrain_overrides"], dict):
+        raise ValueError("retrain_overrides must be an object")
 
-    valid_tunable_names = (ALBEF_ARG_KEYS - {"hpo_trial_number"}) | {"ref_shared_dim", "augment_enable"}
+    valid_tunable_names = (ALBEF_ARG_KEYS - {"hpo_trial_number"}) | DERIVED_PARAM_KEYS
     unknown_tunable = sorted(set(cfg["tunable_params"]) - valid_tunable_names)
     if unknown_tunable:
         raise ValueError(f"Unknown tunable parameter(s): {unknown_tunable}")
 
-    valid_fixed_names = (ALBEF_ARG_KEYS - {"hpo_trial_number"}) | {"augment_enable"}
+    valid_fixed_names = (ALBEF_ARG_KEYS - {"hpo_trial_number"}) | DERIVED_PARAM_KEYS
     unknown_fixed = sorted(set(cfg["fixed_overrides"].keys()) - valid_fixed_names)
     if unknown_fixed:
         raise ValueError(f"Unknown fixed_overrides parameter(s): {unknown_fixed}")
+
+    valid_retrain_names = ALBEF_ARG_KEYS - {"hpo_trial_number"}
+    unknown_retrain = sorted(set(cfg["retrain_overrides"].keys()) - valid_retrain_names)
+    if unknown_retrain:
+        raise ValueError(f"Unknown retrain_overrides parameter(s): {unknown_retrain}")
 
     overlap = set(cfg["tunable_params"]) & set(cfg["fixed_overrides"].keys())
     if overlap:
@@ -377,7 +481,6 @@ def load_hpo_config(config_path: str) -> Dict[str, Any]:
             raise ValueError(f"Missing search_space for tunable parameter '{p}'")
         _validate_search_space_spec(p, cfg["search_space"][p])
 
-    # Fill default storage path
     os.makedirs(cfg["output_dir"], exist_ok=True)
     if cfg["storage"] is None:
         db_path = os.path.join(cfg["output_dir"], "optuna_study.db")
@@ -412,11 +515,59 @@ def _filter_train_config(config: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+def load_base_train_config(hpo_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    config: Dict[str, Any] = {}
+    if hpo_cfg.get("default_train_config"):
+        config.update(_load_json(hpo_cfg["default_train_config"]))
+    config.update(_load_json(hpo_cfg["base_train_config"]))
+    return config
+
+
+def _curriculum_full_epoch(start_epoch: int, ramp_epochs: int) -> int:
+    if int(ramp_epochs) <= 0:
+        return int(start_epoch)
+    return int(start_epoch) + int(ramp_epochs) - 1
+
+
+def _apply_three_stage_constraints(config: Dict[str, Any]) -> None:
+    cls_start = int(config.get("cls_start_epoch", 0))
+    cls_ramp = int(config.get("cls_ramp_epochs", 0))
+    if "retrieval_start_after_cls_epochs" in config:
+        retrieval_offset = int(config.pop("retrieval_start_after_cls_epochs"))
+        config["retrieval_start_epoch"] = cls_start + cls_ramp + retrieval_offset
+
+    epochs = int(config.get("epochs", 1))
+    retrieval_start = int(config.get("retrieval_start_epoch", 0))
+    gallery_ramp = int(config.get("gallery_loss_ramp_epochs", 0))
+    gallery_full = _curriculum_full_epoch(retrieval_start, gallery_ramp)
+    if float(config.get("gallery_loss_weight", 0.0) or 0.0) > 0.0 and gallery_full >= epochs:
+        raise ValueError(
+            "gallery loss does not reach full activation within this trial: "
+            f"epochs={epochs}, retrieval_start_epoch={retrieval_start}, "
+            f"gallery_loss_ramp_epochs={gallery_ramp}, full_epoch={gallery_full}"
+        )
+
+    hard_enabled = bool(config.get("gallery_hard_neg_enable", False))
+    hard_weight = float(config.get("gallery_hard_neg_weight", 0.0) or 0.0)
+    if hard_enabled and hard_weight > 0.0:
+        hard_offset = int(config.get("gallery_hard_neg_start_after_retrieval_epochs", 0))
+        hard_ramp = int(config.get("gallery_hard_neg_ramp_epochs", 0))
+        hard_start = retrieval_start + hard_offset
+        hard_full = _curriculum_full_epoch(hard_start, hard_ramp)
+        if hard_full >= epochs:
+            raise ValueError(
+                "gallery hard-negative loss does not reach full activation within this trial: "
+                f"epochs={epochs}, retrieval_start_epoch={retrieval_start}, "
+                f"gallery_hard_neg_start_after_retrieval_epochs={hard_offset}, "
+                f"gallery_hard_neg_ramp_epochs={hard_ramp}, full_epoch={hard_full}"
+            )
+
+
 def build_trial_config(trial: optuna.Trial, hpo_cfg: Dict[str, Any], base_cfg: Dict[str, Any]) -> Dict[str, Any]:
     config = dict(base_cfg)
     default_aug_preset = {k: base_cfg.get(k, 0.0) for k in AUGMENT_PRESET_KEYS}
 
-    # Runtime overrides from HPO config
+    # Runtime overrides from HPO config.
     for key in (
         "data_path",
         "neg_data_path",
@@ -426,6 +577,10 @@ def build_trial_config(trial: optuna.Trial, hpo_cfg: Dict[str, Any], base_cfg: D
         "enable_ood_monitoring",
         "best_ckpt_metric",
         "cache_in_memory",
+        "batch_size",
+        "val_batch_size",
+        "steps_per_epoch",
+        "val_steps_per_epoch",
     ):
         if key in hpo_cfg:
             config[key] = hpo_cfg[key]
@@ -433,16 +588,14 @@ def build_trial_config(trial: optuna.Trial, hpo_cfg: Dict[str, Any], base_cfg: D
     config["num_workers"] = int(hpo_cfg.get("num_workers", config.get("num_workers", 4)))
     config["epochs"] = int(hpo_cfg["epochs_per_trial"])
 
-    # Required HPO runtime behavior
+    # Required HPO runtime behavior.
     config["early_stop_patience"] = 0
     config["skip_epoch_checkpoints"] = True
 
-    # Sample tunable params
     sampled: Dict[str, Any] = {}
     for name in hpo_cfg["tunable_params"]:
         sampled[name] = suggest_from_space(trial, name, hpo_cfg["search_space"][name])
 
-    # Apply sampled values (with tied params)
     augment_enable = None
     for name, value in sampled.items():
         if name == "ref_shared_dim":
@@ -454,7 +607,6 @@ def build_trial_config(trial: optuna.Trial, hpo_cfg: Dict[str, Any], base_cfg: D
         else:
             config[name] = value
 
-    # Fixed overrides from HPO config
     fixed_overrides = dict(hpo_cfg.get("fixed_overrides", {}))
     if "augment_enable" in fixed_overrides:
         augment_enable = bool(fixed_overrides.pop("augment_enable"))
@@ -468,23 +620,11 @@ def build_trial_config(trial: optuna.Trial, hpo_cfg: Dict[str, Any], base_cfg: D
             for key in AUGMENT_PRESET_KEYS:
                 config[key] = 0.0
 
-    # Hard constraints requested by user
-    cls_start = int(config.get("cls_start_epoch", 0))
-    config["hard_neg_start_epoch"] = cls_start + 5
-    config["cls_ramp_epochs"] = 5
-    config["hard_neg_ramp_epochs"] = 5
-
-    # Keep proj head width valid
     if int(config.get("proj_dim", 0)) < int(config.get("enc_dim", 0)):
         config["proj_dim"] = int(config["enc_dim"])
 
-    if config["epochs"] < int(config["hard_neg_start_epoch"]):
-        raise ValueError(
-            "epochs_per_trial is smaller than derived hard_neg_start_epoch; "
-            f"got epochs={config['epochs']} and hard_neg_start_epoch={config['hard_neg_start_epoch']}"
-        )
+    _apply_three_stage_constraints(config)
 
-    # Trial-specific checkpoint path
     trial_ckpt = os.path.join(hpo_cfg["output_dir"], "results", f"trial_{trial.number}", "checkpoints")
     os.makedirs(trial_ckpt, exist_ok=True)
     config["ckpt_path"] = trial_ckpt
@@ -504,31 +644,27 @@ def run_trial_subprocess(config: Dict[str, Any], trial_number: int, output_dir: 
     with open(config_path, "w") as f:
         json.dump(config, f, indent=2)
 
-    cmd = [sys.executable, "-u", TRAIN_SCRIPT]
-    for key, value in config.items():
-        if key == "hpo_trial_number":
-            continue
-        if value is None:
-            continue
-        if isinstance(value, bool):
-            # Only true CLI flags are passed without an explicit value.
-            # Bool-typed values for non-flag args (e.g., persistent_workers)
-            # must still be serialized as 0/1.
-            if key in ALBEF_BOOL_KEYS:
-                if value:
-                    cmd.append(f"--{key}")
-            else:
-                cmd.append(f"--{key}")
-                cmd.append("1" if value else "0")
-            continue
-        cmd.append(f"--{key}")
-        cmd.append(str(value))
+    cmd = [sys.executable, "-u", TRAIN_SCRIPT, "--json_config", config_path]
 
     print(f"\n{'=' * 60}")
     print(f"Trial {trial_number}: Starting training")
-    print(f"  lr={config.get('lr', 'N/A')}, enc_dim={config.get('enc_dim', 'N/A')}, proj_dim={config.get('proj_dim', 'N/A')}")
-    print(f"  n_ref={config.get('n_ref', 'N/A')}, ref_dim={config.get('ref_dim', 'N/A')}, samples_per_gw={config.get('samples_per_gw', 'N/A')}")
-    print(f"  cls_start_epoch={config.get('cls_start_epoch', 'N/A')}, hard_neg_start_epoch={config.get('hard_neg_start_epoch', 'N/A')}")
+    print(
+        "  "
+        f"lr={config.get('lr', 'N/A')}, weight_decay={config.get('weight_decay', 'N/A')}, "
+        f"warmup_epochs={config.get('warmup_epochs', 'N/A')}"
+    )
+    print(
+        "  "
+        f"cls_start_epoch={config.get('cls_start_epoch', 'N/A')}, "
+        f"cls_ramp_epochs={config.get('cls_ramp_epochs', 'N/A')}, "
+        f"retrieval_start_epoch={config.get('retrieval_start_epoch', 'N/A')}"
+    )
+    print(
+        "  "
+        f"gallery_loss_ramp_epochs={config.get('gallery_loss_ramp_epochs', 'N/A')}, "
+        f"gallery_hard_neg_topk={config.get('gallery_hard_neg_topk', 'N/A')}, "
+        f"gallery_hard_neg_weight={config.get('gallery_hard_neg_weight', 'N/A')}"
+    )
     print(f"{'=' * 60}")
 
     log_path = os.path.join(output_dir, "results", f"trial_{trial_number}", "train.log")
@@ -641,11 +777,8 @@ def objective(trial: optuna.Trial, hpo_cfg: Dict[str, Any], base_cfg: Dict[str, 
         trial.set_user_attr("objective_min_metrics_fail", min_fail_reason)
     trial.set_user_attr("best_epoch", results.get("best_epoch", -1))
     trial.set_user_attr("final_epoch", results.get("final_epoch", -1))
-    trial.set_user_attr("val_recall_at_1", results.get("val_recall_at_1", 0.0))
-    trial.set_user_attr("val_recall_at_5", results.get("val_recall_at_5", 0.0))
-    trial.set_user_attr("val_auroc", results.get("val_auroc", 0.0))
-    trial.set_user_attr("val_auprc", results.get("val_auprc", 0.0))
-    trial.set_user_attr("val_itc_acc", results.get("val_itc_acc", 0.0))
+    for metric_key in sorted(SUPPORTED_OBJECTIVE_COMPONENTS):
+        trial.set_user_attr(metric_key, results.get(metric_key, 0.0))
 
     print(
         f"Trial {trial.number}: objective={score:.6f} "
@@ -667,11 +800,23 @@ def dry_run(hpo_cfg: Dict[str, Any], base_cfg: Dict[str, Any]) -> None:
     for k, v in sorted(trial.params.items()):
         print(f"  {k}: {v}")
 
+    retrieval_start = int(config.get("retrieval_start_epoch", 0))
+    gallery_full = _curriculum_full_epoch(
+        retrieval_start, int(config.get("gallery_loss_ramp_epochs", 0))
+    )
+    hard_start = retrieval_start + int(config.get("gallery_hard_neg_start_after_retrieval_epochs", 0))
+    hard_full = _curriculum_full_epoch(
+        hard_start, int(config.get("gallery_hard_neg_ramp_epochs", 0))
+    )
+
     print("\nConstraint checks:")
     print(f"  n_ref == ref_dim: {config.get('n_ref')} == {config.get('ref_dim')}")
-    print(f"  hard_neg_start_epoch = cls_start_epoch + 5: {config.get('hard_neg_start_epoch')} = {config.get('cls_start_epoch')} + 5")
-    print(f"  cls_ramp_epochs = {config.get('cls_ramp_epochs')}")
-    print(f"  hard_neg_ramp_epochs = {config.get('hard_neg_ramp_epochs')}")
+    print(
+        "  retrieval_start_epoch = cls_start_epoch + cls_ramp_epochs + "
+        f"retrieval_start_after_cls_epochs: {config.get('retrieval_start_epoch')}"
+    )
+    print(f"  gallery full activation epoch (0-based): {gallery_full}")
+    print(f"  gallery hard-negative full activation epoch (0-based): {hard_full}")
     print(f"  epochs = {config.get('epochs')}")
 
     print("\nResolved trial training config:")
@@ -685,7 +830,7 @@ def main() -> None:
     args = parser.parse_args()
 
     hpo_cfg = load_hpo_config(args.config)
-    base_cfg = _load_json(hpo_cfg["base_train_config"])
+    base_cfg = load_base_train_config(hpo_cfg)
 
     print(f"Study: {hpo_cfg['study_name']}")
     print(f"Storage: {hpo_cfg['storage']}")
@@ -696,6 +841,9 @@ def main() -> None:
     if hpo_cfg["objective_min_metrics"]:
         print(f"Objective minimum metrics: {hpo_cfg['objective_min_metrics']}")
     print(f"Config: {hpo_cfg['config_path']}")
+    if hpo_cfg.get("default_train_config"):
+        print(f"Default train config: {hpo_cfg['default_train_config']}")
+    print(f"Base train config: {hpo_cfg['base_train_config']}")
 
     if args.dry_run:
         dry_run(hpo_cfg, base_cfg)
@@ -717,6 +865,7 @@ def main() -> None:
     study.set_user_attr("objective_direction", hpo_cfg["objective_direction"])
     study.set_user_attr("objective_weights", hpo_cfg["objective_weights"])
     study.set_user_attr("objective_min_metrics", hpo_cfg["objective_min_metrics"])
+    study.set_user_attr("retrain_overrides", hpo_cfg.get("retrain_overrides", {}))
 
     study.optimize(
         lambda trial: objective(trial, hpo_cfg, base_cfg),

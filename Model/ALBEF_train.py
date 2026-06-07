@@ -2720,10 +2720,12 @@ def train(args):
                         best_val_score = current_selection_score
                         best_epoch_idx = int(epoch)
                         is_best_epoch = True
+                        retrieval_metrics = val_metrics.get('retrieval', {})
+                        classification_metrics = val_metrics.get('classification', {})
                         best_val_metrics = {
                             "best_ckpt_metric": args.best_ckpt_metric,
                             "best_ckpt_score": current_selection_score,
-                            "best_val_acc_total": val_metrics.get('classification', {}).get('acc_total', 0),
+                            "best_val_acc_total": classification_metrics.get('acc_total', 0),
                             "best_val_loss": val_metrics['total'],
                             "best_epoch": epoch,
                             "best_epoch_1based": epoch + 1,
@@ -2736,12 +2738,11 @@ def train(args):
                             "val_recall_at_1": val_metrics.get('retrieval', {}).get('g2o_recall_at_1', 0),
                             "val_recall_at_5": val_metrics.get('retrieval', {}).get('g2o_recall_at_5', 0),
                             "val_mrr": val_metrics.get('retrieval', {}).get('g2o_mrr', 0),
-                            "val_fusion_gallery_recall_at_1": val_metrics.get('retrieval', {}).get('fusion_gallery_recall_at_1', 0),
-                            "val_fusion_gallery_recall_at_5": val_metrics.get('retrieval', {}).get('fusion_gallery_recall_at_5', 0),
-                            "val_fusion_gallery_mrr": val_metrics.get('retrieval', {}).get('fusion_gallery_mrr', 0),
                             "val_auroc": val_metrics.get('classification', {}).get('auroc', 0),
                             "val_auprc": val_metrics.get('classification', {}).get('auprc', 0),
                         }
+                        for metric_name in sorted(FUSION_GALLERY_BEST_CKPT_METRICS):
+                            best_val_metrics[f"val_{metric_name}"] = retrieval_metrics.get(metric_name, 0)
                         epochs_no_improve = 0
                         best_ckpt = os.path.join(args.ckpt_path, "ALBEF", "albef_best.pth")
                         os.makedirs(os.path.dirname(best_ckpt), exist_ok=True)

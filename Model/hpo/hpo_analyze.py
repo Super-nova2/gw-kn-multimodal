@@ -21,23 +21,33 @@ METRIC_SHORT_NAMES = {
     "val_recall_at_1": "R@1",
     "val_recall_at_5": "R@5",
     "val_mrr": "MRR",
+    "val_fusion_gallery_recall_at_1": "FG_R@1",
+    "val_fusion_gallery_recall_at_5": "FG_R@5",
+    "val_fusion_gallery_mrr": "FG_MRR",
     "val_itc_acc": "ITC_ACC",
 }
 
 PREFERRED_SLICE_PARAMS = [
-    # Current v2 HPO defaults
+    # Current v3 small fusion-gallery HPO defaults
     "lr",
     "weight_decay",
     "warmup_epochs",
+    "cls_start_epoch",
+    "cls_ramp_epochs",
+    "retrieval_start_after_cls_epochs",
+    "gallery_loss_ramp_epochs",
+    "gallery_hard_neg_start_after_retrieval_epochs",
+    "gallery_hard_neg_ramp_epochs",
+    "gallery_hard_neg_weight",
+    "gallery_hard_neg_topk",
+    "time_compat_weight",
+    # Backward-compatible legacy params
     "enc_dim",
     "proj_dim",
     "ref_shared_dim",
-    "cls_start_epoch",
-    "time_compat_weight",
     "semi_hard_margin",
     "hardneg_min_candidates",
     "augment_enable",
-    # Backward-compatible legacy params
     "samples_per_gw",
     "itc_weight",
     "cls_weight",
@@ -269,9 +279,13 @@ def export_top_configs(study, output_dir, config_source_dir, top_k=5):
         else:
             config = dict(trial.params)
 
-        config["epochs"] = 100
-        config["early_stop_patience"] = 25
-        config["early_stop_min_delta"] = 0.005
+        retrain_overrides = _parse_dict_attr(study.user_attrs.get("retrain_overrides", {}))
+        if retrain_overrides:
+            config.update(retrain_overrides)
+        else:
+            config["epochs"] = 100
+            config["early_stop_patience"] = 25
+            config["early_stop_min_delta"] = 0.005
         config.pop("hpo_trial_number", None)
 
         config["ckpt_path"] = config.get("ckpt_path", "").replace(
