@@ -64,6 +64,7 @@ from retrieval_gallery import (  # noqa: E402
     plot_retrieval_curves,
     score_all_galleries_skymap,
 )
+from plot_style import add_panel_labels_below, apply_mnras_style, layout_top_below_legend  # noqa: E402
 from test_evaluate import (  # noqa: E402
     _autocast_context,
     _build_gallery_query_cache,
@@ -686,7 +687,7 @@ def plot_redshift_metrics(
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
-        plt.rcParams.update({"font.size": PLOT_FONT_BASE, "font.family": "serif", "font.serif": ["Times New Roman"]})
+        apply_mnras_style(plt, base_font_size=PLOT_FONT_BASE)
     except Exception:
         return
     rows = list(rows)
@@ -723,12 +724,12 @@ def plot_redshift_metrics(
                     )
             ax.set_xlabel("Redshift")
             ax.set_ylabel(metric_label)
-            ax.set_title(f"{metric_label} vs Redshift  (gallery_size={gallery_size})")
             ax.grid(True, alpha=0.3)
         handles, labels = axes[0].get_legend_handles_labels()
         if handles:
             fig.legend(handles, labels, loc="upper center", ncol=min(4, len(labels)), frameon=False)
-        fig.tight_layout(rect=(0, 0, 1, 0.86))
+        add_panel_labels_below(axes, fontsize=PLOT_FONT_BASE)
+        fig.tight_layout(rect=(0, 0.1, 1, 0.86))
         fig.savefig(str(out / f"redshift_retrieval_metrics_g{gallery_size}.png"), dpi=300, bbox_inches="tight")
         plt.close(fig)
 
@@ -744,7 +745,7 @@ def plot_redshift_macro_metrics(
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
-        plt.rcParams.update({"font.size": PLOT_FONT_BASE, "font.family": "serif", "font.serif": ["Times New Roman"]})
+        apply_mnras_style(plt, base_font_size=PLOT_FONT_BASE)
     except Exception:
         return
     rows = list(rows)
@@ -754,8 +755,8 @@ def plot_redshift_macro_metrics(
     out.mkdir(parents=True, exist_ok=True)
     methods = sorted({str(row["method"]) for row in rows}, key=_plot_method_draw_order)
     metrics = [
-        ("macro_recall_at_1", "Macro R@1"),
-        ("macro_recall_at_10", "Macro R@10"),
+        ("macro_recall_at_1", "Macro Recall@1"),
+        ("macro_recall_at_10", "Macro Recall@10"),
         ("macro_mrr", "Macro MRR"),
     ]
     label_fn = _plot_method_label_fn or (lambda x: x)
@@ -778,19 +779,22 @@ def plot_redshift_macro_metrics(
             )
         ax.set_xlabel("Redshift")
         ax.set_ylabel(metric_label)
-        ax.set_title(f"{metric_label} vs Redshift")
         ax.grid(True, alpha=0.3)
 
     handles, labels = axes[0].get_legend_handles_labels()
+    legend = None
     if handles:
-        fig.legend(
+        legend = fig.legend(
             handles,
             labels,
             loc="upper center",
-            ncol=4,
+            bbox_to_anchor=(0.5, 0.985),
+            ncol=max(1, min(4, len(labels))),
             frameon=False,
         )
-    fig.tight_layout(rect=(0, 0, 1, 0.88))
+    add_panel_labels_below(axes, fontsize=PLOT_FONT_BASE)
+    layout_top = layout_top_below_legend(fig, legend) if legend is not None else 0.94
+    fig.tight_layout(rect=(0, 0.1, 1, layout_top))
     fig.savefig(str(out / "redshift_macro_metrics_log10_weighted.png"), dpi=300, bbox_inches="tight")
     fig.savefig(str(out / "redshift_macro_metrics_log10_weighted.pdf"), bbox_inches="tight")
     plt.close(fig)
@@ -802,7 +806,7 @@ def plot_redshift_coverage(rows: Sequence[Mapping[str, Any]], output_dir: Path) 
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
-        plt.rcParams.update({"font.size": PLOT_FONT_BASE, "font.family": "serif", "font.serif": ["Times New Roman"]})
+        apply_mnras_style(plt, base_font_size=PLOT_FONT_BASE)
     except Exception:
         return
     rows = list(rows)
@@ -836,7 +840,6 @@ def plot_redshift_coverage(rows: Sequence[Mapping[str, Any]], output_dir: Path) 
         ax.set_xlabel("Redshift")
         ax.set_ylabel("Mean Fill Ratio")
         ax.set_ylim(0.0, 1.05)
-        ax.set_title(f"Mean Gallery Fill Ratio vs Redshift  (gallery_size={gallery_size})")
         ax.grid(True, alpha=0.3)
         ax.legend(frameon=False)
         fig.tight_layout()

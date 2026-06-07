@@ -57,6 +57,7 @@ from metrics import (
     compute_classification_metrics,
     compute_embedding_metrics,
 )
+from plot_style import apply_mnras_style
 
 
 _BASE_DIR = os.environ.get('BASE_DIR', '/fred/oz016/bgao_kn')
@@ -64,7 +65,7 @@ _BASE_DIR = os.environ.get('BASE_DIR', '/fred/oz016/bgao_kn')
 MISMATCH_NEGATIVE_LABEL = "Mismatched Negatives"
 MISMATCH_NEGATIVE_PAIR_LABEL = f"{MISMATCH_NEGATIVE_LABEL} (GW, KN_mismatch)"
 LOGIT_DISTRIBUTION_TITLE = "Classification Logit Distribution by Sample Pairs"
-LOGIT_AXIS_LABEL = "Logit"
+LOGIT_AXIS_LABEL = "Logit margin"
 
 
 def parse_args():
@@ -2855,7 +2856,7 @@ def generate_plots(embeddings, results, output_dir, triplet_logits=None):
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
-        plt.rcParams.update({"font.family": "serif", "font.serif": ["Times New Roman"]})
+        apply_mnras_style(plt)
     except ImportError:
         print("matplotlib not available, skipping plots")
         return
@@ -2911,12 +2912,12 @@ def generate_plots(embeddings, results, output_dir, triplet_logits=None):
         fpr = np.concatenate([[0], fpr])
 
         fig, ax = plt.subplots(figsize=(6, 6))
-        ax.plot(fpr, tpr, lw=2)
-        ax.plot([0, 1], [0, 1], "k--", lw=1)
         auroc = results.get("classification", {}).get("auroc", 0)
-        ax.set_title(f"ROC Curve (AUROC={auroc:.3f})")
-        ax.set_xlabel("False Positive Rate")
-        ax.set_ylabel("True Positive Rate")
+        ax.plot(fpr, tpr, lw=2, label=f"AUROC={auroc:.3f}")
+        ax.plot([0, 1], [0, 1], "k--", lw=1)
+        ax.set_xlabel("False positive rate")
+        ax.set_ylabel("True positive rate")
+        ax.legend(frameon=False, loc="lower right")
         fig.savefig(os.path.join(output_dir, "roc_curve.png"), dpi=150,
                     bbox_inches="tight")
         plt.close(fig)
@@ -2929,11 +2930,11 @@ def generate_plots(embeddings, results, output_dir, triplet_logits=None):
         recall = tp_cum / n_pos
 
         fig, ax = plt.subplots(figsize=(6, 6))
-        ax.plot(recall, precision, lw=2)
         auprc = results.get("classification", {}).get("auprc", 0)
-        ax.set_title(f"Precision-Recall Curve (AUPRC={auprc:.3f})")
+        ax.plot(recall, precision, lw=2, label=f"AUPRC={auprc:.3f}")
         ax.set_xlabel("Recall")
         ax.set_ylabel("Precision")
+        ax.legend(frameon=False, loc="lower left")
         fig.savefig(os.path.join(output_dir, "pr_curve.png"), dpi=150,
                     bbox_inches="tight")
         plt.close(fig)
@@ -2957,7 +2958,6 @@ def generate_plots(embeddings, results, output_dir, triplet_logits=None):
         ax.bar(bin_confs, bin_accs, width=0.08, alpha=0.7, label="Model")
         ax.plot([0, 1], [0, 1], "k--", lw=1, label="Perfect")
         ece = results.get("classification", {}).get("ece", 0)
-        ax.set_title(f"Calibration (ECE={ece:.4f})")
         ax.set_xlabel("Mean Predicted Probability")
         ax.set_ylabel("Fraction of Positives")
         ax.legend()
@@ -2979,7 +2979,6 @@ def generate_plots(embeddings, results, output_dir, triplet_logits=None):
             ax.plot(sizes, r1_values, "o-", lw=2)
             ax.set_xlabel("Gallery Size (number of candidates)")
             ax.set_ylabel("Recall@1")
-            ax.set_title("Recall@1 vs Candidate Pool Size")
             ax.set_xscale("log")
             ax.grid(True, alpha=0.3)
             fig.savefig(os.path.join(output_dir, "recall_vs_gallery.png"),
@@ -3088,7 +3087,6 @@ def generate_plots(embeddings, results, output_dir, triplet_logits=None):
             ax.scatter(coords[idx_opt, 0], coords[idx_opt, 1],
                        c=[c], marker="o", s=30, alpha=0.7)
 
-        ax.set_title("t-SNE Embedding Space (^=GW, o=Optical)")
         fig.savefig(os.path.join(output_dir, "tsne_embeddings.png"), dpi=150,
                     bbox_inches="tight")
         plt.close(fig)
@@ -3118,7 +3116,6 @@ def generate_plots(embeddings, results, output_dir, triplet_logits=None):
                         label=f"{src} (n={len(idx)})"
                     )
 
-                ax.set_title("t-SNE of GW Embeddings by Source Type")
                 ax.set_xlabel("t-SNE 1")
                 ax.set_ylabel("t-SNE 2")
                 ax.legend(loc="best", fontsize=12)
@@ -3178,7 +3175,7 @@ def generate_logits_distribution_plot(triplet_logits, output_dir):
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
-        plt.rcParams.update({"font.family": "serif", "font.serif": ["Times New Roman"]})
+        apply_mnras_style(plt)
         from matplotlib.ticker import MaxNLocator
     except ImportError:
         print("matplotlib not available, skipping logits distribution plot")
@@ -3196,6 +3193,14 @@ def generate_logits_distribution_plot(triplet_logits, output_dir):
     if not any(x is not None and len(x) > 0 for x in series):
         print("WARNING: No finite logit margins available. Skipping logits distribution plot.")
         return
+
+    np.savez_compressed(
+        os.path.join(output_dir, "triplet_logit_margins.npz"),
+        positives=margins_pos if margins_pos is not None else np.asarray([], dtype=np.float32),
+        optical_negatives=margins_optical if margins_optical is not None else np.asarray([], dtype=np.float32),
+        gw_negatives=margins_gw if margins_gw is not None else np.asarray([], dtype=np.float32),
+        mismatched_negatives=margins_hard if margins_hard is not None else np.asarray([], dtype=np.float32),
+    )
 
     bins = _logit_margin_bins(series)
     alpha = 0.6
@@ -3216,7 +3221,6 @@ def generate_logits_distribution_plot(triplet_logits, output_dir):
 
     ax.set_xlabel(LOGIT_AXIS_LABEL, fontsize=15)
     ax.set_ylabel('Count', fontsize=15)
-    ax.set_title(LOGIT_DISTRIBUTION_TITLE, fontsize=16)
     ax.legend(loc='upper left', fontsize=13)
     ax.grid(True, alpha=0.3, linestyle='--')
     ax.yaxis.set_major_locator(MaxNLocator(integer=True))
@@ -3236,7 +3240,6 @@ def generate_logits_distribution_plot(triplet_logits, output_dir):
     _plot_logit_margin_kde(ax, margins_hard, x_range, color='#c0392b', label=MISMATCH_NEGATIVE_LABEL)
     ax.set_xlabel(LOGIT_AXIS_LABEL, fontsize=15)
     ax.set_ylabel('Density', fontsize=15)
-    ax.set_title(LOGIT_DISTRIBUTION_TITLE, fontsize=16)
     ax.legend(loc='upper left', fontsize=13)
     ax.grid(True, alpha=0.3, linestyle='--')
     fig.tight_layout()
@@ -3276,7 +3279,7 @@ def generate_gw_shuffle_comparison_plot(triplet_logits_normal, triplet_logits_sh
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
-        plt.rcParams.update({"font.family": "serif", "font.serif": ["Times New Roman"]})
+        apply_mnras_style(plt)
         from scipy import stats
     except ImportError:
         print("matplotlib/scipy not available, skipping GW-shuffle comparison plot")
@@ -3330,13 +3333,12 @@ def generate_gw_shuffle_comparison_plot(triplet_logits_normal, triplet_logits_sh
         
         ax.set_xlabel('Match Probability', fontsize=13)
         ax.set_ylabel('Density', fontsize=13)
-        ax.set_title(title, fontsize=14)
+        ax.text(0.03, 0.97, title, transform=ax.transAxes, ha='left', va='top', fontsize=14, bbox=dict(facecolor='white', edgecolor='none', alpha=0.75, pad=2.0))
         ax.legend(loc='upper right', fontsize=11)
         ax.set_xlim(0, 1)
         ax.axvline(x=0.5, color='black', linestyle=':', linewidth=1, alpha=0.5)
         ax.grid(True, alpha=0.3, linestyle='--')
     
-    fig.suptitle('GW-Shuffle Ablation Test: Effect of Randomizing GW Input', fontsize=16, y=1.02)
     fig.tight_layout()
     fig.savefig(os.path.join(output_dir, "gw_shuffle_comparison.png"), dpi=200,
                 bbox_inches="tight")
@@ -3383,7 +3385,6 @@ def generate_gw_shuffle_comparison_plot(triplet_logits_normal, triplet_logits_sh
     
     ax.set_xlabel('Match Probability (Softmax Output)', fontsize=14)
     ax.set_ylabel('Density', fontsize=14)
-    ax.set_title('GW-Shuffle Ablation: All Distributions Comparison\n(Solid=Normal, Dashed=GW-Shuffled)', fontsize=16)
     ax.legend(loc='upper right', fontsize=12, ncol=2)
     ax.set_xlim(0, 1)
     ax.axvline(x=0.5, color='black', linestyle=':', linewidth=1.5, alpha=0.7)

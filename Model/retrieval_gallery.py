@@ -8,19 +8,31 @@ import h5py
 import numpy as np
 import torch
 
+from plot_style import add_panel_labels_below, apply_mnras_style, layout_top_below_legend
+
 
 TABLE_METRIC_LABELS = ["R@1", "R@5", "R@10", "MRR"]
 TABLE_METRIC_KEYS = ["recall_at_1", "recall_at_5", "recall_at_10", "mrr"]
 PLOT_DPI = 300
-PLOT_FONT_BASE = 14
-RETRIEVAL_CURVES_FIGSIZE = (15, 4.8)
+PLOT_FONT_BASE = 15
+RETRIEVAL_CURVES_FIGSIZE = (15, 7.0)
 PLOT_METHOD_LABELS = {
     "skymap-only": "Skymap-only",
     "optical-only": "Optical-only",
+    "Optical-only baseline": "Optical-only",
     "full": "MAGIKS",
     "Full": "MAGIKS",
+    "Full v11": "MAGIKS",
+    "w/o Gallery Loss": "w/o Retrieval Loss",
+    "v11 w/o Gallery Loss": "w/o Retrieval Loss",
+    "w/o Cross-Attn": "w/o Cross Attention",
+    "v11 w/o Cross-Attn": "w/o Cross Attention",
+    "w/o Fusion": "w/o Fusion Branch",
+    "v11 w/o Fusion": "w/o Fusion Branch",
+    "w/o Hard Mining": "w/o Hard-Negative Mining",
+    "v11 w/o Hard Mining": "w/o Hard-Negative Mining",
     "w/o \u5bf9\u6bd4\u5b66\u4e60": "w/o Contrastive Learning",
-    "w/o \u4ea4\u53c9\u6ce8\u610f\u529b": "w/o Cross-Attention",
+    "w/o \u4ea4\u53c9\u6ce8\u610f\u529b": "w/o Cross Attention",
     "w/o \u878d\u5408\u5206\u652f": "w/o Fusion Branch",
     "\u5168\u6a21\u6001": "MAGIKS",
     "\u5168\u6a21\u6001 + \u56f0\u96be\u6837\u672c\u6316\u6398": "MAGIKS + Hard Mining",
@@ -778,7 +790,7 @@ def plot_retrieval_curves(curve_rows: Sequence[Mapping[str, Any]], output_dir: P
 
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
-        plt.rcParams.update({"font.size": PLOT_FONT_BASE, "font.family": "serif", "font.serif": ["Times New Roman", "STIXGeneral", "DejaVu Serif"]})
+        apply_mnras_style(plt, base_font_size=PLOT_FONT_BASE)
     except Exception:
         return
 
@@ -791,6 +803,7 @@ def plot_retrieval_curves(curve_rows: Sequence[Mapping[str, Any]], output_dir: P
 
     methods = sorted({str(row["method"]) for row in rows}, key=_plot_method_draw_order)
     metrics = ["R@1", "R@10", "MRR"]
+    ylabels = {"R@1": "Recall@1", "R@10": "Recall@10", "MRR": "MRR"}
     fig, axes = plt.subplots(1, len(metrics), figsize=RETRIEVAL_CURVES_FIGSIZE, sharex=False, sharey=False)
     if len(metrics) == 1:
         axes = [axes]
@@ -812,15 +825,25 @@ def plot_retrieval_curves(curve_rows: Sequence[Mapping[str, Any]], output_dir: P
                 label=_plot_method_label(method),
             )
         ax.set_xscale("log")
-        ax.set_xlabel("Gallery Size")
-        ax.set_ylabel(metric_name)
-        ax.set_title(f"{metric_name} vs Gallery Size")
+        ax.set_xlabel("Gallery size")
+        ax.set_ylabel(ylabels.get(metric_name, metric_name))
+        ax.set_ylim(0.0, 1.05)
         ax.grid(True, alpha=0.3)
 
     handles, labels = axes[0].get_legend_handles_labels()
+    legend = None
     if handles:
-        fig.legend(handles, labels, loc="upper center", ncol=max(1, min(4, len(labels))), frameon=False)
-    fig.tight_layout(rect=(0, 0, 1, 0.88))
+        legend = fig.legend(
+            handles,
+            labels,
+            loc="upper center",
+            bbox_to_anchor=(0.5, 0.985),
+            ncol=max(1, min(4, len(labels))),
+            frameon=False,
+        )
+    add_panel_labels_below(axes, fontsize=PLOT_FONT_BASE)
+    layout_top = layout_top_below_legend(fig, legend) if legend is not None else 0.94
+    fig.tight_layout(rect=(0, 0.1, 1, layout_top))
     fig.savefig(output_dir / "retrieval_curves.png", dpi=PLOT_DPI, bbox_inches="tight")
     fig.savefig(output_dir / "retrieval_curves.pdf", bbox_inches="tight")
     plt.close(fig)
@@ -832,7 +855,7 @@ def plot_retrieval_coverage(curve_rows: Sequence[Mapping[str, Any]], output_dir:
 
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
-        plt.rcParams.update({"font.size": PLOT_FONT_BASE, "font.family": "serif", "font.serif": ["Times New Roman", "STIXGeneral", "DejaVu Serif"]})
+        apply_mnras_style(plt, base_font_size=PLOT_FONT_BASE)
     except Exception:
         return
 
@@ -865,10 +888,9 @@ def plot_retrieval_coverage(curve_rows: Sequence[Mapping[str, Any]], output_dir:
         )
 
     ax.set_xscale("log")
-    ax.set_xlabel("Gallery Size")
+    ax.set_xlabel("Gallery size")
     ax.set_ylabel("Mean Fill Ratio")
     ax.set_ylim(0.0, 1.05)
-    ax.set_title("Mean Gallery Fill Ratio Under Candidate Constraints")
     ax.grid(True, alpha=0.3)
     ax.legend(frameon=False)
     fig.tight_layout()
