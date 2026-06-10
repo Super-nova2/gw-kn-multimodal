@@ -4,7 +4,7 @@ from typing import Iterable, Sequence
 
 
 MNRAS_SERIF_FONTS = ["Times New Roman", "STIXGeneral", "DejaVu Serif"]
-MNRAS_FONT_SIZE = 15
+MNRAS_FONT_SIZE = 17
 
 
 def apply_mnras_style(plt, *, base_font_size: int = MNRAS_FONT_SIZE) -> None:

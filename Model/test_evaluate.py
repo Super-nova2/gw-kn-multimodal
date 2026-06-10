@@ -65,7 +65,7 @@ _BASE_DIR = os.environ.get('BASE_DIR', '/fred/oz016/bgao_kn')
 MISMATCH_NEGATIVE_LABEL = "Mismatched Negatives"
 MISMATCH_NEGATIVE_PAIR_LABEL = f"{MISMATCH_NEGATIVE_LABEL} (GW, KN_mismatch)"
 LOGIT_DISTRIBUTION_TITLE = "Classification Logit Distribution by Sample Pairs"
-LOGIT_AXIS_LABEL = "Logit margin"
+LOGIT_AXIS_LABEL = "Logit"
 
 
 def parse_args():
@@ -3118,7 +3118,7 @@ def generate_plots(embeddings, results, output_dir, triplet_logits=None):
 
                 ax.set_xlabel("t-SNE 1")
                 ax.set_ylabel("t-SNE 2")
-                ax.legend(loc="best", fontsize=12)
+                ax.legend(loc="best", fontsize=14)
                 ax.grid(True, alpha=0.2)
                 fig.savefig(os.path.join(output_dir, "tsne_gw_by_source.png"),
                             dpi=150, bbox_inches="tight")
@@ -3219,9 +3219,9 @@ def generate_logits_distribution_plot(triplet_logits, output_dir):
         ax.hist(margins_hard, bins=bins, alpha=alpha, label=MISMATCH_NEGATIVE_LABEL,
                 edgecolor='#e74c3c', linewidth=2, histtype='step')
 
-    ax.set_xlabel(LOGIT_AXIS_LABEL, fontsize=15)
-    ax.set_ylabel('Count', fontsize=15)
-    ax.legend(loc='upper left', fontsize=13)
+    ax.set_xlabel(LOGIT_AXIS_LABEL, fontsize=17)
+    ax.set_ylabel('Count', fontsize=17)
+    ax.legend(loc='upper left', fontsize=15)
     ax.grid(True, alpha=0.3, linestyle='--')
     ax.yaxis.set_major_locator(MaxNLocator(integer=True))
 
@@ -3238,9 +3238,9 @@ def generate_logits_distribution_plot(triplet_logits, output_dir):
     _plot_logit_margin_kde(ax, margins_optical, x_range, color='#2980b9', label='Optical Negatives')
     _plot_logit_margin_kde(ax, margins_gw, x_range, color='#d68910', label='GW Negatives')
     _plot_logit_margin_kde(ax, margins_hard, x_range, color='#c0392b', label=MISMATCH_NEGATIVE_LABEL)
-    ax.set_xlabel(LOGIT_AXIS_LABEL, fontsize=15)
-    ax.set_ylabel('Density', fontsize=15)
-    ax.legend(loc='upper left', fontsize=13)
+    ax.set_xlabel(LOGIT_AXIS_LABEL, fontsize=17)
+    ax.set_ylabel('Density', fontsize=17)
+    ax.legend(loc='upper left', fontsize=15)
     ax.grid(True, alpha=0.3, linestyle='--')
     fig.tight_layout()
     fig.savefig(os.path.join(output_dir, "logits_distribution_kde.png"), dpi=200,
@@ -3331,10 +3331,10 @@ def generate_gw_shuffle_comparison_plot(triplet_logits_normal, triplet_logits_sh
             ax.plot(x_range, kde_s(x_range), color=color_s, linewidth=2.5, linestyle='--',
                    label=f'GW-Shuffle (μ={np.mean(probs_s):.3f})')
         
-        ax.set_xlabel('Match Probability', fontsize=13)
-        ax.set_ylabel('Density', fontsize=13)
-        ax.text(0.03, 0.97, title, transform=ax.transAxes, ha='left', va='top', fontsize=14, bbox=dict(facecolor='white', edgecolor='none', alpha=0.75, pad=2.0))
-        ax.legend(loc='upper right', fontsize=11)
+        ax.set_xlabel('Match Probability', fontsize=15)
+        ax.set_ylabel('Density', fontsize=15)
+        ax.text(0.03, 0.97, title, transform=ax.transAxes, ha='left', va='top', fontsize=16, bbox=dict(facecolor='white', edgecolor='none', alpha=0.75, pad=2.0))
+        ax.legend(loc='upper right', fontsize=13)
         ax.set_xlim(0, 1)
         ax.axvline(x=0.5, color='black', linestyle=':', linewidth=1, alpha=0.5)
         ax.grid(True, alpha=0.3, linestyle='--')
@@ -3383,9 +3383,9 @@ def generate_gw_shuffle_comparison_plot(triplet_logits_normal, triplet_logits_sh
         ax.plot(x_range, kde(x_range), color='#c0392b', linewidth=2.5, linestyle='--',
                label='Mismatched Negatives - Shuffle')
     
-    ax.set_xlabel('Match Probability (Softmax Output)', fontsize=14)
-    ax.set_ylabel('Density', fontsize=14)
-    ax.legend(loc='upper right', fontsize=12, ncol=2)
+    ax.set_xlabel('Match Probability (Softmax Output)', fontsize=16)
+    ax.set_ylabel('Density', fontsize=16)
+    ax.legend(loc='upper right', fontsize=14, ncol=2)
     ax.set_xlim(0, 1)
     ax.axvline(x=0.5, color='black', linestyle=':', linewidth=1.5, alpha=0.7)
     ax.grid(True, alpha=0.3, linestyle='--')

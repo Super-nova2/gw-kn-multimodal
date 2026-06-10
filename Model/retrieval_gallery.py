@@ -14,8 +14,9 @@ from plot_style import add_panel_labels_below, apply_mnras_style, layout_top_bel
 TABLE_METRIC_LABELS = ["R@1", "R@5", "R@10", "MRR"]
 TABLE_METRIC_KEYS = ["recall_at_1", "recall_at_5", "recall_at_10", "mrr"]
 PLOT_DPI = 300
-PLOT_FONT_BASE = 15
-RETRIEVAL_CURVES_FIGSIZE = (15, 7.0)
+PLOT_FONT_BASE = 17
+RETRIEVAL_CURVES_FIGSIZE = (15, 5.875)
+RETRIEVAL_TWO_ROW_LEGEND_FIGSIZE = (15, 6.4)
 PLOT_METHOD_LABELS = {
     "skymap-only": "Skymap-only",
     "optical-only": "Optical-only",
@@ -804,7 +805,8 @@ def plot_retrieval_curves(curve_rows: Sequence[Mapping[str, Any]], output_dir: P
     methods = sorted({str(row["method"]) for row in rows}, key=_plot_method_draw_order)
     metrics = ["R@1", "R@10", "MRR"]
     ylabels = {"R@1": "Recall@1", "R@10": "Recall@10", "MRR": "MRR"}
-    fig, axes = plt.subplots(1, len(metrics), figsize=RETRIEVAL_CURVES_FIGSIZE, sharex=False, sharey=False)
+    figure_size = RETRIEVAL_TWO_ROW_LEGEND_FIGSIZE if len(methods) > 4 else RETRIEVAL_CURVES_FIGSIZE
+    fig, axes = plt.subplots(1, len(metrics), figsize=figure_size, sharex=False, sharey=False)
     if len(metrics) == 1:
         axes = [axes]
 
@@ -841,11 +843,20 @@ def plot_retrieval_curves(curve_rows: Sequence[Mapping[str, Any]], output_dir: P
             ncol=max(1, min(4, len(labels))),
             frameon=False,
         )
-    add_panel_labels_below(axes, fontsize=PLOT_FONT_BASE)
+    add_panel_labels_below(axes, y=-0.24, fontsize=PLOT_FONT_BASE)
     layout_top = layout_top_below_legend(fig, legend) if legend is not None else 0.94
-    fig.tight_layout(rect=(0, 0.1, 1, layout_top))
-    fig.savefig(output_dir / "retrieval_curves.png", dpi=PLOT_DPI, bbox_inches="tight")
-    fig.savefig(output_dir / "retrieval_curves.pdf", bbox_inches="tight")
+    fig.tight_layout(rect=(0, 0.06, 1, layout_top))
+    fig.savefig(
+        output_dir / "retrieval_curves.png",
+        dpi=PLOT_DPI,
+        bbox_inches="tight",
+        pad_inches=0.04,
+    )
+    fig.savefig(
+        output_dir / "retrieval_curves.pdf",
+        bbox_inches="tight",
+        pad_inches=0.04,
+    )
     plt.close(fig)
 
 

@@ -481,11 +481,20 @@ def plot_redshift_macro_metrics(rows: Sequence[Mapping[str, Any]], output_dir: P
             ncol=max(1, min(4, len(labels))),
             frameon=False,
         )
-    add_panel_labels_below(axes, fontsize=PLOT_FONT_BASE)
+    add_panel_labels_below(axes, y=-0.24, fontsize=PLOT_FONT_BASE)
     layout_top = layout_top_below_legend(fig, legend) if legend is not None else 0.94
-    fig.tight_layout(rect=(0, 0.1, 1, layout_top))
-    fig.savefig(out / "redshift_macro_metrics_log10_weighted.png", dpi=300, bbox_inches="tight")
-    fig.savefig(out / "redshift_macro_metrics_log10_weighted.pdf", bbox_inches="tight")
+    fig.tight_layout(rect=(0, 0.06, 1, layout_top))
+    fig.savefig(
+        out / "redshift_macro_metrics_log10_weighted.png",
+        dpi=300,
+        bbox_inches="tight",
+        pad_inches=0.04,
+    )
+    fig.savefig(
+        out / "redshift_macro_metrics_log10_weighted.pdf",
+        bbox_inches="tight",
+        pad_inches=0.04,
+    )
     plt.close(fig)
 
 

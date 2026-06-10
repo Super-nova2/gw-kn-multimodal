@@ -58,7 +58,7 @@ from retrieval_gallery import (  # noqa: E402
     build_time_sky_candidate_sequences,
     extract_gallery_negative_abs_dt_days,
     PLOT_FONT_BASE,
-    RETRIEVAL_CURVES_FIGSIZE,
+    RETRIEVAL_TWO_ROW_LEGEND_FIGSIZE,
     _plot_method_draw_order,
     _plot_method_label,
     plot_retrieval_curves,
@@ -761,7 +761,7 @@ def plot_redshift_macro_metrics(
     ]
     label_fn = _plot_method_label_fn or (lambda x: x)
 
-    fig, axes = plt.subplots(1, 3, figsize=RETRIEVAL_CURVES_FIGSIZE, sharex=False, sharey=False)
+    fig, axes = plt.subplots(1, 3, figsize=RETRIEVAL_TWO_ROW_LEGEND_FIGSIZE, sharex=False, sharey=False)
     for ax, (key, metric_label) in zip(axes, metrics):
         for method in methods:
             method_rows = sorted(
@@ -792,11 +792,20 @@ def plot_redshift_macro_metrics(
             ncol=max(1, min(4, len(labels))),
             frameon=False,
         )
-    add_panel_labels_below(axes, fontsize=PLOT_FONT_BASE)
+    add_panel_labels_below(axes, y=-0.24, fontsize=PLOT_FONT_BASE)
     layout_top = layout_top_below_legend(fig, legend) if legend is not None else 0.94
-    fig.tight_layout(rect=(0, 0.1, 1, layout_top))
-    fig.savefig(str(out / "redshift_macro_metrics_log10_weighted.png"), dpi=300, bbox_inches="tight")
-    fig.savefig(str(out / "redshift_macro_metrics_log10_weighted.pdf"), bbox_inches="tight")
+    fig.tight_layout(rect=(0, 0.06, 1, layout_top))
+    fig.savefig(
+        str(out / "redshift_macro_metrics_log10_weighted.png"),
+        dpi=300,
+        bbox_inches="tight",
+        pad_inches=0.04,
+    )
+    fig.savefig(
+        str(out / "redshift_macro_metrics_log10_weighted.pdf"),
+        bbox_inches="tight",
+        pad_inches=0.04,
+    )
     plt.close(fig)
 
 
