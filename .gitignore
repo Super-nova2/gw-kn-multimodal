@@ -50,3 +50,4 @@ tests/
 
 # dataset
 dataset/test/
+dataset/KN_sim/test_sky_sampling.py
