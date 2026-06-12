@@ -219,7 +219,34 @@ DERIVED_PARAM_KEYS = {
     "ref_shared_dim",
     "augment_enable",
     "retrieval_start_after_cls_epochs",
+    "balanced_model_capacity",
 }
+
+BALANCED_MODEL_CAPACITY_PRESETS = {
+    "baseline": {
+        "enc_dim": 128,
+        "proj_dim": 128,
+        "optical_curve_dim": 192,
+        "optical_coord_dim": 64,
+        "optical_curve_hidden_dim": 256,
+        "contrastive_hidden_dim": 128,
+        "fusion_attn_dim": 128,
+        "fusion_hidden_dim": 256,
+    },
+    "wide_balanced": {
+        "enc_dim": 160,
+        "proj_dim": 160,
+        "optical_curve_dim": 216,
+        "optical_coord_dim": 72,
+        "optical_curve_hidden_dim": 288,
+        "contrastive_hidden_dim": 160,
+        "fusion_attn_dim": 144,
+        "fusion_hidden_dim": 288,
+    },
+}
+BALANCED_MODEL_CAPACITY_KEYS = frozenset(
+    next(iter(BALANCED_MODEL_CAPACITY_PRESETS.values())).keys()
+)
 
 AUGMENT_PRESET_KEYS = (
     "gw_aug_noise",
@@ -308,6 +335,58 @@ def _validate_search_space_spec(name: str, spec: Dict[str, Any]) -> None:
         raise ValueError(f"search_space['{name}'] must define low/high")
     if spec["low"] >= spec["high"]:
         raise ValueError(f"search_space['{name}'] requires low < high")
+
+
+def _validate_balanced_model_capacity_config(cfg: Dict[str, Any]) -> None:
+    tunable_params = set(cfg["tunable_params"])
+    fixed_params = set(cfg["fixed_overrides"])
+    capacity_is_tunable = "balanced_model_capacity" in tunable_params
+    capacity_is_fixed = "balanced_model_capacity" in fixed_params
+    if not capacity_is_tunable and not capacity_is_fixed:
+        return
+
+    conflicts = sorted(
+        BALANCED_MODEL_CAPACITY_KEYS & (tunable_params | fixed_params)
+    )
+    if conflicts:
+        raise ValueError(
+            "balanced_model_capacity controls model dimensions as one preset and cannot "
+            f"be combined with independently tuned or fixed dimensions: {conflicts}"
+        )
+
+    if capacity_is_tunable:
+        spec = cfg["search_space"]["balanced_model_capacity"]
+        if spec["type"] != "categorical":
+            raise ValueError(
+                "search_space['balanced_model_capacity'] must use type='categorical'"
+            )
+        capacity_values = spec["choices"]
+    else:
+        capacity_values = [cfg["fixed_overrides"]["balanced_model_capacity"]]
+
+    invalid = [
+        value
+        for value in capacity_values
+        if not isinstance(value, str)
+        or value not in BALANCED_MODEL_CAPACITY_PRESETS
+    ]
+    if invalid:
+        raise ValueError(
+            f"Unknown balanced_model_capacity preset(s): {sorted(invalid, key=str)}. "
+            f"Supported: {sorted(BALANCED_MODEL_CAPACITY_PRESETS)}"
+        )
+
+
+def _apply_balanced_model_capacity(config: Dict[str, Any], preset_name: Any) -> None:
+    if (
+        not isinstance(preset_name, str)
+        or preset_name not in BALANCED_MODEL_CAPACITY_PRESETS
+    ):
+        raise ValueError(
+            f"Unknown balanced_model_capacity preset '{preset_name}'. "
+            f"Supported: {sorted(BALANCED_MODEL_CAPACITY_PRESETS)}"
+        )
+    config.update(BALANCED_MODEL_CAPACITY_PRESETS[preset_name])
 
 
 def _validate_metric_weights(weights: Dict[str, Any], field_name: str) -> Dict[str, float]:
@@ -481,6 +560,8 @@ def load_hpo_config(config_path: str) -> Dict[str, Any]:
             raise ValueError(f"Missing search_space for tunable parameter '{p}'")
         _validate_search_space_spec(p, cfg["search_space"][p])
 
+    _validate_balanced_model_capacity_config(cfg)
+
     os.makedirs(cfg["output_dir"], exist_ok=True)
     if cfg["storage"] is None:
         db_path = os.path.join(cfg["output_dir"], "optuna_study.db")
@@ -597,6 +678,7 @@ def build_trial_config(trial: optuna.Trial, hpo_cfg: Dict[str, Any], base_cfg: D
         sampled[name] = suggest_from_space(trial, name, hpo_cfg["search_space"][name])
 
     augment_enable = None
+    balanced_model_capacity = None
     for name, value in sampled.items():
         if name == "ref_shared_dim":
             shared = int(value)
@@ -604,12 +686,22 @@ def build_trial_config(trial: optuna.Trial, hpo_cfg: Dict[str, Any], base_cfg: D
             config["ref_dim"] = shared
         elif name == "augment_enable":
             augment_enable = bool(value)
+        elif name == "balanced_model_capacity":
+            balanced_model_capacity = value
         else:
             config[name] = value
 
     fixed_overrides = dict(hpo_cfg.get("fixed_overrides", {}))
     if "augment_enable" in fixed_overrides:
         augment_enable = bool(fixed_overrides.pop("augment_enable"))
+    if "balanced_model_capacity" in fixed_overrides:
+        if balanced_model_capacity is not None:
+            raise ValueError("balanced_model_capacity cannot be both tuned and fixed")
+        balanced_model_capacity = fixed_overrides.pop("balanced_model_capacity")
+
+    if balanced_model_capacity is not None:
+        _apply_balanced_model_capacity(config, balanced_model_capacity)
+
     config.update(fixed_overrides)
 
     if augment_enable is not None:
@@ -810,6 +902,16 @@ def dry_run(hpo_cfg: Dict[str, Any], base_cfg: Dict[str, Any]) -> None:
     )
 
     print("\nConstraint checks:")
+    capacity_name = trial.params.get(
+        "balanced_model_capacity",
+        hpo_cfg.get("fixed_overrides", {}).get("balanced_model_capacity"),
+    )
+    if capacity_name is not None:
+        dims = ", ".join(
+            f"{key}={config.get(key)}"
+            for key in sorted(BALANCED_MODEL_CAPACITY_KEYS)
+        )
+        print(f"  balanced_model_capacity: {capacity_name} ({dims})")
     print(f"  n_ref == ref_dim: {config.get('n_ref')} == {config.get('ref_dim')}")
     print(
         "  retrieval_start_epoch = cls_start_epoch + cls_ramp_epochs + "

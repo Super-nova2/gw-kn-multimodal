@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH --job-name=ALBEF_HPO_v3
+#SBATCH --job-name=ALBEF_HPO
 #SBATCH --output=logs/hpo/%x_%j.out
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
