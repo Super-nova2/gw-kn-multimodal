@@ -13,7 +13,7 @@ import warnings
 warnings.filterwarnings("ignore", "Wswiglal-redir-stdio")
 import torch
 from collections import defaultdict
-from typing import Dict, List, Iterator, Optional, Tuple, Sequence
+from typing import Dict, List, Iterator, Mapping, Optional, Tuple, Sequence
 from torch.utils.data import Dataset, DataLoader, Sampler
 from pathlib import Path
 import subprocess
@@ -1276,17 +1276,71 @@ class GWBatchedSampler(Sampler):
             return total_steps
         return min(total_steps, self.max_steps)
 
-def split_gw_map(gw_to_lc_map: dict, val_split: float, seed: int):
+def load_gw_source_type_map(h5_path: str) -> Dict[int, str]:
+    """Load normalized source labels indexed by GW row."""
+    with h5py.File(h5_path, "r") as f:
+        field = "events/gw_data/source_type"
+        if field not in f:
+            raise KeyError(f"Missing required field '{field}' in {h5_path}")
+        raw = np.asarray(f[field][:]).reshape(-1)
+
+    source_map: Dict[int, str] = {}
+    for gw_id, value in enumerate(raw):
+        if isinstance(value, (bytes, np.bytes_)):
+            value = value.decode("utf-8", errors="strict")
+        label = str(value).strip().lower()
+        if not label:
+            raise ValueError(f"Empty source_type at GW index {gw_id} in {h5_path}")
+        source_map[int(gw_id)] = label
+    return source_map
+
+
+def split_gw_map(
+    gw_to_lc_map: dict,
+    val_split: float,
+    seed: int,
+    source_type_map: Optional[Mapping[int, str]] = None,
+):
     if val_split <= 0 or val_split >= 1:
         raise ValueError("val_split must be in (0, 1).")
 
     gw_ids = np.array(sorted(gw_to_lc_map.keys()))
     rng = np.random.default_rng(seed)
-    rng.shuffle(gw_ids)
+    if source_type_map is None:
+        rng.shuffle(gw_ids)
+        val_size = max(1, int(len(gw_ids) * val_split))
+        val_ids = set(gw_ids[:val_size])
+        train_ids = set(gw_ids[val_size:])
+    else:
+        missing = [int(gw_id) for gw_id in gw_ids if int(gw_id) not in source_type_map]
+        if missing:
+            raise KeyError(
+                "source_type_map is missing GW IDs required for splitting: "
+                f"{missing[:10]}"
+            )
 
-    val_size = max(1, int(len(gw_ids) * val_split))
-    val_ids = set(gw_ids[:val_size])
-    train_ids = set(gw_ids[val_size:])
+        val_ids = set()
+        train_ids = set()
+        labels = sorted({str(source_type_map[int(gw_id)]).strip().lower() for gw_id in gw_ids})
+        for label in labels:
+            label_ids = np.asarray(
+                [
+                    int(gw_id)
+                    for gw_id in gw_ids
+                    if str(source_type_map[int(gw_id)]).strip().lower() == label
+                ],
+                dtype=np.int64,
+            )
+            if label_ids.size < 2:
+                raise ValueError(
+                    f"Source '{label}' has only {label_ids.size} GW event(s); "
+                    "stratified train/validation splitting requires at least 2."
+                )
+            rng.shuffle(label_ids)
+            val_size = max(1, int(label_ids.size * val_split))
+            val_size = min(val_size, int(label_ids.size) - 1)
+            val_ids.update(int(gw_id) for gw_id in label_ids[:val_size])
+            train_ids.update(int(gw_id) for gw_id in label_ids[val_size:])
 
     train_map = {gw_id: gw_to_lc_map[gw_id] for gw_id in train_ids}
     val_map = {gw_id: gw_to_lc_map[gw_id] for gw_id in val_ids}
@@ -1430,6 +1484,8 @@ def create_train_val_dataloaders(
     val_steps_per_epoch: int = None,
     val_split: float = 0.1,
     split_seed: int = 42,
+    val_split_stratify_by_source: bool = False,
+    return_split_maps: bool = False,
     num_workers: int = 4,
     pin_memory: bool = True,
     persistent_workers: bool = True,
@@ -1450,7 +1506,13 @@ def create_train_val_dataloaders(
         print("cache_in_memory=True with num_workers>0 may increase RAM usage.")
 
     gw_map = build_gw_to_lc_mapping(h5_path)
-    train_map, val_map = split_gw_map(gw_map, val_split, split_seed)
+    source_type_map = load_gw_source_type_map(h5_path) if val_split_stratify_by_source else None
+    train_map, val_map = split_gw_map(
+        gw_map,
+        val_split,
+        split_seed,
+        source_type_map=source_type_map,
+    )
 
     if steps_per_epoch is None:
         train_optical = sum(len(v) for v in train_map.values())
@@ -1547,7 +1609,10 @@ def create_train_val_dataloaders(
         label="Validation DataLoader",
     )
 
-    return train_loader, val_loader, steps_per_epoch, len(val_sampler)
+    result = (train_loader, val_loader, steps_per_epoch, len(val_sampler))
+    if return_split_maps:
+        return (*result, train_map, val_map)
+    return result
 
 def create_supcon_dataloaders(
     h5_path: str,
@@ -1558,6 +1623,8 @@ def create_supcon_dataloaders(
     val_steps_per_epoch: int = None,
     val_split: float = 0.1,
     split_seed: int = 42,
+    val_split_stratify_by_source: bool = False,
+    return_split_maps: bool = False,
     num_workers: int = 4,
     pin_memory: bool = True,
     persistent_workers: bool = True,
@@ -1586,7 +1653,13 @@ def create_supcon_dataloaders(
         print("cache_in_memory=True with num_workers>0 may increase RAM usage.")
 
     gw_map = build_gw_to_lc_mapping(h5_path)
-    train_map, val_map = split_gw_map(gw_map, val_split, split_seed)
+    source_type_map = load_gw_source_type_map(h5_path) if val_split_stratify_by_source else None
+    train_map, val_map = split_gw_map(
+        gw_map,
+        val_split,
+        split_seed,
+        source_type_map=source_type_map,
+    )
 
     if steps_per_epoch is None:
         # Calculate based on total optical samples, not GW events
@@ -1685,7 +1758,10 @@ def create_supcon_dataloaders(
         label="Validation DataLoader",
     )
 
-    return train_loader, val_loader, steps_per_epoch, len(val_sampler)
+    result = (train_loader, val_loader, steps_per_epoch, len(val_sampler))
+    if return_split_maps:
+        return (*result, train_map, val_map)
+    return result
 
 
 def create_mixed_gw_dataloaders(

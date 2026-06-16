@@ -28,6 +28,7 @@ declare -A EXPERIMENTS=(
     ["no_cross_atten"]="ALBEF_BNS_NSBH_no_cross_atten.json"
     ["no_hard_mining"]="ALBEF_BNS_NSBH_no_hard_mining.json"
     ["no_fusion"]="ALBEF_BNS_NSBH_no_fusion.json"
+    ["no_contrastive"]="ALBEF_BNS_NSBH_no_contrastive.json"
 )
 
 SUBMIT_ORDER=(
@@ -38,6 +39,7 @@ SUBMIT_ORDER=(
     "no_cross_atten"
     "no_hard_mining"
     "no_fusion"
+    "no_contrastive"
 )
 
 if ! command -v sbatch >/dev/null 2>&1; then

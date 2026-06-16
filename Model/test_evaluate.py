@@ -58,6 +58,7 @@ from metrics import (
     compute_embedding_metrics,
 )
 from plot_style import apply_mnras_style
+from retrieval_gallery import compute_source_macro_and_gap
 
 
 _BASE_DIR = os.environ.get('BASE_DIR', '/fred/oz016/bgao_kn')
@@ -3779,6 +3780,15 @@ def main():
     results["retrieval_gallery"] = _gallery_result
     if _gallery_by_source:
         results["retrieval_gallery_by_source"] = _gallery_by_source
+        normalized_sources = {
+            str(source).strip().lower() for source in _gallery_by_source
+        }
+        if {"bns", "nsbh"}.issubset(normalized_sources):
+            source_macro, source_gap = compute_source_macro_and_gap(
+                _gallery_by_source
+            )
+            results["retrieval_gallery_source_macro"] = source_macro
+            results["retrieval_gallery_source_gap"] = source_gap
 
     print("Computing embedding quality metrics...")
     results["embedding"] = evaluate_embeddings(embeddings)

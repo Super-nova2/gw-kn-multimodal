@@ -56,6 +56,7 @@ from retrieval_gallery import (  # noqa: E402
     build_prefixed_gallery_specs,
     build_synthetic_time_sky_candidate_sequences,
     build_time_sky_candidate_sequences,
+    compute_source_macro_and_gap,
     extract_gallery_negative_abs_dt_days,
     PLOT_FONT_BASE,
     RETRIEVAL_TWO_ROW_LEGEND_FIGSIZE,
@@ -3007,6 +3008,18 @@ def main():
         else:
             raise ValueError(f"Unknown model type: {model_type}")
 
+        retrieval_by_source = model_results[name].get("retrieval_by_source", {})
+        if {"bns", "nsbh"}.issubset(
+            {str(source).strip().lower() for source in retrieval_by_source}
+        ):
+            source_macro, source_gap = compute_source_macro_and_gap(
+                retrieval_by_source
+            )
+        else:
+            source_macro, source_gap = {}, {}
+        model_results[name]["retrieval_source_macro"] = source_macro
+        model_results[name]["retrieval_source_gap"] = source_gap
+
         retrieval_rows[name] = model_results[name]["retrieval"]
         model_curve_rows = build_curve_rows(
             method_name=name,
@@ -3049,6 +3062,11 @@ def main():
                 f"AUROC={cls.get('auroc', 0.0):.4f} "
                 f"AUPRC={cls.get('auprc', 0.0):.4f} "
                 f"F1={cls.get('f1_optimal', 0.0):.4f}"
+            )
+        if source_macro:
+            print(
+                "  source-macro retrieval available for "
+                f"{len(source_macro)} metric(s); source gaps recorded in JSON"
             )
         torch.cuda.empty_cache()
         gc.collect()

@@ -130,6 +130,18 @@ ALBEF_ARG_KEYS = {
     "compute_cls_metrics",
     "compute_fusion_gallery_metrics",
     "fusion_gallery_metrics_start_epoch",
+    "val_split_stratify_by_source",
+    "validation_gallery_enable",
+    "validation_gallery_mode",
+    "validation_gallery_sizes",
+    "validation_gallery_queries_per_source",
+    "validation_gallery_trials",
+    "validation_gallery_seed",
+    "validation_gallery_time_window_days",
+    "validation_gallery_credible_level_max",
+    "validation_gallery_include_undersized",
+    "validation_gallery_mrr_weight",
+    "validation_gallery_recall_at_1_weight",
     "gallery_score_chunk_size",
     "max_gallery_queries",
     "gallery_include_extra_negatives",
@@ -272,6 +284,9 @@ OBJECTIVE_PRESETS = {
         "val_auprc": 0.10,
         "val_auroc": 0.05,
     },
+    "hard_gallery_macro_retrieval": {
+        "val_hard_gallery_macro_retrieval_score": 1.0,
+    },
     # Fully user-defined weighted sum via `objective_weights`.
     "weighted_sum": None,
 }
@@ -285,6 +300,9 @@ SUPPORTED_OBJECTIVE_COMPONENTS = {
     "val_fusion_gallery_recall_at_1",
     "val_fusion_gallery_recall_at_5",
     "val_fusion_gallery_mrr",
+    "val_hard_gallery_macro_mrr",
+    "val_hard_gallery_macro_recall_at_1",
+    "val_hard_gallery_macro_retrieval_score",
     "val_itc_acc",
 }
 
@@ -298,6 +316,9 @@ METRIC_SHORT_NAMES = {
     "val_fusion_gallery_recall_at_5": "FG_R@5",
     "val_fusion_gallery_mrr": "FG_MRR",
     "val_itc_acc": "ITC_ACC",
+    "val_hard_gallery_macro_mrr": "HardMacroMRR",
+    "val_hard_gallery_macro_recall_at_1": "HardMacroR@1",
+    "val_hard_gallery_macro_retrieval_score": "HardMacroScore",
 }
 
 def _resolve_path(path: str) -> str:
@@ -871,6 +892,16 @@ def objective(trial: optuna.Trial, hpo_cfg: Dict[str, Any], base_cfg: Dict[str, 
     trial.set_user_attr("final_epoch", results.get("final_epoch", -1))
     for metric_key in sorted(SUPPORTED_OBJECTIVE_COMPONENTS):
         trial.set_user_attr(metric_key, results.get(metric_key, 0.0))
+    hard_gallery = results.get("val_hard_gallery", {})
+    if isinstance(hard_gallery, dict) and hard_gallery:
+        trial.set_user_attr(
+            "val_hard_gallery_by_source",
+            hard_gallery.get("by_source", {}),
+        )
+        trial.set_user_attr(
+            "val_hard_gallery_source_gap",
+            hard_gallery.get("source_gap", {}),
+        )
 
     print(
         f"Trial {trial.number}: objective={score:.6f} "

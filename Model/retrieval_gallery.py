@@ -758,6 +758,36 @@ def aggregate_gallery_outcomes(
     return metrics, source_metrics, coverage_stats
 
 
+def compute_source_macro_and_gap(
+    source_metrics: Mapping[str, Mapping[str, float]],
+    source_labels: Sequence[str] = ("bns", "nsbh"),
+) -> Tuple[Dict[str, float], Dict[str, float]]:
+    """Compute equal-weight source macro metrics and absolute source gaps."""
+    normalized = {
+        str(label).strip().lower(): {str(key): float(value) for key, value in metrics.items()}
+        for label, metrics in source_metrics.items()
+    }
+    labels = [str(label).strip().lower() for label in source_labels]
+    missing = [label for label in labels if label not in normalized]
+    if missing:
+        raise ValueError(
+            "Cannot compute source macro metrics; missing source(s): "
+            f"{missing}. Available: {sorted(normalized)}"
+        )
+
+    common_keys = set(normalized[labels[0]])
+    for label in labels[1:]:
+        common_keys.intersection_update(normalized[label])
+
+    macro: Dict[str, float] = {}
+    gap: Dict[str, float] = {}
+    for key in sorted(common_keys):
+        values = [normalized[label][key] for label in labels]
+        macro[key] = float(np.mean(values))
+        gap[key] = float(max(values) - min(values))
+    return macro, gap
+
+
 def build_curve_rows(
     *,
     method_name: str,

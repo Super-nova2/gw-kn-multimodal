@@ -5,6 +5,10 @@ from data_loader import (
     build_effective_input_window_metadata,
 )
 from model import GWOpticalALBEFModel, normalize_fusion_mode, migrate_time_embed_state_dict
+from validation_gallery import (
+    ValidationGalleryContext,
+    parse_validation_gallery_sizes,
+)
 from tqdm import tqdm
 import torch
 import torch.nn.functional as F
@@ -195,6 +199,54 @@ def load_gw_event_time_mjd_table(h5_path, device, required=False):
         )
         return None
     return torch.from_numpy(arr).to(device=device)
+
+
+def load_gw_source_type_table(h5_path, device, required=False):
+    """Load GW source labels as integer codes for equality-based sampling."""
+    ds_path = "events/gw_data/source_type"
+    if h5_path is None or not os.path.exists(h5_path):
+        if required:
+            raise FileNotFoundError(f"data_path not found for source_type: {h5_path}")
+        print(f"WARNING: data_path not found for source_type: {h5_path}")
+        return None
+
+    with h5py.File(h5_path, "r") as f:
+        n_gw = int(f["events/gw_data/scalars"].shape[0])
+        if ds_path not in f:
+            if required:
+                raise KeyError(f"Required field missing: {ds_path} in {h5_path}")
+            print(f"WARNING: '{ds_path}' missing in {h5_path}.")
+            return None
+        raw_source_types = np.asarray(f[ds_path][:]).reshape(-1)
+
+    if raw_source_types.shape[0] != n_gw:
+        if required:
+            raise ValueError(
+                f"source_type length mismatch in {h5_path}: "
+                f"got {raw_source_types.shape[0]}, expected {n_gw}"
+            )
+        print(
+            f"WARNING: source_type length mismatch in {h5_path}: "
+            f"got {raw_source_types.shape[0]}, expected {n_gw}"
+        )
+        return None
+
+    source_names = []
+    for value in raw_source_types:
+        if isinstance(value, (bytes, np.bytes_)):
+            value = value.decode("utf-8", errors="strict")
+        source_name = str(value).strip().lower()
+        if not source_name:
+            raise ValueError(f"Empty source_type found in {h5_path}.")
+        source_names.append(source_name)
+
+    labels, codes = np.unique(np.asarray(source_names, dtype=str), return_inverse=True)
+    counts = np.bincount(codes, minlength=len(labels))
+    summary = ", ".join(
+        f"{label}={int(count)}" for label, count in zip(labels.tolist(), counts.tolist())
+    )
+    print(f"Loaded GW source types for mismatched negatives: {summary}")
+    return torch.from_numpy(codes.astype(np.int64, copy=False)).to(device=device)
 
 
 def _collect_dataset_window_metadata(args) -> Dict[str, object]:
@@ -413,16 +465,55 @@ def summarize_abs_time_delta_quantiles(dt_days, quantiles=(0.5, 0.9, 0.95)):
 
 
 
-def sample_mismatched_negatives(batch_size, device, samples_per_gw=1):
+def sample_mismatched_negatives(
+    batch_size,
+    device,
+    samples_per_gw=1,
+    gw_indices=None,
+    source_types=None,
+):
     """
-    Each optical curve independently selects a curve from a different GW event
-    as a mismatched negative sample.
+    Select an optical curve from a different GW event for each anchor.
 
-    samples_per_gw=1: each curve selects a different curve (random derangement)
-    samples_per_gw>1: group by GW, exclude self-group, pick random curve from other group
+    When GW indices and source types are available, candidates from the same
+    source type are preferred. If no other GW of that type exists in the batch,
+    sampling falls back to any different GW event.
     """
     if batch_size < 2:
         return None
+
+    if gw_indices is not None:
+        gw_indices = torch.as_tensor(gw_indices, device=device).reshape(-1)
+        if gw_indices.numel() != batch_size:
+            raise ValueError(
+                f"gw_indices length ({gw_indices.numel()}) != batch_size ({batch_size})"
+            )
+        if torch.unique(gw_indices).numel() < 2:
+            return None
+
+        if source_types is not None:
+            source_types = torch.as_tensor(source_types, device=device).reshape(-1)
+            if source_types.numel() != batch_size:
+                raise ValueError(
+                    f"source_types length ({source_types.numel()}) "
+                    f"!= batch_size ({batch_size})"
+                )
+
+        different_gw = gw_indices.unsqueeze(1) != gw_indices.unsqueeze(0)
+        candidate_mask = different_gw
+        if source_types is not None:
+            same_source = source_types.unsqueeze(1) == source_types.unsqueeze(0)
+            same_source_candidates = different_gw & same_source
+            has_same_source_candidate = same_source_candidates.any(dim=1, keepdim=True)
+            candidate_mask = torch.where(
+                has_same_source_candidate,
+                same_source_candidates,
+                different_gw,
+            )
+
+        random_scores = torch.rand((batch_size, batch_size), device=device)
+        random_scores.masked_fill_(~candidate_mask, -1.0)
+        return random_scores.argmax(dim=1)
 
     n_gw = batch_size // samples_per_gw
     if n_gw < 2:
@@ -672,6 +763,9 @@ FUSION_GALLERY_BEST_CKPT_METRICS = {
     "fusion_gallery_recall_at_5",
     "fusion_gallery_mrr",
 }
+HARD_GALLERY_BEST_CKPT_METRICS = {
+    "hard_gallery_macro_retrieval_score",
+}
 
 
 def should_compute_cls_metrics(args):
@@ -727,72 +821,170 @@ def gallery_loss_full_activation_reachable(args):
     return full_epoch < total_epochs
 
 
-def is_best_ckpt_selection_eligible(args, epoch):
-    """Gate best-checkpoint selection until the requested metric is meaningful."""
+def compute_best_ckpt_stage_epochs(args):
+    """Return the final 0-based epoch of each enabled staged-training phase."""
+    stage_epochs = {}
+
+    warmup_epochs = int(getattr(args, "warmup_epochs", 0))
+    if str(getattr(args, "lr_scheduler", "none")) != "none" and warmup_epochs > 0:
+        stage_epochs["lr_warmup"] = compute_curriculum_full_epoch(0, warmup_epochs)
+
+    if is_cls_branch_enabled(args):
+        stage_epochs["classification"] = compute_curriculum_full_epoch(
+            getattr(args, "cls_start_epoch", 0),
+            getattr(args, "cls_ramp_epochs", 0),
+        )
+
+    if is_gallery_enabled(args):
+        retrieval_start = int(getattr(args, "retrieval_start_epoch", 0))
+        stage_epochs["fusion_gallery"] = compute_curriculum_full_epoch(
+            retrieval_start,
+            getattr(args, "gallery_loss_ramp_epochs", 0),
+        )
+        if (
+            is_gallery_hard_neg_enabled(args)
+            and float(getattr(args, "gallery_hard_neg_weight", 0.0)) > 0.0
+        ):
+            hard_start = retrieval_start + int(
+                getattr(args, "gallery_hard_neg_start_after_retrieval_epochs", 2)
+            )
+            stage_epochs["fusion_gallery_hard_negative"] = compute_curriculum_full_epoch(
+                hard_start,
+                getattr(args, "gallery_hard_neg_ramp_epochs", 2),
+            )
+
+    if (
+        float(getattr(args, "itc_weight", 0.0)) > 0.0
+        and int(getattr(args, "itc_decay_epochs", 0)) > 0
+        and float(getattr(args, "itc_decay_ratio", 0.0)) > 0.0
+    ):
+        stage_epochs["itc_decay"] = compute_curriculum_full_epoch(
+            getattr(args, "itc_decay_start_epoch", 0),
+            getattr(args, "itc_decay_epochs", 0),
+        )
+
+    return stage_epochs
+
+
+def compute_best_ckpt_stable_epoch(args):
+    """Return the first 0-based epoch whose validation follows all enabled phases."""
+    return max(compute_best_ckpt_stage_epochs(args).values(), default=0)
+
+
+def compute_best_ckpt_metric_ready_epoch(args):
+    """Return the first 0-based epoch at which the selected metric is available."""
     metric_name = str(getattr(args, "best_ckpt_metric", "fusion_gallery_mrr"))
 
     if metric_name in CLS_BEST_CKPT_METRICS:
         if not should_compute_cls_metrics(args):
-            return False
-        if is_cls_branch_enabled(args) and not is_cls_active(epoch, args):
-            return False
-        return True
+            raise ValueError(
+                f"best_ckpt_metric={metric_name!r} requires compute_cls_metrics=true."
+            )
+        return 0
 
     if metric_name in FUSION_GALLERY_BEST_CKPT_METRICS:
-        if is_gallery_enabled(args):
-            metric_ready = is_retrieval_active(args, epoch)
-        else:
-            metric_ready = should_compute_fusion_gallery_metrics(args, epoch)
-        if not metric_ready:
-            return False
-        if gallery_loss_full_activation_reachable(args):
-            gallery_weight = compute_gallery_loss_weight(args, epoch)
-            full_weight = float(getattr(args, "gallery_loss_weight", 0.0))
-            if full_weight > 0.0 and gallery_weight < (full_weight - 1e-8):
-                return False
-        if gallery_hard_neg_full_activation_reachable(args):
-            hard_weight = compute_gallery_hard_neg_weight(args, epoch)
-            full_weight = float(getattr(args, "gallery_hard_neg_weight", 0.5))
-            if full_weight > 0.0 and hard_weight < (full_weight - 1e-8):
-                return False
-        return True
+        if not bool(getattr(args, "compute_fusion_gallery_metrics", True)):
+            raise ValueError(
+                f"best_ckpt_metric={metric_name!r} requires "
+                "compute_fusion_gallery_metrics=true."
+            )
+        return max(0, int(getattr(args, "fusion_gallery_metrics_start_epoch", 0)))
+
+    if metric_name in HARD_GALLERY_BEST_CKPT_METRICS:
+        if not bool(getattr(args, "validation_gallery_enable", True)):
+            raise ValueError(
+                f"best_ckpt_metric={metric_name!r} requires validation_gallery_enable=true."
+            )
+        return 0
 
     if metric_name in G2O_BEST_CKPT_METRICS:
-        return True
+        return 0
 
-    return True
+    raise ValueError(f"Unsupported best_ckpt_metric: {metric_name}")
+
+
+def compute_best_ckpt_selection_start_epoch(args):
+    """Return the effective 0-based best-checkpoint tracking start epoch."""
+    automatic_epoch = compute_best_ckpt_stable_epoch(args)
+    metric_ready_epoch = compute_best_ckpt_metric_ready_epoch(args)
+    manual_epoch = getattr(args, "best_ckpt_start_epoch", None)
+    if manual_epoch is None:
+        manual_epoch = 0
+    return max(automatic_epoch, metric_ready_epoch, int(manual_epoch))
+
+
+def validate_best_ckpt_selection_schedule(args):
+    """Validate that all required phases finish while checkpointing is possible."""
+    total_epochs = int(getattr(args, "epochs", 0))
+    if total_epochs <= 0:
+        raise ValueError("epochs must be > 0.")
+
+    manual_epoch = getattr(args, "best_ckpt_start_epoch", None)
+    if manual_epoch is not None and int(manual_epoch) < 0:
+        raise ValueError("best_ckpt_start_epoch must be >= 0 or null.")
+
+    stage_epochs = compute_best_ckpt_stage_epochs(args)
+    unreachable = {
+        name: epoch
+        for name, epoch in stage_epochs.items()
+        if int(epoch) >= total_epochs
+    }
+    if unreachable:
+        details = ", ".join(
+            f"{name}=epoch {epoch + 1}" for name, epoch in sorted(unreachable.items())
+        )
+        raise ValueError(
+            "Best-checkpoint stability phases do not complete within "
+            f"epochs={total_epochs}: {details}."
+        )
+
+    selection_start = compute_best_ckpt_selection_start_epoch(args)
+    if selection_start >= total_epochs:
+        raise ValueError(
+            "Best-checkpoint selection cannot start within training: "
+            f"start epoch={selection_start + 1}, epochs={total_epochs}."
+        )
+    return selection_start
+
+
+def format_best_ckpt_selection_schedule(args):
+    """Format the resolved checkpoint schedule for the training log."""
+    stage_epochs = compute_best_ckpt_stage_epochs(args)
+    stage_text = ", ".join(
+        f"{name}=epoch {epoch + 1}"
+        for name, epoch in sorted(stage_epochs.items(), key=lambda item: item[1])
+    )
+    if not stage_text:
+        stage_text = "none"
+    stable_epoch = compute_best_ckpt_stable_epoch(args)
+    metric_epoch = compute_best_ckpt_metric_ready_epoch(args)
+    manual_epoch = getattr(args, "best_ckpt_start_epoch", None)
+    selection_epoch = compute_best_ckpt_selection_start_epoch(args)
+    manual_text = "none" if manual_epoch is None else f"epoch {int(manual_epoch) + 1}"
+    return (
+        f"phases=[{stage_text}], stable=epoch {stable_epoch + 1}, "
+        f"metric_ready=epoch {metric_epoch + 1}, manual={manual_text}, "
+        f"selection=epoch {selection_epoch + 1}"
+    )
+
+
+def is_best_ckpt_selection_eligible(args, epoch):
+    """Gate selection and early stopping until all enabled phases are stable."""
+    return int(epoch) >= compute_best_ckpt_selection_start_epoch(args)
 
 
 def describe_best_ckpt_selection_pending(args, epoch):
-    metric_name = str(getattr(args, "best_ckpt_metric", "fusion_gallery_mrr"))
-
-    if metric_name in CLS_BEST_CKPT_METRICS:
-        if not should_compute_cls_metrics(args):
-            return "waiting for classification metrics to be enabled."
-        if is_cls_branch_enabled(args) and not is_cls_active(epoch, args):
-            return "waiting for CLS ramp/start before tracking classification metric."
-        return "waiting for classification metric to become available."
-
-    if metric_name in FUSION_GALLERY_BEST_CKPT_METRICS:
-        if is_gallery_enabled(args) and not is_retrieval_active(args, epoch):
-            start = int(getattr(args, "retrieval_start_epoch", 0))
-            return f"waiting for fusion-gallery training start (epoch {start + 1})."
-        if (not is_gallery_enabled(args)) and not should_compute_fusion_gallery_metrics(args, epoch):
-            return "waiting for fusion-gallery metrics to be enabled."
-        if gallery_loss_full_activation_reachable(args):
-            gallery_weight = compute_gallery_loss_weight(args, epoch)
-            full_weight = float(getattr(args, "gallery_loss_weight", 0.0))
-            if full_weight > 0.0 and gallery_weight < (full_weight - 1e-8):
-                return f"waiting for fusion-gallery loss ramp (current={gallery_weight:.3f}, required={full_weight:.3f})."
-        if gallery_hard_neg_full_activation_reachable(args):
-            hard_weight = compute_gallery_hard_neg_weight(args, epoch)
-            full_weight = float(getattr(args, "gallery_hard_neg_weight", 0.5))
-            if full_weight > 0.0 and hard_weight < (full_weight - 1e-8):
-                return f"waiting for retrieval hard-mining ramp (current={hard_weight:.3f}, required={full_weight:.3f})."
-        return "waiting for fusion-gallery metric to become available."
-
-    return "waiting for requested best-checkpoint metric to become available."
-
+    selection_epoch = compute_best_ckpt_selection_start_epoch(args)
+    pending_stages = [
+        f"{name} (epoch {full_epoch + 1})"
+        for name, full_epoch in compute_best_ckpt_stage_epochs(args).items()
+        if int(epoch) < int(full_epoch)
+    ]
+    if pending_stages:
+        reason = "pending phases: " + ", ".join(pending_stages)
+    else:
+        reason = "waiting for metric/manual start constraint"
+    return f"waiting until epoch {selection_epoch + 1}; {reason}."
 
 def compute_weighted_cls_loss(pos_loss, hard_loss, neg_loss, has_negatives, args):
     pos_weight = args.cls_pos_weight
@@ -1224,8 +1416,18 @@ def compute_ckpt_selection_score(val_metrics, metric_name):
         return float(ret_m.get("fusion_gallery_recall_at_5", 0.0))
     if metric_name == "fusion_gallery_mrr":
         return float(ret_m.get("fusion_gallery_mrr", 0.0))
+    if metric_name == "hard_gallery_macro_retrieval_score":
+        return float(
+            val_metrics.get("hard_gallery", {}).get("selection_score", 0.0)
+        )
 
     raise ValueError(f"Unsupported best_ckpt_metric: {metric_name}")
+
+
+def is_checkpoint_score_improved(current_score, previous_best, min_delta):
+    return previous_best is None or float(current_score) > (
+        float(previous_best) + float(min_delta)
+    )
 
 def evaluate(
     model,
@@ -1235,6 +1437,7 @@ def evaluate(
     epoch,
     amp_dtype=torch.float32,
     gw_event_time_mjd_table=None,
+    gw_source_type_table=None,
 ):
     from metrics import (compute_retrieval_metrics,
                          compute_classification_metrics,
@@ -1328,6 +1531,9 @@ def evaluate(
             batch_event_time_mjd = None
             if gw_event_time_mjd_table is not None:
                 batch_event_time_mjd = gw_event_time_mjd_table[gw_indices]
+            batch_source_types = None
+            if gw_source_type_table is not None:
+                batch_source_types = gw_source_type_table[gw_indices]
 
             if has_negatives:
                 neg_t = neg_t.to(device, non_blocking=True)
@@ -1419,7 +1625,9 @@ def evaluate(
                     pos_loss = model.cls_criterion(logits_pos, labels_pos)
 
                     mis_idx = sample_mismatched_negatives(
-                        batch_size, device, samples_per_gw=args.samples_per_gw
+                        batch_size, device, samples_per_gw=args.samples_per_gw,
+                        gw_indices=gw_indices,
+                        source_types=batch_source_types,
                     )
 
                     if mis_idx is None:
@@ -1626,7 +1834,9 @@ def evaluate(
                     cls_logits_available = True
 
                     metric_neg_idx = sample_mismatched_negatives(
-                        batch_size, device, samples_per_gw=args.samples_per_gw
+                        batch_size, device, samples_per_gw=args.samples_per_gw,
+                        gw_indices=gw_indices,
+                        source_types=batch_source_types,
                     )
                     if metric_neg_idx is not None:
                         h_l_mis = h_l[metric_neg_idx].clone()
@@ -1799,6 +2009,48 @@ def evaluate(
 
 
 def train(args):
+    args.validation_gallery_sizes = list(
+        parse_validation_gallery_sizes(args.validation_gallery_sizes)
+    )
+    if (
+        not bool(args.validation_gallery_enable)
+        and args.best_ckpt_metric == "hard_gallery_macro_retrieval_score"
+    ):
+        args.best_ckpt_metric = "fusion_gallery_mrr"
+        print(
+            "validation_gallery_enable=false: falling back to "
+            "best_ckpt_metric='fusion_gallery_mrr'."
+        )
+    if bool(args.validation_gallery_enable):
+        if args.val_split is None or not (0.0 < float(args.val_split) < 1.0):
+            raise ValueError(
+                "validation_gallery_enable requires val_split to be in (0, 1)."
+            )
+        if int(args.validation_gallery_queries_per_source) < 1:
+            raise ValueError(
+                "validation_gallery_queries_per_source must be >= 1."
+            )
+        if int(args.validation_gallery_trials) < 1:
+            raise ValueError("validation_gallery_trials must be >= 1.")
+        if float(args.validation_gallery_time_window_days) <= 0.0:
+            raise ValueError(
+                "validation_gallery_time_window_days must be > 0."
+            )
+        if not (0.0 < float(args.validation_gallery_credible_level_max) <= 1.0):
+            raise ValueError(
+                "validation_gallery_credible_level_max must be in (0, 1]."
+            )
+        metric_weight_sum = float(args.validation_gallery_mrr_weight) + float(
+            args.validation_gallery_recall_at_1_weight
+        )
+        if (
+            float(args.validation_gallery_mrr_weight) < 0.0
+            or float(args.validation_gallery_recall_at_1_weight) < 0.0
+            or metric_weight_sum <= 0.0
+        ):
+            raise ValueError(
+                "validation gallery metric weights must be non-negative and sum to > 0."
+            )
     if args.temp_final is None:
         args.temp_final = args.temp_init
     if args.temp_min <= 0 or args.temp_max <= 0:
@@ -1820,8 +2072,27 @@ def train(args):
         raise ValueError("gallery_loss_weight must be >= 0.")
     if args.gallery_loss_ramp_epochs < 0:
         raise ValueError("gallery_loss_ramp_epochs must be >= 0.")
+    if args.warmup_epochs < 0:
+        raise ValueError("warmup_epochs must be >= 0.")
+    if args.cls_start_epoch < 0:
+        raise ValueError("cls_start_epoch must be >= 0.")
+    if args.cls_ramp_epochs < 0:
+        raise ValueError("cls_ramp_epochs must be >= 0.")
+    if args.retrieval_start_epoch < 0:
+        raise ValueError("retrieval_start_epoch must be >= 0.")
+    if args.fusion_gallery_metrics_start_epoch < 0:
+        raise ValueError("fusion_gallery_metrics_start_epoch must be >= 0.")
+    if args.itc_decay_start_epoch < 0:
+        raise ValueError("itc_decay_start_epoch must be >= 0.")
+    if args.itc_decay_epochs < 0:
+        raise ValueError("itc_decay_epochs must be >= 0.")
     if args.gallery_score_chunk_size < 1:
         raise ValueError("gallery_score_chunk_size must be >= 1.")
+    validate_best_ckpt_selection_schedule(args)
+    print(
+        "Best-checkpoint stability schedule: "
+        f"{format_best_ckpt_selection_schedule(args)}"
+    )
     args.gallery_distractor_time_mode = str(args.gallery_distractor_time_mode).strip().lower()
     if args.gallery_distractor_time_mode in {"synthetic", "after_gw"}:
         args.gallery_distractor_time_mode = "synthetic_after_gw"
@@ -1887,9 +2158,10 @@ def train(args):
         print("Extra-negative time-aware sampling disabled.")
 
     val_loader = None
+    val_gw_map = None
     if args.val_split is not None and 0 < args.val_split < 1:
         if args.itc_loss_type == "supcon":
-            train_loader, val_loader, steps_per_epoch, val_steps = create_supcon_dataloaders(
+            loader_result = create_supcon_dataloaders(
                 h5_path=args.data_path,
                 batch_size=args.batch_size,
                 samples_per_gw=args.samples_per_gw,
@@ -1898,6 +2170,10 @@ def train(args):
                 val_steps_per_epoch=args.val_steps_per_epoch,
                 val_split=args.val_split,
                 split_seed=args.split_seed,
+                val_split_stratify_by_source=bool(
+                    args.val_split_stratify_by_source
+                ),
+                return_split_maps=True,
                 num_workers=args.num_workers,
                 pin_memory=bool(args.pin_memory),
                 persistent_workers=bool(args.persistent_workers),
@@ -1915,12 +2191,20 @@ def train(args):
                 opt_input_window_start=args.ref_start,
                 opt_input_window_end=args.ref_end,
             )
+            (
+                train_loader,
+                val_loader,
+                steps_per_epoch,
+                val_steps,
+                _train_gw_map,
+                val_gw_map,
+            ) = loader_result
             print(
                 f"SupCon mode: {args.samples_per_gw} samples/GW, "
                 f"{args.batch_size // args.samples_per_gw} GW/batch"
             )
         else:
-            train_loader, val_loader, steps_per_epoch, val_steps = create_train_val_dataloaders(
+            loader_result = create_train_val_dataloaders(
                 h5_path=args.data_path,
                 batch_size=args.batch_size,
                 val_batch_size=args.val_batch_size,
@@ -1928,6 +2212,10 @@ def train(args):
                 val_steps_per_epoch=args.val_steps_per_epoch,
                 val_split=args.val_split,
                 split_seed=args.split_seed,
+                val_split_stratify_by_source=bool(
+                    args.val_split_stratify_by_source
+                ),
+                return_split_maps=True,
                 num_workers=args.num_workers,
                 pin_memory=bool(args.pin_memory),
                 persistent_workers=bool(args.persistent_workers),
@@ -1944,6 +2232,14 @@ def train(args):
                 opt_input_window_start=args.ref_start,
                 opt_input_window_end=args.ref_end,
             )
+            (
+                train_loader,
+                val_loader,
+                steps_per_epoch,
+                val_steps,
+                _train_gw_map,
+                val_gw_map,
+            ) = loader_result
         print(f"Train Steps/Epoch: {steps_per_epoch} | Val Steps/Epoch: {val_steps}")
     else:
         if args.steps_per_epoch is not None:
@@ -2091,11 +2387,28 @@ def train(args):
             "Hard-negative time-shift re-encoding requires 'events/gw_data/event_time_mjd' "
             "in training dataset."
         )
+    gw_source_type_table = load_gw_source_type_table(
+        args.data_path, device, required=True
+    )
+    print(
+        "Mismatched-negative policy: prefer a different GW of the same source type."
+    )
     print(
         "Extra-negative time-aware sampling config: "
         f"windows_days={args._hardneg_window_days}, "
         f"min_candidates={args.hardneg_min_candidates}"
     )
+
+    validation_gallery_context = None
+    if bool(args.validation_gallery_enable):
+        if val_gw_map is None:
+            raise ValueError(
+                "validation_gallery_enable requires an event-level validation split."
+            )
+        validation_gallery_context = ValidationGalleryContext.build(
+            args,
+            val_gw_map,
+        )
 
     pbar_update_every = 500
     tb_log_interval = 50
@@ -2197,6 +2510,9 @@ def train(args):
             batch_event_time_mjd = None
             if gw_event_time_mjd_table is not None:
                 batch_event_time_mjd = gw_event_time_mjd_table[gw_indices]
+            batch_source_types = None
+            if gw_source_type_table is not None:
+                batch_source_types = gw_source_type_table[gw_indices]
 
             if has_negatives:
                 neg_t = neg_t.to(device, non_blocking=True)
@@ -2306,7 +2622,9 @@ def train(args):
                     pos_loss = model.cls_criterion(logits_pos, labels_pos)
 
                     mis_idx = sample_mismatched_negatives(
-                        batch_size, device, samples_per_gw=args.samples_per_gw
+                        batch_size, device, samples_per_gw=args.samples_per_gw,
+                        gw_indices=gw_indices,
+                        source_types=batch_source_types,
                     )
 
                     if mis_idx is None:
@@ -2641,6 +2959,7 @@ def train(args):
                 epoch,
                 amp_dtype=amp_dtype,
                 gw_event_time_mjd_table=gw_event_time_mjd_table,
+                gw_source_type_table=gw_source_type_table,
             )
             _close_loader_dataset_handles(
                 val_loader,
@@ -2648,6 +2967,15 @@ def train(args):
                 label="Validation DataLoader",
             )
             if val_metrics is not None:
+                if validation_gallery_context is not None:
+                    hard_gallery_metrics = validation_gallery_context.evaluate(
+                        model,
+                        args,
+                        device,
+                        amp_dtype,
+                        gw_event_time_mjd_table,
+                    )
+                    val_metrics["hard_gallery"] = hard_gallery_metrics
                 print(
                     f"Val Avg Total: {val_metrics['total']:.4f} | "
                     f"ITC: {val_metrics['itc']:.4f} | CLS: {val_metrics['cls']:.4f}"
@@ -2678,6 +3006,46 @@ def train(args):
                 dt_m = val_metrics.get("time_delta", {})
                 for key, value in dt_m.items():
                     writer.add_scalar(f'Val/TimeShift/{key}', value, epoch)
+                hard_gallery = val_metrics.get("hard_gallery", {})
+                if hard_gallery:
+                    writer.add_scalar(
+                        "Val/HardGallery/MacroMRR",
+                        hard_gallery["macro_mrr"],
+                        epoch,
+                    )
+                    writer.add_scalar(
+                        "Val/HardGallery/MacroR1",
+                        hard_gallery["macro_recall_at_1"],
+                        epoch,
+                    )
+                    writer.add_scalar(
+                        "Val/HardGallery/SelectionScore",
+                        hard_gallery["selection_score"],
+                        epoch,
+                    )
+                    for source, source_metrics in hard_gallery["by_source"].items():
+                        for key, value in source_metrics.items():
+                            writer.add_scalar(
+                                f"Val/HardGallery/{source}/{key}",
+                                value,
+                                epoch,
+                            )
+                    for gallery_size in args.validation_gallery_sizes:
+                        bns = hard_gallery["by_source"]["bns"]
+                        nsbh = hard_gallery["by_source"]["nsbh"]
+                        print(
+                            f"  HardGallery G={gallery_size}: "
+                            f"BNS R@1={bns[f'gallery_{gallery_size}_recall_at_1']:.4f} "
+                            f"MRR={bns[f'gallery_{gallery_size}_mrr']:.4f} | "
+                            f"NSBH R@1={nsbh[f'gallery_{gallery_size}_recall_at_1']:.4f} "
+                            f"MRR={nsbh[f'gallery_{gallery_size}_mrr']:.4f}"
+                        )
+                    print(
+                        "  HardGallery macro: "
+                        f"R@1={hard_gallery['macro_recall_at_1']:.4f} "
+                        f"MRR={hard_gallery['macro_mrr']:.4f} "
+                        f"score={hard_gallery['selection_score']:.4f}"
+                    )
                 # Print summary of new metrics
                 r1 = ret.get('g2o_recall_at_1', 0)
                 r5 = ret.get('g2o_recall_at_5', 0)
@@ -2712,9 +3080,10 @@ def train(args):
                     )
                 else:
                     prev_best = best_val_score
-                    improved = (
-                        prev_best is None
-                        or current_selection_score > prev_best + args.early_stop_min_delta
+                    improved = is_checkpoint_score_improved(
+                        current_selection_score,
+                        prev_best,
+                        args.early_stop_min_delta,
                     )
                     if improved:
                         best_val_score = current_selection_score
@@ -2743,6 +3112,16 @@ def train(args):
                         }
                         for metric_name in sorted(FUSION_GALLERY_BEST_CKPT_METRICS):
                             best_val_metrics[f"val_{metric_name}"] = retrieval_metrics.get(metric_name, 0)
+                        hard_gallery = val_metrics.get("hard_gallery", {})
+                        if hard_gallery:
+                            best_val_metrics["val_hard_gallery_macro_mrr"] = hard_gallery["macro_mrr"]
+                            best_val_metrics["val_hard_gallery_macro_recall_at_1"] = hard_gallery[
+                                "macro_recall_at_1"
+                            ]
+                            best_val_metrics[
+                                "val_hard_gallery_macro_retrieval_score"
+                            ] = hard_gallery["selection_score"]
+                            best_val_metrics["val_hard_gallery"] = hard_gallery
                         epochs_no_improve = 0
                         best_ckpt = os.path.join(args.ckpt_path, "ALBEF", "albef_best.pth")
                         os.makedirs(os.path.dirname(best_ckpt), exist_ok=True)
@@ -2760,6 +3139,7 @@ def train(args):
                             'args': vars(args),
                             'dataset_window_metadata': getattr(args, "_dataset_window_metadata", None),
                             'effective_input_window_metadata': getattr(args, "_effective_input_window_metadata", None),
+                            'validation_hard_gallery': val_metrics.get("hard_gallery"),
                         }, best_ckpt)
                         print(
                             f"Saved best checkpoint ({args.best_ckpt_metric}="
@@ -2863,13 +3243,61 @@ if __name__ == "__main__":
     parser.add_argument("--early_stop_patience", type=int, default=10)
     parser.add_argument("--early_stop_min_delta", type=float, default=1e-4,
                         help="Minimum improvement required on best_ckpt_metric to reset early stopping.")
-    parser.add_argument("--best_ckpt_metric", type=str, default="auprc",
+    parser.add_argument("--best_ckpt_metric", type=str, default="hard_gallery_macro_retrieval_score",
                         choices=[
                             "auprc", "auroc", "f1_optimal", "acc_total", "cls_composite_auprc_auroc",
                             "g2o_recall_at_1", "g2o_recall_at_5", "g2o_mrr",
                             "fusion_gallery_recall_at_1", "fusion_gallery_recall_at_5", "fusion_gallery_mrr",
+                            "hard_gallery_macro_retrieval_score",
                         ],
                         help="In-domain validation metric used for selecting best checkpoint. Supports classification and retrieval metrics.")
+    parser.add_argument(
+        "--best_ckpt_start_epoch",
+        type=int,
+        default=None,
+        help=(
+            "Optional 0-based lower bound for best-checkpoint selection. "
+            "The automatic staged-training stability epoch always takes precedence."
+        ),
+    )
+    parser.add_argument(
+        "--val_split_stratify_by_source",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Stratify the event-level train/validation split by GW source_type.",
+    )
+    parser.add_argument(
+        "--validation_gallery_enable",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Compute fixed test-style hard-gallery validation every epoch.",
+    )
+    parser.add_argument(
+        "--validation_gallery_mode",
+        type=str,
+        default="synthetic_time_sky_hard",
+    )
+    parser.add_argument(
+        "--validation_gallery_sizes",
+        type=parse_validation_gallery_sizes,
+        default=[100, 500, 1000],
+    )
+    parser.add_argument("--validation_gallery_queries_per_source", type=int, default=64)
+    parser.add_argument("--validation_gallery_trials", type=int, default=1)
+    parser.add_argument("--validation_gallery_seed", type=int, default=42)
+    parser.add_argument("--validation_gallery_time_window_days", type=float, default=30.0)
+    parser.add_argument("--validation_gallery_credible_level_max", type=float, default=0.9)
+    parser.add_argument(
+        "--validation_gallery_include_undersized",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument("--validation_gallery_mrr_weight", type=float, default=0.8)
+    parser.add_argument(
+        "--validation_gallery_recall_at_1_weight",
+        type=float,
+        default=0.2,
+    )
     parser.add_argument("--n_ref", type=int, default=64)
     parser.add_argument("--ref_start", type=float, default=-0.3)
     parser.add_argument("--ref_end", type=float, default=0.6)
