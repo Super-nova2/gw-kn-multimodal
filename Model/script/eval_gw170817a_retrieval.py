@@ -40,6 +40,7 @@ from retrieval_gallery import (  # noqa: E402
     build_time_sky_candidate_sequences,
     PLOT_FONT_BASE,
     RETRIEVAL_CURVES_FIGSIZE,
+    _plot_method_color_map,
     _plot_method_draw_order,
     plot_retrieval_curves,
     score_all_galleries_skymap,
@@ -313,6 +314,7 @@ def plot_redshift_metrics(rows: Sequence[Mapping[str, Any]], output_dir: Path | 
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
     methods = sorted({str(row["method"]) for row in rows}, key=_plot_method_draw_order)
+    method_colors = _plot_method_color_map(methods)
     metrics = [("recall_at_1", "R@1"), ("recall_at_10", "R@10"), ("mrr", "MRR")]
     all_gallery_sizes = sorted({int(row["gallery_size"]) for row in rows})
 
@@ -331,6 +333,7 @@ def plot_redshift_metrics(rows: Sequence[Mapping[str, Any]], output_dir: Path | 
                         marker="o",
                         linewidth=2,
                         label=_plot_method_label(method),
+                        color=method_colors[method],
                     )
             ax.set_xlabel("Redshift")
             ax.set_ylabel(label)
@@ -359,6 +362,7 @@ def plot_redshift_coverage(rows: Sequence[Mapping[str, Any]], output_dir: Path |
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
     methods = sorted({str(row["method"]) for row in rows}, key=_plot_method_draw_order)
+    method_colors = _plot_method_color_map(methods)
     all_gallery_sizes = sorted({int(row["gallery_size"]) for row in rows})
 
     for gallery_size in all_gallery_sizes:
@@ -375,6 +379,7 @@ def plot_redshift_coverage(rows: Sequence[Mapping[str, Any]], output_dir: Path |
                     marker="o",
                     linewidth=2,
                     label=_plot_method_label(method),
+                    color=method_colors[method],
                 )
         ax.set_xlabel("Redshift")
         ax.set_ylabel("Mean Fill Ratio")
@@ -446,6 +451,7 @@ def plot_redshift_macro_metrics(rows: Sequence[Mapping[str, Any]], output_dir: P
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
     methods = sorted({str(row["method"]) for row in rows}, key=_plot_method_draw_order)
+    method_colors = _plot_method_color_map(methods)
     metrics = [
         ("macro_recall_at_1", "Macro Recall@1"),
         ("macro_recall_at_10", "Macro Recall@10"),
@@ -466,6 +472,7 @@ def plot_redshift_macro_metrics(rows: Sequence[Mapping[str, Any]], output_dir: P
                     marker="o",
                     linewidth=2,
                     label=_plot_method_label(method),
+                    color=method_colors[method],
                 )
         ax.set_xlabel("Redshift")
         ax.set_ylabel(label)

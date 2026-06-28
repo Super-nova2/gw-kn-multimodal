@@ -26,9 +26,7 @@ declare -A EXPERIMENTS=(
     ["no_gallery_loss"]="ALBEF_BNS_NSBH_no_gallery_loss.json"
     ["no_itc_loss"]="ALBEF_BNS_NSBH_no_itc_loss.json"
     ["no_cross_atten"]="ALBEF_BNS_NSBH_no_cross_atten.json"
-    ["no_hard_mining"]="ALBEF_BNS_NSBH_no_hard_mining.json"
     ["no_fusion"]="ALBEF_BNS_NSBH_no_fusion.json"
-    ["no_contrastive"]="ALBEF_BNS_NSBH_no_contrastive.json"
 )
 
 SUBMIT_ORDER=(
@@ -37,9 +35,7 @@ SUBMIT_ORDER=(
     "no_gallery_loss"
     "no_itc_loss"
     "no_cross_atten"
-    "no_hard_mining"
     "no_fusion"
-    "no_contrastive"
 )
 
 if ! command -v sbatch >/dev/null 2>&1; then

@@ -38,10 +38,50 @@ PLOT_METHOD_LABELS = {
     "\u5168\u6a21\u6001": "MAGIKS",
     "\u5168\u6a21\u6001 + \u56f0\u96be\u6837\u672c\u6316\u6398": "MAGIKS + Hard Mining",
 }
+PLOT_METHOD_COLORS = {
+    "skymap-only": "#F2C230",
+    "Skymap-only": "#F2C230",
+    "optical-only": "#1F77B4",
+    "Optical-only": "#1F77B4",
+    "Optical-only baseline": "#1F77B4",
+    "full": "#D62728",
+    "Full": "#D62728",
+    "Full v11": "#D62728",
+    "MAGIKS": "#D62728",
+    "\u5168\u6a21\u6001": "#D62728",
+}
+PLOT_OTHER_METHOD_COLORS = (
+    "#2CA02C",  # green
+    "#9467BD",  # purple
+    "#8C564B",  # brown
+    "#E377C2",  # pink
+    "#7F7F7F",  # gray
+    "#17BECF",  # cyan
+    "#BCBD22",  # olive
+    "#393B79",  # indigo
+)
 
 
 def _plot_method_label(method: str) -> str:
     return PLOT_METHOD_LABELS.get(str(method), str(method))
+
+
+def _plot_method_color(method: str) -> Optional[str]:
+    return PLOT_METHOD_COLORS.get(str(method))
+
+
+def _plot_method_color_map(methods: Sequence[str]) -> Dict[str, str]:
+    colors: Dict[str, str] = {}
+    other_idx = 0
+    for method in methods:
+        method = str(method)
+        fixed = _plot_method_color(method)
+        if fixed:
+            colors[method] = fixed
+            continue
+        colors[method] = PLOT_OTHER_METHOD_COLORS[other_idx % len(PLOT_OTHER_METHOD_COLORS)]
+        other_idx += 1
+    return colors
 
 
 def _plot_method_draw_order(method: str) -> tuple:
@@ -833,6 +873,7 @@ def plot_retrieval_curves(curve_rows: Sequence[Mapping[str, Any]], output_dir: P
     output_dir.mkdir(parents=True, exist_ok=True)
 
     methods = sorted({str(row["method"]) for row in rows}, key=_plot_method_draw_order)
+    method_colors = _plot_method_color_map(methods)
     metrics = ["R@1", "R@10", "MRR"]
     ylabels = {"R@1": "Recall@1", "R@10": "Recall@10", "MRR": "MRR"}
     figure_size = RETRIEVAL_TWO_ROW_LEGEND_FIGSIZE if len(methods) > 4 else RETRIEVAL_CURVES_FIGSIZE
@@ -855,6 +896,7 @@ def plot_retrieval_curves(curve_rows: Sequence[Mapping[str, Any]], output_dir: P
                 marker="o",
                 linewidth=2,
                 label=_plot_method_label(method),
+                color=method_colors[method],
             )
         ax.set_xscale("log")
         ax.set_xlabel("Gallery size")
@@ -918,7 +960,9 @@ def plot_retrieval_coverage(curve_rows: Sequence[Mapping[str, Any]], output_dir:
         }
 
     fig, ax = plt.subplots(figsize=(7, 5))
-    for method in sorted(by_method, key=_plot_method_draw_order):
+    methods = sorted(by_method, key=_plot_method_draw_order)
+    method_colors = _plot_method_color_map(methods)
+    for method in methods:
         ordered = sorted(by_method[method].items(), key=lambda item: int(item[0]))
         ax.plot(
             [gallery_size for gallery_size, _ in ordered],
@@ -926,6 +970,7 @@ def plot_retrieval_coverage(curve_rows: Sequence[Mapping[str, Any]], output_dir:
             marker="o",
             linewidth=2,
             label=_plot_method_label(method),
+            color=method_colors[method],
         )
 
     ax.set_xscale("log")

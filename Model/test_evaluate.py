@@ -3388,7 +3388,7 @@ def generate_gw_shuffle_comparison_plot(triplet_logits_normal, triplet_logits_sh
     ax.set_ylabel('Density', fontsize=16)
     ax.legend(loc='upper right', fontsize=14, ncol=2)
     ax.set_xlim(0, 1)
-    ax.axvline(x=0.5, color='black', linestyle=':', linewidth=1.5, alpha=0.7)
+    ax.axvline(x=0.5, color='black', linestyle=':', linewidth=2, alpha=0.7)
     ax.grid(True, alpha=0.3, linestyle='--')
     
     fig.tight_layout()
