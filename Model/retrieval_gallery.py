@@ -122,7 +122,12 @@ def resolve_checkpoint_path(checkpoint_path: str, model_type: str) -> str:
     if not path.is_dir():
         raise FileNotFoundError(f"Unsupported checkpoint path: {checkpoint_path}")
 
-    preferred_names = ["optical_only_best.pth", "best.pth"] if model_type == "optical" else ["albef_best.pth", "best.pth"]
+    if model_type == "optical":
+        preferred_names = ["optical_only_best.pth", "best.pth"]
+    elif model_type == "fink_rf":
+        preferred_names = ["model.joblib", "fink_rf.joblib", "best.joblib"]
+    else:
+        preferred_names = ["albef_best.pth", "best.pth"]
     for filename in preferred_names:
         matches = sorted(path.rglob(filename))
         if matches:
@@ -148,23 +153,28 @@ def resolve_checkpoint_path(checkpoint_path: str, model_type: str) -> str:
         if matches:
             return str(matches[0].resolve())
 
-    any_pth = sorted(path.rglob("*.pth"))
-    if any_pth:
-        return str(any_pth[0].resolve())
+    if model_type == "fink_rf":
+        any_joblib = sorted(path.rglob("*.joblib"))
+        if any_joblib:
+            return str(any_joblib[0].resolve())
+    else:
+        any_pth = sorted(path.rglob("*.pth"))
+        if any_pth:
+            return str(any_pth[0].resolve())
 
     raise FileNotFoundError(f"No checkpoint file found under directory: {checkpoint_path}")
 
 
 def build_comparison_model_specs(cfg: Mapping[str, Any], cfg_dir: Path) -> List[Dict[str, Any]]:
     model_specs: List[Dict[str, Any]] = []
-    valid_scoring = {"optical", "logits", "contrastive", "auto", "skymap"}
+    valid_scoring = {"optical", "logits", "contrastive", "auto", "skymap", "fink_rf"}
     for raw_spec in cfg.get("models", []):
         spec = dict(raw_spec)
         spec["name"] = str(spec["name"])
         spec["type"] = str(spec["type"])
-        spec["checkpoint"] = resolve_optional_path(cfg_dir, spec.get("checkpoint"))
+        spec["checkpoint"] = resolve_optional_path(cfg_dir, spec.get("checkpoint", spec.get("model_path")))
         spec["config"] = resolve_optional_path(cfg_dir, spec.get("config"))
-        if spec["type"] in {"optical", "multimodal"} and spec["checkpoint"] is None:
+        if spec["type"] in {"optical", "multimodal", "fink_rf"} and spec["checkpoint"] is None:
             raise ValueError(f"models[{spec['name']}] is missing checkpoint")
         if spec["type"] == "multimodal" and spec["config"] is None:
             raise ValueError(f"Multimodal model '{spec['name']}' requires a config path")
@@ -180,6 +190,8 @@ def build_comparison_model_specs(cfg: Mapping[str, Any], cfg_dir: Path) -> List[
                 spec["scoring"] = "optical"
             elif spec["type"] == "skymap":
                 spec["scoring"] = "skymap"
+            elif spec["type"] == "fink_rf":
+                spec["scoring"] = "fink_rf"
             else:
                 spec["scoring"] = "auto"
         if spec["scoring"] not in valid_scoring:

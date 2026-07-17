@@ -42,6 +42,7 @@ from retrieval_gallery import (  # noqa: E402
     RETRIEVAL_CURVES_FIGSIZE,
     _plot_method_color_map,
     _plot_method_draw_order,
+    plot_retrieval_coverage,
     plot_retrieval_curves,
     score_all_galleries_skymap,
 )
@@ -691,6 +692,28 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             outcomes = base_eval.enrich_gallery_outcomes(ranks, galleries)
             del model
+        elif model_type == "fink_rf":
+            artifact = base_eval.load_fink_rf_bundle(model_spec["resolved_checkpoint"])
+            artifact_cfg = dict(artifact.get("config", {}))
+            if (
+                os.path.realpath(str(artifact_cfg.get("neg_train_path", "")))
+                == os.path.realpath(str(cfg["neg_data_path"]))
+                and str(artifact_cfg.get("neg_train_group", "")) == str(cfg["neg_group"])
+            ):
+                raise ValueError(
+                    "Fink RF leakage guard: the negative training source is also the retrieval gallery source."
+                )
+            chunk_size = int(model_spec.get("chunk_size") or artifact_cfg.get("batch_size", 2048))
+            ranks, fink_diagnostics = base_eval.score_all_galleries_fink_rf(
+                artifact,
+                positive_bank,
+                neg_optical_data,
+                galleries,
+                positive_attrs=base_eval._read_h5_attrs(cfg["test_data_path"]),
+                negative_attrs=base_eval._read_h5_attrs(cfg["neg_data_path"]),
+                chunk_size=chunk_size,
+            )
+            outcomes = base_eval.enrich_gallery_outcomes(ranks, galleries)
         elif model_type == "multimodal":
             model, runtime_model_args, saved_args = base_eval.load_multimodal_bundle(
                 model_spec["resolved_checkpoint"],
@@ -776,6 +799,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         }
         if model_type == "optical":
             model_results[name]["original_model_window"] = original_window
+        elif model_type == "fink_rf":
+            model_results[name]["original_model_window"] = artifact_cfg.get("fit_window_days")
+            model_results[name]["fink_rf_diagnostics"] = fink_diagnostics
         elif model_type == "multimodal":
             model_results[name]["original_model_window"] = [
                 float(runtime_model_args.get("original_ref_start", comparison_window[0])),
@@ -816,7 +842,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     output_dir = Path(cfg["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
     plot_retrieval_curves(curve_rows, output_dir)
+    plot_retrieval_coverage(curve_rows, output_dir)
     plot_redshift_metrics(redshift_rows, output_dir)
+    plot_redshift_coverage(redshift_rows, output_dir)
     write_redshift_csv(redshift_rows, output_dir / "redshift_metrics.csv")
     redshift_macro_rows = aggregate_redshift_macro_metrics(redshift_rows)
     write_redshift_macro_csv(redshift_macro_rows, output_dir / "redshift_macro_metrics_log10_weighted.csv")
@@ -842,6 +870,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "config": spec.get("config"),
                     "resolved_checkpoint": spec.get("resolved_checkpoint"),
                     "resolved_config": spec.get("resolved_config"),
+                    "chunk_size": spec.get("chunk_size"),
                 }
                 for spec in model_specs
             ],

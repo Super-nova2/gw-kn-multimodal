@@ -50,3 +50,5 @@ tests/
 
 # dataset
 dataset/test/
+Model/script/merge_gw170817a_retrieval.py
+Model/script/merge_retrieval_comparison.py

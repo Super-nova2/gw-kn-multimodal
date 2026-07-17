@@ -36,8 +36,19 @@ from tqdm import tqdm
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 MODEL_DIR = SCRIPT_DIR.parent
+WORKSPACE_DIR = MODEL_DIR.parent.parent
 if str(MODEL_DIR) not in sys.path:
     sys.path.insert(0, str(MODEL_DIR))
+FINK_RF_SRC_DIR = WORKSPACE_DIR / "fink-rf-reproduction" / "src"
+if FINK_RF_SRC_DIR.exists() and str(FINK_RF_SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(FINK_RF_SRC_DIR))
+
+try:
+    from fink_rf_repro.features import extract_feature_matrix_from_batch as fink_extract_feature_matrix_from_batch
+    from fink_rf_repro.model_io import load_artifact as load_fink_rf_artifact
+except Exception:  # pragma: no cover - optional standalone baseline dependency
+    fink_extract_feature_matrix_from_batch = None
+    load_fink_rf_artifact = None
 
 from data_loader import (  # noqa: E402
     RelationalHDF5Dataset,
@@ -106,7 +117,6 @@ def _lookup_event_time_mjd(gw_event_time_mjd_table, gw_id: int) -> Optional[floa
         return None
     return float(value)
 TABLE_METRIC_KEYS = ["recall_at_1", "recall_at_5", "recall_at_10", "mrr"]
-WORKSPACE_DIR = MODEL_DIR.parent.parent
 DEFAULT_TUTORIAL_NEG_DATA_PATH = str(
     (WORKSPACE_DIR / "data" / "Optical_Only_dataset" / "Tutorial_negative_dataset.h5").resolve()
 )
@@ -1558,7 +1568,7 @@ def enrich_gallery_outcomes(ranks: Mapping[Tuple[int, int, int], int], galleries
     for key, rank in ranks.items():
         gallery_spec = galleries[key]
         outcomes[key] = {
-            "rank": int(rank),
+            "rank": float(rank),
             "requested_gallery_size": int(gallery_spec.get("requested_gallery_size", key[0])),
             "actual_gallery_size": int(gallery_spec.get("actual_gallery_size", key[0])),
             "coverage_met": bool(gallery_spec.get("coverage_met", True)),
@@ -2066,6 +2076,193 @@ def score_all_galleries_optical(
     return ranks
 
 
+
+def _read_h5_attrs(path: Optional[str]) -> Dict[str, Any]:
+    if not path:
+        return {}
+    with h5py.File(path, "r") as f:
+        out: Dict[str, Any] = {}
+        for key in f.attrs.keys():
+            value = f.attrs[key]
+            if isinstance(value, np.ndarray):
+                out[str(key)] = value.tolist()
+            elif isinstance(value, np.generic):
+                out[str(key)] = value.item()
+            elif isinstance(value, bytes):
+                out[str(key)] = value.decode("utf-8", errors="replace")
+            else:
+                out[str(key)] = value
+    return out
+
+
+def load_fink_rf_bundle(checkpoint_path: str) -> Dict[str, Any]:
+    if load_fink_rf_artifact is None or fink_extract_feature_matrix_from_batch is None:
+        raise ImportError(
+            "Fink RF support requires the standalone package at "
+            f"{FINK_RF_SRC_DIR}. Run from the bgao_kn workspace or install fink-rf-reproduction."
+        )
+    artifact = load_fink_rf_artifact(checkpoint_path)
+    missing = [key for key in ("pipeline", "basis", "config") if key not in artifact]
+    if missing:
+        raise KeyError(f"Fink RF artifact is missing required key(s): {missing}")
+    print(f"  Loaded Fink RF artifact from {checkpoint_path}")
+    return artifact
+
+
+def _bank_tensor_to_numpy(bank: Mapping[str, Any], key_candidates: Sequence[str], indices: np.ndarray) -> np.ndarray:
+    for key in key_candidates:
+        if key in bank:
+            value = bank[key]
+            idx = np.asarray(indices, dtype=np.int64)
+            if isinstance(value, torch.Tensor):
+                idx_tensor = torch.from_numpy(idx).long()
+                return value.index_select(0, idx_tensor).detach().cpu().numpy()
+            return np.asarray(value)[idx]
+    raise KeyError(f"Candidate bank is missing all of these fields: {list(key_candidates)}")
+
+
+def _fink_rf_batch_from_bank(bank: Mapping[str, Any], indices: np.ndarray) -> Dict[str, np.ndarray]:
+    idx = np.asarray(indices, dtype=np.int64).reshape(-1)
+    return {
+        "times": _bank_tensor_to_numpy(bank, ("opt_t_raw", "times"), idx).astype(np.float32, copy=False),
+        "values": _bank_tensor_to_numpy(bank, ("opt_v_raw", "values"), idx).astype(np.float32, copy=False),
+        "masks": _bank_tensor_to_numpy(bank, ("opt_mask_raw", "masks"), idx).astype(np.float32, copy=False),
+        "errors": _bank_tensor_to_numpy(bank, ("opt_err_raw", "errors"), idx).astype(np.float32, copy=False),
+    }
+
+
+def score_fink_rf_candidate_bank(
+    artifact: Mapping[str, Any],
+    candidate_bank: Mapping[str, Any],
+    candidate_indices: np.ndarray,
+    attrs: Mapping[str, Any],
+    *,
+    chunk_size: Optional[int] = None,
+) -> Tuple[Dict[int, float], Dict[int, bool], Dict[str, Any]]:
+    indices = np.unique(np.asarray(candidate_indices, dtype=np.int64).reshape(-1))
+    if indices.size == 0:
+        return {}, {}, {"n_rows": 0, "n_valid": 0, "valid_fraction": 0.0}
+    cfg = dict(artifact.get("config", {}))
+    basis = artifact["basis"]
+    pipeline = artifact["pipeline"]
+    bs = int(chunk_size or cfg.get("batch_size", 2048))
+    fit_window = tuple(cfg.get("fit_window_days", (-50.0, 50.0)))
+    min_band_points = int(cfg.get("min_band_points", 2))
+    min_fmax_psfflux = None if cfg.get("min_fmax_psfflux") is None else float(cfg.get("min_fmax_psfflux"))
+    fmax_threshold_source = str(cfg.get("fmax_threshold_source", "lsst_m5"))
+    fmax_threshold_scale = float(cfg.get("fmax_threshold_scale", 1.0))
+    default_time_scale = float(cfg.get("default_time_scale_divisor_days", 100.0))
+    min_valid_bands = int(cfg.get("min_valid_bands", 1))
+    coefficient_bound = float(cfg.get("coefficient_bound", 2.0))
+
+    score_map: Dict[int, float] = {}
+    valid_map: Dict[int, bool] = {}
+    n_valid = 0
+    band_counts: Dict[str, int] = {str(band): 0 for band in getattr(basis, "bands", [])}
+    for start in tqdm(range(0, indices.size, bs), desc="  Scoring Fink RF candidates", leave=False):
+        chunk = indices[start:start + bs]
+        batch = _fink_rf_batch_from_bank(candidate_bank, chunk)
+        X, valid, counts = fink_extract_feature_matrix_from_batch(
+            batch,
+            attrs,
+            basis=basis,
+            fit_window_days=fit_window,
+            min_band_points=min_band_points,
+            min_fmax_psfflux=min_fmax_psfflux,
+            fmax_threshold_source=fmax_threshold_source,
+            fmax_threshold_scale=fmax_threshold_scale,
+            default_time_scale_divisor_days=default_time_scale,
+            min_valid_bands=min_valid_bands,
+            coefficient_bound=coefficient_bound,
+        )
+        probs = pipeline.predict_proba(X)[:, 1].astype(np.float64, copy=False)
+        probs = np.where(valid, probs, -np.inf)
+        for row_idx, prob, ok in zip(chunk.tolist(), probs.tolist(), valid.tolist()):
+            score_map[int(row_idx)] = float(prob)
+            valid_map[int(row_idx)] = bool(ok)
+        n_valid += int(np.asarray(valid, dtype=bool).sum())
+        for band, count in counts["band_valid_counts"].items():
+            band_counts[str(band)] = int(band_counts.get(str(band), 0) + int(count))
+    diagnostics = {
+        "n_rows": int(indices.size),
+        "n_valid": int(n_valid),
+        "valid_fraction": float(n_valid / max(1, int(indices.size))),
+        "band_valid_counts": band_counts,
+        "band_valid_fraction": {band: float(count / max(1, int(indices.size))) for band, count in band_counts.items()},
+    }
+    return score_map, valid_map, diagnostics
+
+
+def _collect_gallery_negative_indices(galleries: Mapping[Tuple[int, int, int], Mapping[str, Any]]) -> np.ndarray:
+    parts = []
+    for spec in galleries.values():
+        neg = np.asarray(spec.get("negative_indices", []), dtype=np.int64).reshape(-1)
+        if neg.size:
+            parts.append(neg)
+    if not parts:
+        return np.empty((0,), dtype=np.int64)
+    return np.unique(np.concatenate(parts, axis=0).astype(np.int64, copy=False))
+
+
+def score_all_galleries_fink_rf(
+    artifact: Mapping[str, Any],
+    positive_bank: Mapping[str, Any],
+    negative_bank: Mapping[str, Any],
+    galleries: Mapping[Tuple[int, int, int], Mapping[str, Any]],
+    *,
+    positive_attrs: Mapping[str, Any],
+    negative_attrs: Mapping[str, Any],
+    chunk_size: Optional[int] = None,
+) -> Tuple[Dict[Tuple[int, int, int], int], Dict[str, Any]]:
+    positive_indices = np.unique(
+        np.asarray([int(spec["positive_index"]) for spec in galleries.values()], dtype=np.int64)
+    )
+    negative_indices = _collect_gallery_negative_indices(galleries)
+    pos_scores, pos_valid, pos_diag = score_fink_rf_candidate_bank(
+        artifact,
+        positive_bank,
+        positive_indices,
+        positive_attrs,
+        chunk_size=chunk_size,
+    )
+    neg_scores, neg_valid, neg_diag = score_fink_rf_candidate_bank(
+        artifact,
+        negative_bank,
+        negative_indices,
+        negative_attrs,
+        chunk_size=chunk_size,
+    )
+
+    ranks: Dict[Tuple[int, int, int], float] = {}
+    positive_invalid = 0
+    negative_invalid = 0
+    for key, gallery_spec in tqdm(galleries.items(), desc="  Ranking Fink RF galleries"):
+        pos_index = int(gallery_spec["positive_index"])
+        neg_indices = np.asarray(gallery_spec.get("negative_indices", []), dtype=np.int64).reshape(-1)
+        pos_score = float(pos_scores.get(pos_index, -np.inf))
+        pos_is_valid = bool(pos_valid.get(pos_index, False))
+        if not pos_is_valid:
+            positive_invalid += 1
+        neg_values = []
+        for neg_index in neg_indices.tolist():
+            neg_values.append(float(neg_scores.get(int(neg_index), -np.inf)))
+            if not bool(neg_valid.get(int(neg_index), False)):
+                negative_invalid += 1
+        neg_array = np.asarray(neg_values, dtype=np.float64)
+        ranks[key] = (
+            float(neg_indices.size)
+            if not pos_is_valid
+            else float(np.sum(neg_array > pos_score) + 0.5 * np.sum(neg_array == pos_score))
+        )
+    diagnostics = {
+        "positive": pos_diag,
+        "negative": neg_diag,
+        "positive_invalid_gallery_count": int(positive_invalid),
+        "negative_invalid_candidate_count": int(negative_invalid),
+    }
+    return ranks, diagnostics
+
+
 def aggregate_metrics(ranks, gallery_sizes, n_trials, unique_gw, *, gw_source_map=None):
     """Convert per-gallery ranks to Recall@K and MRR metrics."""
     metrics: Dict[str, float] = {}
@@ -2079,7 +2276,7 @@ def aggregate_metrics(ranks, gallery_sizes, n_trials, unique_gw, *, gw_source_ma
                 key = (int(gallery_size), int(trial), int(gw_id))
                 if key not in ranks:
                     continue
-                rank = int(ranks[key])
+                rank = float(ranks[key])
                 for k in recalls:
                     recalls[k].append(1.0 if rank < k else 0.0)
                 mrrs.append(1.0 / float(rank + 1))
@@ -2979,6 +3176,50 @@ def main():
                 "effective_input_window_metadata": runtime_model_args.get("effective_input_window_metadata"),
             }
             del negative_embeddings, embeddings, model
+        elif model_type == "fink_rf":
+            artifact = load_fink_rf_bundle(model_spec["resolved_checkpoint"])
+            artifact_cfg = dict(artifact.get("config", {}))
+            if (
+                os.path.realpath(str(artifact_cfg.get("neg_train_path", ""))) == os.path.realpath(str(cfg["neg_data_path"]))
+                and str(artifact_cfg.get("neg_train_group", "")) == str(cfg["neg_group"])
+            ):
+                raise ValueError(
+                    "Fink RF leakage guard: the negative training source is also the retrieval gallery source."
+                )
+            fink_chunk_size = int(model_spec.get("chunk_size") or artifact.get("config", {}).get("batch_size", 2048))
+            ranks, fink_diagnostics = score_all_galleries_fink_rf(
+                artifact,
+                positive_query_bank,
+                neg_optical_data,
+                galleries,
+                positive_attrs=_read_h5_attrs(cfg["test_data_path"]),
+                negative_attrs=_read_h5_attrs(cfg["neg_data_path"]),
+                chunk_size=fink_chunk_size,
+            )
+            outcomes = enrich_gallery_outcomes(ranks, galleries)
+            retrieval_metrics, retrieval_by_source, coverage_stats = aggregate_gallery_outcomes(
+                outcomes=outcomes,
+                gallery_sizes=gallery_sizes,
+                n_trials=n_trials,
+                unique_gw=unique_gw,
+                gw_source_map=gw_source_map if gw_source_map else None,
+            )
+            model_results[name] = {
+                "type": model_type,
+                "scoring": "fink_rf",
+                "resolved_checkpoint": model_spec["resolved_checkpoint"],
+                "resolved_config": model_spec.get("resolved_config"),
+                "original_model_window": artifact.get("config", {}).get("fit_window_days"),
+                "comparison_window": list(comparison_window),
+                "retrieval": retrieval_metrics,
+                "retrieval_by_source": retrieval_by_source,
+                "coverage": {key: float(val.get("coverage", 0.0)) for key, val in coverage_stats.items()},
+                "effective_gallery_size_stats": coverage_stats,
+                "classification_supported": False,
+                "classification": None,
+                "classification_by_source": {},
+                "fink_rf_diagnostics": fink_diagnostics,
+            }
         elif model_type == "skymap":
             if not _gallery_mode_supports_skymap_only(gallery_candidate_mode):
                 raise ValueError(
