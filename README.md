@@ -33,10 +33,9 @@ gw-kn-multimodal/
 │       ├── data/                       # 数据集构建
 │       └── hpo/                        # 超参数优化
 ├── optical_only/
-│   ├── create_optical_only_datasets.py # optical-only 数据集构建
-│   ├── train_optical_only.py/.sh       # optical-only 训练与自动评估
-│   ├── test_evaluate_optical_only.py   # optical-only 评估
-│   └── args/                           # optical-only 配置
+│   ├── args/                           # 当前配置模板与历史配置
+│   ├── scripts/                        # train / eval / data / analysis / plot
+│   └── notebooks/                      # optical-only 分析 notebook
 ├── dataset/
 │   ├── O5_sim_*                        # 模拟事件与分析材料
 │   └── KN_sim/                         # SNANA / OpSim 工作流脚本
@@ -166,27 +165,27 @@ cd <BASE_DIR>/gw-kn-multimodal
 DATASET_MODE=train \
 BUILD_POSITIVE=true \
 BUILD_NEGATIVE=true \
-bash optical_only/submit_create_optical_only_datasets.sh
+bash optical_only/scripts/data/submit_create_datasets.sh
 ```
 
 主脚本：
 
-- `optical_only/submit_create_optical_only_datasets.sh`
-- `optical_only/create_optical_only_datasets.py`
+- `optical_only/scripts/data/submit_create_datasets.sh`
+- `optical_only/scripts/data/create_datasets.py`
 
 ### 5. 训练 optical-only 基线
 
 ```bash
 cd <BASE_DIR>/gw-kn-multimodal
 
-bash optical_only/train_optical_only.sh optical_only/args/optical_only_kn_v14.json
+bash optical_only/scripts/train/train.sh optical_only/args/optical_only_kn_v16.json
 ```
 
 相关文件：
 
-- `optical_only/train_optical_only.py`
-- `optical_only/test_evaluate_optical_only.py`
-- `optical_only/args/optical_only_kn_v14.json`
+- `optical_only/scripts/train/train.py`
+- `optical_only/scripts/eval/evaluate.py`
+- `optical_only/args/optical_only_kn_v16.json`
 
 该脚本训练结束后会自动调用 optical-only 评估脚本。
 
@@ -225,7 +224,7 @@ bash optical_only/train_optical_only.sh optical_only/args/optical_only_kn_v14.js
 本仓库不包含训练数据和大型模拟文件。数据集需通过以下方式获取：
 
 - **GW 模拟事件**：使用 `dataset/KN_sim/` 下的脚本配合 SNANA/OpSim 生成。
-- **训练 HDF5**：使用 `Model/scripts/data/create_dataset_bns_nsbh.py` 和 `optical_only/create_optical_only_datasets.py` 从模拟数据构建。
+- **训练 HDF5**：使用 `Model/scripts/data/create_dataset_bns_nsbh.py` 和 `optical_only/scripts/data/create_datasets.py` 从模拟数据构建。
 - 如需预构建数据集，请联系作者。
 
 ## Citation

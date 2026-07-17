@@ -5,8 +5,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 from typing import Any, Dict
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+MODEL_DIR = SCRIPT_DIR.parents[1]
+if str(MODEL_DIR) not in sys.path:
+    sys.path.insert(0, str(MODEL_DIR))
 
 from scripts.eval.eval_retrieval_comparison import (
     aggregate_redshift_macro_metrics,
@@ -16,7 +22,6 @@ from scripts.eval.eval_retrieval_comparison import (
     write_redshift_macro_csv,
 )
 from retrieval_gallery import plot_retrieval_curves
-
 
 GALLERY_CONFIG_KEYS = (
     "seed",
@@ -31,11 +36,9 @@ GALLERY_CONFIG_KEYS = (
     "negative_sample_strategy",
 )
 
-
 def _load(path: Path) -> Dict[str, Any]:
     with path.open("r", encoding="utf-8") as handle:
         return json.load(handle)
-
 
 def _assert_same_galleries(base: Dict[str, Any], supplement: Dict[str, Any]) -> None:
     for key in GALLERY_CONFIG_KEYS:
@@ -44,7 +47,6 @@ def _assert_same_galleries(base: Dict[str, Any], supplement: Dict[str, Any]) -> 
     for key in ("gallery_positive_summary", "selected_positive_summary"):
         if base.get(key) != supplement.get(key):
             raise ValueError(f"Gallery realization mismatch for {key!r}.")
-
 
 def merge_results(base_path: Path, supplement_path: Path, output_dir: Path) -> Path:
     base = _load(base_path)
@@ -91,7 +93,6 @@ def merge_results(base_path: Path, supplement_path: Path, output_dir: Path) -> P
         plot_redshift_macro_metrics(merged["redshift_macro_rows"], output_dir)
     return output_path
 
-
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base", type=Path, required=True)
@@ -99,7 +100,6 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, required=True)
     args = parser.parse_args()
     print(merge_results(args.base.resolve(), args.supplement.resolve(), args.output_dir.resolve()))
-
 
 if __name__ == "__main__":
     main()

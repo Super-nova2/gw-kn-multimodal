@@ -7,7 +7,7 @@
   "eval_neg_data_path": "<BASE_DIR>/data/Optical_Only_dataset/Tutorial_negative_dataset.h5",
   "eval_neg_group": "Tutorial/optical_data",
   "ckpt_path": "<BASE_DIR>/data/model/checkpoints_optical/",
-  "pretrained_albef_ckpt": "<BASE_DIR>/data/model/checkpoints_bns_nsbh/bns_nsbh_v8/ALBEF/albef_best.pth",
+  "pretrained_albef_ckpt": "<BASE_DIR>/data/model/checkpoints_bns_nsbh/bns_nsbh_full/ALBEF/albef_best.pth",
   "stage_to_jobfs": true,
   "cache_in_memory": false,
   "universal_train_enable": true,
@@ -32,6 +32,8 @@
   "ref_end": 0.2,
   "ref_dim": 64,
   "enc_dim": 128,
+  "optical_curve_dim": 192,
+  "optical_curve_hidden_dim": 256,
   "opt_dropout": 0.1,
   "feature_dropout": 0.05,
   "head_hidden_dim": 128,
@@ -94,5 +96,5 @@
   "offset_seed": 42,
   "offset_bank_size": 1000000,
   "template_status": "v16_simplified_single_view",
-  "template_note": "Simplified v16: ALBEF-initialized optical encoder, single-view prefix fine-tuning, no dual-view consistency, no adversarial heads/GRL."
+  "template_note": "Simplified v16: current MAGIKS full-checkpoint optical encoder initialization, single-view prefix fine-tuning, no dual-view consistency, no adversarial heads/GRL."
 }

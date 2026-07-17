@@ -173,6 +173,8 @@ if [[ -z "${SLURM_JOB_ID:-}" ]]; then
         sbatch_opts+=(--chdir="${CHDIR}")
     fi
 
+    sbatch_opts+=(--export=ALL)
+
     echo "Submitting job with: sbatch ${sbatch_opts[*]} ${script_path}"
     sbatch "${sbatch_opts[@]}" "${script_path}"
     exit 0

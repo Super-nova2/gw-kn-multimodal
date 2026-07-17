@@ -33,10 +33,9 @@ gw-kn-multimodal/
 │       ├── data/                     # Dataset construction
 │       └── hpo/                      # Hyperparameter optimisation
 ├── optical_only/
-│   ├── create_optical_only_datasets.py   # optical-only dataset construction
-│   ├── train_optical_only.py / .sh       # optical-only training and auto-evaluation
-│   ├── test_evaluate_optical_only.py     # optical-only evaluation
-│   └── args/                             # optical-only configurations
+│   ├── args/                             # current templates and archived configs
+│   ├── scripts/                          # train / eval / data / analysis / plot
+│   └── notebooks/                        # optical-only analysis notebooks
 ├── dataset/
 │   ├── O5_sim_*                      # Simulated events and analysis materials
 │   └── KN_sim/                       # SNANA / OpSim workflow scripts
@@ -166,27 +165,27 @@ cd /path/to/gw-kn-multimodal
 DATASET_MODE=train \
 BUILD_POSITIVE=true \
 BUILD_NEGATIVE=true \
-bash optical_only/submit_create_optical_only_datasets.sh
+bash optical_only/scripts/data/submit_create_datasets.sh
 ```
 
 Relevant files:
 
-- `optical_only/submit_create_optical_only_datasets.sh`
-- `optical_only/create_optical_only_datasets.py`
+- `optical_only/scripts/data/submit_create_datasets.sh`
+- `optical_only/scripts/data/create_datasets.py`
 
 ### 5. Train the Optical-Only Baseline
 
 ```bash
 cd /path/to/gw-kn-multimodal
 
-bash optical_only/train_optical_only.sh optical_only/args/optical_only_kn_v14.json
+bash optical_only/scripts/train/train.sh optical_only/args/optical_only_kn_v16.json
 ```
 
 Relevant files:
 
-- `optical_only/train_optical_only.py`
-- `optical_only/test_evaluate_optical_only.py`
-- `optical_only/args/optical_only_kn_v14.json`
+- `optical_only/scripts/train/train.py`
+- `optical_only/scripts/eval/evaluate.py`
+- `optical_only/args/optical_only_kn_v16.json`
 
 The script automatically invokes the optical-only evaluation after training completes.
 
@@ -227,7 +226,7 @@ Copy an existing JSON and edit the following fields:
 This repository does not include training data or large simulation files. Datasets can be obtained by:
 
 - **GW simulated events**: Generate using scripts under `dataset/KN_sim/` with SNANA/OpSim.
-- **Training HDF5**: Build from simulation data using `Model/scripts/data/create_dataset_bns_nsbh.py` and `optical_only/create_optical_only_datasets.py`.
+- **Training HDF5**: Build from simulation data using `Model/scripts/data/create_dataset_bns_nsbh.py` and `optical_only/scripts/data/create_datasets.py`.
 - For pre-built datasets, please contact the authors.
 
 ## Citation
