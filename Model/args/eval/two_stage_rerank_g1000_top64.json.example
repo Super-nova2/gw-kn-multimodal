@@ -1,0 +1,37 @@
+{
+  "stage1_model": {
+    "name": "No Hard Mining",
+    "checkpoint": "<BASE_DIR>/data/model/checkpoints_bns_nsbh/bns_nsbh_ablation_no_hard_mining",
+    "config": "<REPO_ROOT>/Model/args/MAGIKS_BNS_NSBH_no_hard_mining.json"
+  },
+  "stage2_model": {
+    "name": "Full Hard Mining",
+    "checkpoint": "<BASE_DIR>/data/model/checkpoints_bns_nsbh/bns_nsbh_full_hard_mining",
+    "config": "<REPO_ROOT>/Model/args/MAGIKS_BNS_NSBH_full.json"
+  },
+  "gallery_size": 1000,
+  "rerank_topk": 64,
+  "test_data_path": "<BASE_DIR>/data/ALBEF_dataset/combined_dataset_astro_test.h5",
+  "neg_data_path": "<BASE_DIR>/data/Optical_Negative_dataset/ELASTICC_negative_dataset.h5",
+  "neg_group": "ELASTICC/optical_data",
+  "output_dir": "<REPO_ROOT>/Model/eval_results/two_stage_rerank_g1000_top64",
+  "positive_selection": "random",
+  "gallery_trials": 10,
+  "gallery_candidate_mode": "synthetic_time_sky_hard",
+  "gallery_candidate_time_window_days": 30.0,
+  "gallery_candidate_credible_level_max": 0.9,
+  "gallery_include_undersized": true,
+  "n_neg_samples": 500000,
+  "seed": 42,
+  "batch_size": 512,
+  "num_workers": 2,
+  "device": "cuda",
+  "amp_dtype": "bf16",
+  "opt_ref_start": -0.1,
+  "opt_ref_end": 0.2,
+  "force_tutorial_distractors": false,
+  "nonkn_cls_base_field": "zero_time_mjd_cls_base",
+  "negative_sample_strategy": "block_random",
+  "negative_sample_shuffle": true,
+  "stage_to_jobfs": true
+}

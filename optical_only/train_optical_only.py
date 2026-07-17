@@ -1367,7 +1367,7 @@ def train(args):
             raise FileNotFoundError(f"Pretrained checkpoint not found: {args.pretrained_albef_ckpt}")
         ckpt = torch.load(args.pretrained_albef_ckpt, map_location=device)
         state_dict = ckpt.get("model_state_dict", ckpt)
-        missing, unexpected = model.load_optical_encoder_from_albef_state_dict(state_dict, strict=False)
+        missing, unexpected = model.load_optical_encoder_from_magiks_state_dict(state_dict, strict=False)
         init_info = dict(getattr(model, "optical_encoder_init_info", {}) or {})
         init_info.update(
             {
@@ -1377,7 +1377,7 @@ def train(args):
         )
         args._init_source_metadata = init_info
         print(
-            "Loaded optical encoder from ALBEF checkpoint "
+            "Loaded optical encoder from MAGIKS/legacy ALBEF checkpoint "
             f"(missing={len(missing)}, unexpected={len(unexpected)})."
         )
         print(f"Optical init metadata: {json.dumps(args._init_source_metadata, indent=2)}")

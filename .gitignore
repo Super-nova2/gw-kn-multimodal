@@ -31,10 +31,7 @@ hpo_results/
 # User-local JSON configs (track .json.example templates only)
 *.json
 !*.json.example
-!Model/args/eval/retrieval_gw170817a_lsst.json
-!Model/args/eval/retrieval_gw170817a_lsst_balanced.json
-Model/args/eval/retrieval_gw170817a_lsst.json
-Model/args/eval/retrieval_gw170817a_lsst_balanced.json
+archive/
 
 # Generated exports
 *.html
@@ -44,11 +41,8 @@ docs/
 PRD/
 docs/superpowers/
 
-# test 
+# Local scratch files
 tmp/
-tests/
 
 # dataset
 dataset/test/
-Model/script/merge_gw170817a_retrieval.py
-Model/script/merge_retrieval_comparison.py

@@ -15,7 +15,7 @@ from retrieval_gallery import (
     build_synthetic_time_sky_candidate_sequences,
     compute_source_macro_and_gap,
 )
-from script.eval_retrieval_comparison import (
+from scripts.eval.eval_retrieval_comparison import (
     enrich_gallery_outcomes,
     extract_negative_gallery_embeddings,
     extract_optical_candidate_embeddings,
@@ -24,7 +24,7 @@ from script.eval_retrieval_comparison import (
     score_all_galleries_contrastive,
     score_all_galleries_multimodal,
 )
-from test_evaluate import load_negative_optical_samples
+from scripts.eval.evaluate import load_negative_optical_samples
 
 
 SUPPORTED_VALIDATION_GALLERY_MODE = "synthetic_time_sky_hard"

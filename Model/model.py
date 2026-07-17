@@ -1338,7 +1338,7 @@ class GWOpticalContrastiveModel(nn.Module):
         return total_loss, sim_g2o
 
 # ==============================================================================
-# 8. Fusion Branch and Joint ALBEF-Style Model
+# 8. Fusion Branch and Joint MAGIKS Model
 # ==============================================================================
 class CrossAttentionFusion(nn.Module):
     """
@@ -1567,7 +1567,7 @@ class ConcatProjectionFusion(nn.Module):
         return False
 
 
-class GWOpticalALBEFModel(nn.Module):
+class MAGIKSModel(nn.Module):
     """
     Joint model for alignment (contrastive) and fusion (classification).
     """
@@ -2500,9 +2500,9 @@ class OpticalKNClassifier(nn.Module):
         for p in self.optical_encoder.parameters():
             p.requires_grad = bool(trainable)
 
-    def load_optical_encoder_from_albef_state_dict(self, state_dict, strict=False):
+    def load_optical_encoder_from_magiks_state_dict(self, state_dict, strict=False):
         """
-        Load only optical encoder weights from an ALBEF checkpoint state_dict.
+        Load only optical encoder weights from a MAGIKS or legacy ALBEF checkpoint state_dict.
         """
         if not isinstance(state_dict, dict):
             raise TypeError("state_dict must be a dict.")

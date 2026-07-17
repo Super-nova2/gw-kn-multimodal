@@ -1,0 +1,13 @@
+{
+  "checkpoint": "<BASE_DIR>/data/model/checkpoints_bns_nsbh/bns_nsbh_full/ALBEF/albef_best.pth",
+  "model_config": "<REPO_ROOT>/Model/args/MAGIKS_BNS_NSBH_full.json",
+  "data_path": "<BASE_DIR>/data/ALBEF_dataset/combined_dataset_astro_test.h5",
+  "output_dir": "<REPO_ROOT>/Model/eval_results/model_speed",
+  "batch_sizes": [1, 8, 32, 128, 256, 512, 1024],
+  "precision_modes": ["fp32", "amp"],
+  "warmup_iterations": 20,
+  "measure_iterations": 100,
+  "seed": 42,
+  "device": "cuda",
+  "nonkn_cls_base_field": "zero_time_mjd_cls_base"
+}

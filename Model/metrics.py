@@ -1,5 +1,5 @@
 """
-Evaluation metrics for the GW-KN ALBEF model.
+Evaluation metrics for the GW-KN MAGIKS model.
 
 Three categories:
     1. Retrieval metrics (contrastive/ITC branch): Recall@K, MRR, mAP

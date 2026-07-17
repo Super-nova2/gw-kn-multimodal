@@ -17,21 +17,21 @@
 - BNS / NSBH 模拟事件及其对应的 kilonova 光变。
 - GW 标量参数与 skymap 表示。
 - 基于 luptitude、first-detection 对齐和时间偏移建模的光学序列表示。
-- 多模态 ALBEF / 对比学习训练，以及 optical-only 分类基线。
+- 多模态 MAGIKS / 对比学习训练，以及 optical-only 分类基线。
 
 ## 目录结构
 
 ```text
 gw-kn-multimodal/
 ├── Model/
-│   ├── ALBEF_train.py/.sh              # 多模态训练主入口
 │   ├── data_loader.py                  # HDF5 读取与采样器
-│   ├── model.py                        # GW / optical 编码器与分类头
-│   ├── args/                           # 训练与 HPO 配置
-│   └── script/
-│       ├── create_dataset_bns_nsbh.py
-│       ├── submit_create_dataset_bns_nsbh.sh
-│       └── submit_test_evaluate.sh
+│   ├── model.py                        # MAGIKS 模型与编码器
+│   ├── args/                           # 当前配置与可移植模板
+│   └── scripts/
+│       ├── train/                      # 训练入口
+│       ├── eval/                       # 评估、检索与测速
+│       ├── data/                       # 数据集构建
+│       └── hpo/                        # 超参数优化
 ├── optical_only/
 │   ├── create_optical_only_datasets.py # optical-only 数据集构建
 │   ├── train_optical_only.py/.sh       # optical-only 训练与自动评估
@@ -77,10 +77,10 @@ export BASE_DIR=/your/data/root
 首次使用时，复制模板并替换占位符：
 
 ```bash
-# 复制并替换路径
-cd Model/args
-for f in *.json.example; do
-    sed 's|<BASE_DIR>|'"$BASE_DIR"'|g' "$f" > "${f%.example}"
+cd <BASE_DIR>/gw-kn-multimodal
+REPO_ROOT="$(pwd)"
+find Model/args -name '*.json.example' -print0 | while IFS= read -r -d '' f; do
+    sed -e "s|<BASE_DIR>|$BASE_DIR|g" -e "s|<REPO_ROOT>|$REPO_ROOT|g" "$f" > "${f%.example}"
 done
 
 # optical_only/args/ 和 dataset/KN_sim/ 下同理
@@ -95,6 +95,8 @@ done
 | 模型 checkpoint | `$BASE_DIR/data/model/` |
 | skymap / SNANA 数据 | `$BASE_DIR/data/` 和 `$BASE_DIR/SNANA/` |
 
+`ALBEF_dataset` 是现有外部数据存储路径，为兼容既有 HDF5 本轮不重命名。
+
 ## 常用工作流
 
 ### 1. 构建 GW + Optical 联合数据集
@@ -105,7 +107,7 @@ done
 cd <BASE_DIR>/gw-kn-multimodal
 
 PROFILE=final_train DATASET_MODE=train \
-bash Model/script/submit_create_dataset_bns_nsbh.sh
+bash Model/scripts/data/submit_create_dataset_bns_nsbh.sh
 ```
 
 常用环境变量：
@@ -117,8 +119,8 @@ bash Model/script/submit_create_dataset_bns_nsbh.sh
 
 主脚本：
 
-- `Model/script/submit_create_dataset_bns_nsbh.sh`
-- `Model/script/create_dataset_bns_nsbh.py`
+- `Model/scripts/data/submit_create_dataset_bns_nsbh.sh`
+- `Model/scripts/data/create_dataset_bns_nsbh.py`
 
 ### 2. 训练多模态 GW + Optical 模型
 
@@ -127,15 +129,15 @@ bash Model/script/submit_create_dataset_bns_nsbh.sh
 ```bash
 cd <BASE_DIR>/gw-kn-multimodal
 
-bash Model/ALBEF_train.sh Model/args/ALBEF_BNS_NSBH.json
+bash Model/scripts/train/train.sh Model/args/MAGIKS_BNS_NSBH_full.json
 ```
 
 相关文件：
 
-- `Model/ALBEF_train.py`
+- `Model/scripts/train/train.py`
 - `Model/model.py`
 - `Model/data_loader.py`
-- `Model/args/ALBEF_BNS_NSBH.json`
+- `Model/args/MAGIKS_BNS_NSBH_full.json`
 
 训练脚本会从 JSON 中读取数据路径、负样本路径、时间偏移设置、模型超参数和 checkpoint 目录。
 
@@ -144,13 +146,13 @@ bash Model/ALBEF_train.sh Model/args/ALBEF_BNS_NSBH.json
 ```bash
 cd <BASE_DIR>/gw-kn-multimodal
 
-bash Model/script/submit_test_evaluate.sh /path/to/eval_args.json
+bash Model/scripts/eval/submit_test_evaluate.sh /path/to/eval_args.json
 ```
 
 评估入口：
 
-- `Model/test_evaluate.py`
-- `Model/script/submit_test_evaluate.sh`
+- `Model/scripts/eval/evaluate.py`
+- `Model/scripts/eval/submit_test_evaluate.sh`
 
 支持检索、分类、OOD 监控和负样本时间偏移评估。
 
@@ -223,7 +225,7 @@ bash optical_only/train_optical_only.sh optical_only/args/optical_only_kn_v14.js
 本仓库不包含训练数据和大型模拟文件。数据集需通过以下方式获取：
 
 - **GW 模拟事件**：使用 `dataset/KN_sim/` 下的脚本配合 SNANA/OpSim 生成。
-- **训练 HDF5**：使用 `Model/script/create_dataset_bns_nsbh.py` 和 `optical_only/create_optical_only_datasets.py` 从模拟数据构建。
+- **训练 HDF5**：使用 `Model/scripts/data/create_dataset_bns_nsbh.py` 和 `optical_only/create_optical_only_datasets.py` 从模拟数据构建。
 - 如需预构建数据集，请联系作者。
 
 ## Citation

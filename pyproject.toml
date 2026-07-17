@@ -75,6 +75,9 @@ dependencies = [
     "colorlog>=6.10",
 ]
 
+[project.optional-dependencies]
+dev = ["pytest>=7", "ruff", "black"]
+
 [tool.uv]
 index-strategy = "unsafe-best-match"
 

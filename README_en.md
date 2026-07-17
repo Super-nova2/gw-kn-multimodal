@@ -17,21 +17,21 @@ The core research objects include:
 - BNS / NSBH simulated events and their corresponding kilonova light curves.
 - GW scalar parameters and skymap representations.
 - Optical sequence representations based on luptitude, first-detection alignment, and time-offset modelling.
-- Multimodal ALBEF / contrastive learning training, and an optical-only classification baseline.
+- Multimodal MAGIKS / contrastive learning training, and an optical-only classification baseline.
 
 ## Repository Structure
 
 ```text
 gw-kn-multimodal/
 ├── Model/
-│   ├── ALBEF_train.py / .sh          # Multimodal training entry point
-│   ├── data_loader.py                # HDF5 reading and sampler
-│   ├── model.py                      # GW / optical encoders and classification head
-│   ├── args/                         # Training and HPO configurations
-│   └── script/
-│       ├── create_dataset_bns_nsbh.py
-│       ├── submit_create_dataset_bns_nsbh.sh
-│       └── submit_test_evaluate.sh
+│   ├── data_loader.py                # HDF5 reading and samplers
+│   ├── model.py                      # MAGIKS model and encoders
+│   ├── args/                         # Current configs and portable templates
+│   └── scripts/
+│       ├── train/                    # Training entry points
+│       ├── eval/                     # Evaluation, retrieval, and benchmarks
+│       ├── data/                     # Dataset construction
+│       └── hpo/                      # Hyperparameter optimisation
 ├── optical_only/
 │   ├── create_optical_only_datasets.py   # optical-only dataset construction
 │   ├── train_optical_only.py / .sh       # optical-only training and auto-evaluation
@@ -77,9 +77,10 @@ Configuration files use a template pattern:
 On first use, copy templates and substitute your path:
 
 ```bash
-cd Model/args
-for f in *.json.example; do
-    sed 's|<BASE_DIR>|'"$BASE_DIR"'|g' "$f" > "${f%.example}"
+cd /path/to/gw-kn-multimodal
+REPO_ROOT="$(pwd)"
+find Model/args -name '*.json.example' -print0 | while IFS= read -r -d '' f; do
+    sed -e "s|<BASE_DIR>|$BASE_DIR|g" -e "s|<REPO_ROOT>|$REPO_ROOT|g" "$f" > "${f%.example}"
 done
 
 # Repeat for optical_only/args/ and dataset/KN_sim/
@@ -94,6 +95,8 @@ done
 | Checkpoints | `$BASE_DIR/data/model/` |
 | Skymap / SNANA data | `$BASE_DIR/data/` and `$BASE_DIR/SNANA/` |
 
+`ALBEF_dataset` is the existing external data location and remains unchanged for HDF5 compatibility.
+
 ## Workflows
 
 ### 1. Build GW + Optical Dataset
@@ -104,7 +107,7 @@ Organises BNS / NSBH GW parameters, skymaps, and optical light curves into a sin
 cd /path/to/gw-kn-multimodal
 
 PROFILE=final_train DATASET_MODE=train \
-bash Model/script/submit_create_dataset_bns_nsbh.sh
+bash Model/scripts/data/submit_create_dataset_bns_nsbh.sh
 ```
 
 Key environment variables:
@@ -118,23 +121,23 @@ Key environment variables:
 
 Relevant files:
 
-- `Model/script/submit_create_dataset_bns_nsbh.sh`
-- `Model/script/create_dataset_bns_nsbh.py`
+- `Model/scripts/data/submit_create_dataset_bns_nsbh.sh`
+- `Model/scripts/data/create_dataset_bns_nsbh.py`
 
 ### 2. Train the Multimodal GW + Optical Model
 
 ```bash
 cd /path/to/gw-kn-multimodal
 
-bash Model/ALBEF_train.sh Model/args/ALBEF_BNS_NSBH.json
+bash Model/scripts/train/train.sh Model/args/MAGIKS_BNS_NSBH_full.json
 ```
 
 Relevant files:
 
-- `Model/ALBEF_train.py`
+- `Model/scripts/train/train.py`
 - `Model/model.py`
 - `Model/data_loader.py`
-- `Model/args/ALBEF_BNS_NSBH.json`
+- `Model/args/MAGIKS_BNS_NSBH_full.json`
 
 The training script reads data paths, negative sample paths, time-offset settings, model hyperparameters, and checkpoint directory from the JSON config.
 
@@ -143,13 +146,13 @@ The training script reads data paths, negative sample paths, time-offset setting
 ```bash
 cd /path/to/gw-kn-multimodal
 
-bash Model/script/submit_test_evaluate.sh /path/to/eval_args.json
+bash Model/scripts/eval/submit_test_evaluate.sh /path/to/eval_args.json
 ```
 
 Relevant files:
 
-- `Model/test_evaluate.py`
-- `Model/script/submit_test_evaluate.sh`
+- `Model/scripts/eval/evaluate.py`
+- `Model/scripts/eval/submit_test_evaluate.sh`
 
 Supports retrieval, classification, OOD monitoring, and negative-sample time-offset evaluation.
 
@@ -224,7 +227,7 @@ Copy an existing JSON and edit the following fields:
 This repository does not include training data or large simulation files. Datasets can be obtained by:
 
 - **GW simulated events**: Generate using scripts under `dataset/KN_sim/` with SNANA/OpSim.
-- **Training HDF5**: Build from simulation data using `Model/script/create_dataset_bns_nsbh.py` and `optical_only/create_optical_only_datasets.py`.
+- **Training HDF5**: Build from simulation data using `Model/scripts/data/create_dataset_bns_nsbh.py` and `optical_only/create_optical_only_datasets.py`.
 - For pre-built datasets, please contact the authors.
 
 ## Citation

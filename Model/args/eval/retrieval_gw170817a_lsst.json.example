@@ -1,0 +1,53 @@
+{
+  "models": [
+    {
+      "name": "Skymap-only",
+      "type": "skymap"
+    },
+    {
+      "name": "Optical-only baseline",
+      "type": "optical",
+      "checkpoint": "<BASE_DIR>/data/model/checkpoints_optical/optical_only/optical_only_kn_baseline",
+      "config": "<REPO_ROOT>/optical_only/args/optical_only_kn_baseline.json"
+    },
+    {
+      "name": "Fink Random Forest",
+      "type": "fink_rf",
+      "checkpoint": "<BASE_DIR>/fink-rf-reproduction/outputs/fink_rf_ugrizY_fair_albef_elasticc2/model.joblib"
+    },
+    {
+      "name": "Full",
+      "type": "multimodal",
+      "checkpoint": "<BASE_DIR>/data/model/checkpoints_bns_nsbh/bns_nsbh_full",
+      "config": "<REPO_ROOT>/Model/args/MAGIKS_BNS_NSBH_full.json"
+    },
+    {
+      "name": "w/o Gallery Loss",
+      "type": "multimodal",
+      "checkpoint": "<BASE_DIR>/data/model/checkpoints_bns_nsbh/bns_nsbh_ablation_no_gallery_loss",
+      "config": "<REPO_ROOT>/Model/args/MAGIKS_BNS_NSBH_no_gallery_loss.json"
+    }
+  ],
+  "test_data_path": "<BASE_DIR>/data/ALBEF_dataset/gw170817a_lsst_redshift_test.h5",
+  "neg_data_path": "<BASE_DIR>/data/Optical_Only_dataset/ELASTICC_negative_dataset.h5",
+  "neg_group": "ELASTICC/optical_data",
+  "output_dir": "<REPO_ROOT>/Model/eval_results/gw170817a_lsst_retrieval",
+  "gallery_sizes": "10,100,500,1000,2000,5000",
+  "gallery_trials": 10,
+  "gallery_candidate_mode": "synthetic_time_sky_hard",
+  "gallery_candidate_time_window_days": 30.0,
+  "gallery_candidate_credible_level_max": 0.9,
+  "gallery_include_undersized": true,
+  "max_kn_per_redshift_bin": 200,
+  "n_neg_samples": 500000,
+  "seed": 42,
+  "batch_size": 512,
+  "num_workers": 2,
+  "device": "cuda",
+  "amp_dtype": "bf16",
+  "nonkn_cls_base_field": "zero_time_mjd_cls_base",
+  "comparison_window": [
+    -0.1,
+    0.2
+  ]
+}
