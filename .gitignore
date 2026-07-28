@@ -36,6 +36,7 @@ archive/
 # Generated exports
 *.html
 docs/
+reports/
 
 # Deprecated / internal
 PRD/

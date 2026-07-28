@@ -1850,6 +1850,10 @@ def extract_triplet_logits(model, loader, device, model_args, neg_optical_data,
     source_optical_neg = [] # source_type for optical negatives
     source_gw_neg = []      # source_type for GW negatives
     source_hard_neg = []    # source_type for mismatched negatives
+    gw_id_positive = []
+    gw_id_optical_neg = []
+    gw_id_gw_neg = []
+    gw_id_hard_neg = []
     dt_stats = _init_dt_stats()
     cls_time_counts = _init_cls_time_window_counts()
     cls_time_window_days = float(cls_time_window_days or 0.0)
@@ -1997,6 +2001,7 @@ def extract_triplet_logits(model, loader, device, model_args, neg_optical_data,
                 gw_indices_anchor = gw_indices_dev
                 batch_event_time_mjd_anchor = batch_event_time_mjd
 
+            anchor_gw_ids = gw_indices_anchor.detach().cpu().numpy().astype(np.int64).tolist()
             ref_time = build_ref_time(batch_size, n_ref, ref_start, ref_end, device, opt_t.dtype)
 
             with _autocast_context(device, amp_dtype, enabled=amp_enabled):
@@ -2031,6 +2036,7 @@ def extract_triplet_logits(model, loader, device, model_args, neg_optical_data,
                     dt_days=dt_pos,
                 )
                 logits_positive.append(logits_pos.float().cpu())
+                gw_id_positive.extend(anchor_gw_ids)
                 if _cred is not None:
                     cred_positive.append(_cred.detach().float().cpu())
                 if batch_sources is not None:
@@ -2097,6 +2103,7 @@ def extract_triplet_logits(model, loader, device, model_args, neg_optical_data,
                     dt_days=dt_hard,
                 )
                 logits_hard_neg.append(logits_hard.float().cpu())
+                gw_id_hard_neg.extend(anchor_gw_ids)
                 if _cred_hard is not None:
                     cred_hard_neg.append(_cred_hard.detach().float().cpu())
                 if batch_sources is not None:
@@ -2160,6 +2167,7 @@ def extract_triplet_logits(model, loader, device, model_args, neg_optical_data,
                         dt_days=dt_gw_neg,
                     )
                     logits_gw_neg.append(logits_gw.float().cpu())
+                    gw_id_gw_neg.extend(int(value) for value in sampled_neg_gw.tolist())
                     if _cred_gw_neg is not None:
                         cred_gw_neg.append(_cred_gw_neg.detach().float().cpu())
                     if gw_source_types is not None:
@@ -2230,6 +2238,7 @@ def extract_triplet_logits(model, loader, device, model_args, neg_optical_data,
                         dt_days=dt_optical,
                     )
                     logits_optical_neg.append(logits_optical.float().cpu())
+                    gw_id_optical_neg.extend(anchor_gw_ids)
                     if _cred_neg is not None:
                         cred_optical_neg.append(_cred_neg.detach().float().cpu())
                     optical_neg_types.extend(batch_neg_types)
@@ -2252,6 +2261,10 @@ def extract_triplet_logits(model, loader, device, model_args, neg_optical_data,
         "source_optical_neg": source_optical_neg,
         "source_gw_neg": source_gw_neg,
         "source_hard_neg": source_hard_neg,
+        "gw_id_positive": gw_id_positive,
+        "gw_id_optical_neg": gw_id_optical_neg,
+        "gw_id_gw_neg": gw_id_gw_neg,
+        "gw_id_hard_neg": gw_id_hard_neg,
         "time_delta_meta": {
             "enabled": bool(dt_has_any),
             "stats": finalized_dt_stats,

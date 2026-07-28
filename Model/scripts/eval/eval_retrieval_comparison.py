@@ -17,6 +17,7 @@ per-model retrieval metrics, and multimodal triplet-classification metrics.
 
 import argparse
 import gc
+import hashlib
 import h5py
 import json
 import os
@@ -68,6 +69,8 @@ from retrieval_gallery import (  # noqa: E402
     build_synthetic_time_sky_candidate_sequences,
     build_time_sky_candidate_sequences,
     compute_source_macro_and_gap,
+    gallery_outcome_metric_contributions,
+    uniform_random_tie_metric_contributions,
     extract_gallery_negative_abs_dt_days,
     PLOT_FONT_BASE,
     RETRIEVAL_TWO_ROW_LEGEND_FIGSIZE,
@@ -99,11 +102,50 @@ from scripts.eval.evaluate import (  # noqa: E402
     parse_day_windows,
     parse_dt_bin_edges,
 )
+from scripts.eval.eval_run_io import (  # noqa: E402
+    AtomicGzipCsvWriter,
+    CLASSIFICATION_FIELDS,
+    RETRIEVAL_FIELDS,
+    classification_prediction_rows,
+    mark_run_success,
+    prepare_output_directory,
+    retrieval_outcome_rows,
+    stable_digest,
+    source_tree_digest,
+)
 
 
 DEFAULT_COMPARISON_WINDOW = (-0.1, 0.2)
 DEFAULT_DT_BIN_EDGES = "0,3,5,10,30,100,300,inf"
 TABLE_METRIC_LABELS = ["R@1", "R@5", "R@10", "MRR"]
+CANDIDATE_TIME_DELTA_MODES = {"native", "zero"}
+
+
+def normalize_candidate_time_delta_mode(value: Any) -> str:
+    """Validate the runtime GW-to-candidate time-delta treatment."""
+    mode = str(value or "native").strip().lower()
+    if mode not in CANDIDATE_TIME_DELTA_MODES:
+        raise ValueError(
+            "candidate_time_delta_mode must be one of "
+            f"{sorted(CANDIDATE_TIME_DELTA_MODES)}; got {value!r}."
+        )
+    return mode
+
+
+def apply_candidate_time_delta_mode(
+    dt_days: Optional[np.ndarray],
+    *,
+    mode: str,
+    n_candidates: int,
+) -> Optional[np.ndarray]:
+    """Apply an inference-only ablation without changing model architecture."""
+    normalized_mode = normalize_candidate_time_delta_mode(mode)
+    n_candidates = int(n_candidates)
+    if n_candidates < 0:
+        raise ValueError("n_candidates must be non-negative.")
+    if normalized_mode == "zero":
+        return np.zeros((n_candidates,), dtype=np.float32)
+    return dt_days
 
 
 def _lookup_event_time_mjd(gw_event_time_mjd_table, gw_id: int) -> Optional[float]:
@@ -507,25 +549,28 @@ def _aggregate_redshift_metrics(
                     bin_idx,
                     {
                         "redshifts": [],
-                        "ranks": [],
+                        "recalls": {1: [], 5: [], 10: []},
+                        "mrrs": [],
                         "coverage": [],
                         "full_coverage": [],
                         "actual_sizes": [],
                     },
                 )
+                metric_contributions = gallery_outcome_metric_contributions(outcome)
                 actual_size = float(outcome.get("actual_gallery_size", gallery_size))
                 coverage_met = bool(outcome.get("coverage_met", actual_size >= gallery_size))
                 fill_ratio = min(1.0, max(0.0, actual_size / float(max(int(gallery_size), 1))))
                 bucket["redshifts"].append(z)
-                bucket["ranks"].append(float(outcome["rank"]))
+                for k in bucket["recalls"]:
+                    bucket["recalls"][k].append(metric_contributions[f"recall_at_{k}"])
+                bucket["mrrs"].append(metric_contributions["mrr"])
                 bucket["coverage"].append(fill_ratio)
                 bucket["full_coverage"].append(1.0 if coverage_met else 0.0)
                 bucket["actual_sizes"].append(actual_size)
 
         for bin_idx in sorted(buckets):
             bucket = buckets[bin_idx]
-            ranks = np.asarray(bucket["ranks"], dtype=np.float64)
-            n = int(ranks.size)
+            n = int(len(bucket["mrrs"]))
             rows.append({
                 "method": str(method_name),
                 "redshift_bin_label": str(bin_labels[bin_idx]),
@@ -534,10 +579,10 @@ def _aggregate_redshift_metrics(
                 "redshift": float(np.mean(bucket["redshifts"])) if n else 0.0,
                 "gallery_size": int(gallery_size),
                 "n_queries": n,
-                "recall_at_1": float(np.mean(ranks < 1)) if n else 0.0,
-                "recall_at_5": float(np.mean(ranks < 5)) if n else 0.0,
-                "recall_at_10": float(np.mean(ranks < 10)) if n else 0.0,
-                "mrr": float(np.mean(1.0 / (ranks + 1.0))) if n else 0.0,
+                "recall_at_1": float(np.mean(bucket["recalls"][1])) if n else 0.0,
+                "recall_at_5": float(np.mean(bucket["recalls"][5])) if n else 0.0,
+                "recall_at_10": float(np.mean(bucket["recalls"][10])) if n else 0.0,
+                "mrr": float(np.mean(bucket["mrrs"])) if n else 0.0,
                 "coverage": float(np.mean(bucket["coverage"])) if n else 0.0,
                 "fill_ratio_mean": float(np.mean(bucket["coverage"])) if n else 0.0,
                 "full_coverage": float(np.mean(bucket["full_coverage"])) if n else 0.0,
@@ -890,6 +935,471 @@ def _json_safe(obj: Any) -> Any:
     return obj
 
 
+_PARTIAL_REFRESH_COMPAT_FIELDS = (
+    "seed",
+    "gallery_sizes",
+    "gallery_trials",
+    "gallery_candidate_mode",
+    "gallery_candidate_time_window_days",
+    "gallery_candidate_credible_level_max",
+    "gallery_include_undersized",
+    "n_neg_samples",
+    "negative_sample_strategy",
+    "negative_sample_block_rows",
+    "negative_sample_shuffle",
+    "nonkn_cls_base_field",
+    "comparison_window",
+)
+
+
+def _normalized_compat_value(key: str, value: Any) -> Any:
+    if key in {"test_data_path", "neg_data_path"}:
+        return Path(str(value)).name if value not in (None, "") else None
+    if isinstance(value, tuple):
+        return list(value)
+    return value
+
+
+def validate_partial_refresh_compatibility(
+    *,
+    base_output: Mapping[str, Any],
+    cfg: Mapping[str, Any],
+    configured_model_specs: Sequence[Mapping[str, Any]],
+    refresh_model_type: str,
+) -> None:
+    """Fail closed when a partial refresh does not match its base experiment."""
+    base_cfg = base_output.get("config")
+    if not isinstance(base_cfg, Mapping):
+        raise ValueError("Merge base artifact is missing a config mapping.")
+
+    fields = ["test_data_path", "neg_data_path", "neg_group", *_PARTIAL_REFRESH_COMPAT_FIELDS]
+    mismatches = []
+    for key in fields:
+        if key not in base_cfg or key not in cfg:
+            continue
+        old = _normalized_compat_value(key, base_cfg.get(key))
+        new = _normalized_compat_value(key, cfg.get(key))
+        if old != new:
+            mismatches.append(f"{key}: base={old!r}, current={new!r}")
+    if mismatches:
+        raise ValueError("Partial-refresh config mismatch:\n  " + "\n  ".join(mismatches))
+
+    target_specs = [spec for spec in configured_model_specs if str(spec["type"]) == refresh_model_type]
+    if len(target_specs) != 1:
+        raise ValueError(
+            f"Expected exactly one configured model with type={refresh_model_type!r}; got {len(target_specs)}."
+        )
+
+    base_models = base_output.get("models")
+    if not isinstance(base_models, Mapping):
+        raise ValueError("Merge base artifact is missing a models mapping.")
+    configured_non_target = {
+        str(spec["name"]): str(spec["type"])
+        for spec in configured_model_specs
+        if str(spec["type"]) != refresh_model_type
+    }
+    for name, model_type in configured_non_target.items():
+        if name not in base_models:
+            raise ValueError(f"Merge base artifact is missing non-target model {name!r}.")
+        if str(base_models[name].get("type")) != model_type:
+            raise ValueError(
+                f"Model type mismatch for {name!r}: base={base_models[name].get('type')!r}, "
+                f"current={model_type!r}."
+            )
+    unexpected = [
+        name
+        for name, result in base_models.items()
+        if str(result.get("type")) != refresh_model_type and name not in configured_non_target
+    ]
+    if unexpected:
+        raise ValueError(f"Merge base artifact has unexpected non-target model(s): {unexpected}")
+
+
+def merge_partial_model_results(
+    *,
+    base_output: Mapping[str, Any],
+    fresh_model_results: Mapping[str, Mapping[str, Any]],
+    fresh_curve_rows: Sequence[Mapping[str, Any]],
+    fresh_redshift_rows: Sequence[Mapping[str, Any]],
+    configured_model_specs: Sequence[Mapping[str, Any]],
+    refresh_model_type: str,
+) -> Tuple[OrderedDict, OrderedDict, List[Dict[str, Any]], List[Dict[str, Any]], List[str]]:
+    """Replace one model type while preserving all other model results from a base artifact."""
+    target_names = [
+        str(spec["name"])
+        for spec in configured_model_specs
+        if str(spec["type"]) == refresh_model_type
+    ]
+    if len(target_names) != 1:
+        raise ValueError(f"Partial refresh requires exactly one target model; got {target_names}.")
+    target_name = target_names[0]
+    if target_name not in fresh_model_results:
+        raise ValueError(f"Fresh results are missing target model {target_name!r}.")
+
+    base_models = base_output["models"]
+    combined_models: OrderedDict[str, Dict[str, Any]] = OrderedDict()
+    for spec in configured_model_specs:
+        name = str(spec["name"])
+        if name == target_name:
+            combined_models[name] = dict(fresh_model_results[name])
+        else:
+            combined_models[name] = dict(base_models[name])
+
+    combined_retrieval: OrderedDict[str, Dict[str, float]] = OrderedDict(
+        (name, dict(result.get("retrieval", {}))) for name, result in combined_models.items()
+    )
+    combined_curve_rows = [
+        dict(row) for row in base_output.get("curve_rows", []) if str(row.get("method")) != target_name
+    ]
+    combined_curve_rows.extend(dict(row) for row in fresh_curve_rows)
+    combined_redshift_rows = [
+        dict(row) for row in base_output.get("redshift_rows", []) if str(row.get("method")) != target_name
+    ]
+    combined_redshift_rows.extend(dict(row) for row in fresh_redshift_rows)
+    return (
+        combined_models,
+        combined_retrieval,
+        combined_curve_rows,
+        combined_redshift_rows,
+        list(combined_models.keys()),
+    )
+
+
+def write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with tmp_path.open("w", encoding="utf-8") as f:
+        json.dump(_json_safe(payload), f, indent=2, ensure_ascii=False)
+    os.replace(tmp_path, path)
+
+
+def summarize_gallery_identity(
+    galleries: Mapping[Tuple[int, int, int], Mapping[str, Any]],
+) -> Dict[str, Any]:
+    """Hash every non-time candidate identity used by the paired ablation."""
+    digest = hashlib.sha256()
+    n_negative_assignments = 0
+    for key in sorted(galleries):
+        spec = galleries[key]
+        digest.update(np.asarray(key, dtype="<i8").tobytes())
+        digest.update(
+            np.asarray(
+                [
+                    int(spec["positive_index"]),
+                    int(spec.get("requested_gallery_size", key[0])),
+                    int(spec.get("actual_gallery_size", 1)),
+                ],
+                dtype="<i8",
+            ).tobytes()
+        )
+        negative_indices = np.asarray(
+            spec.get("negative_indices", []), dtype="<i8"
+        ).reshape(-1)
+        digest.update(negative_indices.tobytes())
+        n_negative_assignments += int(negative_indices.size)
+        for field in ("negative_synthetic_coordinates", "negative_credible_levels"):
+            values = np.asarray(spec.get(field, []), dtype="<f4")
+            digest.update(np.asarray(values.shape, dtype="<i8").tobytes())
+            digest.update(values.tobytes())
+    return {
+        "sha256": digest.hexdigest(),
+        "n_galleries": int(len(galleries)),
+        "n_negative_assignments": int(n_negative_assignments),
+        "fields": [
+            "gallery_key",
+            "positive_index",
+            "requested_gallery_size",
+            "actual_gallery_size",
+            "negative_indices",
+            "negative_synthetic_coordinates",
+            "negative_credible_levels",
+        ],
+        "excludes": ["candidate_time_delta"],
+    }
+
+
+_BASELINE_COMPARISON_FIELDS = (
+    "seed",
+    "gallery_sizes",
+    "gallery_trials",
+    "gallery_candidate_mode",
+    "gallery_candidate_time_window_days",
+    "gallery_candidate_credible_level_max",
+    "gallery_include_undersized",
+    "positive_selection",
+    "max_gw_events",
+    "n_neg_samples",
+    "negative_sample_strategy",
+    "negative_sample_block_rows",
+    "negative_sample_shuffle",
+    "nonkn_cls_base_field",
+    "comparison_window",
+)
+
+
+def validate_time_delta_baseline_compatibility(
+    baseline_output: Mapping[str, Any],
+    cfg: Mapping[str, Any],
+) -> None:
+    """Require the prior artifact to describe the same deterministic galleries."""
+    baseline_cfg = baseline_output.get("config")
+    if not isinstance(baseline_cfg, Mapping):
+        raise ValueError("Baseline result is missing its config mapping.")
+    mismatches = []
+    for field in _BASELINE_COMPARISON_FIELDS:
+        if field not in baseline_cfg or field not in cfg:
+            continue
+        old = _normalized_compat_value(field, baseline_cfg.get(field))
+        new = _normalized_compat_value(field, cfg.get(field))
+        if old != new:
+            mismatches.append(f"{field}: baseline={old!r}, current={new!r}")
+    if mismatches:
+        raise ValueError(
+            "Time-delta baseline is not gallery-compatible:\n  "
+            + "\n  ".join(mismatches)
+        )
+
+
+_RETRIEVAL_METRIC_RE = re.compile(
+    r"^gallery_(?P<gallery_size>\d+)_(?P<metric>recall_at_1|recall_at_5|recall_at_10|mrr)$"
+)
+
+
+def build_time_delta_metric_delta_rows(
+    baseline_model: Mapping[str, Any],
+    ablated_model: Mapping[str, Any],
+) -> List[Dict[str, Any]]:
+    """Build overall and source-stratified paired metric differences."""
+    rows: List[Dict[str, Any]] = []
+    scopes = [("overall", baseline_model.get("retrieval", {}), ablated_model.get("retrieval", {}))]
+    baseline_by_source = baseline_model.get("retrieval_by_source", {})
+    ablated_by_source = ablated_model.get("retrieval_by_source", {})
+    for source in sorted(set(baseline_by_source) & set(ablated_by_source)):
+        scopes.append((str(source), baseline_by_source[source], ablated_by_source[source]))
+
+    for scope, baseline_metrics, ablated_metrics in scopes:
+        for key, baseline_value_raw in baseline_metrics.items():
+            match = _RETRIEVAL_METRIC_RE.match(str(key))
+            if match is None or key not in ablated_metrics:
+                continue
+            baseline_value = float(baseline_value_raw)
+            ablated_value = float(ablated_metrics[key])
+            absolute_change = ablated_value - baseline_value
+            relative_change = (
+                absolute_change / baseline_value if baseline_value != 0.0 else None
+            )
+            rows.append(
+                {
+                    "scope": scope,
+                    "gallery_size": int(match.group("gallery_size")),
+                    "metric": str(match.group("metric")),
+                    "baseline": baseline_value,
+                    "dt_zero": ablated_value,
+                    "absolute_change": absolute_change,
+                    "relative_change": relative_change,
+                }
+            )
+    return sorted(rows, key=lambda row: (row["scope"], row["gallery_size"], row["metric"]))
+
+
+def build_time_delta_redshift_delta_rows(
+    baseline_rows: Sequence[Mapping[str, Any]],
+    ablated_rows: Sequence[Mapping[str, Any]],
+    *,
+    method_name: str,
+) -> List[Dict[str, Any]]:
+    """Build paired redshift-bin metric differences for one model."""
+    metrics = ("recall_at_1", "recall_at_5", "recall_at_10", "mrr")
+    baseline_lookup = {
+        (str(row["redshift_bin_label"]), int(row["gallery_size"])): row
+        for row in baseline_rows
+        if str(row.get("method")) == str(method_name)
+    }
+    output: List[Dict[str, Any]] = []
+    for row in ablated_rows:
+        if str(row.get("method")) != str(method_name):
+            continue
+        key = (str(row["redshift_bin_label"]), int(row["gallery_size"]))
+        baseline_row = baseline_lookup.get(key)
+        if baseline_row is None:
+            continue
+        for metric in metrics:
+            baseline_value = float(baseline_row[metric])
+            ablated_value = float(row[metric])
+            absolute_change = ablated_value - baseline_value
+            output.append(
+                {
+                    "redshift_bin_label": key[0],
+                    "redshift": float(row["redshift"]),
+                    "gallery_size": key[1],
+                    "metric": metric,
+                    "baseline": baseline_value,
+                    "dt_zero": ablated_value,
+                    "absolute_change": absolute_change,
+                    "relative_change": (
+                        absolute_change / baseline_value if baseline_value != 0.0 else None
+                    ),
+                }
+            )
+    return output
+
+
+def write_rows_csv(rows: Sequence[Mapping[str, Any]], output_path: Path) -> None:
+    import csv
+
+    rows = list(rows)
+    if not rows:
+        return
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def plot_time_delta_ablation(rows: Sequence[Mapping[str, Any]], output_dir: Path) -> None:
+    """Plot paired Full-model retrieval curves for baseline and zero-delta input."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        apply_mnras_style(plt, base_font_size=PLOT_FONT_BASE)
+    except Exception:
+        return
+    overall = [row for row in rows if row.get("scope") == "overall"]
+    if not overall:
+        return
+    metrics = [
+        ("recall_at_1", "R@1"),
+        ("recall_at_5", "R@5"),
+        ("recall_at_10", "R@10"),
+        ("mrr", "MRR"),
+    ]
+    fig, axes = plt.subplots(2, 2, figsize=(10, 8), sharex=True)
+    for ax, (metric, label) in zip(axes.flat, metrics):
+        metric_rows = sorted(
+            [row for row in overall if row["metric"] == metric],
+            key=lambda row: int(row["gallery_size"]),
+        )
+        gallery_sizes = [int(row["gallery_size"]) for row in metric_rows]
+        ax.plot(gallery_sizes, [row["baseline"] for row in metric_rows], marker="o", label="Baseline")
+        ax.plot(gallery_sizes, [row["dt_zero"] for row in metric_rows], marker="s", label=r"$\Delta t=0$")
+        ax.set_xscale("log")
+        ax.set_xlabel("Gallery size")
+        ax.set_ylabel(label)
+        ax.grid(True, alpha=0.3)
+    handles, labels = axes.flat[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="upper center", ncol=2, frameon=False)
+    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    output_dir = Path(output_dir)
+    fig.savefig(output_dir / "time_delta_ablation_comparison.png", dpi=300, bbox_inches="tight")
+    fig.savefig(output_dir / "time_delta_ablation_comparison.pdf", bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_time_delta_redshift_ablation(
+    rows: Sequence[Mapping[str, Any]],
+    output_dir: Path,
+) -> None:
+    """Plot baseline and zero-delta retrieval versus redshift for every gallery size."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        apply_mnras_style(plt, base_font_size=PLOT_FONT_BASE)
+    except Exception:
+        return
+
+    rows = list(rows)
+    if not rows:
+        return
+    gallery_sizes = sorted({int(row["gallery_size"]) for row in rows})
+    metrics = [
+        ("recall_at_1", "R@1"),
+        ("recall_at_10", "R@10"),
+        ("mrr", "MRR"),
+    ]
+    baseline_color = "#1f77b4"
+    zero_color = "#e07a1f"
+    fig, axes = plt.subplots(
+        len(gallery_sizes),
+        len(metrics),
+        figsize=(14, 3.0 * len(gallery_sizes) + 1.2),
+        sharex=True,
+        sharey=True,
+        squeeze=False,
+    )
+
+    for row_idx, gallery_size in enumerate(gallery_sizes):
+        for col_idx, (metric, metric_label) in enumerate(metrics):
+            ax = axes[row_idx, col_idx]
+            metric_rows = sorted(
+                [
+                    row
+                    for row in rows
+                    if int(row["gallery_size"]) == gallery_size
+                    and str(row["metric"]) == metric
+                ],
+                key=lambda row: float(row["redshift"]),
+            )
+            redshift = [float(row["redshift"]) for row in metric_rows]
+            ax.plot(
+                redshift,
+                [float(row["baseline"]) for row in metric_rows],
+                color=baseline_color,
+                linestyle="-",
+                marker="o",
+                linewidth=2,
+                markersize=5,
+                label="Baseline",
+            )
+            ax.plot(
+                redshift,
+                [float(row["dt_zero"]) for row in metric_rows],
+                color=zero_color,
+                linestyle="--",
+                marker="s",
+                markerfacecolor="white",
+                linewidth=2,
+                markersize=5,
+                label=r"$\Delta t=0$",
+            )
+            ax.set_ylim(0.0, 1.02)
+            ax.grid(True, alpha=0.25)
+            if row_idx == 0:
+                ax.set_title(metric_label)
+            if col_idx == 0:
+                ax.set_ylabel(f"Gallery={gallery_size}\nScore")
+            if row_idx == len(gallery_sizes) - 1:
+                ax.set_xlabel("Redshift")
+
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    fig.legend(
+        handles,
+        labels,
+        loc="upper center",
+        ncol=2,
+        frameon=False,
+        bbox_to_anchor=(0.5, 0.992),
+    )
+    fig.suptitle(
+        "Full-model retrieval versus redshift: baseline and zero time-delta input",
+        y=0.965,
+    )
+    fig.tight_layout(rect=(0, 0, 1, 0.945), h_pad=1.0, w_pad=0.8)
+    output_dir = Path(output_dir)
+    fig.savefig(
+        output_dir / "time_delta_ablation_redshift_comparison.png",
+        dpi=300,
+        bbox_inches="tight",
+    )
+    fig.savefig(
+        output_dir / "time_delta_ablation_redshift_comparison.pdf",
+        bbox_inches="tight",
+    )
+    plt.close(fig)
+
+
 def _resolve_checkpoint_path(checkpoint_path: str, model_type: str) -> str:
     path = Path(checkpoint_path).expanduser()
     if path.is_file():
@@ -1048,6 +1558,17 @@ def _resolve_multimodal_scoring(model_spec: Dict[str, Any], saved_args: Dict[str
     if requested in {"", "auto"}:
         return "logits"
     return requested
+
+
+def candidate_time_delta_scoring_kwargs(
+    scoring_mode: str,
+    candidate_time_delta_mode: str,
+) -> Dict[str, str]:
+    """Forward the ablation only to the fusion-logit retrieval scorer."""
+    mode = normalize_candidate_time_delta_mode(candidate_time_delta_mode)
+    return {} if str(scoring_mode).strip().lower() == "contrastive" else {
+        "candidate_time_delta_mode": mode
+    }
 
 
 def _build_test_loader(
@@ -1902,10 +2423,25 @@ def score_all_galleries_multimodal(
     device: torch.device,
     model_args: Dict[str, Any],
     gw_event_time_mjd_table=None,
+    candidate_time_delta_mode: str = "native",
     amp_dtype: torch.dtype = torch.float32,
     amp_enabled: bool = False,
 ):
     """Score galleries with one matched KN and tutorial distractors using fusion logits."""
+    candidate_time_delta_mode = normalize_candidate_time_delta_mode(
+        candidate_time_delta_mode
+    )
+    model_requires_time_delta = _model_requires_time_delta(model)
+    if candidate_time_delta_mode == "zero" and not model_requires_time_delta:
+        raise ValueError(
+            "candidate_time_delta_mode='zero' requested, but the runtime model "
+            "does not consume a time-delta feature."
+        )
+    print(
+        "  Runtime candidate time-delta mode: "
+        f"{candidate_time_delta_mode} "
+        f"(model_requires_time_delta={model_requires_time_delta})"
+    )
     dual = bool(positive_bank.get("dual_fusion", _is_dual_fusion_model(model)))
     print("  Building GW query cache...")
     query_cache = _build_gallery_query_cache(
@@ -1918,6 +2454,8 @@ def score_all_galleries_multimodal(
     )
 
     ranks: Dict[Tuple[int, int, int], int] = {}
+    observed_dt_count = 0
+    observed_nonzero_dt_count = 0
     for key, gallery_spec in tqdm(galleries.items(), desc="  Scoring galleries"):
         _gallery_size, _trial, gw_id = key
         pos_index = int(gallery_spec["positive_index"])
@@ -1935,6 +2473,27 @@ def score_all_galleries_multimodal(
             pos_dt = abs(pos_first_det - gw_event_time_mjd)
         else:
             pos_dt = 0.0
+        pos_dt_values = apply_candidate_time_delta_mode(
+            np.asarray([pos_dt], dtype=np.float32),
+            mode=candidate_time_delta_mode,
+            n_candidates=1,
+        )
+        neg_dt_values = apply_candidate_time_delta_mode(
+            neg_abs_dt_days,
+            mode=candidate_time_delta_mode,
+            n_candidates=int(neg_indices.shape[0]),
+        )
+        for label, values in (("positive", pos_dt_values), ("negative", neg_dt_values)):
+            if values is None:
+                continue
+            values_np = np.asarray(values)
+            observed_dt_count += int(values_np.size)
+            nonzero_count = int(np.count_nonzero(values_np))
+            observed_nonzero_dt_count += nonzero_count
+            if candidate_time_delta_mode == "zero" and nonzero_count:
+                raise AssertionError(
+                    f"Runtime {label} dt audit failed: found {nonzero_count} non-zero values."
+                )
         pos_scores = _score_candidate_bank_with_logits(
             model,
             query_cache[int(gw_id)],
@@ -1942,7 +2501,7 @@ def score_all_galleries_multimodal(
             positive_bank,
             device,
             dual,
-            candidate_abs_dt_days=np.asarray([pos_dt], dtype=np.float32),
+            candidate_abs_dt_days=pos_dt_values,
             amp_dtype=amp_dtype,
             amp_enabled=amp_enabled,
         )
@@ -1954,7 +2513,7 @@ def score_all_galleries_multimodal(
             device,
             dual,
             candidate_coords=neg_candidate_coords,
-            candidate_abs_dt_days=neg_abs_dt_days,
+            candidate_abs_dt_days=neg_dt_values,
             amp_dtype=amp_dtype,
             amp_enabled=amp_enabled,
         )
@@ -1962,6 +2521,10 @@ def score_all_galleries_multimodal(
         ranked = np.argsort(-scores)
         ranks[key] = int(np.where(ranked == 0)[0][0])
 
+    print(
+        "  Runtime candidate time-delta audit: "
+        f"count={observed_dt_count}, nonzero={observed_nonzero_dt_count}"
+    )
     return ranks
 
 
@@ -2213,7 +2776,7 @@ def score_all_galleries_fink_rf(
     positive_attrs: Mapping[str, Any],
     negative_attrs: Mapping[str, Any],
     chunk_size: Optional[int] = None,
-) -> Tuple[Dict[Tuple[int, int, int], int], Dict[str, Any]]:
+) -> Tuple[Dict[Tuple[int, int, int], Dict[str, Any]], Dict[str, Any]]:
     positive_indices = np.unique(
         np.asarray([int(spec["positive_index"]) for spec in galleries.values()], dtype=np.int64)
     )
@@ -2233,9 +2796,18 @@ def score_all_galleries_fink_rf(
         chunk_size=chunk_size,
     )
 
-    ranks: Dict[Tuple[int, int, int], float] = {}
+    outcomes: Dict[Tuple[int, int, int], Dict[str, Any]] = {}
+    max_gallery_size = max(
+        (int(spec.get("actual_gallery_size", 1)) for spec in galleries.values()),
+        default=1,
+    )
+    harmonic_numbers = np.concatenate(
+        [np.asarray([0.0]), np.cumsum(1.0 / np.arange(1, max_gallery_size + 1, dtype=np.float64))]
+    )
     positive_invalid = 0
     negative_invalid = 0
+    tie_block_sizes: List[int] = []
+    n_tied_galleries = 0
     for key, gallery_spec in tqdm(galleries.items(), desc="  Ranking Fink RF galleries"):
         pos_index = int(gallery_spec["positive_index"])
         neg_indices = np.asarray(gallery_spec.get("negative_indices", []), dtype=np.int64).reshape(-1)
@@ -2249,18 +2821,54 @@ def score_all_galleries_fink_rf(
             if not bool(neg_valid.get(int(neg_index), False)):
                 negative_invalid += 1
         neg_array = np.asarray(neg_values, dtype=np.float64)
-        ranks[key] = (
-            float(neg_indices.size)
-            if not pos_is_valid
-            else float(np.sum(neg_array > pos_score) + 0.5 * np.sum(neg_array == pos_score))
+        if pos_is_valid:
+            n_strictly_better = int(np.sum(neg_array > pos_score))
+            n_tied_negatives = int(np.sum(neg_array == pos_score))
+            tie_block_size = n_tied_negatives + 1
+            tie_block_sizes.append(tie_block_size)
+            if n_tied_negatives > 0:
+                n_tied_galleries += 1
+        else:
+            n_strictly_better = int(neg_indices.size)
+            n_tied_negatives = 0
+            tie_block_size = 1
+
+        metric_contributions = uniform_random_tie_metric_contributions(
+            n_strictly_better,
+            n_tied_negatives,
+            harmonic_numbers=harmonic_numbers,
         )
+        outcomes[key] = {
+            "rank": float(n_strictly_better + 0.5 * n_tied_negatives),
+            "metric_contributions": metric_contributions,
+            "n_strictly_better": n_strictly_better,
+            "n_tied_negatives": n_tied_negatives,
+            "tie_block_size": tie_block_size,
+            "tie_policy": "uniform_random_expected",
+            "positive_valid": pos_is_valid,
+            "requested_gallery_size": int(gallery_spec.get("requested_gallery_size", key[0])),
+            "actual_gallery_size": int(gallery_spec.get("actual_gallery_size", neg_indices.size + 1)),
+            "coverage_met": bool(gallery_spec.get("coverage_met", True)),
+            "is_undersized": bool(gallery_spec.get("is_undersized", False)),
+        }
+
+    n_valid_galleries = len(tie_block_sizes)
     diagnostics = {
         "positive": pos_diag,
         "negative": neg_diag,
         "positive_invalid_gallery_count": int(positive_invalid),
         "negative_invalid_candidate_count": int(negative_invalid),
+        "tie_policy": "uniform_random_expected",
+        "tie_score_equality": "exact_float64",
+        "n_galleries": int(len(galleries)),
+        "n_valid_positive_galleries": int(n_valid_galleries),
+        "n_tied_valid_galleries": int(n_tied_galleries),
+        "tied_valid_gallery_fraction": float(n_tied_galleries / max(1, n_valid_galleries)),
+        "tie_block_size_mean": float(np.mean(tie_block_sizes)) if tie_block_sizes else 0.0,
+        "tie_block_size_median": float(np.median(tie_block_sizes)) if tie_block_sizes else 0.0,
+        "tie_block_size_max": int(max(tie_block_sizes)) if tie_block_sizes else 0,
     }
-    return ranks, diagnostics
+    return outcomes, diagnostics
 
 
 def aggregate_metrics(ranks, gallery_sizes, n_trials, unique_gw, *, gw_source_map=None):
@@ -2551,6 +3159,7 @@ def evaluate_multimodal_classification(
     amp_dtype: torch.dtype,
     amp_enabled: bool,
     device: torch.device,
+    return_logits: bool = False,
 ):
     """Run triplet classification for a multimodal model."""
     hardneg_windows_days = parse_day_windows(str(saved_args.get("hardneg_time_window_days", "30,60,120")))
@@ -2625,6 +3234,8 @@ def evaluate_multimodal_classification(
                 report_dt_macro=bool(report_dt_macro),
             )
             cls_by_source = evaluate_classification_triplet_by_source(triplet_logits)
+            if return_logits:
+                return cls_metrics, cls_by_source, triplet_logits
             return cls_metrics, cls_by_source
         except PermissionError:
             if try_num_workers <= 0:
@@ -2707,6 +3318,14 @@ def normalize_shared_config(cfg: Dict[str, Any], cfg_path: Path) -> Dict[str, An
         "amp_dtype": str(cfg.get("amp_dtype", "auto")),
         "no_latex": _as_bool(cfg.get("no_latex", False)),
         "compute_classification_metrics": _as_bool(cfg.get("compute_classification_metrics", True), default=True),
+        "save_outcomes": _as_bool(cfg.get("save_outcomes", False)),
+        "strict_output_safety": _as_bool(cfg.get("strict_output_safety", False)),
+        "resume": _as_bool(cfg.get("resume", False)),
+        "experiment_id": str(cfg.get("experiment_id", "")).strip(),
+        "candidate_time_delta_mode": normalize_candidate_time_delta_mode(
+            cfg.get("candidate_time_delta_mode", "native")
+        ),
+        "baseline_results_path": _resolve_path(cfg_dir, cfg.get("baseline_results_path")),
         "comparison_window": [float(comparison_window[0]), float(comparison_window[1])],
         "comparison_window_start": float(comparison_window[0]),
         "comparison_window_end": float(comparison_window[1]),
@@ -2730,12 +3349,65 @@ def normalize_shared_config(cfg: Dict[str, Any], cfg_path: Path) -> Dict[str, An
 def main():
     parser = argparse.ArgumentParser(description="Unified retrieval and triplet ablation comparison.")
     parser.add_argument("--config", type=str, required=True, help="Path to comparison JSON config")
+    parser.add_argument("--refresh-model-type", help="Evaluate only this model type and merge it into an existing artifact.")
+    parser.add_argument("--merge-existing", help="Existing ablation_comparison.json used as the partial-refresh base.")
     args = parser.parse_args()
+    if bool(args.refresh_model_type) != bool(args.merge_existing):
+        parser.error("--refresh-model-type and --merge-existing must be provided together.")
+
 
     config_path = Path(args.config).expanduser().resolve()
     raw_cfg = _load_json(config_path)
     cfg = normalize_shared_config(raw_cfg, config_path)
-    model_specs = _build_model_specs(raw_cfg, config_path.parent)
+    if cfg["save_outcomes"] and not cfg["strict_output_safety"]:
+        raise ValueError("save_outcomes=true requires strict_output_safety=true.")
+    if cfg["save_outcomes"] and args.refresh_model_type:
+        raise ValueError("Outcome-saving runs do not support partial refresh/merge.")
+    output_dir = Path(cfg["output_dir"])
+    run_manifest = None
+    retrieval_writer = None
+    classification_writer = None
+    if cfg["strict_output_safety"]:
+        experiment_config = dict(raw_cfg)
+        for volatile_key in ("seed", "output_dir", "resume"):
+            experiment_config.pop(volatile_key, None)
+        run_manifest = prepare_output_directory(
+            output_dir,
+            manifest={
+                "experiment_id": cfg["experiment_id"],
+                "experiment_digest": stable_digest(experiment_config),
+                "code_digest": source_tree_digest(MODEL_DIR),
+                "seed": int(cfg["seed"]),
+                "input_config": str(config_path),
+                "test_data_path": cfg["test_data_path"],
+                "neg_data_path": cfg["neg_data_path"],
+            },
+            resume=cfg["resume"],
+        )
+    if cfg["save_outcomes"]:
+        retrieval_writer = AtomicGzipCsvWriter(output_dir / "retrieval_outcomes.csv.gz", RETRIEVAL_FIELDS)
+        classification_writer = AtomicGzipCsvWriter(
+            output_dir / "classification_predictions.csv.gz", CLASSIFICATION_FIELDS
+        )
+    configured_model_specs = _build_model_specs(raw_cfg, config_path.parent)
+    base_output = None
+    refresh_model_type = str(args.refresh_model_type or "").strip()
+    if refresh_model_type:
+        merge_path = Path(args.merge_existing).expanduser().resolve()
+        base_output = _load_json(merge_path)
+        validate_partial_refresh_compatibility(
+            base_output=base_output,
+            cfg=cfg,
+            configured_model_specs=configured_model_specs,
+            refresh_model_type=refresh_model_type,
+        )
+        model_specs = [
+            spec for spec in configured_model_specs if str(spec["type"]) == refresh_model_type
+        ]
+        print(f"Partial refresh: type={refresh_model_type}, base={merge_path}")
+    else:
+        merge_path = None
+        model_specs = list(configured_model_specs)
 
     device = torch.device(cfg["device"] if torch.cuda.is_available() else "cpu")
     amp_dtype, amp_enabled = _resolve_eval_amp(cfg["amp_dtype"], device)
@@ -2970,6 +3642,8 @@ def main():
         f"from {positive_source_label}"
     )
     print(f"  Built {len(galleries)} gallery instances for {len(unique_gw)} GW events")
+    gallery_identity_summary = summarize_gallery_identity(galleries)
+    print(f"  Gallery identity SHA256: {gallery_identity_summary['sha256']}")
 
     selected_gw_indices_np = positive_query_bank["gw_indices"].detach().cpu().numpy().astype(np.int64, copy=False)
     selected_unique_gw, selected_counts = np.unique(selected_gw_indices_np, return_counts=True)
@@ -2997,6 +3671,7 @@ def main():
         name = model_spec["name"]
         model_type = model_spec["type"]
         model_names.append(name)
+        triplet_logits_for_output = None
         print(f"\n{'=' * 60}")
         print(f"Phase 3.{idx}: {name} ({model_type})")
         print("=" * 60)
@@ -3079,6 +3754,10 @@ def main():
                 amp_enabled=amp_enabled,
             )
             scoring_mode = _resolve_multimodal_scoring(model_spec, saved_args)
+            time_delta_scoring_kwargs = candidate_time_delta_scoring_kwargs(
+                scoring_mode,
+                cfg["candidate_time_delta_mode"],
+            )
 
             if scoring_mode == "contrastive":
                 ranks = score_all_galleries_contrastive(
@@ -3093,6 +3772,7 @@ def main():
                     gw_event_time_mjd_table=gw_event_time_mjd_table,
                     amp_dtype=amp_dtype,
                     amp_enabled=amp_enabled,
+                    **time_delta_scoring_kwargs,
                 )
             else:
                 ranks = score_all_galleries_multimodal(
@@ -3107,6 +3787,7 @@ def main():
                     gw_event_time_mjd_table=gw_event_time_mjd_table,
                     amp_dtype=amp_dtype,
                     amp_enabled=amp_enabled,
+                    **time_delta_scoring_kwargs,
                 )
             outcomes = enrich_gallery_outcomes(ranks, galleries)
             retrieval_metrics, retrieval_by_source, coverage_stats = aggregate_gallery_outcomes(
@@ -3129,7 +3810,7 @@ def main():
                 classification_supported = False
             else:
                 print("  Computing triplet classification metrics...")
-                classification_metrics, classification_by_source = evaluate_multimodal_classification(
+                classification_metrics, classification_by_source, triplet_logits_for_output = evaluate_multimodal_classification(
                     model,
                     runtime_model_args,
                     saved_args,
@@ -3154,6 +3835,7 @@ def main():
                     amp_dtype=amp_dtype,
                     amp_enabled=amp_enabled,
                     device=device,
+                    return_logits=True,
                 )
                 classification_supported = True
             model_results[name] = {
@@ -3173,6 +3855,7 @@ def main():
                 "classification_supported": classification_supported,
                 "classification": classification_metrics,
                 "classification_by_source": classification_by_source,
+                "candidate_time_delta_mode": cfg["candidate_time_delta_mode"],
                 "effective_input_window_metadata": runtime_model_args.get("effective_input_window_metadata"),
             }
             del negative_embeddings, embeddings, model
@@ -3187,7 +3870,7 @@ def main():
                     "Fink RF leakage guard: the negative training source is also the retrieval gallery source."
                 )
             fink_chunk_size = int(model_spec.get("chunk_size") or artifact.get("config", {}).get("batch_size", 2048))
-            ranks, fink_diagnostics = score_all_galleries_fink_rf(
+            outcomes, fink_diagnostics = score_all_galleries_fink_rf(
                 artifact,
                 positive_query_bank,
                 neg_optical_data,
@@ -3196,7 +3879,6 @@ def main():
                 negative_attrs=_read_h5_attrs(cfg["neg_data_path"]),
                 chunk_size=fink_chunk_size,
             )
-            outcomes = enrich_gallery_outcomes(ranks, galleries)
             retrieval_metrics, retrieval_by_source, coverage_stats = aggregate_gallery_outcomes(
                 outcomes=outcomes,
                 gallery_sizes=gallery_sizes,
@@ -3255,6 +3937,21 @@ def main():
             }
         else:
             raise ValueError(f"Unknown model type: {model_type}")
+
+        if retrieval_writer is not None:
+            retrieval_writer.writerows(retrieval_outcome_rows(
+                seed=seed,
+                model=name,
+                outcomes=outcomes,
+                gw_source_map=gw_source_map,
+                redshift_metadata=redshift_metadata,
+            ))
+        if classification_writer is not None and triplet_logits_for_output is not None:
+            classification_writer.writerows(classification_prediction_rows(
+                seed=seed,
+                model=name,
+                triplet_logits=triplet_logits_for_output,
+            ))
 
         retrieval_by_source = model_results[name].get("retrieval_by_source", {})
         if {"bns", "nsbh"}.issubset(
@@ -3319,6 +4016,31 @@ def main():
         torch.cuda.empty_cache()
         gc.collect()
 
+    if base_output is not None:
+        for summary_key, fresh_summary in (
+            ("gallery_positive_summary", gallery_positive_summary),
+            ("selected_positive_summary", selected_positive_summary),
+        ):
+            base_summary = base_output.get(summary_key)
+            if base_summary is not None and base_summary != fresh_summary:
+                raise ValueError(
+                    f"Partial-refresh {summary_key} mismatch; refusing to merge different gallery populations."
+                )
+        (
+            model_results,
+            retrieval_rows,
+            curve_rows,
+            redshift_rows,
+            model_names,
+        ) = merge_partial_model_results(
+            base_output=base_output,
+            fresh_model_results=model_results,
+            fresh_curve_rows=curve_rows,
+            fresh_redshift_rows=redshift_rows,
+            configured_model_specs=configured_model_specs,
+            refresh_model_type=refresh_model_type,
+        )
+
     print(f"\n{'=' * 60}")
     print("Results: Overall Retrieval")
     print("=" * 60)
@@ -3329,6 +4051,7 @@ def main():
     output_dir = Path(cfg["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
     plot_retrieval_curves(curve_rows, output_dir)
+    redshift_macro_rows = []
     if redshift_rows:
         write_redshift_csv(redshift_rows, output_dir / "redshift_metrics.csv")
         redshift_macro_rows = aggregate_redshift_macro_metrics(redshift_rows)
@@ -3336,6 +4059,55 @@ def main():
         plot_redshift_metrics(redshift_rows, output_dir)
         plot_redshift_macro_metrics(redshift_macro_rows, output_dir)
         print(f"Wrote redshift-binned outputs to {output_dir}")
+
+    baseline_comparison = None
+    if cfg["baseline_results_path"]:
+        baseline_output = _load_json(Path(cfg["baseline_results_path"]))
+        validate_time_delta_baseline_compatibility(baseline_output, cfg)
+        if baseline_output.get("gallery_positive_summary") != gallery_positive_summary:
+            raise ValueError("Baseline gallery-positive population does not match this run.")
+        if baseline_output.get("selected_positive_summary") != selected_positive_summary:
+            raise ValueError("Baseline selected-positive population does not match this run.")
+        if len(model_names) != 1:
+            raise ValueError("Time-delta baseline comparison requires exactly one evaluated model.")
+        model_name = str(model_names[0])
+        baseline_model = baseline_output.get("models", {}).get(model_name)
+        ablated_model = model_results.get(model_name)
+        if not isinstance(baseline_model, Mapping) or not isinstance(ablated_model, Mapping):
+            raise ValueError(f"Baseline/current results must both contain model {model_name!r}.")
+        metric_delta_rows = build_time_delta_metric_delta_rows(baseline_model, ablated_model)
+        redshift_delta_rows = build_time_delta_redshift_delta_rows(
+            baseline_output.get("redshift_rows", []),
+            redshift_rows,
+            method_name=model_name,
+        )
+        write_rows_csv(
+            metric_delta_rows,
+            output_dir / "time_delta_ablation_metric_deltas.csv",
+        )
+        write_rows_csv(
+            redshift_delta_rows,
+            output_dir / "time_delta_ablation_redshift_deltas.csv",
+        )
+        plot_time_delta_ablation(metric_delta_rows, output_dir)
+        plot_time_delta_redshift_ablation(redshift_delta_rows, output_dir)
+        baseline_comparison = {
+            "baseline_results_path": cfg["baseline_results_path"],
+            "model": model_name,
+            "baseline_candidate_time_delta_mode": baseline_output.get("config", {}).get(
+                "candidate_time_delta_mode", "native"
+            ),
+            "current_candidate_time_delta_mode": cfg["candidate_time_delta_mode"],
+            "gallery_compatibility": {
+                "config_fields": list(_BASELINE_COMPARISON_FIELDS),
+                "positive_summaries_match": True,
+                "identity_basis": "deterministic replay from identical seed and gallery config",
+                "current_gallery_identity": gallery_identity_summary,
+            },
+            "metric_delta_rows": metric_delta_rows,
+            "redshift_delta_rows": redshift_delta_rows,
+        }
+
     output = {
         "table": {
             "gallery_sizes": gallery_sizes,
@@ -3356,6 +4128,13 @@ def main():
         "sampled_positive_summary": sampled_positive_summary,
         "gallery_positive_summary": gallery_positive_summary,
         "selected_positive_summary": selected_positive_summary,
+        "gallery_identity": gallery_identity_summary,
+        "baseline_comparison": baseline_comparison,
+        "partial_refresh": {
+            "base_results": str(merge_path),
+            "refreshed_model_type": refresh_model_type,
+            "tie_policy": "uniform_random_expected" if refresh_model_type == "fink_rf" else None,
+        } if base_output is not None else None,
         "config": {
             "input_config": cfg["input_config"],
             "test_data_path": cfg["test_data_path"],
@@ -3388,6 +4167,11 @@ def main():
             "negative_sample_block_rows": cfg["negative_sample_block_rows"],
             "negative_sample_shuffle": cfg["negative_sample_shuffle"],
             "compute_classification_metrics": cfg["compute_classification_metrics"],
+            "save_outcomes": cfg["save_outcomes"],
+            "strict_output_safety": cfg["strict_output_safety"],
+            "experiment_id": cfg["experiment_id"],
+            "candidate_time_delta_mode": cfg["candidate_time_delta_mode"],
+            "baseline_results_path": cfg["baseline_results_path"],
             "nonkn_cls_base_field": cfg["nonkn_cls_base_field"],
             "report_dt_bins": cfg["report_dt_bins"],
             "dt_bin_edges": dt_bin_edges if dt_bin_edges is not None else None,
@@ -3412,13 +4196,21 @@ def main():
                     "resolved_checkpoint": spec["resolved_checkpoint"],
                     "resolved_config": spec.get("resolved_config"),
                 }
-                for spec in model_specs
+                for spec in configured_model_specs
             ],
         },
     }
     output_path = output_dir / "ablation_comparison.json"
-    with output_path.open("w", encoding="utf-8") as f:
-        json.dump(_json_safe(output), f, indent=2, ensure_ascii=False)
+    write_json_atomic(output_path, output)
+    completed_artifacts = [output_path.name]
+    if retrieval_writer is not None:
+        retrieval_writer.commit()
+        completed_artifacts.append("retrieval_outcomes.csv.gz")
+    if classification_writer is not None:
+        classification_writer.commit()
+        completed_artifacts.append("classification_predictions.csv.gz")
+    if run_manifest is not None:
+        mark_run_success(output_dir, run_manifest, completed_artifacts)
     print(f"\nResults saved to {output_path}")
 
 

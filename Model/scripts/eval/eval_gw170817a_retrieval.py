@@ -34,6 +34,7 @@ from retrieval_gallery import (  # noqa: E402
     _plot_method_label,
     aggregate_gallery_outcomes,
     build_comparison_model_specs,
+    gallery_outcome_metric_contributions,
     build_curve_rows,
     build_prefixed_gallery_specs,
     build_synthetic_time_sky_candidate_sequences,
@@ -54,6 +55,15 @@ from scripts.eval.evaluate import (  # noqa: E402
 )
 from scripts.eval import eval_retrieval_comparison as base_eval  # noqa: E402
 
+from scripts.eval.eval_run_io import (  # noqa: E402
+    AtomicGzipCsvWriter,
+    RETRIEVAL_FIELDS,
+    mark_run_success,
+    prepare_output_directory,
+    retrieval_outcome_rows,
+    stable_digest,
+    source_tree_digest,
+)
 
 TABLE_METRIC_LABELS = ["R@1", "R@5", "R@10", "MRR"]
 TABLE_METRIC_KEYS = ["recall_at_1", "recall_at_5", "recall_at_10", "mrr"]
@@ -150,6 +160,10 @@ def normalize_config(raw_cfg: Mapping[str, Any], cfg_path: Path) -> Dict[str, An
         "nonkn_cls_base_field": str(raw_cfg.get("nonkn_cls_base_field", "zero_time_mjd_cls_base")),
         "comparison_window": [float(v) for v in raw_cfg.get("comparison_window", [-0.1, 0.2])],
         "amp_dtype": str(raw_cfg.get("amp_dtype", "auto")),
+        "save_outcomes": base_eval._as_bool(raw_cfg.get("save_outcomes", False)),
+        "strict_output_safety": base_eval._as_bool(raw_cfg.get("strict_output_safety", False)),
+        "resume": base_eval._as_bool(raw_cfg.get("resume", False)),
+        "experiment_id": str(raw_cfg.get("experiment_id", "")).strip(),
     }
 
 
@@ -261,36 +275,39 @@ def aggregate_redshift_metrics(
                     bin_id,
                     {
                         "redshifts": [],
-                        "rank": [],
+                        "recalls": {1: [], 5: [], 10: []},
+                        "mrrs": [],
                         "coverage": [],
                         "full_coverage": [],
                         "actual_sizes": [],
                     },
                 )
-                rank = int(outcome["rank"])
+                metric_contributions = gallery_outcome_metric_contributions(outcome)
                 actual_size = int(outcome.get("actual_gallery_size", gallery_size))
                 coverage_met = bool(outcome.get("coverage_met", actual_size >= gallery_size))
                 fill_ratio = min(1.0, max(0.0, float(actual_size) / float(max(int(gallery_size), 1))))
                 bucket["redshifts"].append(float(meta["redshift"]))
-                bucket["rank"].append(rank)
+                for k in bucket["recalls"]:
+                    bucket["recalls"][k].append(metric_contributions[f"recall_at_{k}"])
+                bucket["mrrs"].append(metric_contributions["mrr"])
                 bucket["coverage"].append(fill_ratio)
                 bucket["full_coverage"].append(1.0 if coverage_met else 0.0)
                 bucket["actual_sizes"].append(actual_size)
 
         for bin_id in sorted(buckets):
             bucket = buckets[bin_id]
-            ranks = np.asarray(bucket["rank"], dtype=np.int64)
+            n_queries = len(bucket["mrrs"])
             rows.append(
                 {
                     "method": str(method_name),
                     "redshift_bin": int(bin_id),
                     "redshift": float(np.mean(bucket["redshifts"])),
                     "gallery_size": int(gallery_size),
-                    "n_queries": int(ranks.size),
-                    "recall_at_1": float(np.mean(ranks < 1)) if ranks.size else 0.0,
-                    "recall_at_5": float(np.mean(ranks < 5)) if ranks.size else 0.0,
-                    "recall_at_10": float(np.mean(ranks < 10)) if ranks.size else 0.0,
-                    "mrr": float(np.mean(1.0 / (ranks.astype(np.float64) + 1.0))) if ranks.size else 0.0,
+                    "n_queries": int(n_queries),
+                    "recall_at_1": float(np.mean(bucket["recalls"][1])) if n_queries else 0.0,
+                    "recall_at_5": float(np.mean(bucket["recalls"][5])) if n_queries else 0.0,
+                    "recall_at_10": float(np.mean(bucket["recalls"][10])) if n_queries else 0.0,
+                    "mrr": float(np.mean(bucket["mrrs"])) if n_queries else 0.0,
                     "coverage": float(np.mean(bucket["coverage"])) if bucket["coverage"] else 0.0,
                     "fill_ratio_mean": float(np.mean(bucket["coverage"])) if bucket["coverage"] else 0.0,
                     "full_coverage": float(np.mean(bucket["full_coverage"])) if bucket["full_coverage"] else 0.0,
@@ -570,12 +587,62 @@ def _neg_target(n_neg_samples: int) -> Optional[int]:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Dedicated GW170817A LSST redshift retrieval evaluation.")
     parser.add_argument("--config", required=True, help="Path to retrieval_gw170817a_lsst.json")
+    parser.add_argument("--refresh-model-type", help="Evaluate only this model type and merge existing results.")
+    parser.add_argument("--merge-existing", help="Existing gw170817a_retrieval.json used as the merge base.")
     args = parser.parse_args(argv)
+    if bool(args.refresh_model_type) != bool(args.merge_existing):
+        parser.error("--refresh-model-type and --merge-existing must be provided together.")
 
     cfg_path = Path(args.config).expanduser().resolve()
     raw_cfg = _load_json(cfg_path)
     cfg = normalize_config(raw_cfg, cfg_path)
-    model_specs = build_comparison_model_specs(raw_cfg, cfg_path.parent)
+    configured_model_specs = build_comparison_model_specs(raw_cfg, cfg_path.parent)
+    if cfg["save_outcomes"] and not cfg["strict_output_safety"]:
+        raise ValueError("save_outcomes=true requires strict_output_safety=true.")
+    if cfg["save_outcomes"] and args.refresh_model_type:
+        raise ValueError("Outcome-saving runs do not support partial refresh/merge.")
+    output_dir = Path(cfg["output_dir"])
+    run_manifest = None
+    retrieval_writer = None
+    if cfg["strict_output_safety"]:
+        experiment_config = dict(raw_cfg)
+        for volatile_key in ("seed", "output_dir", "resume"):
+            experiment_config.pop(volatile_key, None)
+        run_manifest = prepare_output_directory(
+            output_dir,
+            manifest={
+                "experiment_id": cfg["experiment_id"],
+                "experiment_digest": stable_digest(experiment_config),
+                "code_digest": source_tree_digest(base_eval.MODEL_DIR),
+                "seed": int(cfg["seed"]),
+                "input_config": str(cfg_path),
+                "test_data_path": cfg["test_data_path"],
+                "neg_data_path": cfg["neg_data_path"],
+            },
+            resume=cfg["resume"],
+        )
+    if cfg["save_outcomes"]:
+        retrieval_writer = AtomicGzipCsvWriter(
+            output_dir / "retrieval_outcomes.csv.gz", RETRIEVAL_FIELDS
+        )
+    base_output = None
+    refresh_model_type = str(args.refresh_model_type or "").strip()
+    if refresh_model_type:
+        merge_path = Path(args.merge_existing).expanduser().resolve()
+        base_output = _load_json(merge_path)
+        base_eval.validate_partial_refresh_compatibility(
+            base_output=base_output,
+            cfg=cfg,
+            configured_model_specs=configured_model_specs,
+            refresh_model_type=refresh_model_type,
+        )
+        model_specs = [
+            spec for spec in configured_model_specs if str(spec["type"]) == refresh_model_type
+        ]
+        print(f"Partial refresh: type={refresh_model_type}, base={merge_path}")
+    else:
+        merge_path = None
+        model_specs = list(configured_model_specs)
     _seed_all(int(cfg["seed"]))
 
     device = torch.device(cfg["device"] if torch.cuda.is_available() else "cpu")
@@ -704,7 +771,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "Fink RF leakage guard: the negative training source is also the retrieval gallery source."
                 )
             chunk_size = int(model_spec.get("chunk_size") or artifact_cfg.get("batch_size", 2048))
-            ranks, fink_diagnostics = base_eval.score_all_galleries_fink_rf(
+            outcomes, fink_diagnostics = base_eval.score_all_galleries_fink_rf(
                 artifact,
                 positive_bank,
                 neg_optical_data,
@@ -713,7 +780,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 negative_attrs=base_eval._read_h5_attrs(cfg["neg_data_path"]),
                 chunk_size=chunk_size,
             )
-            outcomes = base_eval.enrich_gallery_outcomes(ranks, galleries)
         elif model_type == "multimodal":
             model, runtime_model_args, saved_args = base_eval.load_multimodal_bundle(
                 model_spec["resolved_checkpoint"],
@@ -779,6 +845,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         else:
             raise ValueError(f"Unsupported model type: {model_type}")
 
+
+        if retrieval_writer is not None:
+            retrieval_writer.writerows(retrieval_outcome_rows(
+                seed=int(cfg["seed"]),
+                model=name,
+                outcomes=outcomes,
+                gw_source_map={int(gw_id): "gw170817a" for gw_id in unique_gw},
+                redshift_metadata=redshift_metadata,
+            ))
         retrieval_metrics, retrieval_by_source, coverage_stats = aggregate_gallery_outcomes(
             outcomes=outcomes,
             gallery_sizes=gallery_sizes,
@@ -834,6 +909,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         torch.cuda.empty_cache()
         gc.collect()
 
+    if base_output is not None:
+        (
+            model_results,
+            retrieval_rows,
+            curve_rows,
+            redshift_rows,
+            model_names,
+        ) = base_eval.merge_partial_model_results(
+            base_output=base_output,
+            fresh_model_results=model_results,
+            fresh_curve_rows=curve_rows,
+            fresh_redshift_rows=redshift_rows,
+            configured_model_specs=configured_model_specs,
+            refresh_model_type=refresh_model_type,
+        )
+
     print(f"\n{'=' * 60}")
     print("Results: Overall Retrieval")
     print("=" * 60)
@@ -859,6 +950,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         "redshift_rows": redshift_rows,
         "redshift_macro_rows": redshift_macro_rows,
         "models": dict(model_results),
+        "partial_refresh": {
+            "base_results": str(merge_path),
+            "refreshed_model_type": refresh_model_type,
+            "tie_policy": "uniform_random_expected" if refresh_model_type == "fink_rf" else None,
+        } if base_output is not None else None,
         "config": {
             **cfg,
             "models": [
@@ -872,12 +968,18 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "resolved_config": spec.get("resolved_config"),
                     "chunk_size": spec.get("chunk_size"),
                 }
-                for spec in model_specs
+                for spec in configured_model_specs
             ],
         },
     }
-    with (output_dir / "gw170817a_retrieval.json").open("w", encoding="utf-8") as f:
-        json.dump(_json_safe(output), f, indent=2, ensure_ascii=False)
+    output_path = output_dir / "gw170817a_retrieval.json"
+    base_eval.write_json_atomic(output_path, output)
+    completed_artifacts = [output_path.name]
+    if retrieval_writer is not None:
+        retrieval_writer.commit()
+        completed_artifacts.append("retrieval_outcomes.csv.gz")
+    if run_manifest is not None:
+        mark_run_success(output_dir, run_manifest, completed_artifacts)
     print(f"Wrote GW170817A retrieval outputs to {output_dir}")
     return 0
 

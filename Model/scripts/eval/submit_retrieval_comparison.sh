@@ -6,7 +6,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=80G
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:a100:1
 #SBATCH --time=12:00:00
 #SBATCH --partition=gpu
 #SBATCH --tmp=200G
@@ -57,8 +57,15 @@ if [[ ! -f "${config_file}" ]]; then
 fi
 config_dir="$(cd "$(dirname "${config_file}")" && pwd)"
 config_file="${config_dir}/$(basename "${config_file}")"
+REFRESH_MODEL_TYPE="${2:-${REFRESH_MODEL_TYPE:-}}"
+MERGE_EXISTING_RESULTS="${3:-${MERGE_EXISTING_RESULTS:-}}"
 
 mkdir -p "${LOG_DIR}"
+
+if [[ "${DRY_RUN:-false}" == "true" && -z "${SLURM_JOB_ID:-}" ]]; then
+    SLURM_JOB_ID=dry-run "${SCRIPT_PATH}" "${config_file}" "${REFRESH_MODEL_TYPE}" "${MERGE_EXISTING_RESULTS}"
+    exit $?
+fi
 
 if [[ -z "${SLURM_JOB_ID:-}" ]]; then
     if ! command -v sbatch >/dev/null 2>&1; then
@@ -87,7 +94,9 @@ if [[ -z "${SLURM_JOB_ID:-}" ]]; then
     if [[ -n "${MEM_PER_TASK:-}" ]]; then
         sbatch_opts+=(--mem="${MEM_PER_TASK}")
     fi
-    if [[ -n "${GPUS:-}" ]]; then
+    if [[ "${NO_GPU:-false}" == "true" ]]; then
+        sbatch_opts+=(--gres=none)
+    elif [[ -n "${GPUS:-}" ]]; then
         sbatch_opts+=(--gres="gpu:${GPUS}")
     fi
     if [[ -n "${NODES:-}" ]]; then
@@ -100,10 +109,18 @@ if [[ -z "${SLURM_JOB_ID:-}" ]]; then
         sbatch_opts+=(--chdir="${CHDIR}")
     fi
 
-    echo "Submitting job with: sbatch ${sbatch_opts[*]} ${SCRIPT_PATH} ${config_file}"
+    script_args=("${config_file}")
+    if [[ -n "${REFRESH_MODEL_TYPE}" || -n "${MERGE_EXISTING_RESULTS}" ]]; then
+        if [[ -z "${REFRESH_MODEL_TYPE}" || -z "${MERGE_EXISTING_RESULTS}" ]]; then
+            echo "REFRESH_MODEL_TYPE and MERGE_EXISTING_RESULTS must be set together." >&2
+            exit 1
+        fi
+        script_args+=("${REFRESH_MODEL_TYPE}" "${MERGE_EXISTING_RESULTS}")
+    fi
+    echo "Submitting job with: sbatch ${sbatch_opts[*]} ${SCRIPT_PATH} ${script_args[*]}"
     (
         cd "${WORKSPACE_ROOT}"
-        sbatch "${sbatch_opts[@]}" "${SCRIPT_PATH}" "${config_file}"
+        sbatch "${sbatch_opts[@]}" "${SCRIPT_PATH}" "${script_args[@]}"
     )
     exit 0
 fi
@@ -119,6 +136,7 @@ TEST_DATA_PATH=$(jq -r '.test_data_path // empty' "$config_file")
 NEG_DATA_PATH=$(jq -r '.neg_data_path // empty' "$config_file")
 NEG_GROUP=$(jq -r '.neg_group // empty' "$config_file")
 OUTPUT_DIR=$(jq -r '.output_dir // empty' "$config_file")
+STRICT_OUTPUT_SAFETY=$(jq -r '.strict_output_safety // false' "$config_file")
 DEVICE=$(jq -r '.device // "cuda"' "$config_file")
 AMP_DTYPE=$(jq -r '.amp_dtype // empty' "$config_file")
 GALLERY_SIZES=$(jq -r '.gallery_sizes // empty' "$config_file")
@@ -149,7 +167,9 @@ fi
 if [[ -z "$OUTPUT_DIR" || "$OUTPUT_DIR" == "null" ]]; then
     OUTPUT_DIR="${DEFAULT_OUTPUT_DIR}"
 fi
-mkdir -p "${OUTPUT_DIR}"
+if [[ "$STRICT_OUTPUT_SAFETY" != "true" ]]; then
+    mkdir -p "${OUTPUT_DIR}"
+fi
 
 echo "========================================"
 echo "SLURM Job Information"
@@ -240,8 +260,20 @@ fi
 # --- end checkpoint pre-check ---
 
 if [[ "$STAGE_TO_JOBFS" == "true" ]]; then
-    JOBFS_DIR="${SLURM_TMPDIR:-${TMPDIR:-${JOBFS:-}}}"
-    if [[ -n "$JOBFS_DIR" ]]; then
+    JOBFS_BASE="${SLURM_TMPDIR:-${TMPDIR:-${JOBFS:-}}}"
+    if [[ -n "$JOBFS_BASE" ]]; then
+        if [[ ! -d "$JOBFS_BASE" || ! -w "$JOBFS_BASE" ]]; then
+            echo "Local tmp base is not a writable directory: $JOBFS_BASE" >&2
+            exit 1
+        fi
+        JOBFS_DIR="$(mktemp -d "${JOBFS_BASE%/}/magiks_${SLURM_JOB_ID}_${SLURM_ARRAY_TASK_ID:-0}.XXXXXX")"
+        cleanup_jobfs() {
+            local expected_prefix="${JOBFS_BASE%/}/magiks_${SLURM_JOB_ID}_${SLURM_ARRAY_TASK_ID:-0}."
+            if [[ -n "${JOBFS_DIR:-}" && "$JOBFS_DIR" == "${expected_prefix}"* && -d "$JOBFS_DIR" ]]; then
+                rm -rf -- "$JOBFS_DIR"
+            fi
+        }
+        trap cleanup_jobfs EXIT
         echo "Staging data files to local disk: $JOBFS_DIR"
         cp -f "$TEST_DATA_PATH" "$JOBFS_DIR"/
         TEST_DATA_PATH="$JOBFS_DIR/$(basename "$TEST_DATA_PATH")"
@@ -259,14 +291,22 @@ if [[ "$STAGE_TO_JOBFS" == "true" ]]; then
         export JOBFS_DIR
         echo "Staging complete. Using JOBFS_DIR=$JOBFS_DIR"
     else
-        echo "No local tmp dir found; skip staging."
+        echo "No local tmp base found; skip staging."
     fi
 fi
 
-echo "Command: python -u ${EVAL_SCRIPT} --config ${config_file}"
+eval_args=(--config "${config_file}")
+if [[ -n "${REFRESH_MODEL_TYPE:-}" || -n "${MERGE_EXISTING_RESULTS:-}" ]]; then
+    if [[ -z "${REFRESH_MODEL_TYPE:-}" || -z "${MERGE_EXISTING_RESULTS:-}" ]]; then
+        echo "REFRESH_MODEL_TYPE and MERGE_EXISTING_RESULTS must be set together." >&2
+        exit 1
+    fi
+    eval_args+=(--refresh-model-type "${REFRESH_MODEL_TYPE}" --merge-existing "${MERGE_EXISTING_RESULTS}")
+fi
+echo "Command: python -u ${EVAL_SCRIPT} ${eval_args[*]}"
 
 cd "${REPO_ROOT}"
-python -u "${EVAL_SCRIPT}" --config "${config_file}"
+python -u "${EVAL_SCRIPT}" "${eval_args[@]}"
 
 exit_code=$?
 if [[ ${exit_code} -ne 0 ]]; then

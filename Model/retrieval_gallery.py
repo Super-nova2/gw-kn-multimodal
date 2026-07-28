@@ -713,6 +713,63 @@ def score_all_galleries_skymap(
     return outcomes
 
 
+def uniform_random_tie_metric_contributions(
+    n_strictly_better: int,
+    n_tied_negatives: int,
+    *,
+    ks: Sequence[int] = (1, 5, 10),
+    harmonic_numbers: Optional[np.ndarray] = None,
+) -> Dict[str, float]:
+    """Return exact expected retrieval metrics for uniform ordering within a tie block."""
+    n_better = int(n_strictly_better)
+    n_tied = int(n_tied_negatives)
+    if n_better < 0 or n_tied < 0:
+        raise ValueError("Tie counts must be non-negative.")
+
+    tie_size = n_tied + 1
+    contributions = {
+        f"recall_at_{int(k)}": float(
+            max(0, min(tie_size, int(k) - n_better)) / tie_size
+        )
+        for k in ks
+    }
+    upper = n_better + tie_size
+    if harmonic_numbers is not None:
+        harmonic = np.asarray(harmonic_numbers, dtype=np.float64).reshape(-1)
+        if harmonic.size <= upper:
+            raise ValueError(
+                f"harmonic_numbers must contain indices through {upper}; got length {harmonic.size}."
+            )
+        reciprocal_sum = float(harmonic[upper] - harmonic[n_better])
+    else:
+        reciprocal_sum = float(
+            np.sum(1.0 / np.arange(n_better + 1, upper + 1, dtype=np.float64))
+        )
+    contributions["mrr"] = reciprocal_sum / float(tie_size)
+    return contributions
+
+
+def gallery_outcome_metric_contributions(
+    outcome: Mapping[str, Any],
+    *,
+    ks: Sequence[int] = (1, 5, 10),
+) -> Dict[str, float]:
+    """Resolve per-gallery metric contributions, with legacy rank fallback."""
+    expected = outcome.get("metric_contributions")
+    if expected is not None:
+        required = [*(f"recall_at_{int(k)}" for k in ks), "mrr"]
+        missing = [key for key in required if key not in expected]
+        if missing:
+            raise KeyError(f"metric_contributions is missing required key(s): {missing}")
+        return {key: float(expected[key]) for key in required}
+
+    rank = float(outcome["rank"])
+    return {
+        **{f"recall_at_{int(k)}": 1.0 if rank < int(k) else 0.0 for k in ks},
+        "mrr": 1.0 / float(rank + 1.0),
+    }
+
+
 def aggregate_gallery_outcomes(
     *,
     outcomes: Mapping[Tuple[int, int, int], Mapping[str, Any]],
@@ -738,7 +795,7 @@ def aggregate_gallery_outcomes(
                 if key not in outcomes:
                     continue
                 outcome = outcomes[key]
-                rank = int(outcome["rank"])
+                metric_contributions = gallery_outcome_metric_contributions(outcome)
                 actual_gallery_size = int(outcome["actual_gallery_size"])
                 coverage_met = bool(outcome.get("coverage_met", actual_gallery_size >= int(gallery_size)))
                 fill_ratio = min(
@@ -747,8 +804,8 @@ def aggregate_gallery_outcomes(
                 )
 
                 for k in recalls:
-                    recalls[k].append(1.0 if rank < k else 0.0)
-                mrrs.append(1.0 / float(rank + 1))
+                    recalls[k].append(metric_contributions[f"recall_at_{k}"])
+                mrrs.append(metric_contributions["mrr"])
                 fill_ratios.append(fill_ratio)
                 full_coverage_flags.append(1.0 if coverage_met else 0.0)
                 actual_sizes.append(actual_gallery_size)
@@ -764,8 +821,8 @@ def aggregate_gallery_outcomes(
                         }
                     source_bucket = by_source[source_label][int(gallery_size)]
                     for k in source_bucket["recalls"]:
-                        source_bucket["recalls"][k].append(1.0 if rank < k else 0.0)
-                    source_bucket["mrrs"].append(1.0 / float(rank + 1))
+                        source_bucket["recalls"][k].append(metric_contributions[f"recall_at_{k}"])
+                    source_bucket["mrrs"].append(metric_contributions["mrr"])
 
         for k, values in recalls.items():
             metrics[f"gallery_{gallery_size}_recall_at_{k}"] = float(np.mean(values)) if values else 0.0
