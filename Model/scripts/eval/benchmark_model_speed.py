@@ -1,9 +1,13 @@
 #!/usr/bin/env python
-"""Benchmark pure forward compute speed for the GW-optical MAGIKS model.
+"""Benchmark forward compute speed for the GW-optical MAGIKS model.
 
-The timed regions assume all input tensors are already resident on the GPU.
-Checkpoint loading, HDF5 reads, CPU preprocessing, and CPU-to-GPU transfers are
-setup costs and are intentionally excluded from the reported latency numbers.
+GPU benchmark: timed regions assume all input tensors are already resident on
+the GPU. Checkpoint loading, HDF5 reads, CPU preprocessing, and CPU-to-GPU
+transfers are setup costs and are intentionally excluded from reported latency.
+
+CPU benchmark: single-sample (batch_size=1, fp32) inference on CPU, measured
+with perf_counter. Enabled by default; set "cpu_benchmark": false in config to
+skip.
 """
 
 from __future__ import annotations
@@ -190,6 +194,13 @@ def normalize_config(cfg: Mapping[str, Any], *, config_path: Optional[str] = Non
     normalized["seed"] = _positive_int(cfg, "seed", 42, allow_zero=True)
     normalized["device"] = str(cfg.get("device", "cuda") or "cuda")
     normalized["nonkn_cls_base_field"] = cfg.get("nonkn_cls_base_field", None)
+    normalized["e2e_benchmark"] = bool(cfg.get("e2e_benchmark", True))
+    normalized["e2e_warmup_iterations"] = _positive_int(
+        cfg, "e2e_warmup_iterations", 3, allow_zero=True
+    )
+    normalized["e2e_measure_iterations"] = _positive_int(
+        cfg, "e2e_measure_iterations", 20
+    )
     normalized["config_path"] = None if config_path is None else str(config_path)
     return normalized
 
@@ -410,7 +421,8 @@ def stage_gpu_batch(cpu_batch: CpuBatch, batch_size: int, device: torch.device, 
         opt_t.dtype,
     )
 
-    torch.cuda.synchronize(device)
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
     return GpuBatch(
         gw_s=gw_s,
         gw_m=gw_m,
@@ -615,30 +627,48 @@ def benchmark_callable(
     device: torch.device,
     checkpoint: str,
 ) -> Dict[str, Any]:
-    torch.cuda.empty_cache()
-    with torch.inference_mode():
-        for _ in range(warmup_iterations):
-            fn()
-    torch.cuda.synchronize(device)
-    torch.cuda.reset_peak_memory_stats(device)
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+        with torch.inference_mode():
+            for _ in range(warmup_iterations):
+                fn()
+        torch.cuda.synchronize(device)
+        torch.cuda.reset_peak_memory_stats(device)
 
-    start_events: List[torch.cuda.Event] = []
-    end_events: List[torch.cuda.Event] = []
-    with torch.inference_mode():
-        for _ in range(measure_iterations):
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
-            start.record()
-            fn()
-            end.record()
-            start_events.append(start)
-            end_events.append(end)
-    torch.cuda.synchronize(device)
+        start_events: List[torch.cuda.Event] = []
+        end_events: List[torch.cuda.Event] = []
+        with torch.inference_mode():
+            for _ in range(measure_iterations):
+                start = torch.cuda.Event(enable_timing=True)
+                end = torch.cuda.Event(enable_timing=True)
+                start.record()
+                fn()
+                end.record()
+                start_events.append(start)
+                end_events.append(end)
+        torch.cuda.synchronize(device)
 
-    elapsed_ms = [float(start.elapsed_time(end)) for start, end in zip(start_events, end_events)]
+        elapsed_ms = [float(start.elapsed_time(end)) for start, end in zip(start_events, end_events)]
+        peak_alloc = float(torch.cuda.max_memory_allocated(device) / (1024.0 ** 2))
+        peak_reserved = float(torch.cuda.max_memory_reserved(device) / (1024.0 ** 2))
+    else:
+        # CPU timing via perf_counter
+        with torch.inference_mode():
+            for _ in range(warmup_iterations):
+                fn()
+
+        elapsed_ms: List[float] = []
+        with torch.inference_mode():
+            for _ in range(measure_iterations):
+                t0 = time.perf_counter()
+                fn()
+                t1 = time.perf_counter()
+                elapsed_ms.append((t1 - t0) * 1000.0)
+
+        peak_alloc = 0.0
+        peak_reserved = 0.0
+
     stats = summarize_latency_ms(elapsed_ms, batch_size)
-    peak_alloc = float(torch.cuda.max_memory_allocated(device) / (1024.0 ** 2))
-    peak_reserved = float(torch.cuda.max_memory_reserved(device) / (1024.0 ** 2))
     return {
         "checkpoint": checkpoint,
         "batch_size": int(batch_size),
@@ -906,7 +936,8 @@ def set_reproducibility(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
@@ -919,10 +950,33 @@ def _safe_cudnn_version() -> Any:
         return {"error": str(exc).splitlines()[0]}
 
 
+def _cpu_model_name() -> str:
+    """Best-effort CPU model name from /proc/cpuinfo."""
+    try:
+        with open("/proc/cpuinfo", "r") as f:
+            for line in f:
+                if line.startswith("model name"):
+                    return line.split(":", 1)[1].strip()
+    except Exception:
+        pass
+    try:
+        import platform
+        return platform.processor() or "unknown"
+    except Exception:
+        return "unknown"
+
+
 def collect_environment(device: torch.device) -> Dict[str, Any]:
     props = torch.cuda.get_device_properties(device)
+    thread_vars = {}
+    for var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
+        thread_vars[var] = os.environ.get(var)
     return {
         "hostname": socket.gethostname(),
+        "cpu_model": _cpu_model_name(),
+        "cpu_cores": os.cpu_count(),
+        "pytorch_cpu_threads": torch.get_num_threads(),
+        "thread_env_vars": thread_vars,
         "python": sys.version.split()[0],
         "torch": torch.__version__,
         "torch_cuda": torch.version.cuda,
@@ -995,6 +1049,13 @@ def run_benchmark(cfg: Mapping[str, Any]) -> Dict[str, Any]:
     model, model_args, saved_args = load_project_model(cfg, device)
     model.eval()
 
+    env = collect_environment(device)
+    print(f"Host:       {env['hostname']}")
+    print(f"CPU:        {env['cpu_model']} ({env['cpu_cores']} cores, PyTorch threads={env['pytorch_cpu_threads']})")
+    print(f"GPU:        {env['gpu_name']} ({env['gpu_total_memory_mb']} MB)")
+    print(f"PyTorch:    {env['torch']}  CUDA: {env['torch_cuda']}  cuDNN: {env['cudnn']}")
+    print()
+
     max_batch_size = max(int(v) for v in cfg["batch_sizes"])
     ref_start = float(model_args.get("ref_start", -0.3))
     ref_end = float(model_args.get("ref_end", 0.6))
@@ -1054,9 +1115,73 @@ def run_benchmark(cfg: Mapping[str, Any]) -> Dict[str, Any]:
             del batch
             torch.cuda.empty_cache()
 
+    # ── End-to-end single-sample benchmark ──────────────────────────
+    # Times the full pipeline: HDF5 read → CPU preprocessing → GPU
+    # transfer → GPU forward pass.  This captures all CPU-side overhead
+    # that the pure-GPU benchmark intentionally excludes.
+    if cfg.get("e2e_benchmark", True):
+        print("\n--- End-to-End Single-Sample Benchmark (bs=1, fp32) ---")
+        print("Pipeline: HDF5 read + CPU prep + GPU transfer + GPU forward + sync")
+        e2e_warmup = int(cfg.get("e2e_warmup_iterations", 3))
+        e2e_measure = int(cfg.get("e2e_measure_iterations", 20))
+
+        # Re-read a fresh single-sample batch so each measurement
+        # includes the real cost of HDF5 I/O and CPU preprocessing.
+        _e2e_cpu_batch = read_cpu_batch(
+            str(cfg["data_path"]), 1,
+            ref_start=ref_start, ref_end=ref_end,
+        )
+
+        def _e2e_forward_once() -> None:
+            _b = stage_gpu_batch(_e2e_cpu_batch, 1, device, model_args)
+            full_multitask_forward(
+                model, _b,
+                device=device,
+                amp_dtype=torch.float32,
+                amp_enabled=False,
+            )
+            torch.cuda.synchronize(device)
+            del _b
+
+        try:
+            with torch.inference_mode():
+                for _ in range(e2e_warmup):
+                    _e2e_forward_once()
+
+            e2e_elapsed: List[float] = []
+            with torch.inference_mode():
+                for _ in range(e2e_measure):
+                    torch.cuda.empty_cache()
+                    t0 = time.perf_counter()
+                    _e2e_forward_once()
+                    t1 = time.perf_counter()
+                    e2e_elapsed.append((t1 - t0) * 1000.0)
+
+            e2e_stats = summarize_latency_ms(e2e_elapsed, 1)
+            e2e_row: Dict[str, Any] = {
+                "checkpoint": str(cfg["checkpoint"]),
+                "batch_size": 1,
+                "precision": "e2e_fp32",
+                "amp_dtype": "fp32",
+                "phase": "full_e2e",
+                "status": "ok",
+                "warmup_iterations": e2e_warmup,
+                "measure_iterations": e2e_measure,
+                **e2e_stats,
+                "peak_allocated_mb": 0.0,
+                "peak_reserved_mb": 0.0,
+                "error": "",
+            }
+            rows.append(e2e_row)
+        except Exception as exc:
+            print(f"Warning: E2E benchmark failed: {exc}. Results may be incomplete.")
+        finally:
+            del _e2e_cpu_batch
+            torch.cuda.empty_cache()
+
     payload = {
         "config": dict(cfg),
-        "environment": collect_environment(device),
+        "environment": env,
         "model": {
             "parameter_count": int(sum(p.numel() for p in model.parameters())),
             "train_args_available": bool(saved_args),
@@ -1075,7 +1200,7 @@ def run_benchmark(cfg: Mapping[str, Any]) -> Dict[str, Any]:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Benchmark pure GPU forward speed for GW-optical MAGIKS.")
+    parser = argparse.ArgumentParser(description="Benchmark GPU/CPU forward speed for GW-optical MAGIKS.")
     parser.add_argument("--config", required=True, help="Path to benchmark JSON config.")
     parser.add_argument(
         "--validate-only",

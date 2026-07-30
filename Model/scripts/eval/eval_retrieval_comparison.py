@@ -118,7 +118,8 @@ from scripts.eval.eval_run_io import (  # noqa: E402
 DEFAULT_COMPARISON_WINDOW = (-0.1, 0.2)
 DEFAULT_DT_BIN_EDGES = "0,3,5,10,30,100,300,inf"
 TABLE_METRIC_LABELS = ["R@1", "R@5", "R@10", "MRR"]
-CANDIDATE_TIME_DELTA_MODES = {"native", "zero"}
+CANDIDATE_TIME_DELTA_MODES = {"native", "positive_shared", "zero"}
+CANDIDATE_COORDINATE_MODES = {"native", "positive_shared"}
 
 
 def normalize_candidate_time_delta_mode(value: Any) -> str:
@@ -137,6 +138,7 @@ def apply_candidate_time_delta_mode(
     *,
     mode: str,
     n_candidates: int,
+    shared_value: Optional[float] = None,
 ) -> Optional[np.ndarray]:
     """Apply an inference-only ablation without changing model architecture."""
     normalized_mode = normalize_candidate_time_delta_mode(mode)
@@ -145,7 +147,25 @@ def apply_candidate_time_delta_mode(
         raise ValueError("n_candidates must be non-negative.")
     if normalized_mode == "zero":
         return np.zeros((n_candidates,), dtype=np.float32)
+    if normalized_mode == "positive_shared":
+        if shared_value is None or not np.isfinite(float(shared_value)):
+            raise ValueError(
+                "candidate_time_delta_mode='positive_shared' requires a finite "
+                "shared_value."
+            )
+        return np.full((n_candidates,), float(shared_value), dtype=np.float32)
     return dt_days
+
+
+def normalize_candidate_coordinate_mode(value: Any) -> str:
+    """Validate inference-time treatment of optical sky coordinates."""
+    mode = str(value or "native").strip().lower()
+    if mode not in CANDIDATE_COORDINATE_MODES:
+        raise ValueError(
+            "candidate_coordinate_mode must be one of "
+            f"{sorted(CANDIDATE_COORDINATE_MODES)}; got {value!r}."
+        )
+    return mode
 
 
 def _lookup_event_time_mjd(gw_event_time_mjd_table, gw_id: int) -> Optional[float]:
@@ -1962,6 +1982,14 @@ def extract_optical_candidate_embeddings(
     all_opt_v = []
     all_opt_mask = []
     all_opt_err = []
+    all_z_curve = []
+
+    optical_encoder = getattr(core_model, "optical_encoder", None)
+    supports_curve_coord_cache = (
+        optical_encoder is not None
+        and hasattr(optical_encoder, "encode_components")
+        and hasattr(optical_encoder, "contrastive_head")
+    )
 
     total = int(optical_data["times"].shape[0])
     for start in tqdm(range(0, total, int(chunk_size)), desc=desc):
@@ -1974,9 +2002,16 @@ def extract_optical_candidate_embeddings(
         opt_err = optical_data["errors"].index_select(0, chunk_idx).to(device)
         ref_time = build_ref_time(opt_t.size(0), n_ref, ref_start, ref_end, device, opt_t.dtype)
         with _autocast_context(device, amp_dtype, enabled=amp_enabled):
-            z_l, h_l = core_model.encode_optical(
-                opt_coords, opt_t, opt_v, ref_time, opt_mask, opt_err
-            )
+            if supports_curve_coord_cache:
+                z_curve, coord_feat, h_l = optical_encoder.encode_components(
+                    opt_coords, opt_t, opt_v, ref_time, opt_mask, opt_err=opt_err
+                )
+                z_l = optical_encoder.contrastive_head(z_curve, coord_feat)
+            else:
+                z_curve = None
+                z_l, h_l = core_model.encode_optical(
+                    opt_coords, opt_t, opt_v, ref_time, opt_mask, opt_err
+                )
 
         all_h_l.append(h_l.float().cpu())
         all_z_l.append(z_l.float().cpu())
@@ -1985,6 +2020,8 @@ def extract_optical_candidate_embeddings(
         all_opt_v.append(opt_v.float().cpu())
         all_opt_mask.append(opt_mask.float().cpu())
         all_opt_err.append(opt_err.float().cpu())
+        if z_curve is not None:
+            all_z_curve.append(z_curve.float().cpu())
 
     result = {
         "h_l_cls": torch.cat(all_h_l),
@@ -1995,6 +2032,8 @@ def extract_optical_candidate_embeddings(
         "opt_mask_raw": torch.cat(all_opt_mask),
         "opt_err_raw": torch.cat(all_opt_err),
     }
+    if all_z_curve:
+        result["z_curve_cls"] = torch.cat(all_z_curve)
     if "gw_indices" in optical_data:
         gw_indices = optical_data["gw_indices"]
         result["gw_indices"] = (
@@ -2151,6 +2190,8 @@ def extract_negative_gallery_embeddings(
     ref_start: float,
     ref_end: float,
     chunk_size: int = 1024,
+    retain_raw: bool = True,
+    show_progress: bool = True,
     amp_dtype: torch.dtype = torch.float32,
     amp_enabled: bool = False,
 ):
@@ -2175,7 +2216,10 @@ def extract_negative_gallery_embeddings(
         and hasattr(optical_encoder, "contrastive_head")
     )
     total = int(neg_optical_data["times"].shape[0])
-    for start in tqdm(range(0, total, int(chunk_size)), desc="  Extracting tutorial distractor embeddings"):
+    starts = range(0, total, int(chunk_size))
+    if show_progress:
+        starts = tqdm(starts, desc="  Extracting tutorial distractor embeddings")
+    for start in starts:
         end = min(start + int(chunk_size), total)
         chunk_idx = torch.arange(start, end, dtype=torch.long)
         opt_coords = neg_optical_data["coordinates"].index_select(0, chunk_idx).to(device)
@@ -2201,20 +2245,26 @@ def extract_negative_gallery_embeddings(
         if z_curve is not None:
             all_z_curve.append(z_curve.float().cpu())
         all_opt_coords.append(opt_coords.float().cpu())
-        all_opt_t.append(opt_t.float().cpu())
-        all_opt_v.append(opt_v.float().cpu())
-        all_opt_mask.append(opt_mask.float().cpu())
-        all_opt_err.append(opt_err.float().cpu())
+        if retain_raw:
+            all_opt_t.append(opt_t.float().cpu())
+            all_opt_v.append(opt_v.float().cpu())
+            all_opt_mask.append(opt_mask.float().cpu())
+            all_opt_err.append(opt_err.float().cpu())
 
     result = {
         "h_l_cls": torch.cat(all_h_l),
         "z_l_cls": torch.cat(all_z_l),
         "opt_coords": torch.cat(all_opt_coords),
-        "opt_t_raw": torch.cat(all_opt_t),
-        "opt_v_raw": torch.cat(all_opt_v),
-        "opt_mask_raw": torch.cat(all_opt_mask),
-        "opt_err_raw": torch.cat(all_opt_err),
     }
+    if retain_raw:
+        result.update(
+            {
+                "opt_t_raw": torch.cat(all_opt_t),
+                "opt_v_raw": torch.cat(all_opt_v),
+                "opt_mask_raw": torch.cat(all_opt_mask),
+                "opt_err_raw": torch.cat(all_opt_err),
+            }
+        )
     if all_z_curve:
         result["z_curve_cls"] = torch.cat(all_z_curve)
     return result
@@ -2257,6 +2307,12 @@ def _candidate_z_l_for_chunk(
             z_curve = candidate_bank["z_curve_cls"].index_select(0, chunk_idx).to(device)
             coord_feat = optical_encoder.encode_coord_only(opt_coords_chunk)
             return optical_encoder.contrastive_head(z_curve, coord_feat)
+    if use_synthetic_coords:
+        raise ValueError(
+            "Synthetic/shared candidate coordinates require z_curve_cls and an "
+            "optical encoder with encode_coord_only/contrastive_head; refusing "
+            "to reuse an embedding computed at the original coordinate."
+        )
     return candidate_bank["z_l_cls"].index_select(0, chunk_idx).to(device)
 
 
@@ -2424,6 +2480,9 @@ def score_all_galleries_multimodal(
     model_args: Dict[str, Any],
     gw_event_time_mjd_table=None,
     candidate_time_delta_mode: str = "native",
+    candidate_coordinate_mode: str = "native",
+    query_input_transform=None,
+    return_score_details: bool = False,
     amp_dtype: torch.dtype = torch.float32,
     amp_enabled: bool = False,
 ):
@@ -2431,10 +2490,14 @@ def score_all_galleries_multimodal(
     candidate_time_delta_mode = normalize_candidate_time_delta_mode(
         candidate_time_delta_mode
     )
+    candidate_coordinate_mode = normalize_candidate_coordinate_mode(
+        candidate_coordinate_mode
+    )
     model_requires_time_delta = _model_requires_time_delta(model)
-    if candidate_time_delta_mode == "zero" and not model_requires_time_delta:
+    if candidate_time_delta_mode != "native" and not model_requires_time_delta:
         raise ValueError(
-            "candidate_time_delta_mode='zero' requested, but the runtime model "
+            f"candidate_time_delta_mode={candidate_time_delta_mode!r} requested, "
+            "but the runtime model "
             "does not consume a time-delta feature."
         )
     print(
@@ -2451,9 +2514,11 @@ def score_all_galleries_multimodal(
         device,
         amp_dtype=amp_dtype,
         amp_enabled=amp_enabled,
+        query_input_transform=query_input_transform,
     )
 
     ranks: Dict[Tuple[int, int, int], int] = {}
+    score_details: Dict[Tuple[int, int, int], Dict[str, Any]] = {}
     observed_dt_count = 0
     observed_nonzero_dt_count = 0
     for key, gallery_spec in tqdm(galleries.items(), desc="  Scoring galleries"):
@@ -2477,12 +2542,29 @@ def score_all_galleries_multimodal(
             np.asarray([pos_dt], dtype=np.float32),
             mode=candidate_time_delta_mode,
             n_candidates=1,
+            shared_value=pos_dt,
         )
         neg_dt_values = apply_candidate_time_delta_mode(
             neg_abs_dt_days,
             mode=candidate_time_delta_mode,
             n_candidates=int(neg_indices.shape[0]),
+            shared_value=pos_dt,
         )
+        pos_candidate_coords = None
+        if candidate_coordinate_mode == "positive_shared":
+            pos_coord = (
+                positive_bank["opt_coords"][pos_index]
+                .detach()
+                .cpu()
+                .numpy()
+                .astype(np.float32, copy=False)
+            )
+            pos_candidate_coords = pos_coord.reshape(1, 2)
+            neg_candidate_coords = np.repeat(
+                pos_coord.reshape(1, 2),
+                int(neg_indices.shape[0]),
+                axis=0,
+            )
         for label, values in (("positive", pos_dt_values), ("negative", neg_dt_values)):
             if values is None:
                 continue
@@ -2501,6 +2583,7 @@ def score_all_galleries_multimodal(
             positive_bank,
             device,
             dual,
+            candidate_coords=pos_candidate_coords,
             candidate_abs_dt_days=pos_dt_values,
             amp_dtype=amp_dtype,
             amp_enabled=amp_enabled,
@@ -2518,13 +2601,25 @@ def score_all_galleries_multimodal(
             amp_enabled=amp_enabled,
         )
         scores = np.concatenate([pos_scores, neg_scores], axis=0)
-        ranked = np.argsort(-scores)
+        ranked = np.argsort(-scores, kind="stable")
         ranks[key] = int(np.where(ranked == 0)[0][0])
+        if return_score_details:
+            best_negative = (
+                float(np.max(neg_scores)) if neg_scores.size else float("-inf")
+            )
+            score_details[key] = {
+                "positive_score": float(pos_scores[0]),
+                "best_negative_score": best_negative,
+                "score_margin": float(pos_scores[0] - best_negative),
+                "candidate_scores": scores.astype(np.float32, copy=False),
+            }
 
     print(
         "  Runtime candidate time-delta audit: "
         f"count={observed_dt_count}, nonzero={observed_nonzero_dt_count}"
     )
+    if return_score_details:
+        return ranks, score_details
     return ranks
 
 

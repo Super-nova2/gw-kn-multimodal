@@ -1169,6 +1169,61 @@ def _read_h5_intervals(dataset, intervals: List[Tuple[int, int]]) -> np.ndarray:
     return np.concatenate(parts, axis=0)
 
 
+def sample_negative_optical_source_indices(
+    neg_data_path,
+    neg_group,
+    n_samples=5000,
+    seed=42,
+    negative_sample_strategy: str = "block_random",
+    negative_sample_block_rows: Optional[int] = None,
+    negative_sample_shuffle: bool = True,
+) -> np.ndarray:
+    """Return the deterministic source-row sample without loading light curves.
+
+    The returned order is identical to ``load_negative_optical_samples`` for
+    the same sampling arguments. Attribution runners can therefore construct
+    galleries cheaply and stream only the selected HDF5 rows during encoding.
+    """
+    if neg_data_path is None or not os.path.exists(neg_data_path):
+        raise FileNotFoundError(f"Negative data path not found: {neg_data_path}")
+
+    rng = np.random.default_rng(seed)
+    with h5py.File(neg_data_path, "r") as handle:
+        group = handle[neg_group]
+        total_samples = int(group["values"].shape[0])
+        if n_samples is None:
+            requested = total_samples
+        else:
+            requested = int(n_samples)
+            if requested <= 0:
+                requested = total_samples
+        sample_strategy = _normalize_negative_sample_strategy(
+            negative_sample_strategy
+        )
+        if requested >= total_samples:
+            return np.arange(total_samples, dtype=np.int64)
+        if sample_strategy == "block_random":
+            block_rows = _infer_negative_sample_block_rows(
+                group, negative_sample_block_rows
+            )
+            _, source_indices = _build_block_sample_intervals(
+                total_samples,
+                requested,
+                rng=rng,
+                block_rows=block_rows,
+            )
+            if bool(negative_sample_shuffle):
+                source_indices = source_indices[
+                    rng.permutation(requested).astype(np.int64)
+                ]
+            return source_indices
+
+        source_indices = rng.choice(
+            total_samples, size=requested, replace=False
+        )
+        return np.sort(source_indices).astype(np.int64, copy=False)
+
+
 def load_negative_optical_samples(
     neg_data_path,
     neg_group,
@@ -2312,9 +2367,21 @@ def evaluate_retrieval_batch_mode(embeddings, ks=(1, 5, 10)):
 
 
 @torch.no_grad()
-def _build_gallery_query_cache(model, unique_gw_ids, test_data_path, device,
-                               amp_dtype=torch.float32, amp_enabled=False):
-    """Cache GW-side classification features once per GW event for gallery eval."""
+def _build_gallery_query_cache(
+    model,
+    unique_gw_ids,
+    test_data_path,
+    device,
+    amp_dtype=torch.float32,
+    amp_enabled=False,
+    query_input_transform=None,
+):
+    """Cache GW-side classification features once per GW event for gallery eval.
+
+    ``query_input_transform`` is an optional inference-only hook with signature
+    ``(gw_id, scalars, skymap) -> (scalars, skymap)``. Inputs and outputs are
+    NumPy arrays. The default keeps the historical evaluation path unchanged.
+    """
     if test_data_path is None or not os.path.exists(test_data_path):
         raise FileNotFoundError(f"test_data_path not found for gallery logits eval: {test_data_path}")
 
@@ -2328,8 +2395,32 @@ def _build_gallery_query_cache(model, unique_gw_ids, test_data_path, device,
 
         for gw_id in tqdm(unique_gw_ids, desc="Caching GW query features"):
             gw_id = int(gw_id)
-            gw_s = torch.from_numpy(gw_scalars_ds[gw_id]).unsqueeze(0).to(device)
-            gw_m = torch.from_numpy(gw_skymaps_ds[gw_id]).unsqueeze(0).to(device)
+            gw_scalars = np.asarray(gw_scalars_ds[gw_id], dtype=np.float32)
+            gw_skymap = np.asarray(gw_skymaps_ds[gw_id], dtype=np.float32)
+            if query_input_transform is not None:
+                gw_scalars, gw_skymap = query_input_transform(
+                    gw_id, gw_scalars.copy(), gw_skymap.copy()
+                )
+                gw_scalars = np.asarray(gw_scalars, dtype=np.float32)
+                gw_skymap = np.asarray(gw_skymap, dtype=np.float32)
+                if gw_scalars.shape != tuple(gw_scalars_ds.shape[1:]):
+                    raise ValueError(
+                        "query_input_transform changed GW scalar shape: "
+                        f"expected {tuple(gw_scalars_ds.shape[1:])}, got {gw_scalars.shape}"
+                    )
+                if gw_skymap.shape != tuple(gw_skymaps_ds.shape[1:]):
+                    raise ValueError(
+                        "query_input_transform changed skymap shape: "
+                        f"expected {tuple(gw_skymaps_ds.shape[1:])}, got {gw_skymap.shape}"
+                    )
+                if not np.all(np.isfinite(gw_scalars)) or not np.all(
+                    np.isfinite(gw_skymap)
+                ):
+                    raise ValueError(
+                        f"query_input_transform produced non-finite values for gw_id={gw_id}"
+                    )
+            gw_s = torch.from_numpy(gw_scalars).unsqueeze(0).to(device)
+            gw_m = torch.from_numpy(gw_skymap).unsqueeze(0).to(device)
 
             with _autocast_context(device, amp_dtype, enabled=amp_enabled):
                 g, H_gw = core_model.gw_encoder(gw_s, gw_m)

@@ -46,6 +46,45 @@ class CandidateTimeDeltaModeTests(unittest.TestCase):
 
         self.assertIs(result, original)
 
+    def test_positive_shared_mode_repeats_positive_delay(self) -> None:
+        result = comparison.apply_candidate_time_delta_mode(
+            np.asarray([1.0, 2.0], dtype=np.float32),
+            mode="positive_shared",
+            n_candidates=2,
+            shared_value=0.75,
+        )
+
+        np.testing.assert_array_equal(
+            result, np.asarray([0.75, 0.75], dtype=np.float32)
+        )
+
+    def test_positive_shared_requires_finite_shared_value(self) -> None:
+        with self.assertRaisesRegex(ValueError, "shared_value"):
+            comparison.apply_candidate_time_delta_mode(
+                None,
+                mode="positive_shared",
+                n_candidates=2,
+            )
+
+    def test_coordinate_mode_fails_closed(self) -> None:
+        self.assertEqual(
+            comparison.normalize_candidate_coordinate_mode("positive_shared"),
+            "positive_shared",
+        )
+        with self.assertRaisesRegex(ValueError, "candidate_coordinate_mode"):
+            comparison.normalize_candidate_coordinate_mode("random")
+
+    def test_synthetic_coordinate_rejects_stale_optical_embedding(self) -> None:
+        with self.assertRaisesRegex(ValueError, "original coordinate"):
+            comparison._candidate_z_l_for_chunk(
+                object(),
+                {"z_l_cls": torch.zeros((1, 2))},
+                torch.tensor([0]),
+                torch.zeros((1, 2)),
+                torch.device("cpu"),
+                use_synthetic_coords=True,
+            )
+
     def test_invalid_mode_fails_closed(self) -> None:
         with self.assertRaisesRegex(ValueError, "candidate_time_delta_mode"):
             comparison.normalize_candidate_time_delta_mode("shuffle")
@@ -136,6 +175,69 @@ class CandidateTimeDeltaModeTests(unittest.TestCase):
                     model_args={},
                     candidate_time_delta_mode="zero",
                 )
+
+    def test_positive_shared_time_and_coordinate_reach_every_candidate(self) -> None:
+        galleries = {
+            (3, 0, 7): {
+                "positive_index": 0,
+                "negative_indices": np.asarray([2, 4], dtype=np.int64),
+            }
+        }
+        captured = []
+
+        def capture_scores(*args, **kwargs):
+            captured.append(
+                {
+                    "dt": np.asarray(kwargs["candidate_abs_dt_days"]).copy(),
+                    "coords": np.asarray(kwargs["candidate_coords"]).copy(),
+                }
+            )
+            return np.zeros(np.asarray(args[2]).shape[0], dtype=np.float32)
+
+        with (
+            mock.patch.object(
+                comparison, "_build_gallery_query_cache", return_value={7: {}}
+            ),
+            mock.patch.object(
+                comparison, "_model_requires_time_delta", return_value=True
+            ),
+            mock.patch.object(
+                comparison,
+                "extract_gallery_negative_abs_dt_days",
+                return_value=np.asarray([7.0, 9.0], dtype=np.float32),
+            ),
+            mock.patch.object(
+                comparison,
+                "_score_candidate_bank_with_logits",
+                side_effect=capture_scores,
+            ),
+        ):
+            comparison.score_all_galleries_multimodal(
+                model=object(),
+                positive_bank={
+                    "dual_fusion": False,
+                    "first_detection_mjd": torch.tensor([102.0]),
+                    "opt_coords": torch.tensor([[1.25, -0.5]]),
+                },
+                negative_bank={},
+                galleries=galleries,
+                unique_gw=[7],
+                test_data_path="unused.h5",
+                device=torch.device("cpu"),
+                model_args={},
+                gw_event_time_mjd_table=np.asarray(
+                    [np.nan] * 7 + [100.0], dtype=np.float64
+                ),
+                candidate_time_delta_mode="positive_shared",
+                candidate_coordinate_mode="positive_shared",
+            )
+
+        np.testing.assert_array_equal(captured[0]["dt"], [2.0])
+        np.testing.assert_array_equal(captured[1]["dt"], [2.0, 2.0])
+        np.testing.assert_array_equal(captured[0]["coords"], [[1.25, -0.5]])
+        np.testing.assert_array_equal(
+            captured[1]["coords"], [[1.25, -0.5], [1.25, -0.5]]
+        )
 
 
 class TimeDeltaComparisonArtifactTests(unittest.TestCase):

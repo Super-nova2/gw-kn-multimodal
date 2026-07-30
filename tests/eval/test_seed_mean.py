@@ -251,5 +251,151 @@ class SeedMeanTests(unittest.TestCase):
             self.assertFalse((output / "_SUCCESS.json").exists())
 
 
+    def test_redshift_macro_rows_are_averaged_equally_by_seed(self) -> None:
+        payloads = {}
+        for seed, value in SEED_VALUES.items():
+            payloads[seed] = {
+                "redshift_macro_rows": [
+                    {
+                        "method": "Full",
+                        "redshift_bin": 0,
+                        "redshift": 0.05,
+                        "weight_scheme": "log10(gallery_size)",
+                        "n_gallery_sizes": 6,
+                        "gallery_weight_sum": 15.0,
+                        "n_queries_mean": 10.0,
+                        "macro_recall_at_1": value,
+                        "macro_recall_at_10": value + 0.05,
+                        "macro_mrr": value + 0.025,
+                    }
+                ]
+            }
+        result = seed_mean._average_redshift_macro_rows(
+            payloads,
+            identity_fields=("method", "redshift_bin"),
+            models=("Full",),
+        )
+        expected = sum(SEED_VALUES.values()) / 3.0
+        self.assertAlmostEqual(float(result.iloc[0]["macro_recall_at_1"]), expected)
+        self.assertEqual(int(result.iloc[0]["n_gallery_sizes"]), 6)
+
+        payloads[456]["redshift_macro_rows"] = []
+        with self.assertRaises(ValueError):
+            seed_mean._average_redshift_macro_rows(
+                payloads,
+                identity_fields=("method", "redshift_bin"),
+                models=("Full",),
+            )
+
+    def test_logit_density_is_an_equal_mean_of_three_seed_densities(self) -> None:
+        rows = []
+        probabilities = {
+            42: (0.2, 0.8),
+            123: (0.3, 0.7),
+            456: (0.4, 0.6),
+        }
+        for seed, pair_probabilities in probabilities.items():
+            for pair_type in seed_mean.PAPER_PAIR_STYLES:
+                for probability in pair_probabilities:
+                    rows.append(
+                        {
+                            "seed": seed,
+                            "model": "Full",
+                            "pair_type": pair_type,
+                            "probability": probability,
+                        }
+                    )
+        density = seed_mean._mean_logit_density(pd.DataFrame(rows), n_bins=12)
+        for pair_type in seed_mean.PAPER_PAIR_STYLES:
+            block = density[density["pair_type"] == pair_type]
+            widths = block["bin_right"] - block["bin_left"]
+            self.assertAlmostEqual(
+                float((block["mean_density"] * widths).sum()), 1.0
+            )
+            self.assertEqual(set(block["n_seeds"]), {3})
+
+    def test_confusion_matrix_uses_point_five_and_equal_seed_mean(self) -> None:
+        rows = []
+        for seed in seed_mean.EVAL_SEEDS:
+            for source_type in ("bns", "nsbh"):
+                rows.extend(
+                    [
+                        {
+                            "seed": seed,
+                            "model": "Full",
+                            "source_type": source_type,
+                            "label": 0,
+                            "probability": 0.49,
+                        },
+                        {
+                            "seed": seed,
+                            "model": "Full",
+                            "source_type": source_type,
+                            "label": 1,
+                            "probability": 0.5,
+                        },
+                    ]
+                )
+        confusion = seed_mean._mean_confusion_rows(pd.DataFrame(rows))
+        diagonal = confusion[
+            confusion["true_label"] == confusion["predicted_label"]
+        ]
+        off_diagonal = confusion[
+            confusion["true_label"] != confusion["predicted_label"]
+        ]
+        self.assertTrue(np.allclose(diagonal["mean_fraction"], 1.0))
+        self.assertTrue(np.allclose(off_diagonal["mean_fraction"], 0.0))
+        self.assertEqual(set(confusion["threshold"]), {0.5})
+
+    def test_paper_plot_styles_match_the_existing_article(self) -> None:
+        self.assertEqual(
+            seed_mean.PAPER_PLOT_ORDER,
+            (
+                "Fink Random Forest",
+                "Optical-only baseline",
+                "Skymap-only",
+                "w/o Contrastive Loss",
+                "w/o Cross-Attn",
+                "w/o Fusion",
+                "w/o Gallery Loss",
+                "Full",
+            ),
+        )
+        self.assertEqual(
+            [
+                seed_mean.PAPER_METHOD_STYLES[model][0]
+                for model in seed_mean.PAPER_PLOT_ORDER
+            ],
+            [
+                "#2CA02C",
+                "#1F77B4",
+                "#F2C230",
+                "#9467BD",
+                "#8C564B",
+                "#E377C2",
+                "#7F7F7F",
+                "#D62728",
+            ],
+        )
+        for marker, linestyle in (
+            style[1:] for style in seed_mean.PAPER_METHOD_STYLES.values()
+        ):
+            self.assertEqual(marker, "o")
+            self.assertEqual(linestyle, "-")
+
+    def test_latex_table_rows_use_article_best_value_emphasis(self) -> None:
+        frame = pd.DataFrame(
+            {
+                "Method": ["A", "B", "C"],
+                "Metric 1": [0.1, 0.2, 0.3],
+                "Metric 2": [0.5, 0.5, 0.1],
+            }
+        )
+        rows = seed_mean._latex_table_rows(frame)
+        self.assertIn(r"\underline{0.200}", rows[1])
+        self.assertIn(r"\textbf{0.500}", rows[1])
+        self.assertIn(r"\textbf{0.300}", rows[2])
+        self.assertIn(r"\underline{0.100}", rows[2])
+
 if __name__ == "__main__":
     unittest.main()

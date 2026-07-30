@@ -28,9 +28,11 @@ hpo_results/
 # OS
 .DS_Store
 
-# User-local JSON configs (track .json.example templates only)
+# User-local JSON configs (explicit experiment configs may be tracked)
 *.json
 !*.json.example
+!Model/args/eval/fixed_checkpoint_attribution_v1.json
+!Model/args/eval/fixed_checkpoint_attribution_v2.json
 archive/
 
 # Generated exports

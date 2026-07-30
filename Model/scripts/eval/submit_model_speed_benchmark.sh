@@ -173,7 +173,7 @@ echo "Model config: ${MODEL_CONFIG:-none}"
 echo "Output dir: ${OUTPUT_DIR}"
 echo "Batch sizes: ${BATCH_SIZES}"
 echo "Precision modes: ${PRECISION_MODES}"
-echo "Run mode: pure GPU forward benchmark"
+echo "Run mode: GPU forward benchmark + end-to-end single-sample benchmark"
 echo
 
 python -u "${BENCH_SCRIPT}" --config "${config_file}"

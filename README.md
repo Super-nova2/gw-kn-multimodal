@@ -155,6 +155,30 @@ bash Model/scripts/eval/submit_test_evaluate.sh /path/to/eval_args.json
 
 支持检索、分类、OOD 监控和负样本时间偏移评估。
 
+### 3b. 固定 checkpoint 的 GW 输入归因
+
+扩展版 v2 固定同一个 checkpoint，不重新训练，共生成 31 个任务/seed：
+
+- 12 个 KN-vs-non-KN operational 条件
+- 18 个 nuisance-nearest KN-vs-KN 条件，其中 4 个是 GW×光变 factorial 条件
+- 1 个 random-same-source KN baseline，用于量化 nearest-nuisance gallery 的额外难度
+
+```bash
+# 仅检查将生成的任务，不写配置、不提交
+DRY_RUN=true bash Model/scripts/eval/submit_fixed_checkpoint_attribution.sh \
+  Model/args/eval/fixed_checkpoint_attribution_v2.json smoke
+
+# smoke 或完整 seed42
+bash Model/scripts/eval/submit_fixed_checkpoint_attribution.sh \
+  Model/args/eval/fixed_checkpoint_attribution_v2.json smoke
+bash Model/scripts/eval/submit_fixed_checkpoint_attribution.sh \
+  Model/args/eval/fixed_checkpoint_attribution_v2.json seed42
+```
+
+factorial 条件检验 distance×brightness、primary-spin×temporal-evolution，
+以及 inclination×color/time-evolution。聚合器额外输出交互效应、随机与
+nearest gallery 的性能差，以及两种 gallery 的 nuisance/物理距离分布。
+
 ### 4. 构建 optical-only 数据集
 
 这个流程会把光变序列做 first-detection 对齐、2 小时同波段合并、luptitude 变换，并输出 optical-only HDF5。

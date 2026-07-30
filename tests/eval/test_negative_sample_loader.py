@@ -10,7 +10,10 @@ MODEL_DIR = Path(__file__).resolve().parents[2] / "Model"
 if str(MODEL_DIR) not in sys.path:
     sys.path.insert(0, str(MODEL_DIR))
 
-from scripts.eval.evaluate import load_negative_optical_samples
+from scripts.eval.evaluate import (
+    load_negative_optical_samples,
+    sample_negative_optical_source_indices,
+)
 
 
 class NegativeSampleLoaderTests(unittest.TestCase):
@@ -188,6 +191,17 @@ class NegativeSampleLoaderTests(unittest.TestCase):
                 loaded["zero_time_mjd_cls_base"].numpy(), zero_time_cls[source_indices]
             )
             self.assertEqual(loaded["types"], [types[i].decode("utf-8") for i in source_indices])
+
+            lightweight = sample_negative_optical_source_indices(
+                h5_path,
+                "ELASTICC/optical_data",
+                n_samples=25,
+                seed=7,
+                negative_sample_strategy="block_random",
+                negative_sample_block_rows=10,
+                negative_sample_shuffle=True,
+            )
+            np.testing.assert_array_equal(lightweight, source_indices)
 
     def test_strategy_aliases_produce_same_result(self):
         with TemporaryDirectory() as tmpdir:
