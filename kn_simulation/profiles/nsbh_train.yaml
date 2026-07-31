@@ -1,0 +1,29 @@
+name: nsbh_train
+source: nsbh
+split: train
+paths:
+  run_dir: ${REPO_ROOT}/kn_simulation/runs/nsbh_train
+  skymap_dir: ${BASE_DIR}/data/skymap/nsbh_skymap_train
+  opsim_db: ${BASE_DIR}/data/rubin_sim/baseline_v5.1/baseline_v5.1.1_10yrs.db
+  sndata_root: ${BASE_DIR}/SNANA/SNDATA_ROOT
+  snana_bin_dir: ${BASE_DIR}/SNANA/SNANA/bin
+  log_dir: ${BASE_DIR}/logs/kn_simulation/nsbh_train
+catalog:
+  seed: 42
+  mjd_min: 61000.0
+  mjd_max: 64500.0
+snana:
+  sim_name: LSST_KN_NSBH_TRAIN
+  template_input: ${REPO_ROOT}/kn_simulation/templates/nsbh.input
+  too_config: ${REPO_ROOT}/kn_simulation/config/rubin_too_2024.yaml
+  coordinate_mode: posterior_3d
+  samples_per_event: 1000
+  sampling_nside: 256
+  credible_level: 0.9
+  cosmology: Planck15
+slurm:
+  batch_size: 20
+  max_concurrency: 20
+  time_limit: "04:00:00"
+  cpus_per_task: 1
+  memory: 10G

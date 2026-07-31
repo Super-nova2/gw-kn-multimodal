@@ -1,0 +1,80 @@
+# Created November 2025
+
+SIMLIB_NREPEAT:   1 # use each LIBID for one time
+NGENTOT_LC: 13107  # number of LC to generate, number of LIBID in SIMLIB file
+
+# name of version to appear in $SNDATA_ROOT/SIM
+GENVERSION: LSST_KN
+
+# define SED model and rate model
+GENMODEL:  $SNDATA_ROOT/models/SIMSED/SIMSED.KN-BULLA19/SIMSED.BULLA-BHNS-M1-2COMP
+DNDZ: POWERLAW  1.0E-6  0.0  # volumetric rate = 1.0E-6/Mpc^3/yr (no z-dependence)
+
+GENFILTERS:   ugrizY
+
+# define distribution of KN parameters
+SIMSED_PARAM: COSTHETA
+GENPEAK_COSTHETA: 0.5
+GENRANGE_COSTHETA: 0.0 1.0
+GENSIGMA_COSTHETA: 0.01 0.01
+
+SIMSED_PARAM: MEJDYN
+GENPEAK_MEJDYN: 0.01
+GENRANGE_MEJDYN: 0.01 0.09
+GENSIGMA_MEJDYN: 0 0
+
+SIMSED_PARAM: MEJWIND
+GENPEAK_MEJWIND: 0.05
+GENRANGE_MEJWIND: 0.01 0.09
+GENSIGMA_MEJWIND: 0 0
+
+
+# define 3 quantities which determine NGEN
+# GENRANGE_PEAKMJD:  61000 64500
+MJD_EXPLODE: 62500.0
+OPTMASK_T0SHIFT_EXPLODE: 0
+
+# define redshift
+GENRANGE_REDSHIFT: 0.01  0.22
+USE_SIMLIB_REDSHIFT:   1    # use redshift in LIB
+SOLID_ANGLE:  6.225            # approx solid angle, steridians
+
+# define MW extinction
+OPT_MWEBV: 1
+OPT_MWCOLORLAW:   99
+
+# LC time span(refer to explode time)
+GENRANGE_TREST:    -30 60  # days
+GENSOURCE: RANDOM
+RANSEED:   123456
+
+# cadence library
+SIMLIB_FILE: ./baseline_v5.0.1_10yrs_test.SIMLIB
+
+# filter transmission curves and calibration info
+KCOR_FILE:    $SNDATA_ROOT/kcor/LSST/baseline_1.9/kcor_LSST.fits
+
+# Effic vs. SNR for detetctions
+SEARCHEFF_PIPELINE_LOGIC_FILE: $SNDATA_ROOT/models/searcheff/SEARCHEFF_PIPELINE_LOGIC.DAT   # 2 detections at any bands
+SEARCHEFF_PIPELINE_FILE: $SNDATA_ROOT/models/searcheff/SEARCHEFF_PIPELINE_LSST_Heaviside.DAT  # SNR > 5 = detection
+APPLY_SEARCHEFF_OPT:  0   # No filtering, keep write mask into output
+
+# Apply selection cut
+APPLY_CUTWIN_OPT: 1 # implement selection cuts
+CUTWIN_NEPOCH: 2 +5 # require 1 epoch with SNR>5
+
+NEWMJD_DIF: 0.0003   # min MJD dif to count NEW MJD(26s, per exposure)
+
+# convert SED into binary 
+SIMSED_USE_BINARY:  1   # speed up the initialization of SED files
+SIMSED_PATH_BINARY: $SNDATA_ROOT/models/SIMSED/BINARY
+
+FORMAT_MASK:  32  # 2=TEXT  32=FITS
+
+# variables to include in one-row per SN text dump
+SIMGEN_DUMP:  26
+  CID LIBID GENTYPE  SNTYPE  ZCMB RA DECL PEAKMJD PEAKMJD_SMEAR MJD_TRIGGER NOBS NEPOCH
+  MWEBV MU SNRMAX SNRMAX2 SNRMAX3 
+  SNRMAX_u SNRMAX_g SNRMAX_r SNRMAX_i SNRMAX_z SNRMAX_Y
+  TIME_ABOVE_SNRMIN CUTMASK  SIM_SEARCHEFF_MASK
+

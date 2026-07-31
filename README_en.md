@@ -36,9 +36,12 @@ gw-kn-multimodal/
 │   ├── args/                             # current templates and archived configs
 │   ├── scripts/                          # train / eval / data / analysis / plot
 │   └── notebooks/                        # optical-only analysis notebooks
-├── dataset/
-│   ├── O5_sim_*                      # Simulated events and analysis materials
-│   └── KN_sim/                       # SNANA / OpSim workflow scripts
+├── kn_simulation/                    # Maintained GWSamplegen → Rubin/SNANA pipeline
+│   ├── bin/kn-sim                    # Unified user entry point
+│   ├── src/                          # Python implementation
+│   ├── profiles/                     # BNS/NSBH train/test profiles
+│   └── runs/                         # Git-ignored runtime directories
+├── dataset/                          # Frozen historical data and workflows
 └── docs/                             # Design notes and experiment records
 ```
 
@@ -82,7 +85,7 @@ find Model/args -name '*.json.example' -print0 | while IFS= read -r -d '' f; do
     sed -e "s|<BASE_DIR>|$BASE_DIR|g" -e "s|<REPO_ROOT>|$REPO_ROOT|g" "$f" > "${f%.example}"
 done
 
-# Repeat for optical_only/args/ and dataset/KN_sim/
+# Repeat for optical_only/args/; kn_simulation uses tracked YAML profiles
 ```
 
 ### Data Directory Layout
@@ -210,7 +213,10 @@ Copy an existing JSON and edit the following fields:
 
 - Most scripts assume a Slurm environment; on local machines they will attempt `sbatch` self-submission.
 - When transferring to a new environment, regenerate config files from `.json.example` templates.
-- Scripts under `dataset/KN_sim/` depend on external SNANA, OpSim data and database files.
+- New optical simulations use `kn_simulation/bin/kn-sim` and depend on external
+  SNANA, OpSim data, and database files.
+- `dataset/` is retained for historical experiments, GW170817A, and existing
+  model consumers; new production jobs must not invoke scripts from it.
 - Some notebooks and experiment documents retain cluster-specific paths from earlier development; verify paths before running.
 
 ## Recommended Starting Order
@@ -225,7 +231,8 @@ Copy an existing JSON and edit the following fields:
 
 This repository does not include training data or large simulation files. Datasets can be obtained by:
 
-- **GW simulated events**: Generate using scripts under `dataset/KN_sim/` with SNANA/OpSim.
+- **GW-associated optical simulations**: use `kn_simulation/bin/kn-sim` to
+  convert a GWSamplegen `catalog.csv` to `kn_catalog.csv` and submit Rubin/SNANA.
 - **Training HDF5**: Build from simulation data using `Model/scripts/data/create_dataset_bns_nsbh.py` and `optical_only/scripts/data/create_datasets.py`.
 - For pre-built datasets, please contact the authors.
 

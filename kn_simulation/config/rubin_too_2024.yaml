@@ -1,0 +1,50 @@
+version: rubin_too_2024
+source_url: https://lssttooworkshop.github.io/images/Rubin_2024_ToO_workshop_final_report.pdf
+
+credible_level: 0.9
+snr_too: 12.0
+effective_fov_deg2: 7.0
+visit_overhead_sec: 4.8
+filter_change_sec: 120.0
+number_of_nights: 4
+visibility_grid_minutes: 1.0
+
+observatory:
+  longitude_deg: -70.749417
+  latitude_deg: -30.244639
+  height_m: 2663.0
+  sun_altitude_max_deg: -12.0
+  target_altitude_min_deg: 20.0
+
+conditions:
+  gold_template_label: GW_case_A
+  silver_template_label: GW_case_D_E
+  airmass_scale: 0.25
+  sun_altitude_scale_deg: 8.0
+  moon_altitude_scale_deg: 20.0
+  moon_distance_scale_deg: 40.0
+
+strategies:
+  gold_five_filter:
+    area_max_deg2: 30.0
+    night0_filters: [u, g, r, i, z]
+    night0_exposure_sec: 120.0
+    night0_repeat_filter: r
+    later_filters: [r, i]
+    later_exposure_sec: 180.0
+    condition_group: gold
+  gold:
+    area_max_deg2: 100.0
+    night0_filters: [g, r, i]
+    night0_exposure_sec: 120.0
+    night0_repeat_filter: r
+    later_filters: [r, i]
+    later_exposure_sec: 180.0
+    condition_group: gold
+  silver:
+    area_max_deg2: 500.0
+    night0_filters: [g, i]
+    night0_exposure_sec: 30.0
+    later_filters: [g, i]
+    later_exposure_sec: 120.0
+    condition_group: silver

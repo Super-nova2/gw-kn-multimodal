@@ -36,9 +36,12 @@ gw-kn-multimodal/
 │   ├── args/                           # 当前配置模板与历史配置
 │   ├── scripts/                        # train / eval / data / analysis / plot
 │   └── notebooks/                      # optical-only 分析 notebook
-├── dataset/
-│   ├── O5_sim_*                        # 模拟事件与分析材料
-│   └── KN_sim/                         # SNANA / OpSim 工作流脚本
+├── kn_simulation/                      # 当前 GWSamplegen → Rubin/SNANA 生产流程
+│   ├── bin/kn-sim                      # 统一用户入口
+│   ├── src/                            # Python 实现
+│   ├── profiles/                       # BNS/NSBH train/test 配置
+│   └── runs/                           # Git 忽略的运行目录
+├── dataset/                            # 冻结的历史数据与旧模拟流程
 └── docs/                               # 设计说明与实验记录
 ```
 
@@ -82,7 +85,7 @@ find Model/args -name '*.json.example' -print0 | while IFS= read -r -d '' f; do
     sed -e "s|<BASE_DIR>|$BASE_DIR|g" -e "s|<REPO_ROOT>|$REPO_ROOT|g" "$f" > "${f%.example}"
 done
 
-# optical_only/args/ 和 dataset/KN_sim/ 下同理
+# optical_only/args/ 下同理；kn_simulation 使用已跟踪的 YAML profiles
 ```
 
 ### 数据目录结构
@@ -232,7 +235,10 @@ bash optical_only/scripts/train/train.sh optical_only/args/optical_only_kn_v16.j
 
 - 很多脚本默认依赖 Slurm；本地直接运行时也会优先尝试 `sbatch` 自提交。
 - 迁移环境前需重新从 `.json.example` 模板生成配置文件。
-- `dataset/KN_sim/` 下的脚本依赖外部 SNANA、OpSim 数据和数据库文件。
+- 新的光学模拟统一从 `kn_simulation/bin/kn-sim` 进入，并依赖外部
+  SNANA、OpSim 数据和数据库文件。
+- `dataset/` 是保留给旧实验、GW170817A 和现有模型消费者的历史目录；
+  新的生产任务不应从该目录调用脚本。
 - 部分 notebook 与实验文档保留了研究期的路径习惯，跑之前建议先核对。
 
 ## 建议起步顺序
@@ -247,7 +253,8 @@ bash optical_only/scripts/train/train.sh optical_only/args/optical_only_kn_v16.j
 
 本仓库不包含训练数据和大型模拟文件。数据集需通过以下方式获取：
 
-- **GW 模拟事件**：使用 `dataset/KN_sim/` 下的脚本配合 SNANA/OpSim 生成。
+- **GW 关联光学模拟**：使用 `kn_simulation/bin/kn-sim` 将 GWSamplegen
+  `catalog.csv` 转换为 `kn_catalog.csv` 后提交 Rubin/SNANA 任务。
 - **训练 HDF5**：使用 `Model/scripts/data/create_dataset_bns_nsbh.py` 和 `optical_only/scripts/data/create_datasets.py` 从模拟数据构建。
 - 如需预构建数据集，请联系作者。
 
