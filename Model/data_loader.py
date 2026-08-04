@@ -3706,9 +3706,16 @@ def sample_moc_skymap(map_file):
     gw_mocmap = torch.tensor(np.vstack([xs, ys, zs, dA, 100 * dP, distmu, distsigma]), dtype=torch.float32)   # [7, N_pixels], no distnorm
 
     # 6) process unnormal distance values
-    inf_dist_mu = torch.where(torch.isinf(gw_mocmap[5]))[0]
-    gw_mocmap[5, inf_dist_mu] = dist_mean  # set inf to mean value
-    gw_mocmap[6, inf_dist_mu] = dist_std   # set inf to std value
+    if dist_mean is not None:
+        invalid_dist_mu = torch.where(
+            ~torch.isfinite(gw_mocmap[5]) | (gw_mocmap[5] <= 0)
+        )[0]
+        gw_mocmap[5, invalid_dist_mu] = dist_mean
+    if dist_std is not None:
+        invalid_dist_sigma = torch.where(
+            ~torch.isfinite(gw_mocmap[6]) | (gw_mocmap[6] <= 0)
+        )[0]
+        gw_mocmap[6, invalid_dist_sigma] = dist_std
     gw_mocmap[5,:] = gw_mocmap[5,:] / 1000.0  # scale down
     gw_mocmap[6,:] = gw_mocmap[6,:] / 1000.0 # scale down
 

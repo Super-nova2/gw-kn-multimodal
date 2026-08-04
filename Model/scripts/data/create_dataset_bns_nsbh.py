@@ -51,6 +51,7 @@ GPS_TIME_COLUMN_CANDIDATES = (
     "gps_event_time",
     "event_gps_time",
     "trigger_time_gps",
+    "geocent_time",
 )
 LUPT_BAND_ORDER = ("u", "g", "r", "i", "z", "Y")
 FIRST_DETECTION_POLICY = "psfflux_snr5_then_photflag_then_head_mjd_detect_first"
@@ -543,12 +544,72 @@ def _cap_nsbh_neg_total(
     return kept_type1, kept_type2
 
 
+def _normalize_gw_catalog_columns(
+    gw_df: pd.DataFrame,
+    skymap_dir: str,
+) -> pd.DataFrame:
+    """Adapt new GWSamplegen/kn_catalog columns to the legacy dataset schema.
+
+    New catalogs provide ``theta_jn`` instead of ``inclination`` and
+    ``luminosity_distance`` instead of ``distmean``/``diststd``.  Inclination
+    is kept in radians so the existing ``cos(inclination)`` step still works;
+    distance moments are read from the skymap extension-1 header when the
+    catalog does not carry them.
+    """
+
+    gw_df = gw_df.copy()
+
+    if "inclination" not in gw_df.columns:
+        if "theta_jn" in gw_df.columns:
+            gw_df["inclination"] = pd.to_numeric(
+                gw_df["theta_jn"], errors="coerce"
+            )
+        elif "viewing_costheta" in gw_df.columns:
+            costheta = pd.to_numeric(
+                gw_df["viewing_costheta"], errors="coerce"
+            ).clip(-1.0, 1.0)
+            gw_df["inclination"] = np.arccos(costheta)
+        else:
+            raise ValueError(
+                "GW catalog has neither inclination nor theta_jn/viewing_costheta"
+            )
+
+    if "distmean" not in gw_df.columns or "diststd" not in gw_df.columns:
+        fallback_mean = (
+            pd.to_numeric(
+                gw_df["luminosity_distance"], errors="coerce"
+            ).to_numpy(np.float64)
+            if "luminosity_distance" in gw_df.columns
+            else np.full(len(gw_df), np.nan)
+        )
+        distmean = np.full(len(gw_df), np.nan, dtype=np.float64)
+        diststd = np.zeros(len(gw_df), dtype=np.float64)
+        for index, sim_id in enumerate(gw_df["simulation_id"].astype(int)):
+            skymap_path = os.path.join(skymap_dir, f"{int(sim_id)}.fits")
+            try:
+                header = fits.getheader(skymap_path, 1)
+                distmean[index] = float(header["DISTMEAN"])
+                diststd[index] = float(header["DISTSTD"])
+            except Exception:
+                if np.isfinite(fallback_mean[index]):
+                    distmean[index] = fallback_mean[index]
+                print(
+                    f"WARNING: no DISTMEAN/DISTSTD for simulation_id={int(sim_id)}, "
+                    "falling back to luminosity_distance/0.0"
+                )
+        gw_df["distmean"] = distmean
+        gw_df["diststd"] = diststd
+
+    return gw_df
+
+
 def _prepare_bns_source(
     cfg: SourceConfig,
     dataset_mode: str,
     rng: np.random.Generator,
 ) -> SourcePrepared:
     gw_df = _load_gw_catalog(cfg.full_catalog_path, cfg.success_ids_path)
+    gw_df = _normalize_gw_catalog_columns(gw_df, cfg.skymap_dir)
 
     missing_cols = [col for col in GW_PARAM_COLUMNS if col not in gw_df.columns]
     if missing_cols:
@@ -619,6 +680,7 @@ def _prepare_nsbh_source(
     rng: np.random.Generator,
 ) -> SourcePrepared:
     gw_df = _load_gw_catalog(cfg.full_catalog_path, success_ids_path=None)
+    gw_df = _normalize_gw_catalog_columns(gw_df, cfg.skymap_dir)
 
     missing_cols = [col for col in GW_PARAM_COLUMNS if col not in gw_df.columns]
     if missing_cols:

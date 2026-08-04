@@ -77,36 +77,35 @@ set_profile_defaults() {
             ;;
         final_train)
             DATASET_MODE="${DATASET_MODE:-train}"
-            BNS_FULL_CATALOG_PATH="${BNS_FULL_CATALOG_PATH:-${REPO_ROOT}/dataset/O5_sim_bns_train/injections_final.csv}"
+            BNS_FULL_CATALOG_PATH="${BNS_FULL_CATALOG_PATH:-${REPO_ROOT}/kn_simulation/runs/bns_train/kn_catalog.csv}"
             BNS_SKYMAP_DIR="${BNS_SKYMAP_DIR:-${BASE_DIR}/data/skymap/bns_skymap_train}"
-            # Keep overridable because BNS_AUG raw SNANA outputs may be compressed/offline.
             BNS_SIM_ROOT="${BNS_SIM_ROOT:-${BASE_DIR}/SNANA/SNDATA_ROOT/SIM/LSST_KN_BNS_TRAIN}"
             BNS_SIM_NAME="${BNS_SIM_NAME:-LSST_KN_BNS_TRAIN}"
-            BNS_SUCCESS_IDS_PATH="${BNS_SUCCESS_IDS_PATH:-${BASE_DIR}/data/LSST_KN_BNS_TRAIN/success_sim_ids.txt}"
+            BNS_SUCCESS_IDS_PATH="${BNS_SUCCESS_IDS_PATH:-${REPO_ROOT}/kn_simulation/runs/bns_train/success_sim_ids.txt}"
 
-            NSBH_FULL_CATALOG_PATH="${NSBH_FULL_CATALOG_PATH:-${REPO_ROOT}/dataset/O5_sim_nsbh_train/injections_pos.csv}"
+            NSBH_FULL_CATALOG_PATH="${NSBH_FULL_CATALOG_PATH:-${REPO_ROOT}/kn_simulation/runs/nsbh_train/kn_catalog.csv}"
             NSBH_SKYMAP_DIR="${NSBH_SKYMAP_DIR:-${BASE_DIR}/data/skymap/nsbh_skymap_train}"
             NSBH_SIM_ROOT="${NSBH_SIM_ROOT:-${BASE_DIR}/SNANA/SNDATA_ROOT/SIM/LSST_KN_NSBH_TRAIN}"
             NSBH_SIM_NAME="${NSBH_SIM_NAME:-LSST_KN_NSBH_TRAIN}"
-            NSBH_SUCCESS_IDS_PATH="${NSBH_SUCCESS_IDS_PATH:-${BASE_DIR}/data/LSST_KN_NSBH_TRAIN/success_sim_ids.txt}"
+            NSBH_SUCCESS_IDS_PATH="${NSBH_SUCCESS_IDS_PATH:-${REPO_ROOT}/kn_simulation/runs/nsbh_train/success_sim_ids.txt}"
 
-            OUTPUT_H5_PATH="${OUTPUT_H5_PATH:-${BASE_DIR}/data/ALBEF_dataset/combined_dataset_${DATASET_MODE}.h5}"
+            OUTPUT_H5_PATH="${OUTPUT_H5_PATH:-${BASE_DIR}/data/ALBEF_dataset/combined_dataset_v2_${DATASET_MODE}.h5}"
             ;;
         astro_test)
             DATASET_MODE="${DATASET_MODE:-test}"
-            BNS_FULL_CATALOG_PATH="${BNS_FULL_CATALOG_PATH:-${REPO_ROOT}/dataset/O5_sim_bns_test/injections_final.csv}"
+            BNS_FULL_CATALOG_PATH="${BNS_FULL_CATALOG_PATH:-${REPO_ROOT}/kn_simulation/runs/bns_test/kn_catalog.csv}"
             BNS_SKYMAP_DIR="${BNS_SKYMAP_DIR:-${BASE_DIR}/data/skymap/bns_skymap_test}"
             BNS_SIM_ROOT="${BNS_SIM_ROOT:-${BASE_DIR}/SNANA/SNDATA_ROOT/SIM/LSST_KN_BNS_TEST}"
             BNS_SIM_NAME="${BNS_SIM_NAME:-LSST_KN_BNS_TEST}"
-            BNS_SUCCESS_IDS_PATH="${BNS_SUCCESS_IDS_PATH:-${BASE_DIR}/data/LSST_KN_BNS_TEST/success_sim_ids.txt}"
+            BNS_SUCCESS_IDS_PATH="${BNS_SUCCESS_IDS_PATH:-${REPO_ROOT}/kn_simulation/runs/bns_test/success_sim_ids.txt}"
 
-            NSBH_FULL_CATALOG_PATH="${NSBH_FULL_CATALOG_PATH:-${REPO_ROOT}/dataset/O5_sim_nsbh_test/injections_full.csv}"
+            NSBH_FULL_CATALOG_PATH="${NSBH_FULL_CATALOG_PATH:-${REPO_ROOT}/kn_simulation/runs/nsbh_test/kn_catalog.csv}"
             NSBH_SKYMAP_DIR="${NSBH_SKYMAP_DIR:-${BASE_DIR}/data/skymap/nsbh_skymap_test}"
             NSBH_SIM_ROOT="${NSBH_SIM_ROOT:-${BASE_DIR}/SNANA/SNDATA_ROOT/SIM/LSST_KN_NSBH_TEST}"
             NSBH_SIM_NAME="${NSBH_SIM_NAME:-LSST_KN_NSBH_TEST}"
-            NSBH_SUCCESS_IDS_PATH="${NSBH_SUCCESS_IDS_PATH:-${BASE_DIR}/data/LSST_KN_NSBH_TEST/success_sim_ids.txt}"
+            NSBH_SUCCESS_IDS_PATH="${NSBH_SUCCESS_IDS_PATH:-${REPO_ROOT}/kn_simulation/runs/nsbh_test/success_sim_ids.txt}"
 
-            OUTPUT_H5_PATH="${OUTPUT_H5_PATH:-${BASE_DIR}/data/ALBEF_dataset/combined_dataset_astro_${DATASET_MODE}.h5}"
+            OUTPUT_H5_PATH="${OUTPUT_H5_PATH:-${BASE_DIR}/data/ALBEF_dataset/combined_dataset_astro_v2_${DATASET_MODE}.h5}"
             ;;
         *)
             echo "Unsupported PROFILE=$PROFILE. Use PROFILE=test_aug, PROFILE=final_train, or PROFILE=astro_test."
