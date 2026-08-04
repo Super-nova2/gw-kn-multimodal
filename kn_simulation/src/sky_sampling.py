@@ -117,6 +117,7 @@ def sample_posterior_3d(
         np.isfinite(distmu)
         & np.isfinite(distsigma)
         & np.isfinite(distnorm)
+        & (distmu > 0)
         & (distsigma > 0)
         & (distnorm > 0)
     )

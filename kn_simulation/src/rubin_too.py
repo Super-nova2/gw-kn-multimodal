@@ -796,6 +796,8 @@ def materialize_sample_visits(
         & (visits["sun_altitude_deg"] <= float(observatory["sun_altitude_max_deg"]))
     )
     visits = visits.loc[visible].reset_index(drop=True)
+    if visits.empty:
+        return pd.DataFrame(columns=columns)
     visits = condition_library.assign(visits)
     result = pd.DataFrame(
         {

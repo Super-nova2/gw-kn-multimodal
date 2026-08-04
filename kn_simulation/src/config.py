@@ -67,6 +67,11 @@ class Profile:
         return self.run_dir / "kn_catalog.manifest.json"
 
     @property
+    def sndata_sim_dir(self) -> Path:
+        """Parent directory for this profile's per-event SNANA outputs."""
+        return self.sndata_root / "SIM" / self.sim_name
+
+    @property
     def work_dir(self) -> Path:
         return self.run_dir / "work"
 

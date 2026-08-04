@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from artifacts import aggregate_status, compact_artifacts
+from catalog import SCHEMA_VERSION as CATALOG_SCHEMA_VERSION
 from config import PIPELINE_ROOT, REPO_ROOT, Profile, resolve_profile_path
 
 
@@ -82,6 +83,11 @@ def validate_prepared_run(profile: Profile) -> dict[str, Any]:
         )
 
     manifest = json.loads(profile.prepared_manifest.read_text(encoding="utf-8"))
+    if manifest.get("schema_version") != CATALOG_SCHEMA_VERSION:
+        raise ValueError(
+            "Prepared catalog uses an obsolete schema; rerun kn-sim prepare with "
+            "--overwrite-prepared"
+        )
     if manifest.get("profile_name") != profile.name:
         raise ValueError("Prepared catalog manifest belongs to a different profile")
     if manifest.get("input_catalog_sha256") != _sha256(profile.input_catalog):

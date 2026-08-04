@@ -331,6 +331,45 @@ def _shard_sources(
     return result
 
 
+def _aggregate_sources(
+    profile: Profile,
+    catalog_ids: list[int],
+    catalog_hash: str,
+    path: Path,
+) -> dict[int, EventSource]:
+    """Return existing aggregate rows so a resume can rebuild a fresh file."""
+
+    result: dict[int, EventSource] = {}
+    with h5py.File(path, "r") as handle:
+        if handle.attrs.get("schema_version") != SCHEMA_VERSION:
+            raise ValueError(f"Unsupported aggregate schema: {path}")
+        if handle.attrs.get("artifact_kind") != "aggregate":
+            raise ValueError(f"Not an aggregate artifact: {path}")
+        if handle.attrs.get("profile_name") != profile.name:
+            raise ValueError(f"Aggregate belongs to another profile: {path}")
+        if handle.attrs.get("prepared_catalog_sha256") != catalog_hash:
+            raise ValueError(f"Aggregate catalog checksum mismatch: {path}")
+        ids = handle["events/simulation_id"][:].astype(np.int64).tolist()
+        positions = {int(value): index for index, value in enumerate(ids)}
+        for simulation_id in catalog_ids:
+            if simulation_id not in positions:
+                continue
+            index = positions[simulation_id]
+            result[simulation_id] = EventSource(
+                simulation_id=simulation_id,
+                kind="aggregate",
+                path=path,
+                event_index=index,
+                coordinate_start=int(handle["events/coordinate_start"][index]),
+                coordinate_count=int(handle["events/coordinate_count"][index]),
+                status=_decode(handle["events/status"][index]),
+                reason=_decode(handle["events/reason"][index]),
+                submission_id=_decode(handle["events/submission_id"][index]),
+                task_index=int(handle["events/task_index"][index]),
+            )
+    return result
+
+
 def _legacy_source(
     profile: Profile,
     simulation_id: int,
@@ -428,8 +467,10 @@ def validate_aggregate(
         if int(handle.attrs["event_count"]) != len(catalog_ids):
             raise ValueError("Aggregate event count attribute is inconsistent")
         statuses = [_decode(value) for value in handle["events/status"][:]]
-        if any(status not in {"success", "skipped"} for status in statuses):
-            raise ValueError("Aggregate contains a nonterminal event status")
+        if any(status not in {"success", "skipped", "failed"} for status in statuses):
+            raise ValueError(
+                "Aggregate contains an unprocessed or invalid event status"
+            )
         coordinate_total = int(handle.attrs["coordinate_count"])
         for column in COORDINATE_COLUMNS:
             if len(handle[f"coordinates/{column}"]) != coordinate_total:
@@ -438,10 +479,17 @@ def validate_aggregate(
                 )
         starts = handle["events/coordinate_start"][:].astype(np.int64)
         counts = handle["events/coordinate_count"][:].astype(np.int64)
-        if len(counts) and not np.all(counts == int(profile.samples_per_event)):
-            raise ValueError(
-                "Aggregate coordinate counts do not match profile samples_per_event"
-            )
+        expected_samples = int(profile.samples_per_event)
+        for status, count in zip(statuses, counts):
+            if status in {"success", "skipped"} and count != expected_samples:
+                raise ValueError(
+                    f"Aggregate {status} event has {count} coordinates; "
+                    f"expected {expected_samples}"
+                )
+            if status == "failed" and not 0 <= count <= expected_samples:
+                raise ValueError(
+                    f"Failed event has invalid coordinate count {count}"
+                )
         if len(starts) and (
             starts[0] != 0
             or not np.array_equal(starts[1:], np.cumsum(counts)[:-1])
@@ -497,23 +545,33 @@ def compact_artifacts(
     event_statuses: dict[int, dict[str, Any]],
     cleanup: bool = True,
 ) -> dict[str, Any]:
-    """Merge latest terminal artifacts into one validated canonical HDF5 file."""
+    """Merge artifacts into one validated canonical HDF5 file.
 
-    nonterminal = [
+    Successful and skipped events must have complete coordinate samples.
+    Failed events are preserved with their status/reason and whatever
+    coordinates were generated, but do not block the merge.
+    """
+
+    invalid = [
         simulation_id
         for simulation_id in catalog_ids
         if event_statuses.get(simulation_id, {}).get("status")
-        not in {"success", "skipped"}
+        not in {"success", "skipped", "failed"}
     ]
-    if nonterminal:
+    if invalid:
         raise ValueError(
-            f"Cannot compact an incomplete run; {len(nonterminal)} events are not "
-            "successful or skipped"
+            f"Cannot compact; {len(invalid)} events are unprocessed or have "
+            "an invalid status"
         )
     catalog_hash = file_sha256(profile.prepared_catalog)
-    if profile.aggregate_artifact_file.is_file():
+    existing_aggregate = profile.aggregate_artifact_file
+    has_pending_shards = (
+        profile.artifact_shard_dir.is_dir()
+        and any(profile.artifact_shard_dir.glob("*.h5"))
+    )
+    if existing_aggregate.is_file() and not has_pending_shards:
         aggregate = validate_aggregate(
-            profile.aggregate_artifact_file,
+            existing_aggregate,
             profile=profile,
             catalog_ids=catalog_ids,
             catalog_hash=catalog_hash,
@@ -525,7 +583,25 @@ def compact_artifacts(
     catalog_statuses = {
         simulation_id: event_statuses[simulation_id] for simulation_id in catalog_ids
     }
-    sources = _shard_sources(profile, catalog_statuses, catalog_hash)
+    sources: dict[int, EventSource] = {}
+    if existing_aggregate.is_file():
+        sources.update(
+            _aggregate_sources(
+                profile,
+                catalog_ids,
+                catalog_hash,
+                existing_aggregate,
+            )
+        )
+    shard_statuses = {
+        simulation_id: status
+        for simulation_id, status in catalog_statuses.items()
+        if status.get("artifact_shard")
+        and _resolve_shard_path(
+            profile, str(status["artifact_shard"])
+        ).is_file()
+    }
+    sources.update(_shard_sources(profile, shard_statuses, catalog_hash))
     for simulation_id in catalog_ids:
         if simulation_id not in sources:
             sources[simulation_id] = _legacy_source(
@@ -538,10 +614,23 @@ def compact_artifacts(
                 f"Artifact/status mismatch for simulation_id={simulation_id}: "
                 f"{source.status} != {expected_status}"
             )
-        if source.coordinate_count != int(profile.samples_per_event):
+        expected_samples = int(profile.samples_per_event)
+        if source.status in {"success", "skipped"}:
+            if source.coordinate_count != expected_samples:
+                raise ValueError(
+                    f"simulation_id={simulation_id} has {source.coordinate_count} "
+                    f"coordinates; expected {expected_samples}"
+                )
+        elif source.status == "failed":
+            if not 0 <= source.coordinate_count <= expected_samples:
+                raise ValueError(
+                    f"simulation_id={simulation_id} has invalid failed-event "
+                    f"coordinate count {source.coordinate_count}"
+                )
+        else:
             raise ValueError(
-                f"simulation_id={simulation_id} has {source.coordinate_count} "
-                f"coordinates; expected {profile.samples_per_event}"
+                f"simulation_id={simulation_id} has unexpected status "
+                f"{source.status}"
             )
 
     coordinate_count = sum(sources[value].coordinate_count for value in catalog_ids)

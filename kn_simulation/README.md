@@ -91,8 +91,11 @@ compact it manually:
 kn_simulation/bin/kn-sim compact bns_train
 ```
 
-`compact` refuses incomplete runs. It uses the same validation and cleanup
-path as the automatic finalizer.
+`compact` refuses runs with missing task shards or unprocessed events. Failed
+events no longer block compaction: they are retained in the aggregate with
+their status/reason and any generated coordinates, while successful and
+skipped events keep complete coordinate samples. It uses the same validation
+and cleanup path as the automatic finalizer.
 
 After a partial run, resubmit only failed or unprocessed events. Successful and
 permanently footprint-uncovered events are not repeated:
@@ -100,6 +103,10 @@ permanently footprint-uncovered events are not repeated:
 ```bash
 kn_simulation/bin/kn-sim submit bns_train --resume
 ```
+
+SNANA writes each event's output under
+`$SNDATA_ROOT/SIM/<sim_name>/<sim_name>_<simulation_id>/`, so every profile/task
+has its own parent directory.
 
 Resource overrides do not require editing a profile:
 
@@ -112,14 +119,36 @@ kn_simulation/bin/kn-sim submit bns_train \
 
 Only the complete GWSamplegen `catalog.csv` schema is accepted. In particular,
 `network_snr` must be present, finite, and non-negative. Truth-level
-`mej_dynamic` and `mej_wind` must both be positive and consistent with
-`mej_total`. Recovered parameters are preserved but are not used to recompute
-ejecta.
+`mej_dynamic` and `mej_wind` must be finite and consistent with `mej_total`.
+Recovered parameters are preserved but are not used to recompute ejecta.
 
-All input rows are retained. There is no SNR or localization-area catalog cut.
-GPS times must map into MJD 61000--64500 and the OpSim coverage. The prepared
-catalog records deterministic event seeds, degree coordinates, viewing angle,
-original ejecta, SNANA-grid ejecta, and explicit clipping flags.
+The copied catalog.csv retains every input row, but kn_catalog.csv keeps only
+events whose original ejecta values lie inside both closed SIMSED ranges:
+
+| Source | mej_dynamic | mej_wind |
+| --- | --- | --- |
+| BNS | [0.001, 0.02] | [0.01, 0.13] |
+| NSBH | [0.01, 0.09] | [0.01, 0.09] |
+
+Boundary values are retained. Out-of-range events are omitted and counted in
+the manifest; ejecta values are never clipped, rounded, or replaced. There is
+no SNR or localization-area catalog cut. GPS times for retained events must map
+into MJD 61000--64500 and the OpSim coverage.
+
+`viewing_costheta` is computed as `abs(cos(theta_jn))`, so validated
+`theta_jn` values automatically map into the model range [0, 1]. BNS
+`phi_deg` is deterministically sampled from a uniform [15, 75) degree
+distribution using the event ID and catalog seed; NSBH uses the model's fixed
+30-degree value. No additional catalog filtering is needed for either angular
+parameter.
+
+The current SNANA templates retain `GENSIGMA_COSTHETA = 0.01` and, for BNS,
+`GENSIGMA_PHI = 1` degree. These produce internal SNANA scatter around the
+catalog peaks while the configured `GENRANGE` remains enforced.
+
+Prepared-catalog schema v2 implements filtering instead of clipping. Runs
+prepared with the earlier clipping schema must be regenerated with
+`--overwrite-prepared` before submission or resume.
 
 ## Rubin routing and coordinate samples
 
@@ -141,7 +170,7 @@ memory while SNANA runs. Each array task then atomically writes one file under
 JSON status sidecar. Workers never append concurrently to a shared HDF5 or
 status file.
 
-For a fully terminal run, the `afterany` finalizer selects the artifact
+After the array completes, the `afterany` finalizer selects the artifact
 referenced by each event's latest status sidecar and creates:
 
 ```text
@@ -150,7 +179,9 @@ runs/<profile>/simulation_intermediates.h5
 
 The aggregate is ordered exactly like `kn_catalog.csv`. It contains event
 status/reason, coordinate offsets and counts, the complete observation plan as
-JSON, task provenance, and the coordinate columns:
+JSON, task provenance, and the coordinate columns. Failed events are included
+but do not block aggregation; the usable event list is written to
+`runs/<profile>/success_sim_ids.txt`.
 
 ```text
 simulation_id, sample_index, ra, dec, distance_mpc,

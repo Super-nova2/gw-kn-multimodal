@@ -1,4 +1,5 @@
 import pandas as pd
+import pytest
 from config import PIPELINE_ROOT
 from rubin_too import classify_event, load_too_config
 from snana import gen_input
@@ -18,8 +19,8 @@ def test_snana_input_uses_only_prepared_catalog_fields():
             "trigger_mjd": [62000.0],
             "viewing_costheta": [0.5],
             "phi_deg": [30.0],
-            "snana_mej_dynamic": [0.01],
-            "snana_mej_wind": [0.02],
+            "mej_dynamic": [0.01],
+            "mej_wind": [0.02],
         }
     )
     template = (
@@ -30,3 +31,19 @@ def test_snana_input_uses_only_prepared_catalog_fields():
     assert "MJD_EXPLODE:  62000.0" in output
     assert "GENPEAK_MEJDYN:  0.01" in output
     assert "GENPEAK_MEJWIND:  0.02" in output
+
+
+def test_snana_input_rejects_unfiltered_ejecta():
+    catalog = pd.DataFrame(
+        {
+            "simulation_id": [7],
+            "trigger_mjd": [62000.0],
+            "viewing_costheta": [0.5],
+            "phi_deg": [30.0],
+            "mej_dynamic": [0.021],
+            "mej_wind": [0.02],
+        }
+    )
+
+    with pytest.raises(ValueError, match="mej_dynamic outside"):
+        gen_input(catalog, "GENPEAK_MEJDYN: 0\n", 7, gw_type="bns")

@@ -12,7 +12,7 @@ import pandas as pd
 import pytest
 from artifacts import SCHEMA_VERSION, write_task_shard
 from astropy.time import Time
-from catalog import prepare_run_catalog
+from catalog import prepare_catalog, prepare_run_catalog
 from config import PIPELINE_ROOT, Profile, SlurmConfig
 from scheduler import (
     compact_profile,
@@ -40,8 +40,8 @@ def make_catalog(path: Path, skymap_dir: Path) -> None:
     redshift = np.array([0.05, 0.1])
     mass1 = np.array([1.6, 1.5])
     mass2 = np.array([1.3, 1.2])
-    dynamic = np.array([0.005, 0.03])
-    wind = np.array([0.04, 0.005])
+    dynamic = np.array([0.005, 0.02])
+    wind = np.array([0.04, 0.01])
     frame = pd.DataFrame(
         {
             "simulation_id": [7, 3],
@@ -145,8 +145,9 @@ def test_prepare_keeps_low_snr_and_writes_audited_run(tmp_path):
     assert profile.input_metadata.is_file()
     manifest = validate_prepared_run(profile)
     assert manifest["input_rows"] == manifest["output_rows"] == 2
-    assert manifest["mej_dynamic_clipped"] == 1
-    assert manifest["mej_wind_clipped"] == 1
+    assert manifest["model_range_filtered_rows"] == 0
+    assert "snana_mej_dynamic" not in prepared
+    assert "mej_dynamic_clipped" not in prepared
 
 
 def test_validate_accepts_manifest_before_finalizer_resource_fields(tmp_path):
@@ -160,6 +161,102 @@ def test_validate_accepts_manifest_before_finalizer_resource_fields(tmp_path):
     )
 
     assert validate_prepared_run(profile)["profile_name"] == profile.name
+
+
+def test_prepare_filters_ejecta_outliers_and_keeps_closed_boundaries(tmp_path):
+    profile, _ = make_profile(tmp_path)
+    source_path = tmp_path / "source_catalog.csv"
+    make_catalog(source_path, profile.skymap_dir)
+    base = pd.read_csv(source_path).iloc[[0, 0, 0, 0]].copy()
+    base["simulation_id"] = [10, 11, 12, 13]
+    base["skymap"] = [
+        f"skymaps/{simulation_id}.fits" for simulation_id in base["simulation_id"]
+    ]
+    for simulation_id in base["simulation_id"]:
+        (profile.skymap_dir / f"{simulation_id}.fits").touch()
+    base["mej_dynamic"] = [0.001, 0.02, 0.0, 0.01]
+    base["mej_wind"] = [0.01, 0.13, 0.04, 0.131]
+    base["mej_total"] = base["mej_dynamic"] + base["mej_wind"]
+
+    prepared, manifest = prepare_catalog(
+        base,
+        source="bns",
+        split="train",
+        seed=42,
+        skymap_dir=profile.skymap_dir,
+        opsim_db=profile.opsim_db,
+    )
+
+    assert prepared["simulation_id"].tolist() == [10, 11]
+    assert prepared["mej_dynamic"].tolist() == [0.001, 0.02]
+    assert prepared["mej_wind"].tolist() == [0.01, 0.13]
+    assert manifest["input_rows"] == 4
+    assert manifest["output_rows"] == 2
+    assert manifest["model_range_filtered_rows"] == 2
+    assert manifest["mej_dynamic_out_of_range_rows"] == 1
+    assert manifest["mej_wind_out_of_range_rows"] == 1
+    assert manifest["optical_model_parameter_ranges"]["mej_dynamic"] == [
+        0.001,
+        0.02,
+    ]
+    assert prepared["viewing_costheta"].between(0.0, 1.0, inclusive="both").all()
+    assert prepared["phi_deg"].between(15.0, 75.0, inclusive="both").all()
+    assert not {
+        "snana_mej_dynamic",
+        "snana_mej_wind",
+        "mej_dynamic_clipped",
+        "mej_wind_clipped",
+    } & set(prepared.columns)
+
+
+def test_prepare_nsbh_filter_keeps_closed_boundaries_and_fixed_phi(tmp_path):
+    profile, _ = make_profile(tmp_path)
+    source_path = tmp_path / "source_catalog.csv"
+    make_catalog(source_path, profile.skymap_dir)
+    base = pd.read_csv(source_path).iloc[[0, 0, 0, 0]].copy()
+    base["simulation_id"] = [20, 21, 22, 23]
+    base["skymap"] = [
+        f"skymaps/{simulation_id}.fits"
+        for simulation_id in base["simulation_id"]
+    ]
+    for simulation_id in base["simulation_id"]:
+        (profile.skymap_dir / f"{simulation_id}.fits").touch()
+    base["mass1_source"] = 5.0
+    base["mass2_source"] = 1.4
+    base["mass1_detector"] = base["mass1_source"] * (1 + base["redshift"])
+    base["mass2_detector"] = base["mass2_source"] * (1 + base["redshift"])
+    base["mej_dynamic"] = [0.01, 0.09, 0.009, 0.05]
+    base["mej_wind"] = [0.01, 0.09, 0.05, 0.091]
+    base["mej_total"] = base["mej_dynamic"] + base["mej_wind"]
+
+    prepared, manifest = prepare_catalog(
+        base,
+        source="nsbh",
+        split="test",
+        seed=42,
+        skymap_dir=profile.skymap_dir,
+        opsim_db=profile.opsim_db,
+    )
+
+    assert prepared["simulation_id"].tolist() == [20, 21]
+    assert prepared["mej_dynamic"].tolist() == [0.01, 0.09]
+    assert prepared["mej_wind"].tolist() == [0.01, 0.09]
+    assert prepared["phi_deg"].tolist() == [30.0, 30.0]
+    assert prepared["viewing_costheta"].between(0.0, 1.0, inclusive="both").all()
+    assert manifest["model_range_filtered_rows"] == 2
+    assert manifest["mej_dynamic_out_of_range_rows"] == 1
+    assert manifest["mej_wind_out_of_range_rows"] == 1
+    assert manifest["optical_model_parameter_ranges"]["phi_deg"] == [30.0, 30.0]
+
+
+def test_validate_rejects_obsolete_clipping_schema(tmp_path):
+    profile, _ = prepare_profile(tmp_path)
+    manifest = json.loads(profile.prepared_manifest.read_text(encoding="utf-8"))
+    manifest["schema_version"] = "gwsamplegen-kn-v1"
+    profile.prepared_manifest.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="obsolete schema"):
+        validate_prepared_run(profile)
 
 
 def test_submit_dry_run_builds_array_without_writing_submission(tmp_path):

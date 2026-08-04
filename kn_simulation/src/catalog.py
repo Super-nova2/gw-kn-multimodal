@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 from astropy.time import Time
 
-SCHEMA_VERSION = "gwsamplegen-kn-v1"
+SCHEMA_VERSION = "gwsamplegen-kn-v2"
 DEFAULT_MJD_MIN = 61_000.0
 DEFAULT_MJD_MAX = 64_500.0
 
@@ -50,9 +50,19 @@ NUMERIC_COLUMNS = tuple(
     column for column in REQUIRED_COLUMNS if column not in {"online_ifos", "skymap"}
 )
 
-SNANA_EJECTA_RANGES = {
-    "bns": {"dynamic": (0.001, 0.02), "wind": (0.01, 0.13)},
-    "nsbh": {"dynamic": (0.01, 0.09), "wind": (0.01, 0.09)},
+OPTICAL_MODEL_RANGES = {
+    "bns": {
+        "mej_dynamic": (0.001, 0.02),
+        "mej_wind": (0.01, 0.13),
+        "viewing_costheta": (0.0, 1.0),
+        "phi_deg": (15.0, 75.0),
+    },
+    "nsbh": {
+        "mej_dynamic": (0.01, 0.09),
+        "mej_wind": (0.01, 0.09),
+        "viewing_costheta": (0.0, 1.0),
+        "phi_deg": (30.0, 30.0),
+    },
 }
 
 
@@ -135,13 +145,51 @@ def _validate_physics(frame: pd.DataFrame, source: str) -> None:
     if np.any((frame["theta_jn"] < 0) | (frame["theta_jn"] > np.pi)):
         raise ValueError("theta_jn must be in radians within [0, pi]")
 
-    if np.any(frame[["mej_dynamic", "mej_wind"]] <= 0):
-        raise ValueError("all catalog events must have positive ejecta components")
     expected_total = frame["mej_dynamic"] + frame["mej_wind"]
     if not np.allclose(frame["mej_total"], expected_total, rtol=1e-8, atol=1e-12):
         raise ValueError("mej_total is inconsistent with mej_dynamic + mej_wind")
     if np.any(frame["network_snr"] < 0):
         raise ValueError("network_snr must be non-negative")
+
+
+def _filter_to_optical_model_ejecta_range(
+    frame: pd.DataFrame,
+    source: str,
+) -> tuple[pd.DataFrame, dict[str, int]]:
+    """Keep events inside both closed ejecta ranges without modifying values."""
+
+    ranges = OPTICAL_MODEL_RANGES[source]
+    dynamic_min, dynamic_max = ranges["mej_dynamic"]
+    wind_min, wind_max = ranges["mej_wind"]
+    dynamic_in_range = frame["mej_dynamic"].between(
+        dynamic_min, dynamic_max, inclusive="both"
+    )
+    wind_in_range = frame["mej_wind"].between(wind_min, wind_max, inclusive="both")
+    keep = dynamic_in_range & wind_in_range
+    statistics = {
+        "model_range_filtered_rows": int((~keep).sum()),
+        "mej_dynamic_out_of_range_rows": int((~dynamic_in_range).sum()),
+        "mej_wind_out_of_range_rows": int((~wind_in_range).sum()),
+    }
+    filtered = frame.loc[keep].copy().reset_index(drop=True)
+    if filtered.empty:
+        raise ValueError(
+            f"no {source.upper()} events remain inside the optical-model ejecta "
+            "parameter ranges"
+        )
+    return filtered, statistics
+
+
+def _validate_generated_model_parameters(frame: pd.DataFrame, source: str) -> None:
+    """Assert that deterministically generated angular parameters are in range."""
+
+    for column in ("viewing_costheta", "phi_deg"):
+        lower, upper = OPTICAL_MODEL_RANGES[source][column]
+        if np.any((frame[column] < lower) | (frame[column] > upper)):
+            raise RuntimeError(
+                f"generated {column} lies outside optical-model range "
+                f"[{lower}, {upper}]"
+            )
 
 
 def _event_random_values(
@@ -162,9 +210,10 @@ def _event_random_values(
         )
         phi_sequence, snana_sequence, coordinate_sequence = sequence.spawn(3)
         if source == "bns":
-            phi[index] = np.random.default_rng(phi_sequence).uniform(15.0, 75.0)
+            phi_min, phi_max = OPTICAL_MODEL_RANGES[source]["phi_deg"]
+            phi[index] = np.random.default_rng(phi_sequence).uniform(phi_min, phi_max)
         else:
-            phi[index] = 30.0
+            phi[index] = OPTICAL_MODEL_RANGES[source]["phi_deg"][0]
         snana_seed[index] = (
             int(snana_sequence.generate_state(1, dtype=np.uint32)[0]) % 2_000_000_000
             + 1
@@ -237,6 +286,9 @@ def prepare_catalog(
     )
     _validate_online_ifos(prepared)
     _validate_physics(prepared, source)
+    prepared, filter_statistics = _filter_to_optical_model_ejecta_range(
+        prepared, source
+    )
     _validate_skymaps(prepared, Path(skymap_dir))
 
     trigger_mjd = np.asarray(
@@ -268,17 +320,7 @@ def prepare_catalog(
     prepared["phi_deg"] = phi
     prepared["snana_seed"] = snana_seed
     prepared["coordinate_seed"] = coordinate_seed
-
-    ranges = SNANA_EJECTA_RANGES[source]
-    prepared["snana_mej_dynamic"] = np.clip(prepared["mej_dynamic"], *ranges["dynamic"])
-    prepared["snana_mej_wind"] = np.clip(prepared["mej_wind"], *ranges["wind"])
-    prepared["mej_dynamic_clipped"] = ~np.isclose(
-        prepared["snana_mej_dynamic"], prepared["mej_dynamic"], rtol=0, atol=0
-    )
-    prepared["mej_wind_clipped"] = ~np.isclose(
-        prepared["snana_mej_wind"], prepared["mej_wind"], rtol=0, atol=0
-    )
-
+    _validate_generated_model_parameters(prepared, source)
     manifest = {
         "schema_version": SCHEMA_VERSION,
         "source": source,
@@ -294,8 +336,10 @@ def prepare_catalog(
         "trigger_mjd_max": float(trigger_mjd.max()),
         "opsim_mjd_min": opsim_min,
         "opsim_mjd_max": opsim_max,
-        "mej_dynamic_clipped": int(prepared["mej_dynamic_clipped"].sum()),
-        "mej_wind_clipped": int(prepared["mej_wind_clipped"].sum()),
+        **filter_statistics,
+        "optical_model_parameter_ranges": {
+            name: list(bounds) for name, bounds in OPTICAL_MODEL_RANGES[source].items()
+        },
         "skymap_directory": str(Path(skymap_dir).resolve()),
         "opsim_database": str(Path(opsim_db).resolve()),
     }
@@ -442,7 +486,9 @@ def prepare_run_catalog(
             "source_catalog": str(input_path),
             "source_catalog_sha256": input_sha256,
             "copied_catalog": str(copied_input),
-            "rows": len(prepared),
+            "rows": int(manifest["input_rows"]),
+            "prepared_rows": int(manifest["output_rows"]),
+            "model_range_filtered_rows": int(manifest["model_range_filtered_rows"]),
         }
         temporary_manifest.write_text(
             json.dumps(manifest, indent=2, sort_keys=True) + "\n",

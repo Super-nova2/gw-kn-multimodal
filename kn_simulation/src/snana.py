@@ -13,6 +13,7 @@ import pandas as pd
 from astropy import cosmology as astropy_cosmology
 from astropy import units as u
 from astropy.cosmology import z_at_value
+from catalog import OPTICAL_MODEL_RANGES
 from ligo.skymap.io.fits import read_sky_map
 from rubin_too import (
     AugmentedSNANASimlib,
@@ -35,10 +36,6 @@ from sky_sampling import (
 SCRIPT_DIR = Path(__file__).resolve().parent
 PIPELINE_DIR = SCRIPT_DIR.parent
 _BASE_DIR = os.environ.get("BASE_DIR", "/fred/oz016/bgao_kn")
-SNANA_EJECTA_RANGES = {
-    "bns": {"dynamic": (0.001, 0.02), "wind": (0.01, 0.13)},
-    "nsbh": {"dynamic": (0.01, 0.09), "wind": (0.01, 0.09)},
-}
 PREPARED_CATALOG_COLUMNS = {
     "simulation_id",
     "network_snr",
@@ -51,17 +48,10 @@ PREPARED_CATALOG_COLUMNS = {
     "phi_deg",
     "mej_dynamic",
     "mej_wind",
-    "snana_mej_dynamic",
-    "snana_mej_wind",
-    "mej_dynamic_clipped",
-    "mej_wind_clipped",
     "snana_seed",
     "coordinate_seed",
 }
-PREPARED_NUMERIC_COLUMNS = PREPARED_CATALOG_COLUMNS - {
-    "mej_dynamic_clipped",
-    "mej_wind_clipped",
-}
+PREPARED_NUMERIC_COLUMNS = PREPARED_CATALOG_COLUMNS
 
 
 def get_nlibid(simlib_file):
@@ -83,26 +73,26 @@ def _event_row(injections, sim_id):
 
 
 def _prepared_ejecta(row, gw_type):
-    if gw_type not in SNANA_EJECTA_RANGES:
+    if gw_type not in OPTICAL_MODEL_RANGES:
         raise ValueError(f"Unsupported GW type: {gw_type}")
-    mej_dyn = float(row["snana_mej_dynamic"])
-    mej_wind = float(row["snana_mej_wind"])
-    dynamic_range = SNANA_EJECTA_RANGES[gw_type]["dynamic"]
-    wind_range = SNANA_EJECTA_RANGES[gw_type]["wind"]
+    mej_dyn = float(row["mej_dynamic"])
+    mej_wind = float(row["mej_wind"])
+    dynamic_range = OPTICAL_MODEL_RANGES[gw_type]["mej_dynamic"]
+    wind_range = OPTICAL_MODEL_RANGES[gw_type]["mej_wind"]
     if not dynamic_range[0] <= mej_dyn <= dynamic_range[1]:
         raise ValueError(
-            f"simulation_id={int(row['simulation_id'])} has snana_mej_dynamic "
+            f"simulation_id={int(row['simulation_id'])} has mej_dynamic "
             f"outside {dynamic_range}"
         )
     if not wind_range[0] <= mej_wind <= wind_range[1]:
         raise ValueError(
-            f"simulation_id={int(row['simulation_id'])} has snana_mej_wind "
+            f"simulation_id={int(row['simulation_id'])} has mej_wind "
             f"outside {wind_range}"
         )
     return mej_dyn, mej_wind
 
 
-def gen_input(injections, text, sim_id, gw_type="bns"):
+def gen_input(injections, text, sim_id, gw_type="bns", sndata_sim_dir=None):
     """Generate SIMGEN input content using one prepared event row."""
     row = _event_row(injections, sim_id)
     mej_dyn, mej_wind = _prepared_ejecta(row, gw_type)
@@ -115,6 +105,17 @@ def gen_input(injections, text, sim_id, gw_type="bns"):
     }
     if gw_type == "bns":
         replacements[r"^(GENPEAK_PHI:\s*)\S+.*$"] = rf"\1 {float(row['phi_deg'])}"
+    if sndata_sim_dir is not None:
+        if re.search(r"^PATH_SNDATA_SIM:", text, flags=re.MULTILINE):
+            replacements[r"^(PATH_SNDATA_SIM:\s*)\S+.*$"] = rf"\1 {sndata_sim_dir}"
+        else:
+            text = re.sub(
+                r"^(GENVERSION:.*)$",
+                rf"\1\nPATH_SNDATA_SIM: {sndata_sim_dir}",
+                text,
+                count=1,
+                flags=re.MULTILINE,
+            )
     for pattern, replacement in replacements.items():
         text = re.sub(pattern, replacement, text, flags=re.MULTILINE)
     return text
@@ -254,6 +255,11 @@ def build_parser():
         default=str(PIPELINE_DIR / "templates" / "bns.input"),
     )
     parser.add_argument(
+        "--sndata-sim-dir",
+        default=None,
+        help="Parent SNANA SIM output directory (default: $SNDATA_ROOT/SIM)",
+    )
+    parser.add_argument(
         "--coordinate_mode",
         choices=("posterior_3d", "posterior_test"),
         default="posterior_3d",
@@ -278,6 +284,17 @@ def main(argv=None):
     simlib_dir = outdir / "SIMLIB"
     input_dir.mkdir(parents=True, exist_ok=True)
     simlib_dir.mkdir(parents=True, exist_ok=True)
+    if args.sndata_sim_dir is not None:
+        Path(args.sndata_sim_dir).mkdir(parents=True, exist_ok=True)
+        # SNANA requires $SNDATA_ROOT/SIM/PATH_SNDATA_SIM.LIST to exist when
+        # PATH_SNDATA_SIM is supplied; create it if the run has not yet done so.
+        sndata_root = os.environ.get("SNDATA_ROOT")
+        if sndata_root:
+            path_sndata_sim_list = Path(sndata_root) / "SIM" / "PATH_SNDATA_SIM.LIST"
+        else:
+            path_sndata_sim_list = Path(args.sndata_sim_dir).parent / "PATH_SNDATA_SIM.LIST"
+        path_sndata_sim_list.parent.mkdir(parents=True, exist_ok=True)
+        path_sndata_sim_list.touch(exist_ok=True)
     opsim_stem = Path(args.Opsim).stem
     catalog = pd.read_csv(args.GW_catalog)
     network_snr_by_id = _validate_requested_network_snr(catalog, args.sim_ids)
@@ -316,10 +333,6 @@ def main(argv=None):
             "cosmology": args.cosmology,
             "mej_dynamic": float(row["mej_dynamic"]),
             "mej_wind": float(row["mej_wind"]),
-            "snana_mej_dynamic": float(row["snana_mej_dynamic"]),
-            "snana_mej_wind": float(row["snana_mej_wind"]),
-            "mej_dynamic_clipped": bool(row["mej_dynamic_clipped"]),
-            "mej_wind_clipped": bool(row["mej_wind_clipped"]),
             "snana_seed": int(row["snana_seed"]),
             "coordinate_seed": int(row["coordinate_seed"]),
             "area90_deg2": None,
@@ -536,7 +549,13 @@ def main(argv=None):
                 text,
                 flags=re.MULTILINE,
             )
-            text = gen_input(catalog, text, sim_id, gw_type=args.GW_type)
+            text = gen_input(
+                catalog,
+                text,
+                sim_id,
+                gw_type=args.GW_type,
+                sndata_sim_dir=args.sndata_sim_dir,
+            )
             input_file.write_text(text, encoding="utf-8")
 
             plan.update(

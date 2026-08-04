@@ -80,7 +80,7 @@ def _cleanup_transients(simlib: Path, input_file: Path) -> None:
 
 def _snana_head(profile: Profile, simulation_id: int) -> Path:
     version = f"{profile.sim_name}_{simulation_id}"
-    return profile.sndata_root / "SIM" / version / f"{version}_HEAD.FITS"
+    return profile.sndata_sim_dir / version / f"{version}_HEAD.FITS"
 
 
 def _generate_documents(profile: Profile, simulation_ids: list[int]) -> dict[int, Any]:
@@ -103,6 +103,8 @@ def _generate_documents(profile: Profile, simulation_ids: list[int]) -> dict[int
         str(profile.work_dir),
         "--template_input",
         str(profile.template_input),
+        "--sndata-sim-dir",
+        str(profile.sndata_sim_dir),
         "--coordinate_mode",
         profile.coordinate_mode,
         "--samples_per_event",
@@ -188,6 +190,10 @@ def run_array_task(
     started = _utc_now()
     profile.work_dir.mkdir(parents=True, exist_ok=True)
     profile.artifact_shard_dir.mkdir(parents=True, exist_ok=True)
+    profile.sndata_sim_dir.mkdir(parents=True, exist_ok=True)
+    path_sndata_sim_list = profile.sndata_root / "SIM" / "PATH_SNDATA_SIM.LIST"
+    path_sndata_sim_list.parent.mkdir(parents=True, exist_ok=True)
+    path_sndata_sim_list.touch(exist_ok=True)
     generated = _generate_documents(profile, selected)
     events = []
     artifact_events = []
@@ -273,7 +279,9 @@ def finalize_submission(
         if status not in grouped:
             status = "failed"
         grouped[status].append(simulation_id)
-    for status in ("success", "failed", "skipped"):
+    _atomic_ids(profile.run_dir / "success_sim_ids.txt", grouped["success"])
+    (profile.status_dir / "success_sim_ids.txt").unlink(missing_ok=True)
+    for status in ("failed", "skipped"):
         _atomic_ids(profile.status_dir / f"{status}_sim_ids.txt", grouped[status])
 
     missing_tasks = len(missing_task_indices)
@@ -292,7 +300,6 @@ def finalize_submission(
     complete = (
         not missing_tasks
         and not invalid_sidecars
-        and not grouped["failed"]
         and not grouped["unprocessed"]
     )
     if complete:

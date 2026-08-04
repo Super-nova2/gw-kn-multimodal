@@ -5,6 +5,8 @@ NGENTOT_LC: 13107  # number of LC to generate, number of LIBID in SIMLIB file
 
 # name of version to appear in $SNDATA_ROOT/SIM
 GENVERSION: LSST_KN
+# parent directory for per-event version subdirectories
+PATH_SNDATA_SIM: $SNDATA_ROOT/SIM
 
 # define SED model and rate model
 GENMODEL:  $SNDATA_ROOT/models/SIMSED/SIMSED.KN-BULLA19/SIMSED.BULLA-BHNS-M1-2COMP
