@@ -71,6 +71,29 @@ def _make_two_pixel_skymap_xy(*, first_high: str) -> torch.Tensor:
 
 
 class RetrievalGalleryTests(unittest.TestCase):
+    def test_no_classification_color_preserves_existing_method_colors(self) -> None:
+        existing_methods = [
+            "Fink Random Forest",
+            "w/o Contrastive Loss",
+            "w/o Cross-Attn",
+            "w/o Fusion",
+            "w/o Gallery Loss",
+            "Full",
+        ]
+        extended_methods = [*existing_methods, "w/o Classification Loss"]
+        existing_order = sorted(existing_methods, key=retrieval_gallery._plot_method_draw_order)
+        extended_order = sorted(extended_methods, key=retrieval_gallery._plot_method_draw_order)
+
+        existing_colors = retrieval_gallery._plot_method_color_map(existing_order)
+        extended_colors = retrieval_gallery._plot_method_color_map(extended_order)
+
+        self.assertEqual(
+            {method: extended_colors[method] for method in existing_methods},
+            existing_colors,
+        )
+        self.assertEqual(extended_colors["w/o Classification Loss"], "#17BECF")
+        self.assertEqual(len(set(extended_colors.values())), len(extended_colors))
+
     def test_build_time_sky_candidate_sequence_filters_and_sorts(self) -> None:
         seq = retrieval_gallery.build_time_sky_candidate_sequence(
             anchor_time_mjd=50.0,

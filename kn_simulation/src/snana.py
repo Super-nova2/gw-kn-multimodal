@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import re
 import traceback
@@ -148,8 +147,7 @@ def _coordinate_samples(args, injections, sky_map, sim_id):
     raise ValueError(f"Unsupported production coordinate mode: {args.coordinate_mode}")
 
 
-def _write_coordinate_manifest(
-    manifest_dir,
+def _coordinate_manifest_frame(
     sim_id,
     ra,
     dec,
@@ -164,7 +162,6 @@ def _write_coordinate_manifest(
     too_nobs=None,
     too_mode=None,
 ):
-    manifest_dir.mkdir(parents=True, exist_ok=True)
     data = {
         "simulation_id": int(sim_id),
         "sample_index": np.arange(len(ra), dtype=int),
@@ -191,35 +188,7 @@ def _write_coordinate_manifest(
             if len(values) != len(ra):
                 raise ValueError(f"Manifest column {name} has the wrong length")
             data[name] = values
-    pd.DataFrame(data).to_csv(
-        manifest_dir / f"{int(sim_id)}.csv",
-        index=False,
-    )
-
-
-def _json_default(value):
-    if isinstance(value, np.generic):
-        return value.item()
-    if isinstance(value, np.ndarray):
-        return value.tolist()
-    if isinstance(value, Path):
-        return str(value)
-    raise TypeError(f"Cannot serialize {type(value).__name__} to JSON")
-
-
-def _write_observation_plan(plan_dir, sim_id, plan):
-    plan_dir.mkdir(parents=True, exist_ok=True)
-    path = plan_dir / f"{int(sim_id)}.json"
-    path.write_text(
-        json.dumps(
-            plan,
-            indent=2,
-            sort_keys=True,
-            default=_json_default,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
+    return pd.DataFrame(data)
 
 
 def _validate_requested_network_snr(catalog, sim_ids):
@@ -292,8 +261,6 @@ def build_parser():
     parser.add_argument("--samples_per_event", type=int, default=64)
     parser.add_argument("--sampling_nside", type=int, default=256)
     parser.add_argument("--cosmology", default="Planck15")
-    parser.add_argument("--coordinate_manifest_dir")
-    parser.add_argument("--observation_plan_dir")
     parser.add_argument(
         "--too_config",
         default=str(PIPELINE_DIR / "config" / "rubin_too_2024.yaml"),
@@ -311,17 +278,6 @@ def main(argv=None):
     simlib_dir = outdir / "SIMLIB"
     input_dir.mkdir(parents=True, exist_ok=True)
     simlib_dir.mkdir(parents=True, exist_ok=True)
-    manifest_dir = (
-        Path(args.coordinate_manifest_dir)
-        if args.coordinate_manifest_dir
-        else outdir / "coordinate_samples"
-    )
-    plan_dir = (
-        Path(args.observation_plan_dir)
-        if args.observation_plan_dir
-        else outdir / "observation_plans"
-    )
-
     opsim_stem = Path(args.Opsim).stem
     catalog = pd.read_csv(args.GW_catalog)
     network_snr_by_id = _validate_requested_network_snr(catalog, args.sim_ids)
@@ -341,6 +297,7 @@ def main(argv=None):
     )
     condition_library = None
 
+    artifacts = {}
     for sim_id in args.sim_ids:
         print(f"\nProcessing simulation ID: {sim_id}")
         sim_id = int(sim_id)
@@ -348,11 +305,8 @@ def main(argv=None):
         row = _event_row(catalog, sim_id)
         simlib_file = simlib_dir / (f"{opsim_stem}_{args.sim_name}_{sim_id}.SIMLIB")
         input_file = input_dir / f"SIMGEN_{args.sim_name}_{sim_id}.INPUT"
-        manifest_file = manifest_dir / f"{sim_id}.csv"
-        plan_file = plan_dir / f"{sim_id}.json"
         _remove_event_products(simlib_file, input_file)
-        manifest_file.unlink(missing_ok=True)
-        plan_file.unlink(missing_ok=True)
+        coordinate_frame = None
 
         plan = {
             "simulation_id": sim_id,
@@ -543,8 +497,7 @@ def main(argv=None):
             if not too_observations.empty:
                 counts = too_observations.groupby("sample_index").size()
                 too_nobs[counts.index.to_numpy(dtype=int)] = counts.to_numpy(dtype=int)
-            _write_coordinate_manifest(
-                manifest_dir,
+            coordinate_frame = _coordinate_manifest_frame(
                 sim_id,
                 ra,
                 dec,
@@ -593,18 +546,24 @@ def main(argv=None):
                 too_visits_written=sim.too_visits_written,
                 removed_baseline_visits=sim.removed_baseline_visits,
             )
-            _write_observation_plan(plan_dir, sim_id, plan)
+            artifacts[sim_id] = {
+                "plan": plan,
+                "coordinates": coordinate_frame,
+            }
         except Exception as error:  # noqa: BLE001 - isolate failures by event
             _remove_event_products(simlib_file, input_file)
-            manifest_file.unlink(missing_ok=True)
             plan.update(
                 status="failed",
                 error_type=type(error).__name__,
                 error=str(error),
             )
-            _write_observation_plan(plan_dir, sim_id, plan)
+            artifacts[sim_id] = {
+                "plan": plan,
+                "coordinates": coordinate_frame,
+            }
             print(f"Failed simulation ID {sim_id}: {error}")
             traceback.print_exc()
+    return artifacts
 
 
 if __name__ == "__main__":

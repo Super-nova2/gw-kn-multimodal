@@ -22,6 +22,8 @@ class SlurmConfig:
     time_limit: str = "04:00:00"
     cpus_per_task: int = 1
     memory: str = "10G"
+    finalizer_time_limit: str = "01:00:00"
+    finalizer_memory: str = "4G"
 
 
 @dataclass(frozen=True)
@@ -74,7 +76,16 @@ class Profile:
 
     @property
     def coordinate_manifest_dir(self) -> Path:
+        """Legacy per-event coordinate directory used only during migration."""
         return self.run_dir / "coordinate_samples"
+
+    @property
+    def artifact_shard_dir(self) -> Path:
+        return self.run_dir / "artifact_shards"
+
+    @property
+    def aggregate_artifact_file(self) -> Path:
+        return self.run_dir / "simulation_intermediates.h5"
 
     @property
     def status_dir(self) -> Path:
@@ -161,6 +172,8 @@ def load_profile(profile: str | Path) -> Profile:
         time_limit=str(slurm_raw.get("time_limit", "04:00:00")),
         cpus_per_task=int(slurm_raw.get("cpus_per_task", 1)),
         memory=str(slurm_raw.get("memory", "10G")),
+        finalizer_time_limit=str(slurm_raw.get("finalizer_time_limit", "01:00:00")),
+        finalizer_memory=str(slurm_raw.get("finalizer_memory", "4G")),
     )
     if slurm.batch_size <= 0 or slurm.max_concurrency <= 0:
         raise ValueError("Slurm batch_size and max_concurrency must be positive")

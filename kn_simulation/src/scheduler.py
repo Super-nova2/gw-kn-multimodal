@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from artifacts import aggregate_status, compact_artifacts
 from config import PIPELINE_ROOT, REPO_ROOT, Profile, resolve_profile_path
 
 
@@ -87,7 +88,16 @@ def validate_prepared_run(profile: Profile) -> dict[str, Any]:
         raise ValueError("catalog.csv checksum no longer matches its manifest")
     if manifest.get("output_catalog_sha256") != _sha256(profile.prepared_catalog):
         raise ValueError("kn_catalog.csv checksum no longer matches its manifest")
-    if manifest.get("profile") != profile.as_manifest():
+    manifest_profile = manifest.get("profile")
+    if isinstance(manifest_profile, dict):
+        manifest_profile = dict(manifest_profile)
+        slurm_snapshot = dict(manifest_profile.get("slurm", {}))
+        slurm_snapshot.setdefault(
+            "finalizer_time_limit", profile.slurm.finalizer_time_limit
+        )
+        slurm_snapshot.setdefault("finalizer_memory", profile.slurm.finalizer_memory)
+        manifest_profile["slurm"] = slurm_snapshot
+    if manifest_profile != profile.as_manifest():
         raise ValueError(
             "Prepared catalog profile snapshot differs from the active profile"
         )
@@ -169,7 +179,8 @@ def submit_profile(
         raise FileNotFoundError(f"Slurm worker does not exist: {worker_script}")
 
     export_common = (
-        f"KN_PROFILE={profile_path},KN_IDS_FILE={ids_path},"
+        f"KN_PIPELINE_ROOT={PIPELINE_ROOT},KN_PROFILE={profile_path},"
+        f"KN_IDS_FILE={ids_path},"
         f"KN_SUBMISSION_ID={submission_id},KN_BATCH_SIZE={batch_size}"
     )
     array_command = [
@@ -214,9 +225,9 @@ def submit_profile(
         "sbatch",
         "--parsable",
         f"--job-name={profile.sim_name}-finalize",
-        "--time=00:20:00",
+        f"--time={profile.slurm.finalizer_time_limit}",
         "--cpus-per-task=1",
-        "--mem=2G",
+        f"--mem={profile.slurm.finalizer_memory}",
         f"--dependency=afterany:{array_job_id}",
         f"--output={profile.log_dir}/%x_%j.out",
         f"--chdir={REPO_ROOT}",
@@ -244,6 +255,16 @@ def submit_profile(
     return result
 
 
+def compact_profile(profile: Profile) -> dict[str, Any]:
+    """Manually compact a fully terminal run using latest event sidecars."""
+
+    return compact_artifacts(
+        profile,
+        catalog_ids=read_catalog_ids(profile.prepared_catalog),
+        event_statuses=latest_event_statuses(profile.status_dir),
+    )
+
+
 def status_report(profile: Profile) -> dict[str, Any]:
     all_ids = read_catalog_ids(profile.prepared_catalog)
     statuses = latest_event_statuses(profile.status_dir)
@@ -259,4 +280,5 @@ def status_report(profile: Profile) -> dict[str, Any]:
         "catalog_events": len(all_ids),
         "counts": counts,
         "latest_submission": submission,
+        "intermediate_artifacts": aggregate_status(profile),
     }

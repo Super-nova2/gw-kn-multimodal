@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import snana
+from artifacts import compact_artifacts, write_task_shard
 from config import Profile, load_profile
 from scheduler import latest_event_statuses, read_catalog_ids
 
@@ -57,7 +58,7 @@ def _read_submission_ids(path: Path) -> list[int]:
     return values
 
 
-def _event_paths(profile: Profile, simulation_id: int) -> tuple[Path, Path, Path]:
+def _event_paths(profile: Profile, simulation_id: int) -> tuple[Path, Path]:
     opsim_stem = profile.opsim_db.stem
     simlib = (
         profile.work_dir
@@ -69,8 +70,7 @@ def _event_paths(profile: Profile, simulation_id: int) -> tuple[Path, Path, Path
         / "SIM_INPUT"
         / (f"SIMGEN_{profile.sim_name}_{simulation_id}.INPUT")
     )
-    plan = profile.observation_plan_dir / f"{simulation_id}.json"
-    return simlib, input_file, plan
+    return simlib, input_file
 
 
 def _cleanup_transients(simlib: Path, input_file: Path) -> None:
@@ -83,7 +83,7 @@ def _snana_head(profile: Profile, simulation_id: int) -> Path:
     return profile.sndata_root / "SIM" / version / f"{version}_HEAD.FITS"
 
 
-def _generate_documents(profile: Profile, simulation_ids: list[int]) -> None:
+def _generate_documents(profile: Profile, simulation_ids: list[int]) -> dict[int, Any]:
     arguments = [
         "--sim_name",
         profile.sim_name,
@@ -111,27 +111,24 @@ def _generate_documents(profile: Profile, simulation_ids: list[int]) -> None:
         str(profile.sampling_nside),
         "--cosmology",
         profile.cosmology,
-        "--coordinate_manifest_dir",
-        str(profile.coordinate_manifest_dir),
-        "--observation_plan_dir",
-        str(profile.observation_plan_dir),
         "--too_config",
         str(profile.too_config),
     ]
-    snana.main(arguments)
+    return snana.main(arguments)
 
 
-def _run_one(profile: Profile, simulation_id: int) -> dict[str, Any]:
-    simlib, input_file, plan_path = _event_paths(profile, simulation_id)
+def _run_one(
+    profile: Profile,
+    simulation_id: int,
+    plan: dict[str, Any],
+) -> dict[str, Any]:
+    simlib, input_file = _event_paths(profile, simulation_id)
     result: dict[str, Any] = {
         "simulation_id": int(simulation_id),
         "status": "failed",
         "reason": None,
     }
     try:
-        if not plan_path.is_file():
-            raise FileNotFoundError(f"observation plan was not generated: {plan_path}")
-        plan = json.loads(plan_path.read_text(encoding="utf-8"))
         if plan.get("status") != "generated":
             result["reason"] = (
                 plan.get("error") or plan.get("reason") or "generation_failed"
@@ -190,10 +187,46 @@ def run_array_task(
         raise ValueError(f"Array task {task_index} selects no events")
     started = _utc_now()
     profile.work_dir.mkdir(parents=True, exist_ok=True)
-    profile.observation_plan_dir.mkdir(parents=True, exist_ok=True)
-    profile.coordinate_manifest_dir.mkdir(parents=True, exist_ok=True)
-    _generate_documents(profile, selected)
-    events = [_run_one(profile, simulation_id) for simulation_id in selected]
+    profile.artifact_shard_dir.mkdir(parents=True, exist_ok=True)
+    generated = _generate_documents(profile, selected)
+    events = []
+    artifact_events = []
+    for simulation_id in selected:
+        product = generated.get(simulation_id)
+        if product is None:
+            product = {
+                "plan": {
+                    "simulation_id": simulation_id,
+                    "status": "failed",
+                    "error": "SNANA document generator returned no event artifact",
+                },
+                "coordinates": None,
+            }
+        plan = product["plan"]
+        result = _run_one(profile, simulation_id, plan)
+        events.append(result)
+        artifact_events.append(
+            {
+                **result,
+                "observation_plan": plan,
+                "coordinates": product.get("coordinates"),
+            }
+        )
+    artifact_path = profile.artifact_shard_dir / f"{submission_id}_{int(task_index)}.h5"
+    write_task_shard(
+        artifact_path,
+        profile=profile,
+        submission_id=submission_id,
+        task_index=task_index,
+        events=artifact_events,
+    )
+    artifact_reference = str(artifact_path.relative_to(profile.run_dir))
+    for event in events:
+        event.update(
+            artifact_shard=artifact_reference,
+            submission_id=submission_id,
+            task_index=int(task_index),
+        )
     document = {
         "profile": profile.name,
         "submission_id": submission_id,
@@ -213,10 +246,25 @@ def finalize_submission(
     submission_id: str,
     expected_tasks: int,
 ) -> tuple[dict[str, Any], bool]:
-    """Consolidate immutable shard sidecars into event-level status lists."""
+    """Consolidate statuses and, for complete runs, merge artifact shards."""
 
     shard_dir = profile.status_dir / "shards"
-    current_shards = list(shard_dir.glob(f"{submission_id}_*.json"))
+    expected_indices = set(range(int(expected_tasks)))
+    completed_indices: set[int] = set()
+    invalid_sidecars: list[str] = []
+    for path in shard_dir.glob(f"{submission_id}_*.json"):
+        try:
+            document = json.loads(path.read_text(encoding="utf-8"))
+            task_index = int(document["task_index"])
+            if document.get("submission_id") != submission_id:
+                raise ValueError("submission_id does not match sidecar filename")
+            expected_name = f"{submission_id}_{task_index}.json"
+            if path.name != expected_name or task_index not in expected_indices:
+                raise ValueError("task_index does not match sidecar filename")
+            completed_indices.add(task_index)
+        except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+            invalid_sidecars.append(path.name)
+    missing_task_indices = sorted(expected_indices - completed_indices)
     statuses = latest_event_statuses(profile.status_dir)
     all_ids = read_catalog_ids(profile.prepared_catalog)
     grouped = {"success": [], "failed": [], "skipped": [], "unprocessed": []}
@@ -228,21 +276,47 @@ def finalize_submission(
     for status in ("success", "failed", "skipped"):
         _atomic_ids(profile.status_dir / f"{status}_sim_ids.txt", grouped[status])
 
-    missing_tasks = max(0, int(expected_tasks) - len(current_shards))
-    summary = {
+    missing_tasks = len(missing_task_indices)
+    summary: dict[str, Any] = {
         "profile": profile.name,
         "submission_id": submission_id,
         "created_utc": _utc_now(),
         "catalog_events": len(all_ids),
         "expected_tasks": int(expected_tasks),
-        "completed_task_sidecars": len(current_shards),
+        "completed_task_sidecars": len(completed_indices),
         "missing_tasks": missing_tasks,
+        "missing_task_indices": missing_task_indices,
+        "invalid_task_sidecars": sorted(invalid_sidecars),
         "counts": {name: len(values) for name, values in grouped.items()},
     }
-    _atomic_json(profile.status_dir / "summary.json", summary)
     complete = (
-        not missing_tasks and not grouped["failed"] and not grouped["unprocessed"]
+        not missing_tasks
+        and not invalid_sidecars
+        and not grouped["failed"]
+        and not grouped["unprocessed"]
     )
+    if complete:
+        try:
+            summary["aggregate"] = compact_artifacts(
+                profile,
+                catalog_ids=all_ids,
+                event_statuses=statuses,
+            )
+        except Exception as error:  # noqa: BLE001 - preserve shards on merge failure
+            traceback.print_exc()
+            summary["aggregate"] = {
+                "status": "failed",
+                "error_type": type(error).__name__,
+                "error": str(error),
+            }
+            complete = False
+    else:
+        summary["aggregate"] = {
+            "status": "deferred",
+            "reason": "run_has_missing_tasks_or_nonterminal_events",
+        }
+    summary["complete"] = complete
+    _atomic_json(profile.status_dir / "summary.json", summary)
     return summary, complete
 
 

@@ -1443,6 +1443,31 @@ class CrossAttentionFusion(nn.Module):
             dt = dt.clamp(max=float(self.time_delta_cls_clip))
         return dt
 
+    @staticmethod
+    def _masked_optical_attention(scores, optical_token_keep_mask=None):
+        """Softmax optical-token scores with an optional ``True == keep`` mask."""
+        if optical_token_keep_mask is None:
+            return torch.softmax(scores, dim=-1)
+
+        keep_mask = torch.as_tensor(
+            optical_token_keep_mask,
+            device=scores.device,
+        )
+        if keep_mask.dtype != torch.bool:
+            raise TypeError("optical_token_keep_mask must be a boolean tensor.")
+        expected_shape = (scores.size(0), scores.size(-1))
+        if tuple(keep_mask.shape) != expected_shape:
+            raise ValueError(
+                "optical_token_keep_mask must have shape "
+                f"{expected_shape}, got {tuple(keep_mask.shape)}."
+            )
+        if torch.any(~keep_mask.any(dim=-1)):
+            raise ValueError(
+                "optical_token_keep_mask must retain at least one token per sample."
+            )
+        masked_scores = scores.masked_fill(~keep_mask.unsqueeze(1), float("-inf"))
+        return torch.softmax(masked_scores, dim=-1)
+
     def forward(
         self,
         g_feat,
@@ -1454,6 +1479,8 @@ class CrossAttentionFusion(nn.Module):
         coord_feat=None,
         sim_itc_pair=None,
         dt_days=None,
+        optical_token_keep_mask=None,
+        return_attention=False,
     ):
         """
         Args:
@@ -1474,16 +1501,24 @@ class CrossAttentionFusion(nn.Module):
             q1 = self.g2o_q(g_feat).unsqueeze(1)
             k1 = self.g2o_k(h_l)
             v1 = self.g2o_v(h_l)
+            optical_attn = self._masked_optical_attention(
+                q1 @ k1.transpose(1, 2) * scale,
+                optical_token_keep_mask,
+            )
             fused_opt = self.g2o_norm(
-                (torch.softmax(q1 @ k1.transpose(1, 2) * scale, dim=-1) @ v1).squeeze(1)
+                (optical_attn @ v1).squeeze(1)
             )
             combined = fused_opt
         elif self.fusion_mode == "legacy_dual":
             q1 = self.g2o_q(g_feat).unsqueeze(1)
             k1 = self.g2o_k(h_l)
             v1 = self.g2o_v(h_l)
+            optical_attn = self._masked_optical_attention(
+                q1 @ k1.transpose(1, 2) * scale,
+                optical_token_keep_mask,
+            )
             fused_opt = self.g2o_norm(
-                (torch.softmax(q1 @ k1.transpose(1, 2) * scale, dim=-1) @ v1).squeeze(1)
+                (optical_attn @ v1).squeeze(1)
             )
             q2 = self.o2g_q(z_l).unsqueeze(1)
             k2 = self.o2g_k(H_gw)
@@ -1503,8 +1538,12 @@ class CrossAttentionFusion(nn.Module):
             q1 = self.param2opt_q(g_param).unsqueeze(1)
             k1 = self.param2opt_k(h_l)
             v1 = self.param2opt_v(h_l)
+            optical_attn = self._masked_optical_attention(
+                q1 @ k1.transpose(1, 2) * scale,
+                optical_token_keep_mask,
+            )
             fused_opt = self.param2opt_norm(
-                (torch.softmax(q1 @ k1.transpose(1, 2) * scale, dim=-1) @ v1).squeeze(1)
+                (optical_attn @ v1).squeeze(1)
             )
 
             q2 = self.coord2gw_q(coord_feat).unsqueeze(1)
@@ -1537,6 +1576,12 @@ class CrossAttentionFusion(nn.Module):
                 )
             combined = torch.cat(pieces, dim=-1)
             aux["max_attention"] = attn.squeeze(1).max(dim=-1).values
+
+        if return_attention:
+            aux["optical_attention"] = optical_attn.squeeze(1)
+            if self.fusion_mode == "physical_dual_hgw":
+                aux["param2opt_attention"] = optical_attn.squeeze(1)
+                aux["coord2gw_attention"] = attn.squeeze(1)
 
         logits = self.classifier(combined)
         return logits, combined, aux
@@ -2037,11 +2082,19 @@ class MAGIKSModel(nn.Module):
         gw_m=None,
         opt_coords=None,
         dt_days=None,
+        optical_token_keep_mask=None,
+        return_aux=False,
     ):
         if self.fusion_mode == "concat_proj":
+            if optical_token_keep_mask is not None:
+                raise ValueError(
+                    "optical_token_keep_mask requires a cross-attention fusion mode."
+                )
             # Use L2-normalized contrastive projections as classifier input
             feat_g, feat_o = self.get_contrastive_embeddings(g_feat, z_l)
             logits, _, _ = self.fusion(feat_g, feat_o)
+            if return_aux:
+                return logits, {}
             return logits
 
         fusion_kwargs = {
@@ -2049,6 +2102,8 @@ class MAGIKSModel(nn.Module):
             "H_gw": H_gw,
             "cred_level": cred_level,
             "dt_days": dt_days,
+            "optical_token_keep_mask": optical_token_keep_mask,
+            "return_attention": bool(return_aux),
         }
         if self.fusion_mode == "physical_dual_hgw":
             if gw_s is None or opt_coords is None:
@@ -2066,7 +2121,9 @@ class MAGIKSModel(nn.Module):
                     "sim_itc_pair": sim_itc_pair,
                 }
             )
-        logits, _, _ = self.fusion(g_feat, h_l, **fusion_kwargs)
+        logits, _, aux = self.fusion(g_feat, h_l, **fusion_kwargs)
+        if return_aux:
+            return logits, aux
         return logits
 
     @staticmethod

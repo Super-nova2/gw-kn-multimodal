@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 MODEL_DIR = Path(__file__).resolve().parents[2] / "Model"
 EVAL_DIR = MODEL_DIR / "scripts" / "eval"
@@ -48,6 +49,7 @@ class MergeGw170817aRetrievalTests(unittest.TestCase):
                 merge.merge_results(base_path, supplement_path, tmp_path / "out")
 
 from scripts.eval.merge_retrieval_comparison import _assert_same_galleries  # noqa: E402
+from scripts.eval import merge_retrieval_comparison as comparison_merge  # noqa: E402
 
 def _result_stub():
     return {
@@ -83,6 +85,57 @@ class MergeRetrievalComparisonTests(unittest.TestCase):
         changed_selection["selected_positive_summary"]["n_selected_positives"] += 1
         with self.assertRaisesRegex(ValueError, "selected_positive_summary"):
             _assert_same_galleries(base, changed_selection)
+
+        base["gallery_identity"] = {"sha256": "base"}
+        changed_identity = copy.deepcopy(base)
+        changed_identity["gallery_identity"] = {"sha256": "different"}
+        with self.assertRaisesRegex(ValueError, "gallery_identity"):
+            _assert_same_galleries(base, changed_identity)
+
+    def test_successful_merge_regenerates_curves_and_coverage(self):
+        base = _result_stub()
+        base.update(
+            {
+                "models": {"base": {"type": "test"}},
+                "curve_rows": [{"method": "base"}],
+                "redshift_rows": [],
+                "redshift_macro_rows": [],
+                "table": {"rows": [{"method": "base"}]},
+            }
+        )
+        base["config"]["models"] = [{"name": "base", "type": "test"}]
+        supplement = copy.deepcopy(base)
+        supplement["models"] = {"new": {"type": "test"}}
+        supplement["curve_rows"] = [{"method": "new"}]
+        supplement["table"] = {"rows": [{"method": "new"}]}
+        supplement["config"]["models"] = [{"name": "new", "type": "test"}]
+        supplement["gallery_identity"] = {"sha256": "shared-gallery"}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            base_path = tmp_path / "base.json"
+            supplement_path = tmp_path / "supplement.json"
+            _write(base_path, base)
+            _write(supplement_path, supplement)
+            with (
+                mock.patch.object(comparison_merge, "plot_retrieval_curves") as plot_curves,
+                mock.patch.object(comparison_merge, "plot_retrieval_coverage") as plot_coverage,
+            ):
+                output_path = comparison_merge.merge_results(
+                    base_path,
+                    supplement_path,
+                    tmp_path / "out",
+                )
+
+            merged = json.loads(output_path.read_text(encoding="utf-8"))
+
+        plot_curves.assert_called_once()
+        plot_coverage.assert_called_once()
+        self.assertEqual(merged["gallery_identity"], {"sha256": "shared-gallery"})
+        self.assertEqual(
+            merged["supplement_provenance"]["gallery_identity_sha256"],
+            "shared-gallery",
+        )
 
     def test_merge_comparison_help_runs_outside_repo(self):
         script = MODEL_DIR / "scripts" / "eval" / "merge_retrieval_comparison.py"

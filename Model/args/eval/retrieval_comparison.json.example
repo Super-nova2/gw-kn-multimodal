@@ -34,6 +34,12 @@
       "config": "<REPO_ROOT>/Model/args/MAGIKS_BNS_NSBH_no_gallery_loss.json"
     },
     {
+      "name": "w/o Classification Loss",
+      "type": "multimodal",
+      "checkpoint": "<BASE_DIR>/data/model/checkpoints_bns_nsbh/bns_nsbh_ablation_no_cls_loss",
+      "config": "<REPO_ROOT>/Model/args/MAGIKS_BNS_NSBH_no_cls_loss.json"
+    },
+    {
       "name": "w/o Cross-Attn",
       "type": "multimodal",
       "checkpoint": "<BASE_DIR>/data/model/checkpoints_bns_nsbh/bns_nsbh_ablation_no_cross_atten",

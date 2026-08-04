@@ -95,6 +95,53 @@ class TimeAwareFusionTests(unittest.TestCase):
         self.assertTrue(torch.allclose(weighted_combined[:, 4:8], base_combined[:, 4:8] * 0.25, atol=1e-6))
         self.assertEqual(tuple(weighted_combined.shape), tuple(base_combined.shape))
 
+    def test_param2opt_attention_export_and_keep_mask(self):
+        fusion = CrossAttentionFusion(
+            4,
+            4,
+            coord_dim=4,
+            attn_dim=4,
+            hidden_dim=8,
+            dual=True,
+            fusion_mode="physical_dual_hgw",
+            dropout=0.0,
+        ).eval()
+        inputs = self._make_inputs()
+
+        logits_default, _, _ = fusion(**inputs)
+        logits_aux, _, aux = fusion(**inputs, return_attention=True)
+        attention = aux["param2opt_attention"]
+
+        q = fusion.param2opt_q(inputs["g_param"]).unsqueeze(1)
+        k = fusion.param2opt_k(inputs["h_l"])
+        expected = torch.softmax((q @ k.transpose(1, 2)) * (4 ** -0.5), dim=-1).squeeze(1)
+
+        self.assertTrue(torch.allclose(logits_default, logits_aux, atol=1e-6))
+        self.assertEqual(tuple(attention.shape), (2, 3))
+        self.assertTrue(torch.allclose(attention, expected, atol=1e-6))
+        self.assertTrue(torch.allclose(attention.sum(dim=-1), torch.ones(2), atol=1e-6))
+
+        keep_mask = torch.tensor([[True, False, True], [False, True, True]])
+        _, _, masked_aux = fusion(
+            **inputs,
+            optical_token_keep_mask=keep_mask,
+            return_attention=True,
+        )
+        masked_attention = masked_aux["param2opt_attention"]
+        self.assertTrue(torch.equal(masked_attention[~keep_mask], torch.zeros(2)))
+        self.assertTrue(torch.allclose(masked_attention.sum(dim=-1), torch.ones(2), atol=1e-6))
+
+        with self.assertRaisesRegex(ValueError, "retain at least one token"):
+            fusion(
+                **inputs,
+                optical_token_keep_mask=torch.zeros((2, 3), dtype=torch.bool),
+            )
+        with self.assertRaisesRegex(TypeError, "boolean tensor"):
+            fusion(
+                **inputs,
+                optical_token_keep_mask=torch.ones((2, 3)),
+            )
+
     def test_gallery_nce_loss_rewards_positive_rank(self):
         positive_mask = torch.tensor(
             [

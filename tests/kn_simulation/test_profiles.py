@@ -24,6 +24,8 @@ def test_production_profiles(name, source, split, mode, samples):
     assert profile.mjd_min == 61000.0
     assert profile.mjd_max == 64500.0
     assert profile.slurm.batch_size == 20
-    assert profile.slurm.max_concurrency == 20
+    assert profile.slurm.max_concurrency == 50
+    assert profile.slurm.finalizer_time_limit == "01:00:00"
+    assert profile.slurm.finalizer_memory == "4G"
     assert profile.run_dir == REPO_ROOT / "kn_simulation" / "runs" / name
     assert isinstance(profile.template_input, Path)

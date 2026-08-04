@@ -49,3 +49,6 @@ tmp/
 
 # dataset
 dataset/test/
+
+# Validation files
+Model/scripts/validation/

@@ -10,7 +10,8 @@ GWSamplegen catalog.csv + <simulation_id>.fits skymaps
     -> validated kn_catalog.csv
     -> Rubin baseline/ToO observation plans
     -> per-event SNANA simulations
-    -> shard sidecars and consolidated status summary
+    -> one intermediate HDF5 shard per Slurm array task
+    -> simulation_intermediates.h5 and consolidated status summary
 ```
 
 ## Layout
@@ -83,6 +84,16 @@ Inspect consolidated event state:
 kn_simulation/bin/kn-sim status bns_train
 ```
 
+If a run reached a terminal state but its automatic finalizer did not complete,
+compact it manually:
+
+```bash
+kn_simulation/bin/kn-sim compact bns_train
+```
+
+`compact` refuses incomplete runs. It uses the same validation and cleanup
+path as the automatic finalizer.
+
 After a partial run, resubmit only failed or unprocessed events. Successful and
 permanently footprint-uncovered events are not repeated:
 
@@ -124,9 +135,41 @@ Planck15, sampling nside 256, seed 42, and the shared Rubin ToO configuration.
 
 ## Slurm products
 
-Array workers write disjoint event products and immutable shard sidecars. They
-never append concurrently to shared status files. An `afterany` finalizer
-merges the latest status for every event into:
+Array workers keep each event's coordinate samples and observation plan in
+memory while SNANA runs. Each array task then atomically writes one file under
+`artifact_shards/<submission_id>_<task_index>.h5`, followed by its immutable
+JSON status sidecar. Workers never append concurrently to a shared HDF5 or
+status file.
+
+For a fully terminal run, the `afterany` finalizer selects the artifact
+referenced by each event's latest status sidecar and creates:
+
+```text
+runs/<profile>/simulation_intermediates.h5
+```
+
+The aggregate is ordered exactly like `kn_catalog.csv`. It contains event
+status/reason, coordinate offsets and counts, the complete observation plan as
+JSON, task provenance, and the coordinate columns:
+
+```text
+simulation_id, sample_index, ra, dec, distance_mpc,
+posterior_probability, is_true_position, redshift, libid,
+in_baseline_footprint, too_tile_index, too_nobs, too_mode
+```
+
+Coordinate datasets are chunked and gzip-compressed. Root attributes record the
+schema version, profile/source/split, prepared-catalog SHA256, creation time,
+event count, and coordinate count.
+
+Before publishing the aggregate, the finalizer reopens the temporary file and
+validates the catalog checksum, event IDs/order, JSON plans, coordinate offsets,
+and per-event sample counts. Only after that validation succeeds does it
+atomically install the aggregate and remove task HDF5 shards plus legacy
+per-event `coordinate_samples/*.csv` and `observation_plans/*.json` files.
+Validation failure leaves all source artifacts in place.
+
+The existing lightweight status sidecars are retained, and the finalizer writes:
 
 ```text
 status/success_sim_ids.txt
@@ -136,5 +179,11 @@ status/summary.json
 ```
 
 Temporary SIMLIB and SNANA input files are removed after each event. Observation
-plans, coordinate manifests, status sidecars, submission metadata, and SNANA
-FITS outputs are retained for audit and resume.
+plans and coordinate samples remain available in the aggregate HDF5; status
+sidecars, submission metadata, and SNANA FITS outputs remain separate for audit
+and resume.
+
+Legacy compatibility is automatic: a successful event from an older run that
+has only `coordinate_samples/<id>.csv` and `observation_plans/<id>.json` is
+imported into the final aggregate without rerunning SNANA. This is how an
+already-successful probe event can be combined with later task shards.

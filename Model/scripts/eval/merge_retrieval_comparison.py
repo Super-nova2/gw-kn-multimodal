@@ -21,7 +21,7 @@ from scripts.eval.eval_retrieval_comparison import (
     write_redshift_csv,
     write_redshift_macro_csv,
 )
-from retrieval_gallery import plot_retrieval_curves
+from retrieval_gallery import plot_retrieval_coverage, plot_retrieval_curves
 
 GALLERY_CONFIG_KEYS = (
     "seed",
@@ -47,6 +47,14 @@ def _assert_same_galleries(base: Dict[str, Any], supplement: Dict[str, Any]) -> 
     for key in ("gallery_positive_summary", "selected_positive_summary"):
         if base.get(key) != supplement.get(key):
             raise ValueError(f"Gallery realization mismatch for {key!r}.")
+    base_identity = base.get("gallery_identity")
+    supplement_identity = supplement.get("gallery_identity")
+    if (
+        base_identity is not None
+        and supplement_identity is not None
+        and base_identity != supplement_identity
+    ):
+        raise ValueError("Gallery realization mismatch for 'gallery_identity'.")
 
 def merge_results(base_path: Path, supplement_path: Path, output_dir: Path) -> Path:
     base = _load(base_path)
@@ -65,6 +73,7 @@ def merge_results(base_path: Path, supplement_path: Path, output_dir: Path) -> P
     merged["curve_rows"] = list(base.get("curve_rows", [])) + list(supplement.get("curve_rows", []))
     merged["redshift_rows"] = list(base.get("redshift_rows", [])) + list(supplement.get("redshift_rows", []))
     merged["redshift_macro_rows"] = aggregate_redshift_macro_metrics(merged["redshift_rows"])
+    merged["gallery_identity"] = base.get("gallery_identity") or supplement.get("gallery_identity")
     merged["table"] = dict(base["table"])
     merged["table"]["rows"] = list(base["table"]["rows"]) + list(supplement["table"]["rows"])
     merged["config"] = dict(base["config"])
@@ -76,6 +85,7 @@ def merge_results(base_path: Path, supplement_path: Path, output_dir: Path) -> P
         "base_result": str(base_path),
         "single_model_result": str(supplement_path),
         "added_method": method,
+        "gallery_identity_sha256": (supplement.get("gallery_identity") or {}).get("sha256"),
     }
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -84,6 +94,7 @@ def merge_results(base_path: Path, supplement_path: Path, output_dir: Path) -> P
         json.dump(merged, handle, indent=2, ensure_ascii=False)
 
     plot_retrieval_curves(merged["curve_rows"], output_dir)
+    plot_retrieval_coverage(merged["curve_rows"], output_dir)
     if merged["redshift_rows"]:
         write_redshift_csv(merged["redshift_rows"], output_dir / "redshift_metrics.csv")
         write_redshift_macro_csv(

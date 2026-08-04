@@ -8,7 +8,7 @@ from pathlib import Path
 
 from catalog import prepare_run_catalog
 from config import load_profile
-from scheduler import status_report, submit_profile
+from scheduler import compact_profile, status_report, submit_profile
 
 
 def _add_submission_options(parser: argparse.ArgumentParser) -> None:
@@ -42,6 +42,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     status = commands.add_parser("status", help="Summarize event status sidecars")
     status.add_argument("profile")
+
+    compact = commands.add_parser("compact", help="Merge terminal artifacts into HDF5")
+    compact.add_argument("profile")
     return parser
 
 
@@ -86,6 +89,8 @@ def main(argv: list[str] | None = None) -> int:
         result = _submit(args)
     elif args.command == "status":
         result = status_report(load_profile(args.profile))
+    elif args.command == "compact":
+        result = compact_profile(load_profile(args.profile))
     else:  # pragma: no cover - argparse enforces the command choices
         raise AssertionError(args.command)
     print(json.dumps(result, indent=2, sort_keys=True))

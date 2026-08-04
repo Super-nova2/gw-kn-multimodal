@@ -95,12 +95,31 @@ class PhysicalDualArchitectureTest(unittest.TestCase):
                 gw_m=gw_m,
                 opt_coords=opt_coords,
             )
+            logits_aux, fusion_aux = model.fusion_logits(
+                feat_g,
+                h_l,
+                z_l=feat_o,
+                H_gw=h_gw,
+                gw_s=gw_s,
+                gw_m=gw_m,
+                opt_coords=opt_coords,
+                return_aux=True,
+            )
 
         self.assertEqual(feat_g.shape, (2, 128))
         self.assertEqual(feat_o.shape, (2, 128))
         self.assertEqual(h_l.shape, (2, 4, 192))
         self.assertEqual(coord_feat.shape, (2, 64))
         self.assertEqual(logits.shape, (2, 2))
+        self.assertTrue(torch.allclose(logits, logits_aux, atol=1e-6))
+        self.assertEqual(tuple(fusion_aux["param2opt_attention"].shape), (2, 4))
+        self.assertTrue(
+            torch.allclose(
+                fusion_aux["param2opt_attention"].sum(dim=-1),
+                torch.ones(2),
+                atol=1e-6,
+            )
+        )
 
         curve_params = trainable_params(model.optical_encoder.curve_encoder)
         coord_params = trainable_params(model.optical_encoder.coord_encoder)

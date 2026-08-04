@@ -23,7 +23,9 @@ snana:
   cosmology: Planck15
 slurm:
   batch_size: 20
-  max_concurrency: 20
+  max_concurrency: 50
   time_limit: "04:00:00"
   cpus_per_task: 1
   memory: 10G
+  finalizer_time_limit: "01:00:00"
+  finalizer_memory: 4G

@@ -1,14 +1,27 @@
 import json
+import os
+import shutil
 import sqlite3
+import subprocess
 from pathlib import Path
 
+import cli as kn_cli
+import h5py
 import numpy as np
 import pandas as pd
+import pytest
+from artifacts import SCHEMA_VERSION, write_task_shard
 from astropy.time import Time
 from catalog import prepare_run_catalog
-from config import Profile, SlurmConfig
-from scheduler import status_report, submit_profile, validate_prepared_run
-from worker import finalize_submission
+from config import PIPELINE_ROOT, Profile, SlurmConfig
+from scheduler import (
+    compact_profile,
+    latest_event_statuses,
+    status_report,
+    submit_profile,
+    validate_prepared_run,
+)
+from worker import finalize_submission, run_array_task
 
 
 def make_opsim(path: Path) -> None:
@@ -136,6 +149,19 @@ def test_prepare_keeps_low_snr_and_writes_audited_run(tmp_path):
     assert manifest["mej_wind_clipped"] == 1
 
 
+def test_validate_accepts_manifest_before_finalizer_resource_fields(tmp_path):
+    profile, _ = prepare_profile(tmp_path)
+    manifest = json.loads(profile.prepared_manifest.read_text(encoding="utf-8"))
+    manifest["profile"]["slurm"].pop("finalizer_time_limit")
+    manifest["profile"]["slurm"].pop("finalizer_memory")
+    profile.prepared_manifest.write_text(
+        json.dumps(manifest),
+        encoding="utf-8",
+    )
+
+    assert validate_prepared_run(profile)["profile_name"] == profile.name
+
+
 def test_submit_dry_run_builds_array_without_writing_submission(tmp_path):
     profile, profile_path = prepare_profile(tmp_path)
     result = submit_profile(
@@ -149,7 +175,39 @@ def test_submit_dry_run_builds_array_without_writing_submission(tmp_path):
     assert result["event_count"] == 2
     assert result["task_count"] == 2
     assert "--array=0-1%3" in result["array_command"]
+    export_argument = next(
+        argument
+        for argument in result["array_command"]
+        if argument.startswith("--export=")
+    )
+    assert "KN_PIPELINE_ROOT=" in export_argument
     assert not profile.submission_file.exists()
+
+
+def test_copied_slurm_launcher_uses_exported_pipeline_root(tmp_path):
+    pipeline_root = tmp_path / "pipeline"
+    worker = pipeline_root / "src" / "worker.py"
+    worker.parent.mkdir(parents=True)
+    worker.write_text("# test worker\n", encoding="utf-8")
+
+    spool = tmp_path / "slurm-spool"
+    spool.mkdir()
+    copied_launcher = spool / "worker.sh"
+    shutil.copy2(PIPELINE_ROOT / "slurm" / "worker.sh", copied_launcher)
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    capture = tmp_path / "python-argument.txt"
+    fake_python = fake_bin / "python"
+    fake_python.write_text('#!/bin/sh\nprintf "%s\\n" "$1" > "$CAPTURE_PATH"\n')
+    fake_python.chmod(0o755)
+    environment = os.environ.copy()
+    environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
+    environment["CAPTURE_PATH"] = str(capture)
+    environment["KN_PIPELINE_ROOT"] = str(pipeline_root)
+
+    subprocess.run([copied_launcher], check=True, env=environment)
+    assert capture.read_text(encoding="utf-8").strip() == str(worker)
 
 
 def test_finalize_and_resume_use_event_sidecars(tmp_path):
@@ -159,6 +217,8 @@ def test_finalize_and_resume_use_event_sidecars(tmp_path):
     shard_dir.mkdir(parents=True)
     shard = {
         "created_utc": "2026-07-31T00:00:00+00:00",
+        "submission_id": "first",
+        "task_index": 0,
         "events": [
             {"simulation_id": 3, "status": "success", "reason": None},
             {"simulation_id": 7, "status": "failed", "reason": "test"},
@@ -177,3 +237,330 @@ def test_finalize_and_resume_use_event_sidecars(tmp_path):
     result = submit_profile(profile, profile_path, dry_run=True, resume=True)
     assert result["event_count"] == 1
     assert status_report(profile)["counts"]["failed"] == 1
+
+
+def coordinate_frame(simulation_id: int, count: int = 8) -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "simulation_id": np.full(count, simulation_id),
+            "sample_index": np.arange(count),
+            "ra": np.linspace(1.0, 2.0, count),
+            "dec": np.linspace(-0.5, 0.5, count),
+            "distance_mpc": np.linspace(100.0, 200.0, count),
+            "posterior_probability": np.full(count, 1.0 / count),
+            "is_true_position": np.arange(count) == 0,
+            "redshift": np.r_[np.nan, np.linspace(0.02, 0.08, count - 1)],
+            "libid": np.arange(count),
+            "in_baseline_footprint": np.arange(count) % 2 == 0,
+            "too_tile_index": np.arange(count) - 1,
+            "too_nobs": np.arange(count) % 3,
+            "too_mode": np.full(count, "baseline_plus_too"),
+        }
+    )
+
+
+def generated_products(simulation_ids: list[int]) -> dict[int, dict]:
+    return {
+        simulation_id: {
+            "plan": {
+                "simulation_id": simulation_id,
+                "status": "generated",
+                "nested": {"nights": [0, 1], "enabled": True},
+            },
+            "coordinates": coordinate_frame(simulation_id),
+        }
+        for simulation_id in simulation_ids
+    }
+
+
+def test_array_tasks_write_hdf5_shards_then_finalizer_sorts_and_compacts(
+    tmp_path, monkeypatch
+):
+    profile, _ = prepare_profile(tmp_path)
+    ids_file = profile.status_dir / "submissions" / "task.ids"
+    ids_file.parent.mkdir(parents=True)
+    ids_file.write_text("7\n3\n", encoding="utf-8")
+    monkeypatch.setattr(
+        "worker._generate_documents",
+        lambda profile, simulation_ids: generated_products(simulation_ids),
+    )
+    monkeypatch.setattr(
+        "worker._run_one",
+        lambda profile, simulation_id, plan: {
+            "simulation_id": simulation_id,
+            "status": "success",
+            "reason": None,
+        },
+    )
+
+    documents = [
+        run_array_task(profile, ids_file, "current", task_index, 1)
+        for task_index in (0, 1)
+    ]
+    artifact_paths = [
+        profile.artifact_shard_dir / f"current_{task_index}.h5" for task_index in (0, 1)
+    ]
+
+    assert [document["events"][0]["simulation_id"] for document in documents] == [7, 3]
+    assert [document["events"][0]["artifact_shard"] for document in documents] == [
+        "artifact_shards/current_0.h5",
+        "artifact_shards/current_1.h5",
+    ]
+    assert all(path.is_file() for path in artifact_paths)
+    assert not profile.coordinate_manifest_dir.exists()
+    assert not profile.observation_plan_dir.exists()
+    with h5py.File(artifact_paths[0], "r") as handle:
+        assert handle.attrs["schema_version"] == SCHEMA_VERSION
+        assert handle["events/simulation_id"][:].tolist() == [7]
+        assert len(handle["coordinates/ra"]) == 8
+        assert handle["coordinates/ra"].compression == "gzip"
+        assert np.isnan(handle["coordinates/redshift"][0])
+        plan = json.loads(handle["events/observation_plan_json"][0])
+        assert plan["nested"]["nights"] == [0, 1]
+
+    summary, complete = finalize_submission(profile, "current", expected_tasks=2)
+
+    assert complete
+    assert summary["complete"]
+    assert summary["aggregate"]["event_count"] == 2
+    assert profile.aggregate_artifact_file.is_file()
+    assert not any(path.exists() for path in artifact_paths)
+    assert (profile.status_dir / "shards" / "current_0.json").is_file()
+    assert (profile.status_dir / "shards" / "current_1.json").is_file()
+    with h5py.File(profile.aggregate_artifact_file, "r") as handle:
+        assert handle["events/simulation_id"][:].tolist() == [3, 7]
+        assert handle["events/coordinate_start"][:].tolist() == [0, 8]
+        assert handle["events/coordinate_count"][:].tolist() == [8, 8]
+        assert handle["coordinates/simulation_id"][:].tolist() == [3] * 8 + [7] * 8
+    artifact_status = status_report(profile)["intermediate_artifacts"]
+    assert artifact_status["exists"]
+    assert artifact_status["pending_artifact_shards"] == 0
+
+
+def test_failed_task_artifact_supports_zero_coordinates(tmp_path):
+    profile, _ = prepare_profile(tmp_path)
+    path = profile.artifact_shard_dir / "failed_0.h5"
+
+    write_task_shard(
+        path,
+        profile=profile,
+        submission_id="failed",
+        task_index=0,
+        events=[
+            {
+                "simulation_id": 3,
+                "status": "failed",
+                "reason": "generation failed",
+                "observation_plan": {
+                    "simulation_id": 3,
+                    "status": "failed",
+                },
+                "coordinates": None,
+            }
+        ],
+    )
+
+    with h5py.File(path, "r") as handle:
+        assert handle.attrs["coordinate_count"] == 0
+        assert handle["coordinates/ra"].shape == (0,)
+        assert handle["events/coordinate_count"][:].tolist() == [0]
+
+
+def test_finalizer_imports_legacy_event_and_cleans_sources(tmp_path):
+    profile, _ = prepare_profile(tmp_path)
+    profile.coordinate_manifest_dir.mkdir(parents=True)
+    profile.observation_plan_dir.mkdir(parents=True)
+    coordinate_frame(7).to_csv(
+        profile.coordinate_manifest_dir / "7.csv",
+        index=False,
+    )
+    (profile.observation_plan_dir / "7.json").write_text(
+        json.dumps(
+            {
+                "simulation_id": 7,
+                "status": "generated",
+                "legacy": {"preserved": True},
+            }
+        ),
+        encoding="utf-8",
+    )
+    status_shards = profile.status_dir / "shards"
+    status_shards.mkdir(parents=True)
+    (status_shards / "legacy_0.json").write_text(
+        json.dumps(
+            {
+                "created_utc": "2026-08-04T00:00:00+00:00",
+                "events": [{"simulation_id": 7, "status": "success", "reason": None}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    artifact_path = profile.artifact_shard_dir / "current_0.h5"
+    write_task_shard(
+        artifact_path,
+        profile=profile,
+        submission_id="current",
+        task_index=0,
+        events=[
+            {
+                "simulation_id": 3,
+                "status": "success",
+                "reason": None,
+                "observation_plan": {
+                    "simulation_id": 3,
+                    "status": "generated",
+                },
+                "coordinates": coordinate_frame(3),
+            }
+        ],
+    )
+    (status_shards / "current_0.json").write_text(
+        json.dumps(
+            {
+                "created_utc": "2026-08-04T01:00:00+00:00",
+                "submission_id": "current",
+                "task_index": 0,
+                "events": [
+                    {
+                        "simulation_id": 3,
+                        "status": "success",
+                        "reason": None,
+                        "artifact_shard": "artifact_shards/current_0.h5",
+                        "submission_id": "current",
+                        "task_index": 0,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    summary, complete = finalize_submission(profile, "current", expected_tasks=1)
+
+    assert complete
+    assert summary["aggregate"]["cleanup"] == {
+        "artifact_shards": 1,
+        "coordinate_csv": 1,
+        "observation_plans": 1,
+    }
+    assert not profile.coordinate_manifest_dir.exists()
+    assert not profile.observation_plan_dir.exists()
+    with h5py.File(profile.aggregate_artifact_file, "r") as handle:
+        assert handle["events/simulation_id"][:].tolist() == [3, 7]
+        submissions = [
+            value.decode() if isinstance(value, bytes) else value
+            for value in handle["events/submission_id"][:]
+        ]
+        assert submissions == ["current", "legacy"]
+        legacy_plan = json.loads(handle["events/observation_plan_json"][1])
+        assert legacy_plan["legacy"]["preserved"]
+
+
+def test_corrupt_shard_keeps_all_source_artifacts(tmp_path):
+    profile, _ = prepare_profile(tmp_path)
+    artifact_path = profile.artifact_shard_dir / "current_0.h5"
+    write_task_shard(
+        artifact_path,
+        profile=profile,
+        submission_id="current",
+        task_index=0,
+        events=[
+            {
+                "simulation_id": simulation_id,
+                "status": "success",
+                "reason": None,
+                "observation_plan": {
+                    "simulation_id": simulation_id,
+                    "status": "generated",
+                },
+                "coordinates": coordinate_frame(simulation_id),
+            }
+            for simulation_id in (3, 7)
+        ],
+    )
+    with h5py.File(artifact_path, "r+") as handle:
+        handle.attrs["prepared_catalog_sha256"] = "corrupt"
+    status_shards = profile.status_dir / "shards"
+    status_shards.mkdir(parents=True)
+    (status_shards / "current_0.json").write_text(
+        json.dumps(
+            {
+                "created_utc": "2026-08-04T01:00:00+00:00",
+                "submission_id": "current",
+                "task_index": 0,
+                "events": [
+                    {
+                        "simulation_id": simulation_id,
+                        "status": "success",
+                        "reason": None,
+                        "artifact_shard": "artifact_shards/current_0.h5",
+                    }
+                    for simulation_id in (3, 7)
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    summary, complete = finalize_submission(profile, "current", expected_tasks=1)
+
+    assert not complete
+    assert summary["aggregate"]["status"] == "failed"
+    assert "checksum mismatch" in summary["aggregate"]["error"]
+    assert artifact_path.is_file()
+    assert not profile.aggregate_artifact_file.exists()
+
+
+def test_latest_retry_status_selects_new_artifact_reference(tmp_path):
+    profile, _ = prepare_profile(tmp_path)
+    shard_dir = profile.status_dir / "shards"
+    shard_dir.mkdir(parents=True)
+    for name, created, artifact in (
+        ("old_0.json", "2026-08-04T00:00:00+00:00", "artifact_shards/old.h5"),
+        ("new_0.json", "2026-08-04T01:00:00+00:00", "artifact_shards/new.h5"),
+    ):
+        (shard_dir / name).write_text(
+            json.dumps(
+                {
+                    "created_utc": created,
+                    "events": [
+                        {
+                            "simulation_id": 3,
+                            "status": "success",
+                            "artifact_shard": artifact,
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    assert latest_event_statuses(profile.status_dir)[3]["artifact_shard"].endswith(
+        "new.h5"
+    )
+
+
+def test_compact_cli_routes_to_manual_compactor(monkeypatch, capsys):
+    sentinel = object()
+    seen = []
+    monkeypatch.setattr(kn_cli, "load_profile", lambda reference: sentinel)
+    monkeypatch.setattr(
+        kn_cli,
+        "compact_profile",
+        lambda profile: seen.append(profile) or {"event_count": 2},
+    )
+    result = kn_cli.main(["compact", "bns_test"])
+
+    assert result == 0
+    assert seen == [sentinel]
+    assert json.loads(capsys.readouterr().out) == {"event_count": 2}
+
+
+def test_manual_compact_refuses_incomplete_run(tmp_path):
+    profile, _ = prepare_profile(tmp_path)
+
+    with pytest.raises(ValueError, match="incomplete run"):
+        compact_profile(profile)
+
+    assert not profile.aggregate_artifact_file.exists()

@@ -48,6 +48,7 @@ PLOT_METHOD_COLORS = {
     "Full": "#D62728",
     "Full v11": "#D62728",
     "MAGIKS": "#D62728",
+    "w/o Classification Loss": "#17BECF",
     "\u5168\u6a21\u6001": "#D62728",
 }
 PLOT_OTHER_METHOD_COLORS = (
@@ -56,7 +57,6 @@ PLOT_OTHER_METHOD_COLORS = (
     "#8C564B",  # brown
     "#E377C2",  # pink
     "#7F7F7F",  # gray
-    "#17BECF",  # cyan
     "#BCBD22",  # olive
     "#393B79",  # indigo
 )
