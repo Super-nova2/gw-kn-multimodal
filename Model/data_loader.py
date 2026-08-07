@@ -528,6 +528,8 @@ class RelationalHDF5Dataset(Dataset):
         # Negative GW support (BNS events without KN)
         self.use_neg_gw = use_neg_gw
         self.neg_gw_indices = None
+        self.neg_gw_source_types = None
+        self.neg_gw_types = None
         self.n_pos_gw = None
         self.opt_input_window_start, self.opt_input_window_end = _normalize_runtime_input_window(
             opt_input_window_start,
@@ -602,6 +604,23 @@ class RelationalHDF5Dataset(Dataset):
                 has_kn = f['events/gw_data/has_kn'][:]
                 self.neg_gw_indices = np.where(has_kn == 0)[0]
                 self.n_pos_gw = int(np.sum(has_kn == 1))
+                required_neg_fields = ("events/gw_data/neg_type", "events/gw_data/source_type")
+                missing_neg_fields = [name for name in required_neg_fields if name not in f]
+                if missing_neg_fields and len(self.neg_gw_indices):
+                    raise KeyError(
+                        f"Negative-GW sampling requires fields {missing_neg_fields} in {h5_path}"
+                    )
+                if len(self.neg_gw_indices):
+                    neg_type_all = np.asarray(f["events/gw_data/neg_type"][:], dtype=np.int8)
+                    source_all = np.asarray(f["events/gw_data/source_type"][:]).reshape(-1)
+                    source_all = np.asarray([
+                        value.decode("utf-8") if isinstance(value, bytes) else str(value)
+                        for value in source_all
+                    ])
+                    self.neg_gw_types = neg_type_all[self.neg_gw_indices]
+                    self.neg_gw_source_types = source_all[self.neg_gw_indices]
+                    if not np.isin(self.neg_gw_types, (1, 2)).all():
+                        raise ValueError("All has_kn=0 events must have neg_type 1 or 2")
                 print(f"Loaded {len(self.neg_gw_indices)} negative GW events (no KN)")
 
                 if self.cache_in_memory:
@@ -884,8 +903,26 @@ class RelationalHDF5Dataset(Dataset):
         ):
             neg_gw_s, neg_gw_m = self.get_neg_gw_sample(int(neg_gw_local_idx))
             if neg_gw_s is not None and neg_gw_m is not None:
+                parent_gw_idx = int(gw_idx)
+                actual_neg_gw_idx = int(self.neg_gw_indices[int(neg_gw_local_idx)])
                 gw_scalar = neg_gw_s
                 gw_skymap = neg_gw_m
+                gw_idx = actual_neg_gw_idx
+                if self.return_zero_time_mjd:
+                    if self.gw_event_time_mjd_np is None:
+                        raise KeyError("Negative-GW time re-anchoring requires event_time_mjd")
+                    parent_time = float(self.gw_event_time_mjd_np[parent_gw_idx])
+                    negative_time = float(self.gw_event_time_mjd_np[actual_neg_gw_idx])
+                    if not np.isfinite(parent_time) or not np.isfinite(negative_time):
+                        raise ValueError("Negative-GW time re-anchoring requires finite event times")
+                    opt_zero_time_mjd_base = torch.as_tensor(
+                        negative_time + (float(opt_zero_time_mjd_base) - parent_time),
+                        dtype=torch.float32,
+                    )
+                    opt_first_detection_mjd = torch.as_tensor(
+                        negative_time + (float(opt_first_detection_mjd) - parent_time),
+                        dtype=torch.float32,
+                    )
                 is_neg_gw = True
         
         # Optional: Retrieve Negative Optical Data (non-KN or unrelated transient)
@@ -1121,17 +1158,13 @@ class MultiPositiveGWBatchedSampler(Sampler):
 
 
 class MixedGWBatchedSampler(Sampler):
-    """
-    Batch sampler that includes both positive and negative GW events.
+    """Build batches with classification-only negative-GW/KN pairs.
 
-    Structure per batch (batch_size=128, neg_gw_ratio=0.2):
-    - 102 positive GW-optical pairs (80%)
-    - 26 negative GW paired with random optical (20%)
-
-    The sampler yields lists of (opt_idx, neg_gw_local_idx) tuples:
-    - opt_idx: Optical sample index
-    - neg_gw_local_idx: -1 means "use parent GW", >= 0 means "use negative GW at this local index"
+    Negative GW events are balanced across available ``source_type x neg_type``
+    strata and are paired with a positive optical light curve from the same
+    source class.
     """
+
     def __init__(
         self,
         gw_to_lc_map: dict,
@@ -1139,96 +1172,96 @@ class MixedGWBatchedSampler(Sampler):
         batch_size: int,
         steps_per_epoch: int,
         neg_gw_ratio: float = 0.2,
-        samples_per_gw: int = 1
+        samples_per_gw: int = 1,
+        neg_gw_source_types: np.ndarray = None,
+        neg_gw_types: np.ndarray = None,
+        gw_source_type_map: dict = None,
     ):
-        """
-        Args:
-            gw_to_lc_map: Dictionary mapping positive GW_ID -> [LC_ID_1, LC_ID_2, ...]
-            neg_gw_indices: Array of local indices into dataset.neg_gw_indices
-            batch_size: Total samples per batch
-            steps_per_epoch: Number of batches per epoch
-            neg_gw_ratio: Fraction of batch to fill with negative GW pairs
-            samples_per_gw: Number of optical samples per GW (for SupCon compatibility)
-        """
         self.gw_to_lc_map = gw_to_lc_map
-        self.neg_gw_local_indices = np.array(neg_gw_indices, dtype=int)
-        self.batch_size = batch_size
-        self.steps_per_epoch = steps_per_epoch
-        self.neg_gw_ratio = neg_gw_ratio
-        self.samples_per_gw = samples_per_gw
+        self.neg_gw_local_indices = np.asarray(neg_gw_indices, dtype=np.int64)
+        self.batch_size = int(batch_size)
+        self.steps_per_epoch = int(steps_per_epoch)
+        self.neg_gw_ratio = float(neg_gw_ratio)
+        self.samples_per_gw = int(samples_per_gw)
+        if not 0.0 <= self.neg_gw_ratio < 1.0:
+            raise ValueError("neg_gw_ratio must be in [0, 1).")
 
         self.pos_gw_ids = list(gw_to_lc_map.keys())
-        self.n_neg_per_batch = int(batch_size * neg_gw_ratio)
-        self.n_pos_per_batch = batch_size - self.n_neg_per_batch
-
-        # Collect all optical indices for negative pairing
-        self.all_opt_indices = []
-        for lcs in gw_to_lc_map.values():
-            self.all_opt_indices.extend(lcs)
-        self.all_opt_indices = np.array(self.all_opt_indices)
-
-        # Adjust for SupCon mode
-        if samples_per_gw > 1:
-            self.n_gw_per_batch = self.n_pos_per_batch // samples_per_gw
-            self.n_pos_per_batch = self.n_gw_per_batch * samples_per_gw
+        self.n_neg_per_batch = int(self.batch_size * self.neg_gw_ratio)
+        self.n_pos_per_batch = self.batch_size - self.n_neg_per_batch
+        if self.samples_per_gw > 1:
+            self.n_gw_per_batch = self.n_pos_per_batch // self.samples_per_gw
+            self.n_pos_per_batch = self.n_gw_per_batch * self.samples_per_gw
             self.n_neg_per_batch = self.batch_size - self.n_pos_per_batch
         else:
             self.n_gw_per_batch = self.n_pos_per_batch
-
         if self.n_gw_per_batch > len(self.pos_gw_ids):
             raise ValueError(
-                f"Not enough positive GW events. Need {self.n_gw_per_batch}, have {len(self.pos_gw_ids)}"
+                f"Not enough positive GW events. Need {self.n_gw_per_batch}, "
+                f"have {len(self.pos_gw_ids)}"
             )
-        if len(self.neg_gw_local_indices) == 0 and self.n_neg_per_batch > 0:
+        if self.n_neg_per_batch and len(self.neg_gw_local_indices) == 0:
             raise ValueError("No negative GW indices provided for mixed sampling.")
+
+        self._strata = {}
+        self._optical_by_source = {}
+        if self.n_neg_per_batch:
+            if neg_gw_source_types is None or neg_gw_types is None or gw_source_type_map is None:
+                raise ValueError(
+                    "Balanced negative-GW sampling requires source types, neg types, "
+                    "and the positive GW source map."
+                )
+            neg_sources = np.asarray(neg_gw_source_types)
+            neg_types = np.asarray(neg_gw_types, dtype=np.int8)
+            if len(neg_sources) != len(self.neg_gw_local_indices) or len(neg_types) != len(self.neg_gw_local_indices):
+                raise ValueError("Negative-GW metadata must align with local indices.")
+            for local_idx, source, neg_type in zip(self.neg_gw_local_indices, neg_sources, neg_types):
+                key = (str(source).lower(), int(neg_type))
+                self._strata.setdefault(key, []).append(int(local_idx))
+            for gw_id, optical_ids in self.gw_to_lc_map.items():
+                source = str(gw_source_type_map[int(gw_id)]).lower()
+                self._optical_by_source.setdefault(source, []).extend(
+                    int(idx) for idx in optical_ids
+                )
+            missing_sources = sorted({key[0] for key in self._strata} - set(self._optical_by_source))
+            if missing_sources:
+                raise ValueError(
+                    f"No positive optical samples available for negative-GW sources {missing_sources}"
+                )
+            self._stratum_keys = sorted(self._strata)
+        else:
+            self._stratum_keys = []
 
         print(
             f"MixedGWBatchedSampler: {len(self.pos_gw_ids)} positive GW, "
-            f"{len(self.neg_gw_local_indices)} negative GW, "
+            f"{len(self.neg_gw_local_indices)} negative GW in {len(self._stratum_keys)} strata, "
             f"{self.n_pos_per_batch} pos/batch, {self.n_neg_per_batch} neg/batch"
         )
 
     def __iter__(self) -> Iterator[list]:
+        stratum_cursor = int(np.random.randint(len(self._stratum_keys))) if self._stratum_keys else 0
         for _ in range(self.steps_per_epoch):
-            batch_opt_indices = []
-            batch_neg_gw_local_indices = []  # -1 for positive, local index for negative
+            pairs = []
+            batch_gw_ids = np.random.choice(
+                self.pos_gw_ids, self.n_gw_per_batch, replace=False
+            )
+            for gw_id in batch_gw_ids:
+                optical_ids = self.gw_to_lc_map[gw_id]
+                if self.samples_per_gw > 1:
+                    replace = len(optical_ids) < self.samples_per_gw
+                    chosen = np.random.choice(optical_ids, self.samples_per_gw, replace=replace)
+                    pairs.extend((int(opt_idx), -1) for opt_idx in chosen)
+                else:
+                    pairs.append((int(np.random.choice(optical_ids)), -1))
 
-            # 1. Sample positive GW-optical pairs
-            if self.samples_per_gw > 1:
-                # SupCon mode: multiple samples per GW
-                batch_gw_ids = np.random.choice(
-                    self.pos_gw_ids, self.n_gw_per_batch, replace=False
-                )
-                for gw_id in batch_gw_ids:
-                    lcs = self.gw_to_lc_map[gw_id]
-                    replace = len(lcs) < self.samples_per_gw
-                    chosen_lcs = np.random.choice(lcs, self.samples_per_gw, replace=replace)
-                    batch_opt_indices.extend(chosen_lcs.tolist())
-                    batch_neg_gw_local_indices.extend([-1] * self.samples_per_gw)
-            else:
-                # Standard mode: one sample per GW
-                batch_gw_ids = np.random.choice(
-                    self.pos_gw_ids, self.n_pos_per_batch, replace=False
-                )
-                for gw_id in batch_gw_ids:
-                    lcs = self.gw_to_lc_map[gw_id]
-                    batch_opt_indices.append(np.random.choice(lcs))
-                    batch_neg_gw_local_indices.append(-1)
-
-            # 2. Sample negative GW pairs
-            # Random optical indices paired with random negative GW
-            if self.n_neg_per_batch > 0:
-                opt_replace = self.n_neg_per_batch > len(self.all_opt_indices)
-                neg_opt = np.random.choice(self.all_opt_indices, self.n_neg_per_batch, replace=opt_replace)
-                neg_replace = self.n_neg_per_batch > len(self.neg_gw_local_indices)
-                neg_gw_local = np.random.choice(
-                    self.neg_gw_local_indices, self.n_neg_per_batch, replace=neg_replace
-                )
-                batch_opt_indices.extend(neg_opt.tolist())
-                batch_neg_gw_local_indices.extend(neg_gw_local.tolist())
-
-            batch_pairs = list(zip(batch_opt_indices, batch_neg_gw_local_indices))
-            yield batch_pairs
+            for offset in range(self.n_neg_per_batch):
+                key = self._stratum_keys[(stratum_cursor + offset) % len(self._stratum_keys)]
+                local_idx = int(np.random.choice(self._strata[key]))
+                optical_idx = int(np.random.choice(self._optical_by_source[key[0]]))
+                pairs.append((optical_idx, local_idx))
+            stratum_cursor += self.n_neg_per_batch
+            np.random.shuffle(pairs)
+            yield pairs
 
     def __len__(self):
         return self.steps_per_epoch
@@ -1428,6 +1461,7 @@ def create_training_dataloader(
     opt_input_window_end: Optional[float] = None,
     loader_usage: str = "train",
     loader_label: str = "Train DataLoader",
+    train_neg_gw_ratio: float = 0.0,
 ):
     """
     Factory function to initialize the Dataset, Sampler, and DataLoader.
@@ -1443,6 +1477,7 @@ def create_training_dataloader(
         negative_h5_path=negative_h5_path,
         negative_group=negative_group,
         cache_in_memory=cache_in_memory,
+        use_neg_gw=float(train_neg_gw_ratio) > 0.0,
         return_zero_time_mjd=return_zero_time_mjd,
         nonkn_cls_base_field=nonkn_cls_base_field,
         extra_negative_timeaware_enable=extra_negative_timeaware_enable,
@@ -1455,11 +1490,25 @@ def create_training_dataloader(
     
     # 3. Initialize Custom Sampler
     # Note: 'steps_per_epoch' defines how many batches constitute one epoch loop
-    sampler = BalancedGWBatchedSampler(
-        gw_to_lc_map=gw_map,
-        batch_size=batch_size,
-        steps_per_epoch=steps_per_epoch
-    )
+    if float(train_neg_gw_ratio) > 0.0:
+        source_type_map = load_gw_source_type_map(h5_path)
+        neg_local = np.arange(len(dataset.neg_gw_indices), dtype=np.int64)
+        sampler = MixedGWBatchedSampler(
+            gw_to_lc_map=gw_map,
+            neg_gw_indices=neg_local,
+            batch_size=batch_size,
+            steps_per_epoch=steps_per_epoch,
+            neg_gw_ratio=float(train_neg_gw_ratio),
+            neg_gw_source_types=dataset.neg_gw_source_types,
+            neg_gw_types=dataset.neg_gw_types,
+            gw_source_type_map=source_type_map,
+        )
+    else:
+        sampler = BalancedGWBatchedSampler(
+            gw_to_lc_map=gw_map,
+            batch_size=batch_size,
+            steps_per_epoch=steps_per_epoch
+        )
 
     # 4. Initialize DataLoader
     # IMPORTANT: batch_sampler is used, so batch_size/shuffle/sampler/drop_last 
@@ -1501,12 +1550,14 @@ def create_train_val_dataloaders(
     extra_negative_timeaware_seed: int = 42,
     opt_input_window_start: Optional[float] = None,
     opt_input_window_end: Optional[float] = None,
+    train_neg_gw_ratio: float = 0.0,
 ):
     if cache_in_memory and num_workers > 0:
         print("cache_in_memory=True with num_workers>0 may increase RAM usage.")
 
     gw_map = build_gw_to_lc_mapping(h5_path)
-    source_type_map = load_gw_source_type_map(h5_path) if val_split_stratify_by_source else None
+    use_train_neg_gw = float(train_neg_gw_ratio) > 0.0
+    source_type_map = load_gw_source_type_map(h5_path) if (val_split_stratify_by_source or use_train_neg_gw) else None
     train_map, val_map = split_gw_map(
         gw_map,
         val_split,
@@ -1534,6 +1585,7 @@ def create_train_val_dataloaders(
             negative_h5_path=negative_h5_path,
             negative_group=negative_group,
             cache_in_memory=cache_in_memory,
+            use_neg_gw=use_train_neg_gw,
             return_zero_time_mjd=return_zero_time_mjd,
             nonkn_cls_base_field=nonkn_cls_base_field,
             extra_negative_timeaware_enable=extra_negative_timeaware_enable,
@@ -1551,6 +1603,7 @@ def create_train_val_dataloaders(
             negative_h5_path=negative_h5_path,
             negative_group=negative_group,
             cache_in_memory=cache_in_memory,
+            use_neg_gw=use_train_neg_gw,
             return_zero_time_mjd=return_zero_time_mjd,
             nonkn_cls_base_field=nonkn_cls_base_field,
             extra_negative_timeaware_enable=extra_negative_timeaware_enable,
@@ -1575,11 +1628,27 @@ def create_train_val_dataloaders(
             opt_input_window_end=opt_input_window_end,
         )
 
-    train_sampler = BalancedGWBatchedSampler(
-        gw_to_lc_map=train_map,
-        batch_size=batch_size,
-        steps_per_epoch=steps_per_epoch
-    )
+    if use_train_neg_gw:
+        if train_dataset.neg_gw_indices is None or len(train_dataset.neg_gw_indices) == 0:
+            raise ValueError(f"No negative GW events found in {h5_path}")
+        neg_local = np.arange(len(train_dataset.neg_gw_indices), dtype=np.int64)
+        train_sampler = MixedGWBatchedSampler(
+            gw_to_lc_map=train_map,
+            neg_gw_indices=neg_local,
+            batch_size=batch_size,
+            steps_per_epoch=steps_per_epoch,
+            neg_gw_ratio=float(train_neg_gw_ratio),
+            samples_per_gw=1,
+            neg_gw_source_types=train_dataset.neg_gw_source_types,
+            neg_gw_types=train_dataset.neg_gw_types,
+            gw_source_type_map=source_type_map,
+        )
+    else:
+        train_sampler = BalancedGWBatchedSampler(
+            gw_to_lc_map=train_map,
+            batch_size=batch_size,
+            steps_per_epoch=steps_per_epoch
+        )
     val_sampler = BalancedGWBatchedSampler(
         gw_to_lc_map=val_map,
         batch_size=val_batch_size,
@@ -1641,6 +1710,7 @@ def create_supcon_dataloaders(
     extra_negative_timeaware_seed: int = 42,
     opt_input_window_start: Optional[float] = None,
     opt_input_window_end: Optional[float] = None,
+    train_neg_gw_ratio: float = 0.0,
 ):
     """
     Create dataloaders for Supervised Contrastive Learning.
@@ -1653,7 +1723,8 @@ def create_supcon_dataloaders(
         print("cache_in_memory=True with num_workers>0 may increase RAM usage.")
 
     gw_map = build_gw_to_lc_mapping(h5_path)
-    source_type_map = load_gw_source_type_map(h5_path) if val_split_stratify_by_source else None
+    use_train_neg_gw = float(train_neg_gw_ratio) > 0.0
+    source_type_map = load_gw_source_type_map(h5_path) if (val_split_stratify_by_source or use_train_neg_gw) else None
     train_map, val_map = split_gw_map(
         gw_map,
         val_split,
@@ -1679,6 +1750,7 @@ def create_supcon_dataloaders(
             negative_h5_path=negative_h5_path,
             negative_group=negative_group,
             cache_in_memory=cache_in_memory,
+            use_neg_gw=use_train_neg_gw,
             return_zero_time_mjd=return_zero_time_mjd,
             nonkn_cls_base_field=nonkn_cls_base_field,
             extra_negative_timeaware_enable=extra_negative_timeaware_enable,
@@ -1696,6 +1768,7 @@ def create_supcon_dataloaders(
             negative_h5_path=negative_h5_path,
             negative_group=negative_group,
             cache_in_memory=cache_in_memory,
+            use_neg_gw=use_train_neg_gw,
             return_zero_time_mjd=return_zero_time_mjd,
             nonkn_cls_base_field=nonkn_cls_base_field,
             extra_negative_timeaware_enable=extra_negative_timeaware_enable,
@@ -1720,13 +1793,33 @@ def create_supcon_dataloaders(
             opt_input_window_end=opt_input_window_end,
         )
 
-    train_sampler = MultiPositiveGWBatchedSampler(
-        gw_to_lc_map=train_map,
-        batch_size=batch_size,
-        samples_per_gw=samples_per_gw,
-        steps_per_epoch=steps_per_epoch,
-        min_lc_per_gw=min_lc_per_gw
-    )
+    if use_train_neg_gw:
+        if train_dataset.neg_gw_indices is None or len(train_dataset.neg_gw_indices) == 0:
+            raise ValueError(f"No negative GW events found in {h5_path}")
+        eligible_train_map = {
+            gw_id: optical_ids for gw_id, optical_ids in train_map.items()
+            if len(optical_ids) >= min_lc_per_gw
+        }
+        neg_local = np.arange(len(train_dataset.neg_gw_indices), dtype=np.int64)
+        train_sampler = MixedGWBatchedSampler(
+            gw_to_lc_map=eligible_train_map,
+            neg_gw_indices=neg_local,
+            batch_size=batch_size,
+            steps_per_epoch=steps_per_epoch,
+            neg_gw_ratio=float(train_neg_gw_ratio),
+            samples_per_gw=samples_per_gw,
+            neg_gw_source_types=train_dataset.neg_gw_source_types,
+            neg_gw_types=train_dataset.neg_gw_types,
+            gw_source_type_map=source_type_map,
+        )
+    else:
+        train_sampler = MultiPositiveGWBatchedSampler(
+            gw_to_lc_map=train_map,
+            batch_size=batch_size,
+            samples_per_gw=samples_per_gw,
+            steps_per_epoch=steps_per_epoch,
+            min_lc_per_gw=min_lc_per_gw
+        )
     val_sampler = MultiPositiveGWBatchedSampler(
         gw_to_lc_map=val_map,
         batch_size=val_batch_size,
@@ -1824,7 +1917,10 @@ def create_mixed_gw_dataloaders(
         print("cache_in_memory=True with num_workers>0 may increase RAM usage.")
 
     gw_map = build_gw_to_lc_mapping(h5_path)
-    train_map, val_map = split_gw_map(gw_map, val_split, split_seed)
+    source_type_map = load_gw_source_type_map(h5_path)
+    train_map, val_map = split_gw_map(
+        gw_map, val_split, split_seed, source_type_map=source_type_map
+    )
 
     # Create dataset with negative GW support
     if cache_in_memory:
@@ -1895,15 +1991,25 @@ def create_mixed_gw_dataloaders(
         total_val_optical = sum(len(lcs) for lcs in val_map.values())
         val_steps_per_epoch = max(1, total_val_optical // val_batch_size)
 
-    # Split negative GW indices across train/val (local indices into dataset.neg_gw_indices)
-    neg_local_indices = np.arange(len(train_dataset.neg_gw_indices))
+    # Stratify negative GW indices across source_type x neg_type.
     rng = np.random.default_rng(split_seed)
-    rng.shuffle(neg_local_indices)
-    val_neg_count = max(1, int(len(neg_local_indices) * val_split))
-    if len(neg_local_indices) - val_neg_count < 1:
-        val_neg_count = max(0, len(neg_local_indices) - 1)
-    val_neg_local = neg_local_indices[:val_neg_count]
-    train_neg_local = neg_local_indices[val_neg_count:]
+    train_parts = []
+    val_parts = []
+    neg_sources = np.asarray(train_dataset.neg_gw_source_types)
+    neg_types = np.asarray(train_dataset.neg_gw_types, dtype=np.int8)
+    for source, neg_type in sorted({
+        (str(source), int(neg_type))
+        for source, neg_type in zip(neg_sources, neg_types)
+    }):
+        local = np.flatnonzero((neg_sources == source) & (neg_types == neg_type))
+        rng.shuffle(local)
+        val_count = min(max(1, int(len(local) * val_split)), max(0, len(local) - 1))
+        val_parts.append(local[:val_count])
+        train_parts.append(local[val_count:])
+    train_neg_local = np.concatenate(train_parts) if train_parts else np.empty(0, dtype=np.int64)
+    val_neg_local = np.concatenate(val_parts) if val_parts else np.empty(0, dtype=np.int64)
+    if len(train_neg_local) == 0 or len(val_neg_local) == 0:
+        raise ValueError("Mixed train/validation loading requires at least two negative GW events in a stratum")
 
     # Create mixed samplers
     train_sampler = MixedGWBatchedSampler(
@@ -1912,7 +2018,10 @@ def create_mixed_gw_dataloaders(
         batch_size=batch_size,
         steps_per_epoch=steps_per_epoch,
         neg_gw_ratio=neg_gw_ratio,
-        samples_per_gw=samples_per_gw
+        samples_per_gw=samples_per_gw,
+        neg_gw_source_types=neg_sources[train_neg_local],
+        neg_gw_types=neg_types[train_neg_local],
+        gw_source_type_map=source_type_map,
     )
     val_sampler = MixedGWBatchedSampler(
         gw_to_lc_map=val_map,
@@ -1920,7 +2029,10 @@ def create_mixed_gw_dataloaders(
         batch_size=val_batch_size,
         steps_per_epoch=val_steps_per_epoch,
         neg_gw_ratio=neg_gw_ratio,
-        samples_per_gw=samples_per_gw
+        samples_per_gw=samples_per_gw,
+        neg_gw_source_types=neg_sources[val_neg_local],
+        neg_gw_types=neg_types[val_neg_local],
+        gw_source_type_map=source_type_map,
     )
 
     train_loader = _build_configured_dataloader(

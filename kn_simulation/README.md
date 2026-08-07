@@ -6,8 +6,8 @@ This is the maintained optical-simulation entry point. The repository's
 The supported data flow is:
 
 ```text
-GWSamplegen catalog.csv + <simulation_id>.fits skymaps
-    -> validated kn_catalog.csv
+GWSamplegen pos_catalog.csv + neg_catalog.csv + separate skymap roots
+    -> validated positive-only kn_catalog.csv + retained neg_catalog.csv
     -> Rubin baseline/ToO observation plans
     -> per-event SNANA simulations
     -> one intermediate HDF5 shard per Slurm array task
@@ -29,19 +29,12 @@ Do not execute files under `src/` directly. Do not place legacy
 
 ## Prerequisites
 
-The Rubin-time GWSamplegen run must be complete. Copy its FITS maps to the
-profile's configured skymap directory before preparing the catalog. The four
-configured directories are:
-
-| Profile | Skymap directory |
-| --- | --- |
-| `bns_train` | `$BASE_DIR/data/skymap/bns_skymap_train` |
-| `bns_test` | `$BASE_DIR/data/skymap/bns_skymap_test` |
-| `nsbh_train` | `$BASE_DIR/data/skymap/nsbh_skymap_train` |
-| `nsbh_test` | `$BASE_DIR/data/skymap/nsbh_skymap_test` |
-
-`BASE_DIR` defaults to `/fred/oz016/bgao_kn`. Profiles also require the Rubin
-OpSim database, SNANA installation, SNDATA_ROOT models, and `sbatch`.
+The matching GWSamplegen dual bundle must be complete. Production profiles read
+positive maps from
+`GWSamplegen/outputs/production_rubin_dual/<source>_<split>_seed_42/pos/skymaps`
+and type-1 maps from the sibling `neg/skymaps` directory. `BASE_DIR` defaults to
+`/fred/oz016/bgao_kn`. Profiles also require the Rubin OpSim database, SNANA
+installation, SNDATA_ROOT models, and `sbatch`.
 
 ## Commands
 
@@ -49,16 +42,18 @@ Prepare a run without submitting compute work:
 
 ```bash
 kn_simulation/bin/kn-sim prepare bns_train \
-    --catalog /path/to/GWSamplegen/output/catalog.csv
+    --pos-catalog /path/to/bns_train_seed_42/pos_catalog.csv \
+    --neg-catalog /path/to/bns_train_seed_42/neg_catalog.csv
 ```
 
 This validates the complete catalog and every expected skymap before writing:
 
 ```text
-kn_simulation/runs/bns_train/catalog.csv
-kn_simulation/runs/bns_train/catalog.input.json
-kn_simulation/runs/bns_train/kn_catalog.csv
-kn_simulation/runs/bns_train/kn_catalog.manifest.json
+kn_simulation/runs_dual/bns_train/catalog.csv
+kn_simulation/runs_dual/bns_train/catalog.input.json
+kn_simulation/runs_dual/bns_train/kn_catalog.csv
+kn_simulation/runs_dual/bns_train/neg_catalog.csv
+kn_simulation/runs_dual/bns_train/dual_catalog.manifest.json
 ```
 
 Existing prepared files are protected. Use `--overwrite-prepared` only when an
@@ -75,7 +70,8 @@ Prepare and submit in one command:
 
 ```bash
 kn_simulation/bin/kn-sim run bns_train \
-    --catalog /path/to/GWSamplegen/output/catalog.csv
+    --pos-catalog /path/to/bns_train_seed_42/pos_catalog.csv \
+    --neg-catalog /path/to/bns_train_seed_42/neg_catalog.csv
 ```
 
 Inspect consolidated event state:
@@ -122,8 +118,14 @@ Only the complete GWSamplegen `catalog.csv` schema is accepted. In particular,
 `mej_dynamic` and `mej_wind` must be finite and consistent with `mej_total`.
 Recovered parameters are preserved but are not used to recompute ejecta.
 
-The copied catalog.csv retains every input row, but kn_catalog.csv keeps only
-events whose original ejecta values lie inside both closed SIMSED ranges:
+Dual preparation requires canonical `sample_class` and
+`event_uid=<source>_<split>_<pos|neg>_<simulation_id>` fields. The copied
+`catalog.csv` and prepared `kn_catalog.csv` contain only the positive stream and
+are the only events submitted to SNANA. The separately validated
+`neg_catalog.csv` retains every physical double-zero type-1 event and its own
+skymap; it is never treated as a failed optical simulation. Positive events are
+physically valid when `mej_dynamic + mej_wind > 0`, although only events whose
+original component values lie inside both closed SIMSED ranges can enter SNANA:
 
 | Source | mej_dynamic | mej_wind |
 | --- | --- | --- |
@@ -146,8 +148,9 @@ The current SNANA templates retain `GENSIGMA_COSTHETA = 0.01` and, for BNS,
 `GENSIGMA_PHI = 1` degree. These produce internal SNANA scatter around the
 catalog peaks while the configured `GENRANGE` remains enforced.
 
-Prepared-catalog schema v2 implements filtering instead of clipping. Runs
-prepared with the earlier clipping schema must be regenerated with
+Prepared-catalog schema v3 validates the double-zero `neg_type` label and
+records type-1 exclusions in the manifest while retaining v2's filtering
+instead of clipping. Runs prepared with an earlier schema must be regenerated with
 `--overwrite-prepared` before submission or resume.
 
 ## Rubin routing and coordinate samples
@@ -177,7 +180,7 @@ referenced by each event's latest status sidecar and creates:
 runs/<profile>/simulation_intermediates.h5
 ```
 
-The aggregate is ordered exactly like `kn_catalog.csv`. It contains event
+The aggregate is ordered exactly like the positive-only `kn_catalog.csv`. It contains event
 status/reason, coordinate offsets and counts, the complete observation plan as
 JSON, task provenance, and the coordinate columns. Failed events are included
 but do not block aggregation; the usable event list is written to

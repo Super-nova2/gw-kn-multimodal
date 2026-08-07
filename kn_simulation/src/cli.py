@@ -6,7 +6,7 @@ import argparse
 import json
 from pathlib import Path
 
-from catalog import prepare_run_catalog
+from catalog import prepare_dual_run_catalog, prepare_run_catalog
 from config import load_profile
 from scheduler import compact_profile, status_report, submit_profile
 
@@ -27,7 +27,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     prepare = commands.add_parser("prepare", help="Build a validated kn_catalog.csv")
     prepare.add_argument("profile")
-    prepare.add_argument("--catalog", required=True, type=Path)
+    prepare.add_argument("--catalog", type=Path, help="Legacy single positive catalog")
+    prepare.add_argument("--pos-catalog", type=Path)
+    prepare.add_argument("--neg-catalog", type=Path)
     prepare.add_argument("--overwrite-prepared", action="store_true")
 
     submit = commands.add_parser("submit", help="Submit SNANA array and finalizer")
@@ -36,7 +38,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     run = commands.add_parser("run", help="Prepare a catalog, then submit it")
     run.add_argument("profile")
-    run.add_argument("--catalog", required=True, type=Path)
+    run.add_argument("--catalog", type=Path, help="Legacy single positive catalog")
+    run.add_argument("--pos-catalog", type=Path)
+    run.add_argument("--neg-catalog", type=Path)
     run.add_argument("--overwrite-prepared", action="store_true")
     _add_submission_options(run)
 
@@ -50,6 +54,33 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _prepare(args: argparse.Namespace) -> dict:
     profile = load_profile(args.profile)
+    legacy = args.catalog is not None
+    dual = args.pos_catalog is not None or args.neg_catalog is not None
+    if legacy == dual:
+        raise ValueError(
+            "provide either --catalog or both --pos-catalog and --neg-catalog"
+        )
+    if dual:
+        if args.pos_catalog is None or args.neg_catalog is None:
+            raise ValueError("dual preparation requires both catalog paths")
+        if profile.negative_skymap_dir is None:
+            raise ValueError("dual preparation requires paths.negative_skymap_dir")
+        return prepare_dual_run_catalog(
+            args.pos_catalog,
+            args.neg_catalog,
+            profile.run_dir,
+            profile_name=profile.name,
+            source=profile.source,
+            split=profile.split,
+            seed=profile.seed,
+            positive_skymap_dir=profile.skymap_dir,
+            negative_skymap_dir=profile.negative_skymap_dir,
+            opsim_db=profile.opsim_db,
+            mjd_min=profile.mjd_min,
+            mjd_max=profile.mjd_max,
+            profile=profile.as_manifest(),
+            overwrite=args.overwrite_prepared,
+        )
     return prepare_run_catalog(
         args.catalog,
         profile.run_dir,

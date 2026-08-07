@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 from astropy.time import Time
 
-SCHEMA_VERSION = "gwsamplegen-kn-v2"
+SCHEMA_VERSION = "gwsamplegen-kn-v3"
 DEFAULT_MJD_MIN = 61_000.0
 DEFAULT_MJD_MAX = 64_500.0
 
@@ -152,6 +152,29 @@ def _validate_physics(frame: pd.DataFrame, source: str) -> None:
         raise ValueError("network_snr must be non-negative")
 
 
+def _normalize_neg_type(frame: pd.DataFrame) -> None:
+    """Validate the physical double-zero type-1 label in-place."""
+    components = frame[["mej_dynamic", "mej_wind"]]
+    if np.any(components < 0):
+        raise ValueError("physical ejecta component masses must be non-negative")
+    both_zero = (frame["mej_dynamic"] == 0.0) & (frame["mej_wind"] == 0.0)
+    if "neg_type" not in frame:
+        frame["neg_type"] = both_zero.astype(np.int8)
+        return
+    values = pd.to_numeric(frame["neg_type"], errors="coerce").to_numpy()
+    if not np.all(np.isfinite(values)) or not np.all(np.isin(values, (0, 1))):
+        raise ValueError("input GW catalog neg_type must contain only 0 or 1")
+    values = values.astype(np.int8)
+    expected = both_zero.to_numpy(dtype=np.int8)
+    if not np.array_equal(values, expected):
+        bad = frame.loc[values != expected, "simulation_id"].tolist()[:10]
+        raise ValueError(
+            "neg_type is inconsistent with physical double-zero ejecta for "
+            f"simulation_id={bad}"
+        )
+    frame["neg_type"] = values
+
+
 def _filter_to_optical_model_ejecta_range(
     frame: pd.DataFrame,
     source: str,
@@ -165,11 +188,15 @@ def _filter_to_optical_model_ejecta_range(
         dynamic_min, dynamic_max, inclusive="both"
     )
     wind_in_range = frame["mej_wind"].between(wind_min, wind_max, inclusive="both")
-    keep = dynamic_in_range & wind_in_range
+    type1 = frame["neg_type"] == 1
+    keep = (~type1) & dynamic_in_range & wind_in_range
     statistics = {
         "model_range_filtered_rows": int((~keep).sum()),
         "mej_dynamic_out_of_range_rows": int((~dynamic_in_range).sum()),
         "mej_wind_out_of_range_rows": int((~wind_in_range).sum()),
+        "input_type1_rows": int(type1.sum()),
+        "excluded_type1_no_ejecta_rows": int(type1.sum()),
+        "snana_input_rows": int(keep.sum()),
     }
     filtered = frame.loc[keep].copy().reset_index(drop=True)
     if filtered.empty:
@@ -286,6 +313,7 @@ def prepare_catalog(
     )
     _validate_online_ifos(prepared)
     _validate_physics(prepared, source)
+    _normalize_neg_type(prepared)
     prepared, filter_statistics = _filter_to_optical_model_ejecta_range(
         prepared, source
     )
@@ -508,3 +536,163 @@ def prepare_run_catalog(
         for temporary in temporaries:
             temporary.unlink(missing_ok=True)
     return manifest
+
+
+def validate_type1_negative_catalog(
+    catalog: pd.DataFrame,
+    *,
+    source: str,
+    split: str,
+    skymap_dir: Path,
+) -> tuple[pd.DataFrame, dict]:
+    """Validate a complete type-1 GW catalog without preparing SNANA inputs."""
+    source = source.lower()
+    split = split.lower()
+    missing = sorted(set(REQUIRED_COLUMNS) - set(catalog.columns))
+    if missing:
+        raise ValueError(f"negative catalog is missing required columns: {missing}")
+    if catalog.empty:
+        raise ValueError("negative catalog contains no complete GW events")
+
+    validated = catalog.copy()
+    _require_finite(validated, NUMERIC_COLUMNS)
+    _validate_ids(validated)
+    _validate_online_ifos(validated)
+    _validate_physics(validated, source)
+    _normalize_neg_type(validated)
+    if not (validated["neg_type"] == 1).all():
+        bad = validated.loc[validated["neg_type"] != 1, "simulation_id"].tolist()[:10]
+        raise ValueError(f"negative catalog contains non-type1 events: {bad}")
+
+    expected_class = "neg"
+    if "sample_class" not in validated:
+        raise ValueError("negative catalog is missing sample_class")
+    if not (validated["sample_class"].astype(str) == expected_class).all():
+        raise ValueError("negative catalog sample_class must be neg")
+    if "event_uid" not in validated:
+        raise ValueError("negative catalog is missing event_uid")
+    expected_uid = (
+        source
+        + "_"
+        + split
+        + "_neg_"
+        + validated["simulation_id"].astype(np.int64).astype(str)
+    )
+    if not (validated["event_uid"].astype(str) == expected_uid).all():
+        raise ValueError("negative catalog event_uid does not match source/split/id")
+    if validated["event_uid"].duplicated().any():
+        raise ValueError("negative catalog contains duplicate event_uid values")
+
+    validated = validated.sort_values("simulation_id", kind="stable").reset_index(
+        drop=True
+    )
+    _validate_skymaps(validated, Path(skymap_dir))
+    return validated, {
+        "rows": len(validated),
+        "sample_class": "neg",
+        "neg_type": 1,
+        "skymap_directory": str(Path(skymap_dir).resolve()),
+    }
+
+
+def prepare_dual_run_catalog(
+    positive_input_path: Path,
+    negative_input_path: Path,
+    run_dir: Path,
+    *,
+    profile_name: str,
+    source: str,
+    split: str,
+    seed: int,
+    positive_skymap_dir: Path,
+    negative_skymap_dir: Path,
+    opsim_db: Path,
+    mjd_min: float = DEFAULT_MJD_MIN,
+    mjd_max: float = DEFAULT_MJD_MAX,
+    profile: dict | None = None,
+    overwrite: bool = False,
+) -> dict:
+    """Prepare positive events for SNANA and retain type-1 events separately."""
+    positive_input_path = Path(positive_input_path).resolve()
+    negative_input_path = Path(negative_input_path).resolve()
+    run_dir = Path(run_dir).resolve()
+    for path in (positive_input_path, negative_input_path):
+        if not path.is_file():
+            raise FileNotFoundError(f"input catalog does not exist: {path}")
+
+    negative_output = run_dir / "neg_catalog.csv"
+    dual_manifest_path = run_dir / "dual_catalog.manifest.json"
+    if not overwrite:
+        existing = [
+            path for path in (negative_output, dual_manifest_path) if path.exists()
+        ]
+        if existing:
+            raise FileExistsError(f"refusing to overwrite existing files: {existing}")
+
+    positive_frame = pd.read_csv(positive_input_path)
+    for column in ("sample_class", "event_uid"):
+        if column not in positive_frame:
+            raise ValueError(f"positive catalog is missing {column}")
+    if not (positive_frame["sample_class"].astype(str) == "pos").all():
+        raise ValueError("positive catalog sample_class must be pos")
+    expected_positive_uid = (
+        source.lower()
+        + "_"
+        + split.lower()
+        + "_pos_"
+        + positive_frame["simulation_id"].astype(np.int64).astype(str)
+    )
+    if not (positive_frame["event_uid"].astype(str) == expected_positive_uid).all():
+        raise ValueError("positive catalog event_uid does not match source/split/id")
+    if positive_frame["event_uid"].duplicated().any():
+        raise ValueError("positive catalog contains duplicate event_uid values")
+
+    negative, negative_manifest = validate_type1_negative_catalog(
+        pd.read_csv(negative_input_path),
+        source=source,
+        split=split,
+        skymap_dir=negative_skymap_dir,
+    )
+    positive_manifest = prepare_run_catalog(
+        positive_input_path,
+        run_dir,
+        profile_name=profile_name,
+        source=source,
+        split=split,
+        seed=seed,
+        skymap_dir=positive_skymap_dir,
+        opsim_db=opsim_db,
+        mjd_min=mjd_min,
+        mjd_max=mjd_max,
+        profile=profile,
+        overwrite=overwrite,
+    )
+
+    negative_temporary = run_dir / ".neg_catalog.csv.tmp"
+    manifest_temporary = run_dir / ".dual_catalog.manifest.json.tmp"
+    try:
+        negative.to_csv(negative_temporary, index=False)
+        result = {
+            "schema_version": SCHEMA_VERSION,
+            "mode": "dual",
+            "profile_name": profile_name,
+            "positive": positive_manifest,
+            "negative": {
+                **negative_manifest,
+                "source_catalog": str(negative_input_path),
+                "source_catalog_sha256": _sha256(negative_input_path),
+                "output_catalog": str(negative_output),
+                "output_catalog_sha256": _sha256(negative_temporary),
+            },
+            "snana_catalog": str(run_dir / "kn_catalog.csv"),
+            "snana_contains_sample_class": ["pos"],
+        }
+        manifest_temporary.write_text(
+            json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        negative_temporary.replace(negative_output)
+        manifest_temporary.replace(dual_manifest_path)
+    finally:
+        negative_temporary.unlink(missing_ok=True)
+        manifest_temporary.unlink(missing_ok=True)
+    return result

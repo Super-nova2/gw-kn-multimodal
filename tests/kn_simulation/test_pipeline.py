@@ -12,7 +12,7 @@ import pandas as pd
 import pytest
 from artifacts import SCHEMA_VERSION, write_task_shard
 from astropy.time import Time
-from catalog import prepare_catalog, prepare_run_catalog
+from catalog import prepare_catalog, prepare_dual_run_catalog, prepare_run_catalog
 from config import PIPELINE_ROOT, Profile, SlurmConfig
 from scheduler import (
     compact_profile,
@@ -21,7 +21,7 @@ from scheduler import (
     submit_profile,
     validate_prepared_run,
 )
-from worker import finalize_submission, run_array_task
+from worker import _cleanup_snana_unneeded_outputs, finalize_submission, run_array_task
 
 
 def make_opsim(path: Path) -> None:
@@ -135,6 +135,33 @@ def prepare_profile(tmp_path: Path) -> tuple[Profile, Path]:
     return profile, profile_path
 
 
+def test_worker_removes_only_unused_per_event_snana_outputs(tmp_path):
+    profile, _ = make_profile(tmp_path)
+    simulation_id = 7
+    version = f"{profile.sim_name}_{simulation_id}"
+    event_dir = profile.sndata_sim_dir / version
+    event_dir.mkdir(parents=True)
+    required = [
+        event_dir / f"{version}_HEAD.FITS",
+        event_dir / f"{version}_PHOT.FITS",
+        event_dir / f"{version}.README",
+    ]
+    unused = [
+        event_dir / f"{version}.DUMP",
+        event_dir / f"{version}.LIST",
+    ]
+    global_list = profile.sndata_root / "SIM" / "PATH_SNDATA_SIM.LIST"
+    global_list.parent.mkdir(parents=True, exist_ok=True)
+    for path in [*required, *unused, global_list]:
+        path.touch()
+
+    _cleanup_snana_unneeded_outputs(profile, simulation_id)
+
+    assert all(path.is_file() for path in required)
+    assert not any(path.exists() for path in unused)
+    assert global_list.is_file()
+
+
 def test_prepare_keeps_low_snr_and_writes_audited_run(tmp_path):
     profile, _ = prepare_profile(tmp_path)
     prepared = pd.read_csv(profile.prepared_catalog)
@@ -148,6 +175,54 @@ def test_prepare_keeps_low_snr_and_writes_audited_run(tmp_path):
     assert manifest["model_range_filtered_rows"] == 0
     assert "snana_mej_dynamic" not in prepared
     assert "mej_dynamic_clipped" not in prepared
+
+
+def test_dual_prepare_keeps_type1_separate_from_snana_catalog(tmp_path):
+    profile, _ = make_profile(tmp_path)
+    positive_path = tmp_path / "positive.csv"
+    make_catalog(positive_path, profile.skymap_dir)
+    positive = pd.read_csv(positive_path)
+    positive["sample_class"] = "pos"
+    positive["event_uid"] = [
+        f"bns_train_pos_{simulation_id}" for simulation_id in positive["simulation_id"]
+    ]
+    positive.to_csv(positive_path, index=False)
+
+    negative_maps = tmp_path / "negative_skymaps"
+    negative_maps.mkdir()
+    negative_path = tmp_path / "negative.csv"
+    negative = positive.iloc[[0]].copy()
+    # Deliberately collide with a positive simulation_id; event_uid is the key.
+    negative["mej_dynamic"] = 0.0
+    negative["mej_wind"] = 0.0
+    negative["mej_total"] = 0.0
+    negative["neg_type"] = 1
+    negative["sample_class"] = "neg"
+    negative["event_uid"] = "bns_train_neg_7"
+    negative["skymap"] = "skymaps/7.fits"
+    negative.to_csv(negative_path, index=False)
+    (negative_maps / "7.fits").touch()
+
+    result = prepare_dual_run_catalog(
+        positive_path,
+        negative_path,
+        profile.run_dir,
+        profile_name=profile.name,
+        source=profile.source,
+        split=profile.split,
+        seed=profile.seed,
+        positive_skymap_dir=profile.skymap_dir,
+        negative_skymap_dir=negative_maps,
+        opsim_db=profile.opsim_db,
+        profile=profile.as_manifest(),
+    )
+
+    prepared = pd.read_csv(profile.prepared_catalog)
+    retained_negative = pd.read_csv(profile.run_dir / "neg_catalog.csv")
+    assert set(prepared["sample_class"]) == {"pos"}
+    assert retained_negative["event_uid"].tolist() == ["bns_train_neg_7"]
+    assert result["negative"]["rows"] == 1
+    assert result["snana_contains_sample_class"] == ["pos"]
 
 
 def test_validate_accepts_manifest_before_finalizer_resource_fields(tmp_path):
@@ -209,6 +284,55 @@ def test_prepare_filters_ejecta_outliers_and_keeps_closed_boundaries(tmp_path):
     } & set(prepared.columns)
 
 
+def test_prepare_excludes_double_zero_type1_but_not_single_component_from_physical_classification(
+    tmp_path,
+):
+    profile, _ = make_profile(tmp_path)
+    source_path = tmp_path / "source_catalog.csv"
+    make_catalog(source_path, profile.skymap_dir)
+    base = pd.read_csv(source_path).iloc[[0, 0, 0, 0]].copy()
+    base["simulation_id"] = [30, 31, 32, 33]
+    base["skymap"] = [f"skymaps/{event_id}.fits" for event_id in base["simulation_id"]]
+    for event_id in base["simulation_id"]:
+        (profile.skymap_dir / f"{event_id}.fits").touch()
+    base["mej_dynamic"] = [0.0, 0.0, 0.005, 0.005]
+    base["mej_wind"] = [0.0, 0.04, 0.0, 0.04]
+    base["mej_total"] = base["mej_dynamic"] + base["mej_wind"]
+    base["neg_type"] = [1, 0, 0, 0]
+
+    prepared, manifest = prepare_catalog(
+        base,
+        source="bns",
+        split="train",
+        seed=42,
+        skymap_dir=profile.skymap_dir,
+        opsim_db=profile.opsim_db,
+    )
+
+    assert prepared["simulation_id"].tolist() == [33]
+    assert manifest["input_type1_rows"] == 1
+    assert manifest["excluded_type1_no_ejecta_rows"] == 1
+    assert manifest["snana_input_rows"] == 1
+
+
+def test_prepare_rejects_neg_type_inconsistent_with_double_zero(tmp_path):
+    profile, _ = make_profile(tmp_path)
+    source_path = tmp_path / "source_catalog.csv"
+    make_catalog(source_path, profile.skymap_dir)
+    catalog = pd.read_csv(source_path)
+    catalog["neg_type"] = [1, 0]
+
+    with pytest.raises(ValueError, match="inconsistent with physical double-zero"):
+        prepare_catalog(
+            catalog,
+            source="bns",
+            split="train",
+            seed=42,
+            skymap_dir=profile.skymap_dir,
+            opsim_db=profile.opsim_db,
+        )
+
+
 def test_prepare_nsbh_filter_keeps_closed_boundaries_and_fixed_phi(tmp_path):
     profile, _ = make_profile(tmp_path)
     source_path = tmp_path / "source_catalog.csv"
@@ -216,8 +340,7 @@ def test_prepare_nsbh_filter_keeps_closed_boundaries_and_fixed_phi(tmp_path):
     base = pd.read_csv(source_path).iloc[[0, 0, 0, 0]].copy()
     base["simulation_id"] = [20, 21, 22, 23]
     base["skymap"] = [
-        f"skymaps/{simulation_id}.fits"
-        for simulation_id in base["simulation_id"]
+        f"skymaps/{simulation_id}.fits" for simulation_id in base["simulation_id"]
     ]
     for simulation_id in base["simulation_id"]:
         (profile.skymap_dir / f"{simulation_id}.fits").touch()
@@ -657,7 +780,7 @@ def test_compact_cli_routes_to_manual_compactor(monkeypatch, capsys):
 def test_manual_compact_refuses_incomplete_run(tmp_path):
     profile, _ = prepare_profile(tmp_path)
 
-    with pytest.raises(ValueError, match="incomplete run"):
+    with pytest.raises(ValueError, match="incomplete run|unprocessed"):
         compact_profile(profile)
 
     assert not profile.aggregate_artifact_file.exists()

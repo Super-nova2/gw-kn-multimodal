@@ -49,6 +49,7 @@ class Profile:
     mjd_max: float
     credible_level: float
     slurm: SlurmConfig
+    negative_skymap_dir: Path | None = None
 
     @property
     def input_catalog(self) -> Path:
@@ -105,6 +106,7 @@ class Profile:
         for key in (
             "run_dir",
             "skymap_dir",
+            "negative_skymap_dir",
             "opsim_db",
             "sndata_root",
             "snana_bin_dir",
@@ -112,7 +114,8 @@ class Profile:
             "template_input",
             "too_config",
         ):
-            result[key] = str(result[key])
+            if result[key] is not None:
+                result[key] = str(result[key])
         return result
 
 
@@ -191,6 +194,11 @@ def load_profile(profile: str | Path) -> Profile:
         split=split,
         run_dir=_expand_path(_require(paths, "run_dir"), variables),
         skymap_dir=_expand_path(_require(paths, "skymap_dir"), variables),
+        negative_skymap_dir=(
+            _expand_path(paths["negative_skymap_dir"], variables)
+            if paths.get("negative_skymap_dir")
+            else None
+        ),
         opsim_db=_expand_path(_require(paths, "opsim_db"), variables),
         sndata_root=_expand_path(_require(paths, "sndata_root"), variables),
         snana_bin_dir=_expand_path(_require(paths, "snana_bin_dir"), variables),

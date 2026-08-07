@@ -2146,6 +2146,26 @@ def train(args):
         or args.gallery_loss_weight > 0
         or args.time_compat_weight > 0
     )
+    if not 0.0 <= float(args.neg_gw_pair_ratio) < 1.0:
+        raise ValueError("neg_gw_pair_ratio must be in [0, 1).")
+    train_neg_gw_ratio = 0.0
+    if float(args.neg_gw_pair_ratio) > 0.0 and is_cls_branch_enabled(args):
+        with h5py.File(args.data_path, "r") as f:
+            required = (
+                "events/gw_data/has_kn",
+                "events/gw_data/neg_type",
+                "events/gw_data/source_type",
+                "events/gw_data/event_time_mjd",
+            )
+            if all(name in f for name in required):
+                has_kn = np.asarray(f["events/gw_data/has_kn"][:])
+                if np.any(has_kn == 0):
+                    train_neg_gw_ratio = float(args.neg_gw_pair_ratio)
+            if train_neg_gw_ratio == 0.0:
+                print("Negative-GW pairs disabled: the training H5 has no complete negative-GW schema/events.")
+    elif float(args.neg_gw_pair_ratio) > 0.0:
+        print("Negative-GW pairs disabled because the classification branch is inactive.")
+    print(f"Train negative-GW pair ratio: {train_neg_gw_ratio:.3f}")
     print(f"CLS/gallery/time-compat optical first-detection metadata requested: {int(need_zero_time_mjd_for_cls)}")
 
     timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -2197,6 +2217,7 @@ def train(args):
                 extra_negative_timeaware_seed=extra_neg_timeaware_seed,
                 opt_input_window_start=args.ref_start,
                 opt_input_window_end=args.ref_end,
+                train_neg_gw_ratio=train_neg_gw_ratio,
             )
             (
                 train_loader,
@@ -2238,6 +2259,7 @@ def train(args):
                 extra_negative_timeaware_seed=extra_neg_timeaware_seed,
                 opt_input_window_start=args.ref_start,
                 opt_input_window_end=args.ref_end,
+                train_neg_gw_ratio=train_neg_gw_ratio,
             )
             (
                 train_loader,
@@ -2278,6 +2300,7 @@ def train(args):
             opt_input_window_end=args.ref_end,
             loader_usage="train",
             loader_label="Train DataLoader",
+            train_neg_gw_ratio=train_neg_gw_ratio,
         )
 
     mtan_cfg = resolve_mtan_runtime_config(args)
@@ -2463,6 +2486,10 @@ def train(args):
         )
         
         for batch_idx, batch_data in enumerate(pbar):
+            pair_is_neg_gw = None
+            if train_neg_gw_ratio > 0.0:
+                pair_is_neg_gw = batch_data[-1]
+                batch_data = batch_data[:-1]
             _opt_zero_time_mjd_base = None
             _neg_zero_time_mjd_base = None
             _neg_zero_time_mjd_cls_base = None
@@ -2514,6 +2541,17 @@ def train(args):
             opt_err = opt_err.to(device, non_blocking=True)
             opt_coords = opt_coords.to(device, non_blocking=True)
             gw_indices = gw_indices.to(device, non_blocking=True).long()
+            if pair_is_neg_gw is None:
+                pair_is_neg_gw = torch.zeros(
+                    (gw_indices.shape[0],), device=device, dtype=torch.bool
+                )
+            else:
+                pair_is_neg_gw = pair_is_neg_gw.to(
+                    device, non_blocking=True
+                ).bool()
+            itc_pair_mask = ~pair_is_neg_gw
+            if not bool(itc_pair_mask.any()):
+                raise ValueError("Each training batch must retain at least one positive GW-optical pair")
             batch_event_time_mjd = None
             if gw_event_time_mjd_table is not None:
                 batch_event_time_mjd = gw_event_time_mjd_table[gw_indices]
@@ -2587,28 +2625,39 @@ def train(args):
                             neg_coords, neg_t, neg_v, opt_ref_t, neg_mask, neg_err,
                         )
                     extra_neg_event_time_mjd = neg_zero_time_mjd_for_itc
+                itc_g = g[itc_pair_mask]
+                itc_z_l = z_l[itc_pair_mask]
+                itc_gw_indices = gw_indices[itc_pair_mask]
+                itc_gw_event_time = (
+                    batch_event_time_mjd[itc_pair_mask]
+                    if batch_event_time_mjd is not None else None
+                )
+                itc_opt_first_detection = (
+                    _opt_first_detection_mjd[itc_pair_mask]
+                    if _opt_first_detection_mjd is not None else None
+                )
                 if args.itc_loss_type == "supcon":
                     itc_loss, sim_g2o, sim_g2o_for_loss = model.compute_supcon_loss(
-                        g, z_l, gw_indices, margin=args.supcon_margin,
-                        gw_event_time_mjd=batch_event_time_mjd,
+                        itc_g, itc_z_l, itc_gw_indices, margin=args.supcon_margin,
+                        gw_event_time_mjd=itc_gw_event_time,
                         opt_event_time_mjd=resolve_optical_candidate_time_mjd(
-                            _opt_first_detection_mjd, batch_event_time_mjd
+                            itc_opt_first_detection, itc_gw_event_time
                         ),
                         extra_neg_z=extra_neg_z_itc,
                         extra_neg_opt_event_time_mjd=extra_neg_event_time_mjd,
                     )
                 else:
                     itc_loss, sim_g2o, sim_g2o_for_loss = model.compute_itc_loss(
-                        g, z_l, gw_indices,
-                        gw_event_time_mjd=batch_event_time_mjd,
+                        itc_g, itc_z_l, itc_gw_indices,
+                        gw_event_time_mjd=itc_gw_event_time,
                         opt_event_time_mjd=resolve_optical_candidate_time_mjd(
-                            _opt_first_detection_mjd, batch_event_time_mjd
+                            itc_opt_first_detection, itc_gw_event_time
                         ),
                         extra_neg_z=extra_neg_z_itc,
                         extra_neg_opt_event_time_mjd=extra_neg_event_time_mjd,
                     )
 
-                labels_pos = torch.ones(batch_size, device=device, dtype=torch.long)
+                labels_pos = (~pair_is_neg_gw).to(dtype=torch.long)
                 labels_neg = torch.zeros(batch_size, device=device, dtype=torch.long)
                 gallery_loss = torch.zeros((), device=device)
                 gallery_hard_loss = torch.zeros((), device=device)
@@ -2737,15 +2786,23 @@ def train(args):
 
                 # --- Shared gallery computation (independent of CLS branch) ---
                 if is_retrieval_active(args, epoch) and gallery_extra_h_l is not None:
-                    h_candidates = [h_l]
-                    z_candidates = [z_l]
-                    coords_candidates = [opt_coords]
-                    candidate_gw_indices = [gw_indices]
+                    gallery_query_g = g[itc_pair_mask]
+                    gallery_query_H = H_gw[itc_pair_mask] if H_gw is not None else None
+                    gallery_query_gw_s = gw_s[itc_pair_mask]
+                    gallery_query_gw_m = gw_m[itc_pair_mask]
+                    gallery_query_event_time = (
+                        batch_event_time_mjd[itc_pair_mask]
+                        if batch_event_time_mjd is not None else None
+                    )
+                    h_candidates = [h_l[itc_pair_mask]]
+                    z_candidates = [z_l[itc_pair_mask]]
+                    coords_candidates = [opt_coords[itc_pair_mask]]
+                    candidate_gw_indices = [itc_gw_indices]
                     candidate_time_blocks = []
                     if batch_event_time_mjd is not None:
                         pos_gallery_time = resolve_optical_candidate_time_mjd(
                             _opt_first_detection_mjd, batch_event_time_mjd
-                        ).to(device=device, dtype=torch.float32)
+                        )[itc_pair_mask].to(device=device, dtype=torch.float32)
                         candidate_time_blocks.append(pos_gallery_time)
                     if (
                         has_negatives
@@ -2773,10 +2830,10 @@ def train(args):
                     z_gallery = torch.cat(z_candidates, dim=0)
                     coords_gallery = torch.cat(coords_candidates, dim=0)
                     gallery_gw_indices = torch.cat(candidate_gw_indices, dim=0)
-                    gallery_pos_mask_full = gw_indices.unsqueeze(1) == gallery_gw_indices.unsqueeze(0)
+                    gallery_pos_mask_full = itc_gw_indices.unsqueeze(1) == gallery_gw_indices.unsqueeze(0)
                     gallery_candidate_time = torch.cat(candidate_time_blocks, dim=0) if candidate_time_blocks else None
                     dt_gallery = build_gallery_time_delta_matrix(
-                        batch_event_time_mjd,
+                        gallery_query_event_time,
                         gallery_candidate_time,
                         positive_mask=gallery_pos_mask_full,
                         distractor_time_mode=args.gallery_distractor_time_mode,
@@ -2786,17 +2843,20 @@ def train(args):
                     # Query subsampling: randomly select a subset of queries to
                     # bound GPU memory when scoring against the full candidate gallery.
                     max_queries = int(getattr(args, "max_gallery_queries", 0) or 0)
-                    n_q_total = int(g.size(0))
+                    n_q_total = int(gallery_query_g.size(0))
                     if max_queries > 0 and n_q_total > max_queries:
                         q_idx = torch.randperm(n_q_total, device=device)[:max_queries]
-                        g_q = g[q_idx]
-                        H_q = H_gw[q_idx] if H_gw is not None else None
-                        gw_s_q = gw_s[q_idx] if gw_s is not None else None
-                        gw_m_q = gw_m[q_idx] if gw_m is not None else None
+                        g_q = gallery_query_g[q_idx]
+                        H_q = gallery_query_H[q_idx] if gallery_query_H is not None else None
+                        gw_s_q = gallery_query_gw_s[q_idx]
+                        gw_m_q = gallery_query_gw_m[q_idx]
                         dt_q = dt_gallery[q_idx, :] if dt_gallery is not None else None
                         gallery_pos_mask = gallery_pos_mask_full[q_idx, :]
                     else:
-                        g_q, H_q, gw_s_q, gw_m_q = g, H_gw, gw_s, gw_m
+                        g_q = gallery_query_g
+                        H_q = gallery_query_H
+                        gw_s_q = gallery_query_gw_s
+                        gw_m_q = gallery_query_gw_m
                         dt_q = dt_gallery
                         gallery_pos_mask = gallery_pos_mask_full
 
@@ -2856,8 +2916,8 @@ def train(args):
             with torch.no_grad():
                 # ITC accuracy: accept any optical sample from the same GW event
                 itc_preds = sim_g2o_detached.argmax(dim=1)
-                pred_gw = gw_indices[itc_preds]
-                itc_acc = (gw_indices == pred_gw).float().mean().item()
+                pred_gw = itc_gw_indices[itc_preds]
+                itc_acc = (itc_gw_indices == pred_gw).float().mean().item()
 
                 if cls_branch_enabled:
                     pos_acc = (logits_pos.argmax(dim=1) == labels_pos).float().mean().item()
@@ -3378,6 +3438,8 @@ if __name__ == "__main__":
                         help="Negative class weight for CLS loss")
     parser.add_argument("--cls_extra_neg_weight", type=float, default=1.0,
                         help="Extra negative class weight for CLS loss")
+    parser.add_argument("--neg_gw_pair_ratio", type=float, default=0.2,
+                        help="Training batch fraction of classification-only negative-GW/positive-optical pairs.")
     parser.add_argument("--cls_ramp_epochs", type=int, default=0,
                         help="Epochs to ramp CLS weight from 0 to cls_weight (0 to disable)")
     parser.add_argument("--retrieval_start_epoch", type=int, default=0,

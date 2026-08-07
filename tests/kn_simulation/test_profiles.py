@@ -1,7 +1,7 @@
 from pathlib import Path
 
 import pytest
-from config import REPO_ROOT, load_profile
+from config import DEFAULT_BASE_DIR, REPO_ROOT, load_profile
 
 
 @pytest.mark.parametrize(
@@ -27,5 +27,11 @@ def test_production_profiles(name, source, split, mode, samples):
     assert profile.slurm.max_concurrency == 50
     assert profile.slurm.finalizer_time_limit == "01:00:00"
     assert profile.slurm.finalizer_memory == "4G"
-    assert profile.run_dir == REPO_ROOT / "kn_simulation" / "runs" / name
+    assert profile.run_dir == REPO_ROOT / "kn_simulation" / "runs_dual" / name
+    assert profile.skymap_dir == (
+        DEFAULT_BASE_DIR / "data" / "skymap" / "positive" / f"{source}_skymap_{split}"
+    )
+    assert profile.negative_skymap_dir == (
+        DEFAULT_BASE_DIR / "data" / "skymap" / "negative" / f"{source}_skymap_{split}"
+    )
     assert isinstance(profile.template_input, Path)

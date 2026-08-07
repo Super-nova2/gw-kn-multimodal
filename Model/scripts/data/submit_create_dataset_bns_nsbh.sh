@@ -43,15 +43,14 @@ SEED="${SEED:-42}"
 BNS_MAX_LC_PER_GW="${BNS_MAX_LC_PER_GW:-1000}"
 NSBH_MAX_LC_PER_GW="${NSBH_MAX_LC_PER_GW:-1000}"
 
-BNS_MAX_NEG_GW="${BNS_MAX_NEG_GW:-1000}"
-NSBH_MAX_NEG_GW="${NSBH_MAX_NEG_GW:-1000}"
+BNS_MAX_NEG_GW="${BNS_MAX_NEG_GW:-}"
+NSBH_MAX_NEG_GW="${NSBH_MAX_NEG_GW:-}"
 BNS_MAX_POS_GW="${BNS_MAX_POS_GW:-}"
 NSBH_MAX_POS_GW="${NSBH_MAX_POS_GW:-}"
-NSBH_MAX_NEG_TYPE1_GW="${NSBH_MAX_NEG_TYPE1_GW:-500}"
-NSBH_MAX_NEG_TYPE2_GW="${NSBH_MAX_NEG_TYPE2_GW:-500}"
-NSBH_MEJ_COL="${NSBH_MEJ_COL:-mej_tot}"
-NSBH_TYPE1_THRESHOLD="${NSBH_TYPE1_THRESHOLD:-0.0}"
-NSBH_REQUIRE_SUCCESS_FOR_MEJ_POS="${NSBH_REQUIRE_SUCCESS_FOR_MEJ_POS:-1}"
+BNS_MAX_NEG_TYPE1_GW="${BNS_MAX_NEG_TYPE1_GW:-}"
+BNS_MAX_NEG_TYPE2_GW="${BNS_MAX_NEG_TYPE2_GW:-}"
+NSBH_MAX_NEG_TYPE1_GW="${NSBH_MAX_NEG_TYPE1_GW:-}"
+NSBH_MAX_NEG_TYPE2_GW="${NSBH_MAX_NEG_TYPE2_GW:-}"
 FLUXCAL_ZP="${FLUXCAL_ZP:-27.5}"
 PSFFLUX_ZP="${PSFFLUX_ZP:-31.4}"
 LUPT_K="${LUPT_K:-1.0}"
@@ -61,6 +60,12 @@ set_profile_defaults() {
     case "$PROFILE" in
         test_aug)
             DATASET_MODE="${DATASET_MODE:-test}"
+            BNS_MAX_NEG_GW="${BNS_MAX_NEG_GW:-1500}"
+            BNS_MAX_NEG_TYPE1_GW="${BNS_MAX_NEG_TYPE1_GW:-500}"
+            BNS_MAX_NEG_TYPE2_GW="${BNS_MAX_NEG_TYPE2_GW:-1000}"
+            NSBH_MAX_NEG_GW="${NSBH_MAX_NEG_GW:-1000}"
+            NSBH_MAX_NEG_TYPE1_GW="${NSBH_MAX_NEG_TYPE1_GW:-500}"
+            NSBH_MAX_NEG_TYPE2_GW="${NSBH_MAX_NEG_TYPE2_GW:-500}"
             BNS_FULL_CATALOG_PATH="${BNS_FULL_CATALOG_PATH:-${REPO_ROOT}/dataset/O5_sim_bns/injections_final.csv}"
             BNS_SKYMAP_DIR="${BNS_SKYMAP_DIR:-${BASE_DIR}/data/skymap/bns_skymap_v0}"
             BNS_SIM_ROOT="${BNS_SIM_ROOT:-${BASE_DIR}/SNANA/SNDATA_ROOT/SIM/LSST_KN_BNS}"
@@ -77,35 +82,47 @@ set_profile_defaults() {
             ;;
         final_train)
             DATASET_MODE="${DATASET_MODE:-train}"
-            BNS_FULL_CATALOG_PATH="${BNS_FULL_CATALOG_PATH:-${REPO_ROOT}/kn_simulation/runs/bns_train/kn_catalog.csv}"
-            BNS_SKYMAP_DIR="${BNS_SKYMAP_DIR:-${BASE_DIR}/data/skymap/bns_skymap_train}"
-            BNS_SIM_ROOT="${BNS_SIM_ROOT:-${BASE_DIR}/SNANA/SNDATA_ROOT/SIM/LSST_KN_BNS_TRAIN}"
-            BNS_SIM_NAME="${BNS_SIM_NAME:-LSST_KN_BNS_TRAIN}"
-            BNS_SUCCESS_IDS_PATH="${BNS_SUCCESS_IDS_PATH:-${REPO_ROOT}/kn_simulation/runs/bns_train/success_sim_ids.txt}"
+            BNS_MAX_NEG_GW="${BNS_MAX_NEG_GW:-10000}"
+            BNS_MAX_NEG_TYPE1_GW="${BNS_MAX_NEG_TYPE1_GW:-5000}"
+            BNS_MAX_NEG_TYPE2_GW="${BNS_MAX_NEG_TYPE2_GW:-5000}"
+            NSBH_MAX_NEG_GW="${NSBH_MAX_NEG_GW:-10000}"
+            NSBH_MAX_NEG_TYPE1_GW="${NSBH_MAX_NEG_TYPE1_GW:-5000}"
+            NSBH_MAX_NEG_TYPE2_GW="${NSBH_MAX_NEG_TYPE2_GW:-5000}"
+            BNS_FULL_CATALOG_PATH="${BNS_FULL_CATALOG_PATH:-${BASE_DIR}/GWSamplegen/outputs/production_rubin_dual/bns_train_seed_42/pos_catalog.csv}"
+            BNS_SKYMAP_DIR="${BNS_SKYMAP_DIR:-${BASE_DIR}/data/skymap/positive/bns_skymap_train}"
+            BNS_SIM_ROOT="${BNS_SIM_ROOT:-${BASE_DIR}/SNANA/SNDATA_ROOT/SIM/LSST_KN_BNS_TRAIN_DUAL}"
+            BNS_SIM_NAME="${BNS_SIM_NAME:-LSST_KN_BNS_TRAIN_DUAL}"
+            BNS_SUCCESS_IDS_PATH="${BNS_SUCCESS_IDS_PATH:-${REPO_ROOT}/kn_simulation/runs_dual/bns_train/success_sim_ids.txt}"
 
-            NSBH_FULL_CATALOG_PATH="${NSBH_FULL_CATALOG_PATH:-${REPO_ROOT}/kn_simulation/runs/nsbh_train/kn_catalog.csv}"
-            NSBH_SKYMAP_DIR="${NSBH_SKYMAP_DIR:-${BASE_DIR}/data/skymap/nsbh_skymap_train}"
-            NSBH_SIM_ROOT="${NSBH_SIM_ROOT:-${BASE_DIR}/SNANA/SNDATA_ROOT/SIM/LSST_KN_NSBH_TRAIN}"
-            NSBH_SIM_NAME="${NSBH_SIM_NAME:-LSST_KN_NSBH_TRAIN}"
-            NSBH_SUCCESS_IDS_PATH="${NSBH_SUCCESS_IDS_PATH:-${REPO_ROOT}/kn_simulation/runs/nsbh_train/success_sim_ids.txt}"
+            NSBH_FULL_CATALOG_PATH="${NSBH_FULL_CATALOG_PATH:-${BASE_DIR}/GWSamplegen/outputs/production_rubin_dual/nsbh_train_seed_42/pos_catalog.csv}"
+            NSBH_SKYMAP_DIR="${NSBH_SKYMAP_DIR:-${BASE_DIR}/data/skymap/positive/nsbh_skymap_train}"
+            NSBH_SIM_ROOT="${NSBH_SIM_ROOT:-${BASE_DIR}/SNANA/SNDATA_ROOT/SIM/LSST_KN_NSBH_TRAIN_DUAL}"
+            NSBH_SIM_NAME="${NSBH_SIM_NAME:-LSST_KN_NSBH_TRAIN_DUAL}"
+            NSBH_SUCCESS_IDS_PATH="${NSBH_SUCCESS_IDS_PATH:-${REPO_ROOT}/kn_simulation/runs_dual/nsbh_train/success_sim_ids.txt}"
 
-            OUTPUT_H5_PATH="${OUTPUT_H5_PATH:-${BASE_DIR}/data/ALBEF_dataset/combined_dataset_v2_${DATASET_MODE}.h5}"
+            OUTPUT_H5_PATH="${OUTPUT_H5_PATH:-${BASE_DIR}/data/ALBEF_dataset/combined_dataset_${DATASET_MODE}.h5}"
             ;;
         astro_test)
             DATASET_MODE="${DATASET_MODE:-test}"
-            BNS_FULL_CATALOG_PATH="${BNS_FULL_CATALOG_PATH:-${REPO_ROOT}/kn_simulation/runs/bns_test/kn_catalog.csv}"
-            BNS_SKYMAP_DIR="${BNS_SKYMAP_DIR:-${BASE_DIR}/data/skymap/bns_skymap_test}"
-            BNS_SIM_ROOT="${BNS_SIM_ROOT:-${BASE_DIR}/SNANA/SNDATA_ROOT/SIM/LSST_KN_BNS_TEST}"
-            BNS_SIM_NAME="${BNS_SIM_NAME:-LSST_KN_BNS_TEST}"
-            BNS_SUCCESS_IDS_PATH="${BNS_SUCCESS_IDS_PATH:-${REPO_ROOT}/kn_simulation/runs/bns_test/success_sim_ids.txt}"
+            BNS_MAX_NEG_GW="${BNS_MAX_NEG_GW:-1500}"
+            BNS_MAX_NEG_TYPE1_GW="${BNS_MAX_NEG_TYPE1_GW:-500}"
+            BNS_MAX_NEG_TYPE2_GW="${BNS_MAX_NEG_TYPE2_GW:-1000}"
+            NSBH_MAX_NEG_GW="${NSBH_MAX_NEG_GW:-1000}"
+            NSBH_MAX_NEG_TYPE1_GW="${NSBH_MAX_NEG_TYPE1_GW:-500}"
+            NSBH_MAX_NEG_TYPE2_GW="${NSBH_MAX_NEG_TYPE2_GW:-500}"
+            BNS_FULL_CATALOG_PATH="${BNS_FULL_CATALOG_PATH:-${BASE_DIR}/GWSamplegen/outputs/production_rubin_dual/bns_test_seed_42/pos_catalog.csv}"
+            BNS_SKYMAP_DIR="${BNS_SKYMAP_DIR:-${BASE_DIR}/data/skymap/positive/bns_skymap_test}"
+            BNS_SIM_ROOT="${BNS_SIM_ROOT:-${BASE_DIR}/SNANA/SNDATA_ROOT/SIM/LSST_KN_BNS_TEST_DUAL}"
+            BNS_SIM_NAME="${BNS_SIM_NAME:-LSST_KN_BNS_TEST_DUAL}"
+            BNS_SUCCESS_IDS_PATH="${BNS_SUCCESS_IDS_PATH:-${REPO_ROOT}/kn_simulation/runs_dual/bns_test/success_sim_ids.txt}"
 
-            NSBH_FULL_CATALOG_PATH="${NSBH_FULL_CATALOG_PATH:-${REPO_ROOT}/kn_simulation/runs/nsbh_test/kn_catalog.csv}"
-            NSBH_SKYMAP_DIR="${NSBH_SKYMAP_DIR:-${BASE_DIR}/data/skymap/nsbh_skymap_test}"
-            NSBH_SIM_ROOT="${NSBH_SIM_ROOT:-${BASE_DIR}/SNANA/SNDATA_ROOT/SIM/LSST_KN_NSBH_TEST}"
-            NSBH_SIM_NAME="${NSBH_SIM_NAME:-LSST_KN_NSBH_TEST}"
-            NSBH_SUCCESS_IDS_PATH="${NSBH_SUCCESS_IDS_PATH:-${REPO_ROOT}/kn_simulation/runs/nsbh_test/success_sim_ids.txt}"
+            NSBH_FULL_CATALOG_PATH="${NSBH_FULL_CATALOG_PATH:-${BASE_DIR}/GWSamplegen/outputs/production_rubin_dual/nsbh_test_seed_42/pos_catalog.csv}"
+            NSBH_SKYMAP_DIR="${NSBH_SKYMAP_DIR:-${BASE_DIR}/data/skymap/positive/nsbh_skymap_test}"
+            NSBH_SIM_ROOT="${NSBH_SIM_ROOT:-${BASE_DIR}/SNANA/SNDATA_ROOT/SIM/LSST_KN_NSBH_TEST_DUAL}"
+            NSBH_SIM_NAME="${NSBH_SIM_NAME:-LSST_KN_NSBH_TEST_DUAL}"
+            NSBH_SUCCESS_IDS_PATH="${NSBH_SUCCESS_IDS_PATH:-${REPO_ROOT}/kn_simulation/runs_dual/nsbh_test/success_sim_ids.txt}"
 
-            OUTPUT_H5_PATH="${OUTPUT_H5_PATH:-${BASE_DIR}/data/ALBEF_dataset/combined_dataset_astro_v2_${DATASET_MODE}.h5}"
+            OUTPUT_H5_PATH="${OUTPUT_H5_PATH:-${BASE_DIR}/data/ALBEF_dataset/combined_dataset_astro_${DATASET_MODE}.h5}"
             ;;
         *)
             echo "Unsupported PROFILE=$PROFILE. Use PROFILE=test_aug, PROFILE=final_train, or PROFILE=astro_test."
@@ -140,45 +157,112 @@ append_optional_arg() {
 
 validate_output_h5_schema() {
     local h5_path="$1"
-    python - "$h5_path" <<'PY'
+    python - "$h5_path" <<'PY_VALIDATE_H5'
 import sys
-import numpy as np
 import h5py
+import numpy as np
 
 h5_path = sys.argv[1]
+base = "events/gw_data"
+required = (
+    "scalars", "skymaps", "ids", "event_uid", "simulation_id", "sample_class",
+    "has_kn", "neg_type",
+    "mej_dynamic", "mej_wind", "mej_tot", "event_time_mjd", "source_type",
+)
 with h5py.File(h5_path, "r") as f:
-    scalars_path = "events/gw_data/scalars"
-    event_time_path = "events/gw_data/event_time_mjd"
-    if scalars_path not in f:
-        raise SystemExit(f"[SchemaError] Missing dataset: {scalars_path}")
-    if event_time_path not in f:
-        raise SystemExit(f"[SchemaError] Missing dataset: {event_time_path}")
+    missing = [f"{base}/{name}" for name in required if f"{base}/{name}" not in f]
+    if missing:
+        raise SystemExit(f"[SchemaError] Missing datasets: {missing}")
+    n_gw = int(f[f"{base}/scalars"].shape[0])
+    if f[f"{base}/scalars"].shape != (n_gw, 7):
+        raise SystemExit(f"[SchemaError] scalars must have shape (n_gw, 7)")
+    if f[f"{base}/skymaps"].shape != (n_gw, 7, 19200):
+        raise SystemExit(f"[SchemaError] skymaps must have shape (n_gw, 7, 19200)")
+    for name in required[2:]:
+        if f[f"{base}/{name}"].shape != (n_gw,):
+            raise SystemExit(
+                f"[SchemaError] {base}/{name} must have shape ({n_gw},), "
+                f"got {f[f'{base}/{name}'].shape}"
+            )
 
-    scalars = f[scalars_path]
-    event_time = f[event_time_path]
-    if scalars.ndim != 2 or scalars.shape[1] != 7:
-        raise SystemExit(
-            f"[SchemaError] {scalars_path} shape must be (n_gw, 7), got {tuple(scalars.shape)}"
-        )
-    if event_time.ndim != 1:
-        raise SystemExit(
-            f"[SchemaError] {event_time_path} shape must be (n_gw,), got {tuple(event_time.shape)}"
-        )
-    if event_time.shape[0] != scalars.shape[0]:
-        raise SystemExit(
-            f"[SchemaError] Length mismatch: {event_time_path}={event_time.shape[0]} "
-            f"vs {scalars_path} n_gw={scalars.shape[0]}"
-        )
-
-    invalid = int((~np.isfinite(event_time[:])).sum())
-    print(
-        f"[SchemaOK] n_gw={scalars.shape[0]} scalars_dim={scalars.shape[1]} "
-        f"event_time_len={event_time.shape[0]} invalid_event_time={invalid}"
+    has_kn = np.asarray(f[f"{base}/has_kn"][:], dtype=np.int8)
+    neg_type = np.asarray(f[f"{base}/neg_type"][:], dtype=np.int8)
+    dynamic = np.asarray(f[f"{base}/mej_dynamic"][:], dtype=np.float64)
+    wind = np.asarray(f[f"{base}/mej_wind"][:], dtype=np.float64)
+    total = np.asarray(f[f"{base}/mej_tot"][:], dtype=np.float64)
+    event_time = np.asarray(f[f"{base}/event_time_mjd"][:], dtype=np.float64)
+    decode = lambda values: np.asarray(
+        [value.decode() if isinstance(value, bytes) else str(value) for value in values]
     )
-PY
+    ids = decode(f[f"{base}/ids"][:])
+    event_uid = decode(f[f"{base}/event_uid"][:])
+    simulation_id = np.asarray(f[f"{base}/simulation_id"][:], dtype=np.int64)
+    sample_class = decode(f[f"{base}/sample_class"][:])
+    source_type = decode(f[f"{base}/source_type"][:])
+    if not np.array_equal(ids, event_uid) or len(set(event_uid.tolist())) != n_gw:
+        raise SystemExit("[SchemaError] event_uid must be unique and match legacy ids")
+    if (simulation_id < 0).any() or not np.isin(sample_class, ("pos", "neg")).all():
+        raise SystemExit("[SchemaError] invalid simulation_id or sample_class")
+    if not np.array_equal(sample_class == "neg", neg_type == 1):
+        raise SystemExit("[SchemaError] only type-1 events may come from the neg stream")
+    split = str(f.attrs["dataset_mode"])
+    expected_uid = np.asarray(
+        [f"{source}_{split}_{klass}_{sim_id}" for source, klass, sim_id in zip(
+            source_type, sample_class, simulation_id
+        )]
+    )
+    if not np.array_equal(event_uid, expected_uid):
+        raise SystemExit("[SchemaError] non-canonical event_uid")
+    if not np.isin(has_kn, (0, 1)).all() or not np.isin(neg_type, (0, 1, 2)).all():
+        raise SystemExit("[SchemaError] has_kn or neg_type contains invalid labels")
+    if not np.isfinite(dynamic).all() or not np.isfinite(wind).all():
+        raise SystemExit("[SchemaError] ejecta components must be finite")
+    if (dynamic < 0).any() or (wind < 0).any():
+        raise SystemExit("[SchemaError] physical ejecta components must be non-negative")
+    if not np.allclose(total, dynamic + wind, rtol=1e-5, atol=1e-8):
+        raise SystemExit("[SchemaError] mej_tot != mej_dynamic + mej_wind")
+    double_zero = (dynamic == 0.0) & (wind == 0.0)
+    if not np.array_equal(neg_type == 1, double_zero):
+        raise SystemExit("[SchemaError] type-1 must be exactly physical double-zero ejecta")
+    if not np.all(total[neg_type != 1] > 0.0):
+        raise SystemExit("[SchemaError] positive and type-2 events require total ejecta > 0")
+    if not np.array_equal(has_kn == 1, neg_type == 0):
+        raise SystemExit("[SchemaError] has_kn=1 must be equivalent to neg_type=0")
+
+    parent_path = "events/optical_data/parent_gw_idx"
+    if parent_path not in f:
+        raise SystemExit(f"[SchemaError] Missing dataset: {parent_path}")
+    parents = np.asarray(f[parent_path][:], dtype=np.int64)
+    if ((parents < 0) | (parents >= n_gw)).any():
+        raise SystemExit("[SchemaError] optical parent_gw_idx out of range")
+    if parents.size and not np.all(has_kn[parents] == 1):
+        raise SystemExit("[SchemaError] optical samples may only reference has_kn=1 GW events")
+
+    invalid_time = int((~np.isfinite(event_time)).sum())
+    counts = {label: int((neg_type == label).sum()) for label in (0, 1, 2)}
+    print(
+        f"[SchemaOK] n_gw={n_gw} n_optical={len(parents)} "
+        f"positive={counts[0]} type1={counts[1]} type2={counts[2]} "
+        f"invalid_event_time={invalid_time}"
+    )
+PY_VALIDATE_H5
 }
 
 set_profile_defaults
+
+if [[ "$PROFILE" == "final_train" || "$PROFILE" == "astro_test" ]]; then
+    BNS_BUNDLE_ROOT="${BASE_DIR}/GWSamplegen/outputs/production_rubin_dual/bns_${DATASET_MODE}_seed_42"
+    NSBH_BUNDLE_ROOT="${BASE_DIR}/GWSamplegen/outputs/production_rubin_dual/nsbh_${DATASET_MODE}_seed_42"
+    BNS_NEGATIVE_CATALOG_PATH="${BNS_NEGATIVE_CATALOG_PATH:-${BNS_BUNDLE_ROOT}/neg_catalog.csv}"
+    BNS_NEGATIVE_SKYMAP_DIR="${BNS_NEGATIVE_SKYMAP_DIR:-${BASE_DIR}/data/skymap/negative/bns_skymap_${DATASET_MODE}}"
+    NSBH_NEGATIVE_CATALOG_PATH="${NSBH_NEGATIVE_CATALOG_PATH:-${NSBH_BUNDLE_ROOT}/neg_catalog.csv}"
+    NSBH_NEGATIVE_SKYMAP_DIR="${NSBH_NEGATIVE_SKYMAP_DIR:-${BASE_DIR}/data/skymap/negative/nsbh_skymap_${DATASET_MODE}}"
+else
+    : "${BNS_NEGATIVE_CATALOG_PATH:?test_aug requires BNS_NEGATIVE_CATALOG_PATH}"
+    : "${BNS_NEGATIVE_SKYMAP_DIR:?test_aug requires BNS_NEGATIVE_SKYMAP_DIR}"
+    : "${NSBH_NEGATIVE_CATALOG_PATH:?test_aug requires NSBH_NEGATIVE_CATALOG_PATH}"
+    : "${NSBH_NEGATIVE_SKYMAP_DIR:?test_aug requires NSBH_NEGATIVE_SKYMAP_DIR}"
+fi
 
 if [[ "$DATASET_MODE" != "train" && "$DATASET_MODE" != "test" ]]; then
     echo "DATASET_MODE must be train or test, got: $DATASET_MODE"
@@ -231,11 +315,13 @@ if [[ -z "${SLURM_JOB_ID:-}" ]]; then
     export BUFFER_LIMIT NUM_WORKERS SEED
     export BNS_MAX_LC_PER_GW NSBH_MAX_LC_PER_GW
     export BNS_MAX_NEG_GW NSBH_MAX_NEG_GW BNS_MAX_POS_GW NSBH_MAX_POS_GW
+    export BNS_MAX_NEG_TYPE1_GW BNS_MAX_NEG_TYPE2_GW
     export NSBH_MAX_NEG_TYPE1_GW NSBH_MAX_NEG_TYPE2_GW
-    export NSBH_MEJ_COL NSBH_TYPE1_THRESHOLD NSBH_REQUIRE_SUCCESS_FOR_MEJ_POS
     export FLUXCAL_ZP PSFFLUX_ZP LUPT_K LUPT_M5_MAG
     export BNS_FULL_CATALOG_PATH BNS_SKYMAP_DIR BNS_SIM_ROOT BNS_SIM_NAME BNS_SUCCESS_IDS_PATH
+    export BNS_NEGATIVE_CATALOG_PATH BNS_NEGATIVE_SKYMAP_DIR
     export NSBH_FULL_CATALOG_PATH NSBH_SKYMAP_DIR NSBH_SIM_ROOT NSBH_SIM_NAME NSBH_SUCCESS_IDS_PATH
+    export NSBH_NEGATIVE_CATALOG_PATH NSBH_NEGATIVE_SKYMAP_DIR
     export OUTPUT_H5_PATH
     sbatch_opts+=(--export=ALL)
 
@@ -249,26 +335,21 @@ fi
 
 require_file "$BNS_FULL_CATALOG_PATH"
 require_file "$NSBH_FULL_CATALOG_PATH"
+require_file "$BNS_NEGATIVE_CATALOG_PATH"
+require_file "$NSBH_NEGATIVE_CATALOG_PATH"
 require_dir "$BNS_SKYMAP_DIR"
 require_dir "$NSBH_SKYMAP_DIR"
+require_dir "$BNS_NEGATIVE_SKYMAP_DIR"
+require_dir "$NSBH_NEGATIVE_SKYMAP_DIR"
 require_dir "$BNS_SIM_ROOT"
 require_dir "$NSBH_SIM_ROOT"
 
-if [[ -n "${BNS_SUCCESS_IDS_PATH:-}" && ! -f "$BNS_SUCCESS_IDS_PATH" ]]; then
-    echo "WARNING: BNS success ids file not found, skip filtering: $BNS_SUCCESS_IDS_PATH"
-    BNS_SUCCESS_IDS_PATH=""
+if [[ -z "${BNS_SUCCESS_IDS_PATH:-}" || -z "${NSBH_SUCCESS_IDS_PATH:-}" ]]; then
+    echo "BNS_SUCCESS_IDS_PATH and NSBH_SUCCESS_IDS_PATH are required to distinguish type-2 negatives from missing observation coverage."
+    exit 1
 fi
-
-if [[ "${NSBH_REQUIRE_SUCCESS_FOR_MEJ_POS}" == "1" ]]; then
-    if [[ -z "${NSBH_SUCCESS_IDS_PATH:-}" ]]; then
-        echo "NSBH_SUCCESS_IDS_PATH is required when NSBH_REQUIRE_SUCCESS_FOR_MEJ_POS=1."
-        exit 1
-    fi
-    require_file "$NSBH_SUCCESS_IDS_PATH"
-elif [[ -n "${NSBH_SUCCESS_IDS_PATH:-}" && ! -f "$NSBH_SUCCESS_IDS_PATH" ]]; then
-    echo "WARNING: NSBH success ids file not found, skip filtering: $NSBH_SUCCESS_IDS_PATH"
-    NSBH_SUCCESS_IDS_PATH=""
-fi
+require_file "$BNS_SUCCESS_IDS_PATH"
+require_file "$NSBH_SUCCESS_IDS_PATH"
 
 mkdir -p "$(dirname "$OUTPUT_H5_PATH")"
 
@@ -299,17 +380,18 @@ cmd=(
     --lupt_m5_mag "$LUPT_M5_MAG"
     --bns_full_catalog_path "$BNS_FULL_CATALOG_PATH"
     --bns_skymap_dir "$BNS_SKYMAP_DIR"
+    --bns_negative_catalog_path "$BNS_NEGATIVE_CATALOG_PATH"
+    --bns_negative_skymap_dir "$BNS_NEGATIVE_SKYMAP_DIR"
     --bns_sim_root "$BNS_SIM_ROOT"
     --bns_sim_name "$BNS_SIM_NAME"
     --bns_max_lc_per_gw "$BNS_MAX_LC_PER_GW"
     --nsbh_full_catalog_path "$NSBH_FULL_CATALOG_PATH"
     --nsbh_skymap_dir "$NSBH_SKYMAP_DIR"
+    --nsbh_negative_catalog_path "$NSBH_NEGATIVE_CATALOG_PATH"
+    --nsbh_negative_skymap_dir "$NSBH_NEGATIVE_SKYMAP_DIR"
     --nsbh_sim_root "$NSBH_SIM_ROOT"
     --nsbh_sim_name "$NSBH_SIM_NAME"
     --nsbh_max_lc_per_gw "$NSBH_MAX_LC_PER_GW"
-    --nsbh_mej_col "$NSBH_MEJ_COL"
-    --nsbh_type1_threshold "$NSBH_TYPE1_THRESHOLD"
-    --nsbh_require_success_for_mej_pos "$NSBH_REQUIRE_SUCCESS_FOR_MEJ_POS"
 )
 
 append_optional_arg --bns_success_ids_path "${BNS_SUCCESS_IDS_PATH:-}"
@@ -318,6 +400,8 @@ append_optional_arg --bns_max_neg_gw "${BNS_MAX_NEG_GW:-}"
 append_optional_arg --nsbh_max_neg_gw "${NSBH_MAX_NEG_GW:-}"
 append_optional_arg --bns_max_pos_gw "${BNS_MAX_POS_GW:-}"
 append_optional_arg --nsbh_max_pos_gw "${NSBH_MAX_POS_GW:-}"
+append_optional_arg --bns_max_neg_type1_gw "${BNS_MAX_NEG_TYPE1_GW:-}"
+append_optional_arg --bns_max_neg_type2_gw "${BNS_MAX_NEG_TYPE2_GW:-}"
 append_optional_arg --nsbh_max_neg_type1_gw "${NSBH_MAX_NEG_TYPE1_GW:-}"
 append_optional_arg --nsbh_max_neg_type2_gw "${NSBH_MAX_NEG_TYPE2_GW:-}"
 

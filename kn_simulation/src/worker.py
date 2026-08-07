@@ -78,6 +78,21 @@ def _cleanup_transients(simlib: Path, input_file: Path) -> None:
     input_file.unlink(missing_ok=True)
 
 
+def _cleanup_snana_unneeded_outputs(profile: Profile, simulation_id: int) -> None:
+    """Remove per-event SNANA products that are not used downstream."""
+    version = f"{profile.sim_name}_{simulation_id}"
+    event_dir = profile.sndata_sim_dir / version
+    for suffix in (".DUMP", ".LIST"):
+        path = event_dir / f"{version}{suffix}"
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as error:
+            print(
+                f"WARNING: could not remove unused SNANA output {path}: {error}",
+                file=sys.stderr,
+            )
+
+
 def _snana_head(profile: Profile, simulation_id: int) -> Path:
     version = f"{profile.sim_name}_{simulation_id}"
     return profile.sndata_sim_dir / version / f"{version}_HEAD.FITS"
@@ -170,6 +185,7 @@ def _run_one(
         traceback.print_exc()
         return result
     finally:
+        _cleanup_snana_unneeded_outputs(profile, simulation_id)
         _cleanup_transients(simlib, input_file)
 
 
@@ -297,11 +313,7 @@ def finalize_submission(
         "invalid_task_sidecars": sorted(invalid_sidecars),
         "counts": {name: len(values) for name, values in grouped.items()},
     }
-    complete = (
-        not missing_tasks
-        and not invalid_sidecars
-        and not grouped["unprocessed"]
-    )
+    complete = not missing_tasks and not invalid_sidecars and not grouped["unprocessed"]
     if complete:
         try:
             summary["aggregate"] = compact_artifacts(

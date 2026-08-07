@@ -56,7 +56,9 @@ GPS_TIME_COLUMN_CANDIDATES = (
 LUPT_BAND_ORDER = ("u", "g", "r", "i", "z", "Y")
 FIRST_DETECTION_POLICY = "psfflux_snr5_then_photflag_then_head_mjd_detect_first"
 FIRST_DETECTION_SNR_DOMAIN = "merged_psfflux"
-SCALAR_COLUMN_NAMES = "mass1_detector,mass2_detector,spin1z,spin2z,costheta,distmean_gpc,diststd_gpc"
+SCALAR_COLUMN_NAMES = (
+    "mass1_detector,mass2_detector,spin1z,spin2z,costheta,distmean_gpc,diststd_gpc"
+)
 DEFAULT_MTAN_SNR_S0 = 3.0
 DEFAULT_MTAN_SNR_BETA = 1.0
 DEFAULT_MTAN_SNR_CLIP_MIN = -8.0
@@ -107,7 +109,9 @@ def build_luptitude_params(
             f"Invalid FLUXCAL->psfFlux conversion factor computed from fluxcal_zp={fluxcal_zp}, psfflux_zp={psfflux_zp}."
         )
 
-    lupt_f5sigma_njy = 10.0 ** ((float(psfflux_zp) - lupt_m5_mag.astype(np.float64, copy=False)) / 2.5)
+    lupt_f5sigma_njy = 10.0 ** (
+        (float(psfflux_zp) - lupt_m5_mag.astype(np.float64, copy=False)) / 2.5
+    )
     if np.any(lupt_f5sigma_njy <= 0) or not np.all(np.isfinite(lupt_f5sigma_njy)):
         raise ValueError("Derived lupt_f5sigma_njy values must be finite and > 0.")
     lupt_b_njy = float(lupt_k) * (lupt_f5sigma_njy / 5.0)
@@ -158,13 +162,11 @@ class SourceConfig:
     sim_root: str
     sim_name: str
     success_ids_path: Optional[str] = None
+    negative_catalog_path: Optional[str] = None
+    negative_skymap_dir: Optional[str] = None
     max_lc_per_gw: Optional[int] = 1000
     max_neg_gw: Optional[int] = None
     max_pos_gw: Optional[int] = None
-    # NSBH-only controls
-    mej_col: str = "mej_tot"
-    type1_threshold: float = 0.0
-    require_success_for_mej_pos: bool = False
     max_neg_type1_gw: Optional[int] = None
     max_neg_type2_gw: Optional[int] = None
 
@@ -180,20 +182,26 @@ class SourcePrepared:
     neg_event_ids: np.ndarray
     neg_type_by_event: Dict[int, int]
     mej_by_event: Dict[int, float]
+    mej_dynamic_by_event: Dict[int, float]
+    mej_wind_by_event: Dict[int, float]
     event_time_mjd: np.ndarray
     event_time_col: str
     event_time_from_gps: bool
     n_invalid_event_time: int
     n_missing_skymap: int
     n_filtered_non_success_mej_pos: int = 0
-    nsbh_mej_col_resolved: Optional[str] = None
     success_ids_mej_pos: Optional[Set[int]] = None
+    simulation_id_by_event: Dict[int, int] = None
+    event_uid_by_event: Dict[int, str] = None
+    sample_class_by_event: Dict[int, str] = None
+    skymap_dir_by_event: Dict[int, str] = None
 
 
 @dataclass(frozen=True)
 class EventProcessTask:
     tag: str
     event_id: int
+    simulation_id: int
     sim_root: str
     sim_name: str
     skymap_dir: str
@@ -209,7 +217,9 @@ class EventProcessResult:
     event_id: int
     include_lightcurves: bool
     status: str
-    lcs: Optional[List[Tuple]] = None  # 5-tuple normally; 6-tuple when first_detection mode
+    lcs: Optional[List[Tuple]] = (
+        None  # 5-tuple normally; 6-tuple when first_detection mode
+    )
     skymap: Optional[np.ndarray] = None
 
 
@@ -224,13 +234,16 @@ def _build_event_process_task(
     return EventProcessTask(
         tag=str(src.cfg.tag),
         event_id=int(event_id),
+        simulation_id=int(src.simulation_id_by_event[event_id]),
         sim_root=str(src.cfg.sim_root),
         sim_name=str(src.cfg.sim_name),
-        skymap_dir=str(src.cfg.skymap_dir),
+        skymap_dir=str(src.skymap_dir_by_event[event_id]),
         include_lightcurves=bool(include_lightcurves),
         fluxcal_to_psfflux_factor=float(fluxcal_to_psfflux_factor),
         psfflux_zp=float(psfflux_zp),
-        lupt_b_njy=tuple(float(x) for x in np.asarray(lupt_b_njy, dtype=np.float64).tolist()),
+        lupt_b_njy=tuple(
+            float(x) for x in np.asarray(lupt_b_njy, dtype=np.float64).tolist()
+        ),
     )
 
 
@@ -246,10 +259,12 @@ def _sampled_skymap_to_numpy(skymap_obj) -> np.ndarray:
 
 
 def _process_event_task(task: EventProcessTask) -> EventProcessResult:
-    lcs: Optional[List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]]] = None
+    lcs: Optional[
+        List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]]
+    ] = None
     if task.include_lightcurves:
         lcs = parse_snana_fits(
-            event_id=int(task.event_id),
+            event_id=int(task.simulation_id),
             sim_dir=task.sim_root,
             sim_name=task.sim_name,
             fluxcal_to_psfflux_factor=float(task.fluxcal_to_psfflux_factor),
@@ -267,7 +282,7 @@ def _process_event_task(task: EventProcessTask) -> EventProcessResult:
                 skymap=None,
             )
 
-    skymap_path = os.path.join(task.skymap_dir, f"{int(task.event_id)}.fits")
+    skymap_path = os.path.join(task.skymap_dir, f"{int(task.simulation_id)}.fits")
     try:
         skymap = _sampled_skymap_to_numpy(sample_moc_skymap(skymap_path))
     except Exception:
@@ -301,7 +316,9 @@ def _iter_event_task_results(
     effective_workers = max(1, min(int(num_workers), len(tasks)))
     if effective_workers <= 1:
         iterator = (_process_event_task(task) for task in tasks)
-        for result in tqdm(iterator, total=len(tasks), desc=desc, mininterval=0.5, miniters=100):
+        for result in tqdm(
+            iterator, total=len(tasks), desc=desc, mininterval=0.5, miniters=100
+        ):
             yield result
         return
 
@@ -314,14 +331,20 @@ def _iter_event_task_results(
         except ValueError:
             pass
 
-    print(f"[{desc}] using ordered process pool with {effective_workers} workers (chunksize={chunksize})")
+    print(
+        f"[{desc}] using ordered process pool with {effective_workers} workers (chunksize={chunksize})"
+    )
     with ProcessPoolExecutor(**executor_kwargs) as executor:
         iterator = executor.map(_process_event_task, tasks, chunksize=chunksize)
-        for result in tqdm(iterator, total=len(tasks), desc=desc, mininterval=0.5, miniters=100):
+        for result in tqdm(
+            iterator, total=len(tasks), desc=desc, mininterval=0.5, miniters=100
+        ):
             yield result
 
 
-def _find_column_case_insensitive(df: pd.DataFrame, candidates: Tuple[str, ...]) -> Optional[str]:
+def _find_column_case_insensitive(
+    df: pd.DataFrame, candidates: Tuple[str, ...]
+) -> Optional[str]:
     col_by_lower = {str(col).lower(): str(col) for col in df.columns}
     for cand in candidates:
         found = col_by_lower.get(cand.lower())
@@ -335,7 +358,9 @@ def _gps_to_mjd(gps_values: np.ndarray) -> np.ndarray:
     finite_mask = np.isfinite(gps_values)
     if not np.any(finite_mask):
         return out
-    out[finite_mask] = Time(gps_values[finite_mask], format="gps", scale="utc").mjd.astype(np.float64)
+    out[finite_mask] = Time(
+        gps_values[finite_mask], format="gps", scale="utc"
+    ).mjd.astype(np.float64)
     return out
 
 
@@ -354,11 +379,15 @@ def _extract_event_time_mjd(
     used_gps_fallback = False
 
     if event_time_col is not None:
-        event_time_mjd = pd.to_numeric(gw_df[event_time_col], errors="coerce").to_numpy(np.float64)
+        event_time_mjd = pd.to_numeric(gw_df[event_time_col], errors="coerce").to_numpy(
+            np.float64
+        )
     else:
         gps_col = _find_column_case_insensitive(gw_df, GPS_TIME_COLUMN_CANDIDATES)
         if gps_col is not None:
-            gps_values = pd.to_numeric(gw_df[gps_col], errors="coerce").to_numpy(np.float64)
+            gps_values = pd.to_numeric(gw_df[gps_col], errors="coerce").to_numpy(
+                np.float64
+            )
             event_time_mjd = _gps_to_mjd(gps_values)
             event_time_col = gps_col
             used_gps_fallback = True
@@ -394,7 +423,9 @@ def _load_gw_catalog(
 
     dup_count = int(gw_df["simulation_id"].duplicated().sum())
     if dup_count > 0:
-        print(f"WARNING: found {dup_count} duplicate simulation_id rows. Keeping first occurrence.")
+        print(
+            f"WARNING: found {dup_count} duplicate simulation_id rows. Keeping first occurrence."
+        )
         gw_df = gw_df.drop_duplicates(subset=["simulation_id"], keep="first").copy()
         gw_df.reset_index(drop=True, inplace=True)
 
@@ -407,21 +438,6 @@ def _normalize_max_count(value: Optional[int]) -> Optional[int]:
     if int(value) <= 0:
         return None
     return int(value)
-
-
-def _resolve_nsbh_mej_col(gw_df: pd.DataFrame, requested_col: str) -> str:
-    if requested_col in gw_df.columns:
-        return requested_col
-    if requested_col == "mej_tot" and "mej_total" in gw_df.columns:
-        return "mej_total"
-    # Extra fallback for robustness if caller passes unexpected name.
-    if "mej_tot" in gw_df.columns:
-        return "mej_tot"
-    if "mej_total" in gw_df.columns:
-        return "mej_total"
-    raise ValueError(
-        f"NSBH catalog missing mej column. Tried '{requested_col}', 'mej_tot', 'mej_total'."
-    )
 
 
 def _scan_source_pos_neg(
@@ -517,7 +533,7 @@ def _shuffle_event_ids(
     return rng.permutation(event_ids).astype(np.int64, copy=False)
 
 
-def _cap_nsbh_neg_total(
+def _cap_neg_total(
     type1_ids: np.ndarray,
     type2_ids: np.ndarray,
     max_total: Optional[int],
@@ -532,7 +548,10 @@ def _cap_nsbh_neg_total(
 
     all_ids = np.concatenate([type1_ids, type2_ids], axis=0)
     all_types = np.concatenate(
-        [np.ones(len(type1_ids), dtype=np.int8), np.full(len(type2_ids), 2, dtype=np.int8)],
+        [
+            np.ones(len(type1_ids), dtype=np.int8),
+            np.full(len(type2_ids), 2, dtype=np.int8),
+        ],
         axis=0,
     )
     chosen_idx = rng.choice(total, size=max_total, replace=False)
@@ -561,13 +580,11 @@ def _normalize_gw_catalog_columns(
 
     if "inclination" not in gw_df.columns:
         if "theta_jn" in gw_df.columns:
-            gw_df["inclination"] = pd.to_numeric(
-                gw_df["theta_jn"], errors="coerce"
-            )
+            gw_df["inclination"] = pd.to_numeric(gw_df["theta_jn"], errors="coerce")
         elif "viewing_costheta" in gw_df.columns:
-            costheta = pd.to_numeric(
-                gw_df["viewing_costheta"], errors="coerce"
-            ).clip(-1.0, 1.0)
+            costheta = pd.to_numeric(gw_df["viewing_costheta"], errors="coerce").clip(
+                -1.0, 1.0
+            )
             gw_df["inclination"] = np.arccos(costheta)
         else:
             raise ValueError(
@@ -576,9 +593,9 @@ def _normalize_gw_catalog_columns(
 
     if "distmean" not in gw_df.columns or "diststd" not in gw_df.columns:
         fallback_mean = (
-            pd.to_numeric(
-                gw_df["luminosity_distance"], errors="coerce"
-            ).to_numpy(np.float64)
+            pd.to_numeric(gw_df["luminosity_distance"], errors="coerce").to_numpy(
+                np.float64
+            )
             if "luminosity_distance" in gw_df.columns
             else np.full(len(gw_df), np.nan)
         )
@@ -603,207 +620,221 @@ def _normalize_gw_catalog_columns(
     return gw_df
 
 
-def _prepare_bns_source(
+def _sample_required_event_ids(
+    event_ids: np.ndarray,
+    max_count: Optional[int],
+    rng: np.random.Generator,
+    *,
+    label: str,
+) -> np.ndarray:
+    normalized = _normalize_max_count(max_count)
+    if normalized is not None and len(event_ids) < normalized:
+        raise ValueError(
+            f"{label}: found {len(event_ids)} candidates but {normalized} are required"
+        )
+    return _sample_event_ids(event_ids, normalized, rng)
+
+
+def _validate_catalog_namespace(
+    frame: pd.DataFrame, *, source: str, split: str, sample_class: str
+) -> None:
+    required = {"simulation_id", "event_uid", "sample_class"}
+    missing = sorted(required - set(frame.columns))
+    if missing:
+        raise ValueError(f"{source} {sample_class} catalog missing columns: {missing}")
+    if frame.empty:
+        raise ValueError(f"{source} {sample_class} catalog is empty")
+    if not (frame["sample_class"].astype(str) == sample_class).all():
+        raise ValueError(f"{source} catalog sample_class must be {sample_class}")
+    actual = frame["event_uid"].astype(str)
+    expected = (
+        source
+        + "_"
+        + split
+        + "_"
+        + sample_class
+        + "_"
+        + frame["simulation_id"].astype(np.int64).astype(str)
+    )
+    if not (actual == expected).all():
+        raise ValueError(f"{source} {sample_class} event_uid is not canonical")
+    if actual.duplicated().any():
+        raise ValueError(f"{source} {sample_class} catalog has duplicate event_uid")
+
+
+def _prepare_source(
     cfg: SourceConfig,
     dataset_mode: str,
     rng: np.random.Generator,
 ) -> SourcePrepared:
-    gw_df = _load_gw_catalog(cfg.full_catalog_path, cfg.success_ids_path)
-    gw_df = _normalize_gw_catalog_columns(gw_df, cfg.skymap_dir)
-
-    missing_cols = [col for col in GW_PARAM_COLUMNS if col not in gw_df.columns]
-    if missing_cols:
+    if dataset_mode not in {"train", "test"}:
+        raise ValueError(f"unsupported dataset split: {dataset_mode}")
+    if not cfg.negative_catalog_path or not cfg.negative_skymap_dir:
         raise ValueError(
-            f"{cfg.tag}: missing required columns {missing_cols} in {cfg.full_catalog_path}"
+            f"{cfg.tag}: separate negative catalog and skymap dir are required"
         )
 
-    gw_df = gw_df.copy()
-    event_time_mjd, event_time_col, event_time_from_gps, n_invalid_event_time = _extract_event_time_mjd(
-        gw_df
+    positive = _load_gw_catalog(cfg.full_catalog_path, success_ids_path=None)
+    negative = _load_gw_catalog(cfg.negative_catalog_path, success_ids_path=None)
+    _validate_catalog_namespace(
+        positive, source=cfg.tag, split=dataset_mode, sample_class="pos"
+    )
+    _validate_catalog_namespace(
+        negative, source=cfg.tag, split=dataset_mode, sample_class="neg"
+    )
+    positive = _normalize_gw_catalog_columns(positive, cfg.skymap_dir)
+    negative = _normalize_gw_catalog_columns(negative, cfg.negative_skymap_dir)
+
+    required = [*GW_PARAM_COLUMNS, "mej_dynamic", "mej_wind"]
+    for label, frame in (("positive", positive), ("negative", negative)):
+        missing_cols = [col for col in required if col not in frame.columns]
+        if missing_cols:
+            raise ValueError(
+                f"{cfg.tag} {label}: missing required columns {missing_cols}"
+            )
+
+    positive = positive.copy()
+    negative = negative.copy()
+    positive_original = positive["simulation_id"].to_numpy(np.int64)
+    negative_original = negative["simulation_id"].to_numpy(np.int64)
+    if np.any(positive_original < 0) or np.any(negative_original < 0):
+        raise ValueError(f"{cfg.tag}: simulation_id must be non-negative")
+    positive["_original_simulation_id"] = positive_original
+    negative["_original_simulation_id"] = negative_original
+    positive["_internal_event_id"] = positive_original
+    negative["_internal_event_id"] = -(negative_original + 1)
+    positive["_skymap_dir"] = str(cfg.skymap_dir)
+    negative["_skymap_dir"] = str(cfg.negative_skymap_dir)
+    gw_df = pd.concat([positive, negative], ignore_index=True, sort=False)
+    gw_df["simulation_id"] = gw_df["_internal_event_id"].astype(np.int64)
+
+    event_time_mjd, event_time_col, event_time_from_gps, n_invalid_event_time = (
+        _extract_event_time_mjd(gw_df)
     )
     gw_df["inclination"] = np.cos(gw_df["inclination"])
     gw_df["distmean"] = gw_df["distmean"] / 1000.0
     gw_df["diststd"] = gw_df["diststd"] / 1000.0
+    dynamic = pd.to_numeric(gw_df["mej_dynamic"], errors="coerce").to_numpy(np.float64)
+    wind = pd.to_numeric(gw_df["mej_wind"], errors="coerce").to_numpy(np.float64)
+    if not np.all(np.isfinite(dynamic)) or not np.all(np.isfinite(wind)):
+        raise ValueError(f"{cfg.tag}: ejecta component masses must be finite")
+    if np.any(dynamic < 0) or np.any(wind < 0):
+        raise ValueError(
+            f"{cfg.tag}: physical ejecta component masses must be non-negative"
+        )
+    total = dynamic + wind
+    classes = gw_df["sample_class"].astype(str).to_numpy()
+    if np.any(total[classes == "pos"] <= 0):
+        raise ValueError(f"{cfg.tag}: positive catalog requires total ejecta > 0")
+    if np.any(dynamic[classes == "neg"] != 0) or np.any(wind[classes == "neg"] != 0):
+        raise ValueError(f"{cfg.tag}: type-1 catalog requires double-zero ejecta")
 
     sim_ids = gw_df["simulation_id"].to_numpy(np.int64)
-
-    pos_ids, neg_ids, missing_skymap = _scan_source_pos_neg(
-        event_ids=sim_ids,
+    if len(sim_ids) != len(set(sim_ids.tolist())):
+        raise ValueError(f"{cfg.tag}: internal event IDs are not unique")
+    if not cfg.success_ids_path:
+        raise ValueError(
+            f"{cfg.tag}: success_ids_path is required to exclude missing coverage"
+        )
+    success_ids = _load_success_ids(cfg.success_ids_path)
+    positive_ids_all = positive_original
+    success_positive_ids = np.asarray(
+        [
+            int(event_id)
+            for event_id in positive_ids_all
+            if int(event_id) in success_ids
+        ],
+        dtype=np.int64,
+    )
+    n_filtered_non_success = int(len(positive_ids_all) - len(success_positive_ids))
+    pos_ids, type2_ids, missing_skymap_positive = _scan_source_pos_neg(
+        event_ids=success_positive_ids,
         skymap_dir=cfg.skymap_dir,
         sim_root=cfg.sim_root,
         sim_name=cfg.sim_name,
-        scan_desc=f"Scanning {cfg.tag.upper()} events",
+        scan_desc=f"Scanning {cfg.tag.upper()} successful positive-ejecta events",
     )
+    valid_negative_original, missing_skymap_type1 = _scan_ids_with_skymap_only(
+        event_ids=negative_original,
+        skymap_dir=cfg.negative_skymap_dir,
+        scan_desc=f"Scanning {cfg.tag.upper()} type-1 events",
+    )
+    type1_ids = -(valid_negative_original + 1)
 
-    max_neg = _normalize_max_count(cfg.max_neg_gw)
-
-    if dataset_mode == "test":
-        neg_ids = _sample_event_ids(neg_ids, max_neg, rng)
-    else:
-        neg_ids = np.empty((0,), dtype=np.int64)
-
-    event_to_row: Dict[int, int] = {int(eid): i for i, eid in enumerate(sim_ids)}
-    gw_params = gw_df[GW_PARAM_COLUMNS].to_numpy(np.float32)
-    neg_type_by_event = {int(eid): 2 for eid in neg_ids.tolist()}
-    mej_by_event = {int(eid): np.nan for eid in sim_ids.tolist()}
+    sampled_type1 = _sample_required_event_ids(
+        type1_ids, cfg.max_neg_type1_gw, rng, label=f"{cfg.tag} type-1"
+    )
+    sampled_type2 = _sample_required_event_ids(
+        type2_ids, cfg.max_neg_type2_gw, rng, label=f"{cfg.tag} type-2"
+    )
+    sampled_type1, sampled_type2 = _cap_neg_total(
+        sampled_type1, sampled_type2, _normalize_max_count(cfg.max_neg_gw), rng
+    )
+    neg_ids = np.concatenate([sampled_type1, sampled_type2], axis=0)
+    neg_type_by_event = {int(event_id): 1 for event_id in sampled_type1.tolist()}
+    neg_type_by_event.update({int(event_id): 2 for event_id in sampled_type2.tolist()})
+    event_to_row = {int(event_id): index for index, event_id in enumerate(sim_ids)}
+    simulation_id_by_event = dict(
+        zip(
+            sim_ids.tolist(), gw_df["_original_simulation_id"].astype(np.int64).tolist()
+        )
+    )
+    event_uid_by_event = dict(
+        zip(sim_ids.tolist(), gw_df["event_uid"].astype(str).tolist())
+    )
+    sample_class_by_event = dict(
+        zip(sim_ids.tolist(), gw_df["sample_class"].astype(str).tolist())
+    )
+    skymap_dir_by_event = dict(
+        zip(sim_ids.tolist(), gw_df["_skymap_dir"].astype(str).tolist())
+    )
 
     print(
-        f"\n[{cfg.tag}] catalog={len(sim_ids)} "
-        f"event_time_col={event_time_col} "
-        f"event_time_from_gps={int(event_time_from_gps)} "
-        f"invalid_event_time={n_invalid_event_time} "
-        f"missing_skymap={missing_skymap} "
-        f"positive_candidates={len(pos_ids)} selected_neg={len(neg_ids)}"
+        f"[{cfg.tag}] pos_catalog={len(positive)} neg_catalog={len(negative)} "
+        f"filtered_without_success={n_filtered_non_success} "
+        f"positive_with_lc={len(pos_ids)} selected_type1={len(sampled_type1)} "
+        f"selected_type2={len(sampled_type2)}"
     )
-
     return SourcePrepared(
         cfg=cfg,
         gw_df=gw_df,
-        gw_params=gw_params,
+        gw_params=gw_df[GW_PARAM_COLUMNS].to_numpy(np.float32),
         sim_ids=sim_ids,
         event_to_row=event_to_row,
         pos_event_ids=pos_ids,
         neg_event_ids=neg_ids,
         neg_type_by_event=neg_type_by_event,
-        mej_by_event=mej_by_event,
+        mej_by_event={int(sim_ids[i]): float(total[i]) for i in range(len(sim_ids))},
+        mej_dynamic_by_event={
+            int(sim_ids[i]): float(dynamic[i]) for i in range(len(sim_ids))
+        },
+        mej_wind_by_event={
+            int(sim_ids[i]): float(wind[i]) for i in range(len(sim_ids))
+        },
         event_time_mjd=event_time_mjd,
         event_time_col=event_time_col,
         event_time_from_gps=event_time_from_gps,
         n_invalid_event_time=n_invalid_event_time,
-        n_missing_skymap=missing_skymap,
+        n_missing_skymap=missing_skymap_positive + missing_skymap_type1,
+        n_filtered_non_success_mej_pos=n_filtered_non_success,
+        success_ids_mej_pos=success_ids,
+        simulation_id_by_event=simulation_id_by_event,
+        event_uid_by_event=event_uid_by_event,
+        sample_class_by_event=sample_class_by_event,
+        skymap_dir_by_event=skymap_dir_by_event,
     )
+
+
+def _prepare_bns_source(
+    cfg: SourceConfig, dataset_mode: str, rng: np.random.Generator
+) -> SourcePrepared:
+    return _prepare_source(cfg, dataset_mode, rng)
 
 
 def _prepare_nsbh_source(
-    cfg: SourceConfig,
-    dataset_mode: str,
-    rng: np.random.Generator,
+    cfg: SourceConfig, dataset_mode: str, rng: np.random.Generator
 ) -> SourcePrepared:
-    gw_df = _load_gw_catalog(cfg.full_catalog_path, success_ids_path=None)
-    gw_df = _normalize_gw_catalog_columns(gw_df, cfg.skymap_dir)
-
-    missing_cols = [col for col in GW_PARAM_COLUMNS if col not in gw_df.columns]
-    if missing_cols:
-        raise ValueError(
-            f"{cfg.tag}: missing required columns {missing_cols} in {cfg.full_catalog_path}"
-        )
-
-    gw_df = gw_df.copy()
-    event_time_mjd, event_time_col, event_time_from_gps, n_invalid_event_time = _extract_event_time_mjd(
-        gw_df
-    )
-    gw_df["inclination"] = np.cos(gw_df["inclination"])
-    gw_df["distmean"] = gw_df["distmean"] / 1000.0
-    gw_df["diststd"] = gw_df["diststd"] / 1000.0
-
-    mej_col = _resolve_nsbh_mej_col(gw_df, cfg.mej_col)
-    mej_values = pd.to_numeric(gw_df[mej_col], errors="coerce").to_numpy(np.float64)
-
-    sim_ids = gw_df["simulation_id"].to_numpy(np.int64)
-    event_to_row: Dict[int, int] = {int(eid): i for i, eid in enumerate(sim_ids)}
-    gw_params = gw_df[GW_PARAM_COLUMNS].to_numpy(np.float32)
-    mej_by_event = {
-        int(sim_ids[i]): float(mej_values[i]) if np.isfinite(mej_values[i]) else np.nan
-        for i in range(len(sim_ids))
-    }
-
-    type1_mask = np.isfinite(mej_values) & (mej_values <= float(cfg.type1_threshold))
-    mej_pos_mask = np.isfinite(mej_values) & (mej_values > float(cfg.type1_threshold))
-    type1_ids_all = sim_ids[type1_mask]
-    mej_pos_ids_all = sim_ids[mej_pos_mask]
-
-    success_ids: Optional[Set[int]] = None
-    mej_pos_ids_filtered = mej_pos_ids_all
-    n_filtered_non_success = 0
-    if cfg.require_success_for_mej_pos:
-        if not cfg.success_ids_path:
-            raise ValueError(
-                "NSBH requires success filtering for mej>threshold, but --nsbh_success_ids_path is empty."
-            )
-        success_ids = _load_success_ids(cfg.success_ids_path)
-        keep_mask = np.fromiter(
-            (int(eid) in success_ids for eid in mej_pos_ids_all),
-            dtype=bool,
-            count=len(mej_pos_ids_all),
-        )
-        mej_pos_ids_filtered = mej_pos_ids_all[keep_mask]
-        n_filtered_non_success = int(len(mej_pos_ids_all) - len(mej_pos_ids_filtered))
-
-    pos_ids, type2_ids, missing_skymap_mej_pos = _scan_source_pos_neg(
-        event_ids=mej_pos_ids_filtered,
-        skymap_dir=cfg.skymap_dir,
-        sim_root=cfg.sim_root,
-        sim_name=cfg.sim_name,
-        scan_desc="Scanning NSBH mej>threshold success-eligible events",
-    )
-
-    type1_ids = np.empty((0,), dtype=np.int64)
-    missing_skymap_type1 = 0
-    if dataset_mode == "test":
-        type1_ids, missing_skymap_type1 = _scan_ids_with_skymap_only(
-            event_ids=type1_ids_all,
-            skymap_dir=cfg.skymap_dir,
-            scan_desc="Scanning NSBH type1 negative candidates (mej<=threshold)",
-        )
-
-    sampled_type1 = np.empty((0,), dtype=np.int64)
-    sampled_type2 = np.empty((0,), dtype=np.int64)
-    if dataset_mode == "test":
-        sampled_type1 = _sample_event_ids(
-            type1_ids,
-            _normalize_max_count(cfg.max_neg_type1_gw),
-            rng,
-        )
-        sampled_type2 = _sample_event_ids(
-            type2_ids,
-            _normalize_max_count(cfg.max_neg_type2_gw),
-            rng,
-        )
-        sampled_type1, sampled_type2 = _cap_nsbh_neg_total(
-            sampled_type1,
-            sampled_type2,
-            _normalize_max_count(cfg.max_neg_gw),
-            rng,
-        )
-
-    neg_ids = np.concatenate([sampled_type1, sampled_type2], axis=0)
-    neg_type_by_event: Dict[int, int] = {int(eid): 1 for eid in sampled_type1.tolist()}
-    neg_type_by_event.update({int(eid): 2 for eid in sampled_type2.tolist()})
-
-    print(
-        f"\n[{cfg.tag}] catalog={len(sim_ids)} "
-        f"event_time_col={event_time_col} "
-        f"event_time_from_gps={int(event_time_from_gps)} "
-        f"invalid_event_time={n_invalid_event_time} "
-        f"mej_col={mej_col} "
-        f"type1_candidates={len(type1_ids_all)} "
-        f"mej_pos_candidates={len(mej_pos_ids_all)} "
-        f"filtered_non_success_mej_pos={n_filtered_non_success} "
-        f"positive_candidates={len(pos_ids)} "
-        f"selected_neg_type1={len(sampled_type1)} "
-        f"selected_neg_type2={len(sampled_type2)} "
-        f"missing_skymap={missing_skymap_mej_pos + missing_skymap_type1}"
-    )
-
-    return SourcePrepared(
-        cfg=cfg,
-        gw_df=gw_df,
-        gw_params=gw_params,
-        sim_ids=sim_ids,
-        event_to_row=event_to_row,
-        pos_event_ids=pos_ids,
-        neg_event_ids=neg_ids,
-        neg_type_by_event=neg_type_by_event,
-        mej_by_event=mej_by_event,
-        event_time_mjd=event_time_mjd,
-        event_time_col=event_time_col,
-        event_time_from_gps=event_time_from_gps,
-        n_invalid_event_time=n_invalid_event_time,
-        n_missing_skymap=missing_skymap_mej_pos + missing_skymap_type1,
-        n_filtered_non_success_mej_pos=n_filtered_non_success,
-        nsbh_mej_col_resolved=mej_col,
-        success_ids_mej_pos=success_ids,
-    )
+    return _prepare_source(cfg, dataset_mode, rng)
 
 
 def create_dataset_with_neg_gw_bns_nsbh_fast(
@@ -832,11 +863,17 @@ def create_dataset_with_neg_gw_bns_nsbh_fast(
     if not np.isfinite(fluxcal_to_psfflux_factor) or fluxcal_to_psfflux_factor <= 0:
         raise ValueError("fluxcal_to_psfflux_factor must be finite and > 0.")
     if lupt_m5_mag is None or np.asarray(lupt_m5_mag).shape != (NUM_BANDS,):
-        raise ValueError(f"lupt_m5_mag must contain {NUM_BANDS} values in order u,g,r,i,z,Y.")
+        raise ValueError(
+            f"lupt_m5_mag must contain {NUM_BANDS} values in order u,g,r,i,z,Y."
+        )
     if lupt_f5sigma_njy is None or np.asarray(lupt_f5sigma_njy).shape != (NUM_BANDS,):
-        raise ValueError(f"lupt_f5sigma_njy must contain {NUM_BANDS} values in order u,g,r,i,z,Y.")
+        raise ValueError(
+            f"lupt_f5sigma_njy must contain {NUM_BANDS} values in order u,g,r,i,z,Y."
+        )
     if lupt_b_njy is None or np.asarray(lupt_b_njy).shape != (NUM_BANDS,):
-        raise ValueError(f"lupt_b_njy must contain {NUM_BANDS} values in order u,g,r,i,z,Y.")
+        raise ValueError(
+            f"lupt_b_njy must contain {NUM_BANDS} values in order u,g,r,i,z,Y."
+        )
 
     rng = np.random.default_rng(seed)
     bns_rng = np.random.default_rng(int(rng.integers(0, 2**31 - 1)))
@@ -867,14 +904,13 @@ def create_dataset_with_neg_gw_bns_nsbh_fast(
         )
         for tag in ("bns", "nsbh")
     }
-    neg_events: List[Tuple[str, int]] = []
-    if dataset_mode == "test":
-        neg_events = (
-            [("bns", int(eid)) for eid in prepared["bns"].neg_event_ids.tolist()]
-            + [("nsbh", int(eid)) for eid in prepared["nsbh"].neg_event_ids.tolist()]
-        )
+    neg_events: List[Tuple[str, int]] = [
+        ("bns", int(eid)) for eid in prepared["bns"].neg_event_ids.tolist()
+    ] + [("nsbh", int(eid)) for eid in prepared["nsbh"].neg_event_ids.tolist()]
 
-    n_positive_candidates = int(pos_candidate_counts["bns"] + pos_candidate_counts["nsbh"])
+    n_positive_candidates = int(
+        pos_candidate_counts["bns"] + pos_candidate_counts["nsbh"]
+    )
     n_target_pos = int(target_pos_counts["bns"] + target_pos_counts["nsbh"])
     n_expected_gw = n_target_pos + len(neg_events)
     print(
@@ -912,6 +948,15 @@ def create_dataset_with_neg_gw_bns_nsbh_fast(
             dtype=dt_str,
             chunks=(gw_chunk,),
         )
+        ds_gw_event_uid = grp_gw.create_dataset(
+            "event_uid", (0,), maxshape=(None,), dtype=dt_str, chunks=(gw_chunk,)
+        )
+        ds_gw_simulation_id = grp_gw.create_dataset(
+            "simulation_id", (0,), maxshape=(None,), dtype="i8", chunks=(gw_chunk,)
+        )
+        ds_gw_sample_class = grp_gw.create_dataset(
+            "sample_class", (0,), maxshape=(None,), dtype=dt_str, chunks=(gw_chunk,)
+        )
         ds_gw_has_kn = grp_gw.create_dataset(
             "has_kn",
             (0,),
@@ -925,6 +970,12 @@ def create_dataset_with_neg_gw_bns_nsbh_fast(
             maxshape=(None,),
             dtype="i4",
             chunks=(gw_chunk,),
+        )
+        ds_gw_mej_dynamic = grp_gw.create_dataset(
+            "mej_dynamic", (0,), maxshape=(None,), dtype="f4", chunks=(gw_chunk,)
+        )
+        ds_gw_mej_wind = grp_gw.create_dataset(
+            "mej_wind", (0,), maxshape=(None,), dtype="f4", chunks=(gw_chunk,)
         )
         ds_gw_mej_tot = grp_gw.create_dataset(
             "mej_tot",
@@ -1045,8 +1096,13 @@ def create_dataset_with_neg_gw_bns_nsbh_fast(
             ds_gw_scalars.resize(new_size, axis=0)
             ds_gw_skymaps.resize(new_size, axis=0)
             ds_gw_ids.resize(new_size, axis=0)
+            ds_gw_event_uid.resize(new_size, axis=0)
+            ds_gw_simulation_id.resize(new_size, axis=0)
+            ds_gw_sample_class.resize(new_size, axis=0)
             ds_gw_has_kn.resize(new_size, axis=0)
             ds_gw_neg_type.resize(new_size, axis=0)
+            ds_gw_mej_dynamic.resize(new_size, axis=0)
+            ds_gw_mej_wind.resize(new_size, axis=0)
             ds_gw_mej_tot.resize(new_size, axis=0)
             ds_gw_event_time_mjd.resize(new_size, axis=0)
             ds_gw_source_type.resize(new_size, axis=0)
@@ -1055,8 +1111,12 @@ def create_dataset_with_neg_gw_bns_nsbh_fast(
             scalar: np.ndarray,
             skymap: np.ndarray,
             gw_id: str,
+            simulation_id: int,
+            sample_class: str,
             has_kn: int,
             neg_type: int,
+            mej_dynamic: float,
+            mej_wind: float,
             mej_tot: float,
             event_time_mjd: float,
             source_type: str,
@@ -1066,8 +1126,13 @@ def create_dataset_with_neg_gw_bns_nsbh_fast(
             ds_gw_scalars[gw_count] = scalar
             ds_gw_skymaps[gw_count] = skymap
             ds_gw_ids[gw_count] = gw_id
+            ds_gw_event_uid[gw_count] = gw_id
+            ds_gw_simulation_id[gw_count] = int(simulation_id)
+            ds_gw_sample_class[gw_count] = sample_class
             ds_gw_has_kn[gw_count] = int(has_kn)
             ds_gw_neg_type[gw_count] = int(neg_type)
+            ds_gw_mej_dynamic[gw_count] = np.float32(mej_dynamic)
+            ds_gw_mej_wind[gw_count] = np.float32(mej_wind)
             ds_gw_mej_tot[gw_count] = np.float32(mej_tot)
             ds_gw_event_time_mjd[gw_count] = np.float64(event_time_mjd)
             ds_gw_source_type[gw_count] = source_type
@@ -1103,7 +1168,9 @@ def create_dataset_with_neg_gw_bns_nsbh_fast(
                 opt_buffer_first_detection_mjd, dtype=np.float64
             )
             ds_opt_coordinates[cur:new_size] = np.asarray(opt_buffer_coordinates)
-            ds_parent_idx[cur:new_size] = np.asarray(opt_buffer_parent_idx, dtype=np.int32)
+            ds_parent_idx[cur:new_size] = np.asarray(
+                opt_buffer_parent_idx, dtype=np.int32
+            )
 
             total_optical_count += n_new
             opt_buffer_vals.clear()
@@ -1123,7 +1190,9 @@ def create_dataset_with_neg_gw_bns_nsbh_fast(
             candidate_ids = np.asarray(src.pos_event_ids, dtype=np.int64)
             if limit is not None:
                 candidate_ids = _shuffle_event_ids(candidate_ids, pos_order_rngs[tag])
-            task_batch_size = pos_task_batch_size if limit is not None else max(1, len(candidate_ids))
+            task_batch_size = (
+                pos_task_batch_size if limit is not None else max(1, len(candidate_ids))
+            )
 
             for batch_start in range(0, len(candidate_ids), task_batch_size):
                 if limit is not None and source_counts[tag]["pos"] >= limit:
@@ -1131,7 +1200,9 @@ def create_dataset_with_neg_gw_bns_nsbh_fast(
 
                 batch_records: List[Tuple[str, int, int]] = []
                 batch_tasks: List[EventProcessTask] = []
-                for event_id_np in candidate_ids[batch_start: batch_start + task_batch_size]:
+                for event_id_np in candidate_ids[
+                    batch_start : batch_start + task_batch_size
+                ]:
                     event_id = int(event_id_np)
                     row_idx = src.event_to_row.get(event_id)
                     if row_idx is None:
@@ -1156,7 +1227,9 @@ def create_dataset_with_neg_gw_bns_nsbh_fast(
                         desc=f"Positive GW {tag.upper()}",
                     ),
                 ):
-                    if task_result.tag != rec_tag or int(task_result.event_id) != int(event_id):
+                    if task_result.tag != rec_tag or int(task_result.event_id) != int(
+                        event_id
+                    ):
                         raise RuntimeError(
                             f"Mismatched positive task result ordering: expected {rec_tag}_{event_id}, got {task_result.tag}_{task_result.event_id}"
                         )
@@ -1173,7 +1246,10 @@ def create_dataset_with_neg_gw_bns_nsbh_fast(
                     if len(lcs) == 0:
                         source_counts[tag]["drop_empty_lc"] += 1
                         continue
-                    if task_result.status == "missing_skymap" or task_result.skymap is None:
+                    if (
+                        task_result.status == "missing_skymap"
+                        or task_result.skymap is None
+                    ):
                         source_counts[tag]["drop_skymap"] += 1
                         continue
                     if task_result.status != "ok":
@@ -1182,31 +1258,26 @@ def create_dataset_with_neg_gw_bns_nsbh_fast(
                         )
 
                     skymap = np.asarray(task_result.skymap, dtype=np.float32)
-                    gw_id = f"{tag}_{event_id}"
+                    gw_id = src.event_uid_by_event[event_id]
                     if gw_id in written_id_set:
                         continue
                     written_id_set.add(gw_id)
 
-                    mej_val = float(src.mej_by_event.get(event_id, np.nan))
+                    mej_val = float(src.mej_by_event[event_id])
+                    mej_dynamic = float(src.mej_dynamic_by_event[event_id])
+                    mej_wind = float(src.mej_wind_by_event[event_id])
                     event_time_val = float(src.event_time_mjd[row_idx])
-                    if (
-                        tag == "nsbh"
-                        and nsbh_cfg.require_success_for_mej_pos
-                        and np.isfinite(mej_val)
-                        and mej_val > nsbh_cfg.type1_threshold
-                        and src.success_ids_mej_pos is not None
-                        and event_id not in src.success_ids_mej_pos
-                    ):
-                        raise RuntimeError(
-                            f"NSBH mej>threshold event {event_id} passed into output but not in success ids."
-                        )
 
                     gw_idx = append_gw(
                         scalar=src.gw_params[row_idx],
                         skymap=skymap,
                         gw_id=gw_id,
+                        simulation_id=src.simulation_id_by_event[event_id],
+                        sample_class=src.sample_class_by_event[event_id],
                         has_kn=1,
                         neg_type=0,
+                        mej_dynamic=mej_dynamic,
+                        mej_wind=mej_wind,
                         mej_tot=mej_val,
                         event_time_mjd=event_time_val,
                         source_type=tag,
@@ -1215,13 +1286,22 @@ def create_dataset_with_neg_gw_bns_nsbh_fast(
                     if not np.isfinite(event_time_val):
                         source_counts[tag]["invalid_event_time_written"] += 1
 
-                    for vals, errs, masks, times, coordinates, first_detection_mjd in lcs:
+                    for (
+                        vals,
+                        errs,
+                        masks,
+                        times,
+                        coordinates,
+                        first_detection_mjd,
+                    ) in lcs:
                         opt_buffer_vals.append(vals)
                         opt_buffer_errs.append(errs)
                         opt_buffer_masks.append(masks)
                         opt_buffer_times.append(times)
                         opt_buffer_zero_time_mjd_base.append(float(first_detection_mjd))
-                        opt_buffer_first_detection_mjd.append(float(first_detection_mjd))
+                        opt_buffer_first_detection_mjd.append(
+                            float(first_detection_mjd)
+                        )
                         opt_buffer_coordinates.append(coordinates)
                         opt_buffer_parent_idx.append(gw_idx)
 
@@ -1230,82 +1310,79 @@ def create_dataset_with_neg_gw_bns_nsbh_fast(
 
         flush_opt_buffer()
 
-        if dataset_mode == "test":
-            neg_event_records: List[Tuple[str, int, int]] = []
-            neg_tasks: List[EventProcessTask] = []
-            for tag, event_id in neg_events:
-                src = prepared[tag]
-                row_idx = src.event_to_row.get(event_id)
-                if row_idx is None:
-                    continue
-                neg_event_records.append((tag, int(event_id), int(row_idx)))
-                neg_tasks.append(
-                    _build_event_process_task(
-                        src=src,
-                        event_id=int(event_id),
-                        include_lightcurves=False,
-                        fluxcal_to_psfflux_factor=float(fluxcal_to_psfflux_factor),
-                        psfflux_zp=float(psfflux_zp),
-                        lupt_b_njy=np.asarray(lupt_b_njy, dtype=np.float64),
-                    )
+        neg_event_records: List[Tuple[str, int, int]] = []
+        neg_tasks: List[EventProcessTask] = []
+        for tag, event_id in neg_events:
+            src = prepared[tag]
+            row_idx = src.event_to_row.get(event_id)
+            if row_idx is None:
+                continue
+            neg_event_records.append((tag, int(event_id), int(row_idx)))
+            neg_tasks.append(
+                _build_event_process_task(
+                    src=src,
+                    event_id=int(event_id),
+                    include_lightcurves=False,
+                    fluxcal_to_psfflux_factor=float(fluxcal_to_psfflux_factor),
+                    psfflux_zp=float(psfflux_zp),
+                    lupt_b_njy=np.asarray(lupt_b_njy, dtype=np.float64),
+                )
+            )
+
+        print("\nWriting negative GW events...")
+        for (tag, event_id, row_idx), task_result in zip(
+            neg_event_records,
+            _iter_event_task_results(
+                neg_tasks, num_workers=int(num_workers), desc="Negative GW"
+            ),
+        ):
+            if task_result.tag != tag or int(task_result.event_id) != int(event_id):
+                raise RuntimeError(
+                    f"Mismatched negative task result ordering: expected {tag}_{event_id}, got {task_result.tag}_{task_result.event_id}"
+                )
+            if task_result.status == "missing_skymap" or task_result.skymap is None:
+                raise RuntimeError(
+                    f"Selected negative GW {tag}_{event_id} lost its required skymap"
+                )
+            if task_result.status != "ok":
+                raise RuntimeError(
+                    f"Unexpected negative task status for {tag}_{event_id}: {task_result.status}"
                 )
 
-            print("\nWriting negative GW events...")
-            for (tag, event_id, row_idx), task_result in zip(
-                neg_event_records,
-                _iter_event_task_results(neg_tasks, num_workers=int(num_workers), desc="Negative GW"),
-            ):
-                if task_result.tag != tag or int(task_result.event_id) != int(event_id):
-                    raise RuntimeError(
-                        f"Mismatched negative task result ordering: expected {tag}_{event_id}, got {task_result.tag}_{task_result.event_id}"
-                    )
-                if task_result.status == "missing_skymap" or task_result.skymap is None:
-                    source_counts[tag]["drop_skymap"] += 1
-                    continue
-                if task_result.status != "ok":
-                    raise RuntimeError(
-                        f"Unexpected negative task status for {tag}_{event_id}: {task_result.status}"
-                    )
+            src = prepared[tag]
+            skymap = np.asarray(task_result.skymap, dtype=np.float32)
+            gw_id = src.event_uid_by_event[event_id]
+            if gw_id in written_id_set:
+                continue
+            written_id_set.add(gw_id)
 
-                src = prepared[tag]
-                skymap = np.asarray(task_result.skymap, dtype=np.float32)
-                gw_id = f"{tag}_{event_id}"
-                if gw_id in written_id_set:
-                    continue
-                written_id_set.add(gw_id)
+            neg_type = int(src.neg_type_by_event[event_id])
+            mej_val = float(src.mej_by_event[event_id])
+            mej_dynamic = float(src.mej_dynamic_by_event[event_id])
+            mej_wind = float(src.mej_wind_by_event[event_id])
+            event_time_val = float(src.event_time_mjd[row_idx])
 
-                neg_type = int(src.neg_type_by_event.get(event_id, 2))
-                mej_val = float(src.mej_by_event.get(event_id, np.nan))
-                event_time_val = float(src.event_time_mjd[row_idx])
-                if (
-                    tag == "nsbh"
-                    and nsbh_cfg.require_success_for_mej_pos
-                    and np.isfinite(mej_val)
-                    and mej_val > nsbh_cfg.type1_threshold
-                    and src.success_ids_mej_pos is not None
-                    and event_id not in src.success_ids_mej_pos
-                ):
-                    raise RuntimeError(
-                        f"NSBH mej>threshold event {event_id} passed into output but not in success ids."
-                    )
-
-                append_gw(
-                    scalar=src.gw_params[row_idx],
-                    skymap=skymap,
-                    gw_id=gw_id,
-                    has_kn=0,
-                    neg_type=neg_type,
-                    mej_tot=mej_val,
-                    event_time_mjd=event_time_val,
-                    source_type=tag,
-                )
-                source_counts[tag]["neg"] += 1
-                if not np.isfinite(event_time_val):
-                    source_counts[tag]["invalid_event_time_written"] += 1
-                if neg_type == 1:
-                    source_counts[tag]["neg_type1"] += 1
-                elif neg_type == 2:
-                    source_counts[tag]["neg_type2"] += 1
+            append_gw(
+                scalar=src.gw_params[row_idx],
+                skymap=skymap,
+                gw_id=gw_id,
+                simulation_id=src.simulation_id_by_event[event_id],
+                sample_class=src.sample_class_by_event[event_id],
+                has_kn=0,
+                neg_type=neg_type,
+                mej_dynamic=mej_dynamic,
+                mej_wind=mej_wind,
+                mej_tot=mej_val,
+                event_time_mjd=event_time_val,
+                source_type=tag,
+            )
+            source_counts[tag]["neg"] += 1
+            if not np.isfinite(event_time_val):
+                source_counts[tag]["invalid_event_time_written"] += 1
+            if neg_type == 1:
+                source_counts[tag]["neg_type1"] += 1
+            elif neg_type == 2:
+                source_counts[tag]["neg_type2"] += 1
 
         # Ensure GW arrays are exactly used size (already true, but explicit for safety).
         resize_gw(gw_count)
@@ -1314,10 +1391,31 @@ def create_dataset_with_neg_gw_bns_nsbh_fast(
         n_pos_nsbh = int(source_counts["nsbh"]["pos"])
         n_neg_bns = int(source_counts["bns"]["neg"])
         n_neg_nsbh = int(source_counts["nsbh"]["neg"])
+        n_neg_type1_bns = int(source_counts["bns"]["neg_type1"])
+        n_neg_type2_bns = int(source_counts["bns"]["neg_type2"])
         n_neg_type1_nsbh = int(source_counts["nsbh"]["neg_type1"])
         n_neg_type2_nsbh = int(source_counts["nsbh"]["neg_type2"])
         n_pos = n_pos_bns + n_pos_nsbh
         n_neg = n_neg_bns + n_neg_nsbh
+        expected_neg_counts = {
+            tag: {
+                neg_type: sum(
+                    int(prepared[tag].neg_type_by_event[int(event_id)]) == neg_type
+                    for event_id in prepared[tag].neg_event_ids
+                )
+                for neg_type in (1, 2)
+            }
+            for tag in ("bns", "nsbh")
+        }
+        actual_neg_counts = {
+            "bns": {1: n_neg_type1_bns, 2: n_neg_type2_bns},
+            "nsbh": {1: n_neg_type1_nsbh, 2: n_neg_type2_nsbh},
+        }
+        if actual_neg_counts != expected_neg_counts:
+            raise RuntimeError(
+                "Negative-GW output quota mismatch: "
+                f"expected={expected_neg_counts}, actual={actual_neg_counts}"
+            )
 
         f.attrs["dataset_mode"] = dataset_mode
         f.attrs["n_pos_gw_bns"] = n_pos_bns
@@ -1326,8 +1424,15 @@ def create_dataset_with_neg_gw_bns_nsbh_fast(
         f.attrs["n_neg_gw_nsbh"] = n_neg_nsbh
         f.attrs["n_pos_gw"] = n_pos
         f.attrs["n_neg_gw"] = n_neg
+        f.attrs["n_neg_type1_gw_bns"] = n_neg_type1_bns
+        f.attrs["n_neg_type2_gw_bns"] = n_neg_type2_bns
         f.attrs["n_neg_type1_gw_nsbh"] = n_neg_type1_nsbh
         f.attrs["n_neg_type2_gw_nsbh"] = n_neg_type2_nsbh
+        f.attrs["neg_type1_definition"] = "mej_dynamic == 0 and mej_wind == 0"
+        f.attrs["positive_ejecta_definition"] = "mej_dynamic + mej_wind > 0"
+        f.attrs["neg_type2_definition"] = (
+            "total ejecta > 0, successful Rubin/SNANA coverage, no usable detectable KN"
+        )
         f.attrs["n_total_gw"] = int(gw_count)
         f.attrs["n_total_optical"] = int(total_optical_count)
         f.attrs["preprocess_num_workers"] = int(num_workers)
@@ -1336,9 +1441,9 @@ def create_dataset_with_neg_gw_bns_nsbh_fast(
         f.attrs["dropped_empty_lc_nsbh"] = int(source_counts["nsbh"]["drop_empty_lc"])
         f.attrs["dropped_skymap_bns"] = int(source_counts["bns"]["drop_skymap"])
         f.attrs["dropped_skymap_nsbh"] = int(source_counts["nsbh"]["drop_skymap"])
-        f.attrs["nsbh_mej_col"] = prepared["nsbh"].nsbh_mej_col_resolved or nsbh_cfg.mej_col
-        f.attrs["nsbh_type1_threshold"] = float(nsbh_cfg.type1_threshold)
-        f.attrs["nsbh_require_success_for_mej_pos"] = int(nsbh_cfg.require_success_for_mej_pos)
+        f.attrs["n_filtered_non_success_mej_pos_bns"] = int(
+            prepared["bns"].n_filtered_non_success_mej_pos
+        )
         f.attrs["n_filtered_non_success_mej_pos_nsbh"] = int(
             prepared["nsbh"].n_filtered_non_success_mej_pos
         )
@@ -1346,8 +1451,12 @@ def create_dataset_with_neg_gw_bns_nsbh_fast(
         f.attrs["event_time_col_nsbh"] = prepared["nsbh"].event_time_col
         f.attrs["event_time_from_gps_bns"] = int(prepared["bns"].event_time_from_gps)
         f.attrs["event_time_from_gps_nsbh"] = int(prepared["nsbh"].event_time_from_gps)
-        f.attrs["n_invalid_event_time_bns_catalog"] = int(prepared["bns"].n_invalid_event_time)
-        f.attrs["n_invalid_event_time_nsbh_catalog"] = int(prepared["nsbh"].n_invalid_event_time)
+        f.attrs["n_invalid_event_time_bns_catalog"] = int(
+            prepared["bns"].n_invalid_event_time
+        )
+        f.attrs["n_invalid_event_time_nsbh_catalog"] = int(
+            prepared["nsbh"].n_invalid_event_time
+        )
         f.attrs["n_invalid_event_time_bns_written"] = int(
             source_counts["bns"]["invalid_event_time_written"]
         )
@@ -1362,7 +1471,9 @@ def create_dataset_with_neg_gw_bns_nsbh_fast(
         f.attrs["requested_max_pos_gw_nsbh"] = int(pos_limits["nsbh"] or 0)
         f.attrs["positive_candidates_bns"] = int(pos_candidate_counts["bns"])
         f.attrs["positive_candidates_nsbh"] = int(pos_candidate_counts["nsbh"])
-        f.attrs["time_zero_base_semantics"] = "optical zero_time_mjd_base stores first_detection_mjd"
+        f.attrs["time_zero_base_semantics"] = (
+            "optical zero_time_mjd_base stores first_detection_mjd"
+        )
         f.attrs["first_detection_policy"] = FIRST_DETECTION_POLICY
         f.attrs["first_detection_snr_domain"] = FIRST_DETECTION_SNR_DOMAIN
         f.attrs["first_detection_snr_threshold"] = 5.0
@@ -1383,17 +1494,16 @@ def create_dataset_with_neg_gw_bns_nsbh_fast(
 
         print("\nProcessing complete.")
         print(f"  Mode: {dataset_mode}")
+        print(f"  Pos GW: total={n_pos} (bns={n_pos_bns}, nsbh={n_pos_nsbh})")
+        print(f"  Neg GW: total={n_neg} (bns={n_neg_bns}, nsbh={n_neg_nsbh})")
         print(
-            f"  Pos GW: total={n_pos} (bns={n_pos_bns}, nsbh={n_pos_nsbh})"
+            "  Neg types: "
+            f"BNS(type1={n_neg_type1_bns}, type2={n_neg_type2_bns}), "
+            f"NSBH(type1={n_neg_type1_nsbh}, type2={n_neg_type2_nsbh})"
         )
         print(
-            f"  Neg GW: total={n_neg} (bns={n_neg_bns}, nsbh={n_neg_nsbh})"
-        )
-        print(
-            f"  NSBH neg types: type1={n_neg_type1_nsbh}, type2={n_neg_type2_nsbh}"
-        )
-        print(
-            "  NSBH filtered mej>threshold non-success events: "
+            "  Positive-ejecta events excluded without successful coverage "
+            f"(bns/nsbh): {prepared['bns'].n_filtered_non_success_mej_pos}/"
             f"{prepared['nsbh'].n_filtered_non_success_mej_pos}"
         )
         print(
@@ -1440,7 +1550,12 @@ def _build_arg_parser():
     p.add_argument("--output_h5_path", required=True)
     p.add_argument("--dataset_mode", choices=["train", "test"], default="train")
     p.add_argument("--buffer_limit", type=int, default=10000)
-    p.add_argument("--num_workers", type=int, default=1, help="Parallel worker count for per-event preprocessing.")
+    p.add_argument(
+        "--num_workers",
+        type=int,
+        default=1,
+        help="Parallel worker count for per-event preprocessing.",
+    )
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--fluxcal_zp", type=float, default=27.5)
     p.add_argument("--psfflux_zp", type=float, default=31.4)
@@ -1455,31 +1570,28 @@ def _build_arg_parser():
     # BNS source
     p.add_argument("--bns_full_catalog_path", required=True)
     p.add_argument("--bns_skymap_dir", required=True)
+    p.add_argument("--bns_negative_catalog_path", required=True)
+    p.add_argument("--bns_negative_skymap_dir", required=True)
     p.add_argument("--bns_sim_root", required=True)
     p.add_argument("--bns_sim_name", required=True)
     p.add_argument("--bns_success_ids_path", default=None)
     p.add_argument("--bns_max_lc_per_gw", type=int, default=1000)
     p.add_argument("--bns_max_neg_gw", type=int, default=None)
     p.add_argument("--bns_max_pos_gw", type=int, default=None)
+    p.add_argument("--bns_max_neg_type1_gw", type=int, default=None)
+    p.add_argument("--bns_max_neg_type2_gw", type=int, default=None)
 
     # NSBH source
     p.add_argument("--nsbh_full_catalog_path", required=True)
     p.add_argument("--nsbh_skymap_dir", required=True)
+    p.add_argument("--nsbh_negative_catalog_path", required=True)
+    p.add_argument("--nsbh_negative_skymap_dir", required=True)
     p.add_argument("--nsbh_sim_root", required=True)
     p.add_argument("--nsbh_sim_name", required=True)
     p.add_argument("--nsbh_success_ids_path", default=None)
     p.add_argument("--nsbh_max_lc_per_gw", type=int, default=1000)
     p.add_argument("--nsbh_max_neg_gw", type=int, default=None)
     p.add_argument("--nsbh_max_pos_gw", type=int, default=None)
-    p.add_argument("--nsbh_mej_col", default="mej_tot")
-    p.add_argument("--nsbh_type1_threshold", type=float, default=0.0)
-    p.add_argument(
-        "--nsbh_require_success_for_mej_pos",
-        type=int,
-        choices=[0, 1],
-        default=1,
-        help="1: require mej>threshold NSBH events to be in success ids; 0: disable this filter.",
-    )
     p.add_argument("--nsbh_max_neg_type1_gw", type=int, default=None)
     p.add_argument("--nsbh_max_neg_type2_gw", type=int, default=None)
 
@@ -1503,9 +1615,13 @@ if __name__ == "__main__":
         sim_root=args.bns_sim_root,
         sim_name=args.bns_sim_name,
         success_ids_path=args.bns_success_ids_path,
+        negative_catalog_path=args.bns_negative_catalog_path,
+        negative_skymap_dir=args.bns_negative_skymap_dir,
         max_lc_per_gw=args.bns_max_lc_per_gw,
         max_neg_gw=args.bns_max_neg_gw,
         max_pos_gw=args.bns_max_pos_gw,
+        max_neg_type1_gw=args.bns_max_neg_type1_gw,
+        max_neg_type2_gw=args.bns_max_neg_type2_gw,
     )
     nsbh_cfg = SourceConfig(
         tag="nsbh",
@@ -1514,12 +1630,11 @@ if __name__ == "__main__":
         sim_root=args.nsbh_sim_root,
         sim_name=args.nsbh_sim_name,
         success_ids_path=args.nsbh_success_ids_path,
+        negative_catalog_path=args.nsbh_negative_catalog_path,
+        negative_skymap_dir=args.nsbh_negative_skymap_dir,
         max_lc_per_gw=args.nsbh_max_lc_per_gw,
         max_neg_gw=args.nsbh_max_neg_gw,
         max_pos_gw=args.nsbh_max_pos_gw,
-        mej_col=args.nsbh_mej_col,
-        type1_threshold=args.nsbh_type1_threshold,
-        require_success_for_mej_pos=bool(args.nsbh_require_success_for_mej_pos),
         max_neg_type1_gw=args.nsbh_max_neg_type1_gw,
         max_neg_type2_gw=args.nsbh_max_neg_type2_gw,
     )

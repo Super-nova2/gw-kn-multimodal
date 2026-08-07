@@ -1,2 +1,3 @@
 runs/*
+runs_dual/*
 !runs/README.md
