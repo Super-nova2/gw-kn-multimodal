@@ -41,6 +41,9 @@ WRITE_META_FEATURES="${WRITE_META_FEATURES:-true}"  # true|false
 NEG_MATCH_POS_DENSITY="${NEG_MATCH_POS_DENSITY:-true}" # true|false
 PREFIX_TASK_ENABLE="${PREFIX_TASK_ENABLE:-false}"   # true|false
 DATASET_TAG="${DATASET_TAG:-}"
+BUILD_POSITIVE_FROM_ALBEF="${BUILD_POSITIVE_FROM_ALBEF:-false}" # true|false
+ALBEF_TRAIN_SOURCE_H5="${ALBEF_TRAIN_SOURCE_H5:-${BASE_DIR}/data/ALBEF_dataset/combined_dataset_train.h5}"
+ALBEF_TEST_SOURCE_H5="${ALBEF_TEST_SOURCE_H5:-${BASE_DIR}/data/ALBEF_dataset/combined_dataset_astro_test.h5}"
 
 normalize_bool() {
     local v
@@ -57,11 +60,16 @@ normalize_bool() {
 
 BUILD_POSITIVE="$(normalize_bool "${BUILD_POSITIVE}")"
 BUILD_NEGATIVE="$(normalize_bool "${BUILD_NEGATIVE}")"
+BUILD_POSITIVE_FROM_ALBEF="$(normalize_bool "${BUILD_POSITIVE_FROM_ALBEF}")"
+if [[ "${BUILD_POSITIVE}" == "true" && "${BUILD_POSITIVE_FROM_ALBEF}" == "true" ]]; then
+    echo "BUILD_POSITIVE and BUILD_POSITIVE_FROM_ALBEF cannot both be true." >&2
+    exit 1
+fi
 ENFORCE_TIME_WINDOW="$(normalize_bool "${ENFORCE_TIME_WINDOW}")"
 WRITE_META_FEATURES="$(normalize_bool "${WRITE_META_FEATURES}")"
 NEG_MATCH_POS_DENSITY="$(normalize_bool "${NEG_MATCH_POS_DENSITY}")"
 PREFIX_TASK_ENABLE="$(normalize_bool "${PREFIX_TASK_ENABLE}")"
-if [[ "${BUILD_POSITIVE}" != "true" && "${BUILD_NEGATIVE}" != "true" ]]; then
+if [[ "${BUILD_POSITIVE}" != "true" && "${BUILD_NEGATIVE}" != "true" && "${BUILD_POSITIVE_FROM_ALBEF}" != "true" ]]; then
     echo "Nothing to build: BUILD_POSITIVE=${BUILD_POSITIVE}, BUILD_NEGATIVE=${BUILD_NEGATIVE}"
     echo "Set at least one of BUILD_POSITIVE/BUILD_NEGATIVE to true."
     exit 1
@@ -78,6 +86,9 @@ if [[ -n "${DATASET_TAG_SLUG}" ]]; then
     LOCK_TAG="_${DATASET_TAG_SLUG}"
 else
     LOCK_TAG=""
+fi
+if [[ "${BUILD_POSITIVE_FROM_ALBEF}" == "true" ]]; then
+    LOCK_TAG="${LOCK_TAG}_albef_import"
 fi
 
 # Self-submit: run this script directly to submit job to Slurm.
@@ -106,6 +117,7 @@ BUILD_SCRIPT="${SCRIPT_DIR}/create_datasets.py"
 
 case "${DATASET_MODE}" in
     train)
+        ALBEF_SOURCE_H5="${ALBEF_SOURCE_H5:-${ALBEF_TRAIN_SOURCE_H5}}"
         BNS_SIM_ROOT="${BASE_DIR}/SNANA/SNDATA_ROOT/SIM/LSST_KN_BNS_TRAIN"
         BNS_SIM_NAME="LSST_KN_BNS_TRAIN"
 
@@ -124,6 +136,7 @@ case "${DATASET_MODE}" in
         fi
         ;;
     test)
+        ALBEF_SOURCE_H5="${ALBEF_SOURCE_H5:-${ALBEF_TEST_SOURCE_H5}}"
         BNS_SIM_ROOT="${BASE_DIR}/SNANA/SNDATA_ROOT/SIM/LSST_KN_BNS_TEST"
         BNS_SIM_NAME="LSST_KN_BNS_TEST"
 
@@ -213,6 +226,8 @@ echo "Dataset mode: ${DATASET_MODE}"
 echo "Prefix task enable: ${PREFIX_TASK_ENABLE}"
 echo "Dataset tag: ${DATASET_TAG_SLUG:-<legacy-default>}"
 echo "Build positive: ${BUILD_POSITIVE}"
+echo "Build positive from ALBEF: ${BUILD_POSITIVE_FROM_ALBEF}"
+echo "ALBEF source H5: ${ALBEF_SOURCE_H5:-<unset>}"
 echo "Build negative: ${BUILD_NEGATIVE}"
 echo "Output POS: ${OUTPUT_POS_H5}"
 echo "Output NEG: ${OUTPUT_NEG_H5}"
@@ -270,7 +285,13 @@ if [[ -n "${MAX_NEGATIVE_HEADS}" ]]; then
     cmd+=(--max_negative_heads "${MAX_NEGATIVE_HEADS}")
 fi
 
-if [[ "${BUILD_POSITIVE}" == "true" ]]; then
+if [[ "${BUILD_POSITIVE_FROM_ALBEF}" == "true" ]]; then
+    cmd+=(
+        --build_positive_from_albef
+        --output_pos_h5 "${OUTPUT_POS_H5}"
+        --albef_source_h5 "${ALBEF_SOURCE_H5}"
+    )
+elif [[ "${BUILD_POSITIVE}" == "true" ]]; then
     cmd+=(
         --build_positive
         --output_pos_h5 "${OUTPUT_POS_H5}"

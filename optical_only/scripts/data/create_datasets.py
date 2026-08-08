@@ -530,6 +530,43 @@ def transform_psfflux_to_luptitude(
     )
 
 
+def luptitude_to_psfflux(
+    values: np.ndarray,
+    errors: np.ndarray,
+    band_indices: np.ndarray,
+    *,
+    psfflux_zp: float,
+    lupt_b_njy: Sequence[float],
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Invert stored luptitude arrays back into psfFlux and psfFlux sigma.
+
+    Used to reconstruct per-slot detection flags (SNR > threshold) for
+    optical-only datasets derived from the multimodal ALBEF H5 files.
+    """
+    values = np.asarray(values, dtype=np.float64)
+    errors = np.asarray(errors, dtype=np.float64)
+    band_indices = np.asarray(band_indices, dtype=np.int64)
+    if values.shape != errors.shape or values.shape != band_indices.shape:
+        raise ValueError("values, errors, and band_indices must have identical shapes.")
+
+    b_all = np.asarray(lupt_b_njy, dtype=np.float64)
+    if b_all.ndim != 1 or b_all.size == 0:
+        raise ValueError("lupt_b_njy must be a non-empty 1-D array.")
+    if np.max(band_indices, initial=0) >= b_all.size:
+        raise ValueError("lupt_b_njy does not cover all requested band indices.")
+
+    b = b_all[band_indices]
+    two_b = 2.0 * b
+    x = (float(psfflux_zp) - values) / ASINH_MAG_FACTOR - np.log(b)
+    flux = two_b * np.sinh(x)
+    sigma_flux = (
+        np.abs(errors)
+        * np.sqrt(np.square(flux) + np.square(two_b))
+        / ASINH_MAG_FACTOR
+    )
+    return flux, sigma_flux
+
+
 def format_realization(
     mjd: np.ndarray,
     flux: np.ndarray,
@@ -1459,6 +1496,368 @@ def create_positive_h5(
     print(f"[POS] Saved: {output_h5}")
 
 
+_ALBEF_ATTR_COPY_KEYS = (
+    "photometry_representation",
+    "flux_input_column",
+    "fluxerr_input_column",
+    "fluxcal_zp",
+    "psfflux_zp",
+    "fluxcal_to_psfflux_factor",
+    "lupt_k",
+    "lupt_band_order",
+    "lupt_m5_mag",
+    "lupt_f5sigma_njy",
+    "lupt_b_njy",
+    "values_semantics",
+    "errors_semantics",
+    "lightcurve_merge_window_hours",
+    "lightcurve_merge_mode",
+    "lightcurve_merge_flux_domain",
+    "first_detection_policy",
+    "first_detection_snr_domain",
+    "first_detection_snr_threshold",
+    "min_nobs_stage",
+)
+
+
+def _copy_albef_root_attrs(src, dst) -> None:
+    for key in _ALBEF_ATTR_COPY_KEYS:
+        if key not in src.attrs:
+            continue
+        value = src.attrs[key]
+        if isinstance(value, np.ndarray):
+            dst.attrs[key] = value.copy()
+        else:
+            dst.attrs[key] = value
+    if "time_scale_divisor_days" not in dst.attrs:
+        dst.attrs["time_scale_divisor_days"] = 100.0
+
+
+def create_positive_h5_from_albef(
+    output_h5: Path,
+    albef_source_h5: Path,
+    snr_threshold: float = 5.0,
+    write_meta_features: bool = True,
+    buffer_limit: int = 8192,
+    enforce_positive_only: bool = True,
+    archive_existing: bool = True,
+) -> None:
+    """Build the legacy optical-only positive H5 from a multimodal ALBEF H5.
+
+    Copies the stored positive optical arrays, recomputes per-slot
+    ``slot_is_detection`` from luptitude->psfFlux SNR, and writes the same
+    meta_* fields consumed by the optical-only baseline.
+    """
+    output_h5 = Path(output_h5)
+    albef_source_h5 = Path(albef_source_h5)
+    if not albef_source_h5.is_file():
+        raise FileNotFoundError(f"ALBEF source H5 not found: {albef_source_h5}")
+    output_h5.parent.mkdir(parents=True, exist_ok=True)
+    tmp_h5 = output_h5.with_name(f"{output_h5.name}.tmp_albef_import")
+    if tmp_h5.exists():
+        tmp_h5.unlink()
+    chunk_size = 1024
+
+    with h5py.File(albef_source_h5, "r") as src:
+        if "events/optical_data" not in src:
+            raise KeyError(f"Missing 'events/optical_data' in {albef_source_h5}")
+        grp_opt = src["events/optical_data"]
+        required = (
+            "values",
+            "errors",
+            "masks",
+            "times",
+            "coordinates",
+            "zero_time_mjd_base",
+            "parent_gw_idx",
+        )
+        for field in required:
+            if field not in grp_opt:
+                raise KeyError(f"Missing 'events/optical_data/{field}' in {albef_source_h5}")
+
+        n_total = int(grp_opt["values"].shape[0])
+        parent_all = np.asarray(grp_opt["parent_gw_idx"][:], dtype=np.int64)
+        if "events/gw_data/has_kn" not in src:
+            raise KeyError(f"Missing 'events/gw_data/has_kn' in {albef_source_h5}")
+        has_kn = np.asarray(src["events/gw_data/has_kn"][:], dtype=np.int32).reshape(-1)
+        if has_kn.size == 0:
+            raise ValueError("Empty has_kn in ALBEF source; cannot validate positive rows.")
+
+        if bool(enforce_positive_only):
+            pos_mask = has_kn[parent_all] == 1
+            n_dropped = int((~pos_mask).sum())
+            if n_dropped:
+                print(f"[POS-ALBEF] Filtering {n_dropped} optical rows belonging to has_kn=0 events.")
+        else:
+            pos_mask = np.ones(n_total, dtype=bool)
+        n_optical = int(pos_mask.sum())
+        if n_optical == 0:
+            raise ValueError("No positive optical rows found in ALBEF source.")
+        pos_rows = np.flatnonzero(pos_mask).astype(np.int64, copy=False)
+        parent_pos = parent_all[pos_mask]
+        unique_parents = np.unique(parent_pos)
+
+        psfflux_zp = float(src.attrs.get("psfflux_zp", 31.4))
+        lupt_b_njy = np.asarray(
+            src.attrs.get(
+                "lupt_b_njy",
+                [
+                    200.0,
+                    72.6156109540202,
+                    95.7260184645276,
+                    182.40216787118175,
+                    347.56016574987456,
+                    1049.6149204995424,
+                ],
+            ),
+            dtype=np.float64,
+        )
+        lupt_k = float(src.attrs.get("lupt_k", 1.0))
+        lupt_m5_mag = np.asarray(
+            src.attrs.get("lupt_m5_mag", [23.9, 25.0, 24.7, 24.0, 23.3, 22.1]),
+            dtype=np.float64,
+        )
+        if "lupt_f5sigma_njy" in src.attrs:
+            lupt_f5sigma_njy = np.asarray(src.attrs["lupt_f5sigma_njy"], dtype=np.float64)
+        else:
+            lupt_f5sigma_njy = 5.0 * lupt_b_njy / max(lupt_k, 1e-12)
+        fluxcal_to_psfflux_factor = float(
+            src.attrs.get("fluxcal_to_psfflux_factor", 36.3078054770101)
+        )
+
+        source_all = np.asarray(src["events/gw_data/source_type"][:]).reshape(-1)
+        pos_sources = source_all[unique_parents]
+
+        def _source_label(value) -> str:
+            if isinstance(value, (bytes, np.bytes_)):
+                return value.decode("utf-8", errors="replace")
+            return str(value)
+
+        source_counts = {
+            _source_label(value): int((pos_sources == value).sum())
+            for value in np.unique(pos_sources)
+        }
+
+        try:
+            with h5py.File(tmp_h5, "w") as f:
+                opt_grp = f.create_group("events/optical_data")
+                (
+                    ds_values,
+                    ds_errors,
+                    ds_masks,
+                    ds_times,
+                    ds_slot_is_detection,
+                    ds_zero_time_mjd_base,
+                    ds_coords,
+                    ds_meta_n_obs,
+                    ds_meta_n_det,
+                    ds_meta_n_det_snr5,
+                    ds_meta_n_bands,
+                    ds_meta_t_span,
+                    ds_meta_single_band_id,
+                ) = _create_optical_group(
+                    opt_grp, chunk_size, write_meta_features=bool(write_meta_features)
+                )
+                ds_parent = opt_grp.create_dataset(
+                    "parent_gw_idx",
+                    (0,),
+                    maxshape=(None,),
+                    dtype="i4",
+                    chunks=(chunk_size,),
+                )
+
+                b_vals = []
+                b_errs = []
+                b_masks = []
+                b_times = []
+                b_slots = []
+                b_zero = []
+                b_coords = []
+                b_parent = []
+                b_n_obs = []
+                b_n_det = []
+                b_n_det_snr5 = []
+                b_n_bands = []
+                b_t_span = []
+                b_single_band = []
+                optical_count = 0
+
+                def flush() -> None:
+                    nonlocal optical_count
+                    if not b_vals:
+                        return
+                    n_new = len(b_vals)
+                    cur = optical_count
+                    new_size = cur + n_new
+                    ds_values.resize(new_size, axis=0)
+                    ds_errors.resize(new_size, axis=0)
+                    ds_masks.resize(new_size, axis=0)
+                    ds_times.resize(new_size, axis=0)
+                    ds_slot_is_detection.resize(new_size, axis=0)
+                    ds_zero_time_mjd_base.resize(new_size, axis=0)
+                    ds_coords.resize(new_size, axis=0)
+                    ds_parent.resize(new_size, axis=0)
+                    if ds_meta_n_det is not None:
+                        ds_meta_n_obs.resize(new_size, axis=0)
+                        ds_meta_n_det.resize(new_size, axis=0)
+                        ds_meta_n_det_snr5.resize(new_size, axis=0)
+                        ds_meta_n_bands.resize(new_size, axis=0)
+                        ds_meta_t_span.resize(new_size, axis=0)
+                        ds_meta_single_band_id.resize(new_size, axis=0)
+                    ds_values[cur:new_size] = np.asarray(b_vals, dtype=np.float32)
+                    ds_errors[cur:new_size] = np.asarray(b_errs, dtype=np.float32)
+                    ds_masks[cur:new_size] = np.asarray(b_masks, dtype=np.float32)
+                    ds_times[cur:new_size] = np.asarray(b_times, dtype=np.float32)
+                    ds_slot_is_detection[cur:new_size] = np.asarray(b_slots, dtype=np.float32)
+                    ds_zero_time_mjd_base[cur:new_size] = np.asarray(b_zero, dtype=np.float64)
+                    ds_coords[cur:new_size] = np.asarray(b_coords, dtype=np.float32)
+                    ds_parent[cur:new_size] = np.asarray(b_parent, dtype=np.int32)
+                    if ds_meta_n_det is not None:
+                        ds_meta_n_obs[cur:new_size] = np.asarray(b_n_obs, dtype=np.int16)
+                        ds_meta_n_det[cur:new_size] = np.asarray(b_n_det, dtype=np.int16)
+                        ds_meta_n_det_snr5[cur:new_size] = np.asarray(b_n_det_snr5, dtype=np.int16)
+                        ds_meta_n_bands[cur:new_size] = np.asarray(b_n_bands, dtype=np.int8)
+                        ds_meta_t_span[cur:new_size] = np.asarray(b_t_span, dtype=np.float32)
+                        ds_meta_single_band_id[cur:new_size] = np.asarray(
+                            b_single_band, dtype=np.int8
+                        )
+                    optical_count = new_size
+                    b_vals.clear()
+                    b_errs.clear()
+                    b_masks.clear()
+                    b_times.clear()
+                    b_slots.clear()
+                    b_zero.clear()
+                    b_coords.clear()
+                    b_parent.clear()
+                    b_n_obs.clear()
+                    b_n_det.clear()
+                    b_n_det_snr5.clear()
+                    b_n_bands.clear()
+                    b_t_span.clear()
+                    b_single_band.clear()
+
+                for start in range(0, n_optical, int(buffer_limit)):
+                    end = min(start + int(buffer_limit), n_optical)
+                    rows = pos_rows[start:end]
+                    vals = np.asarray(grp_opt["values"][rows], dtype=np.float32)
+                    errs = np.asarray(grp_opt["errors"][rows], dtype=np.float32)
+                    masks = np.asarray(grp_opt["masks"][rows], dtype=np.float32)
+                    times = np.asarray(grp_opt["times"][rows], dtype=np.float32)
+                    coords = np.asarray(grp_opt["coordinates"][rows], dtype=np.float32)
+                    zero = np.asarray(
+                        grp_opt["zero_time_mjd_base"][rows], dtype=np.float64
+                    )
+                    band_idx = np.broadcast_to(
+                        np.arange(NUM_BANDS, dtype=np.int64), vals.shape
+                    )
+                    flux, sigma = luptitude_to_psfflux(
+                        vals,
+                        errs,
+                        band_idx,
+                        psfflux_zp=psfflux_zp,
+                        lupt_b_njy=lupt_b_njy,
+                    )
+                    snr = np.where(masks > 0, flux / np.maximum(sigma, 1e-30), 0.0)
+                    slots = (snr > float(snr_threshold)).any(axis=-1).astype(np.float32)
+
+                    for i in range(rows.size):
+                        b_vals.append(vals[i])
+                        b_errs.append(errs[i])
+                        b_masks.append(masks[i])
+                        b_times.append(times[i])
+                        b_slots.append(slots[i])
+                        b_zero.append(float(zero[i]))
+                        b_coords.append(coords[i])
+                        b_parent.append(int(parent_pos[start + i]))
+                        if ds_meta_n_det is not None:
+                            (
+                                n_obs_i,
+                                n_det_snr5_i,
+                                n_bands_i,
+                                t_span_i,
+                                single_band_i,
+                            ) = compute_detection_meta_from_formatted(
+                                masks[i], times[i], slots[i]
+                            )
+                            b_n_obs.append(int(n_obs_i))
+                            b_n_det.append(int(n_obs_i))
+                            b_n_det_snr5.append(int(n_det_snr5_i))
+                            b_n_bands.append(int(n_bands_i))
+                            b_t_span.append(float(t_span_i))
+                            b_single_band.append(int(single_band_i))
+
+                    if len(b_vals) >= int(buffer_limit):
+                        flush()
+
+                flush()
+
+                f.attrs["source_albef_h5"] = str(albef_source_h5.resolve())
+                f.attrs["source_albef_n_total_gw"] = int(has_kn.size)
+                f.attrs["source_albef_n_total_optical"] = int(n_total)
+                f.attrs["n_total_gw"] = int(unique_parents.size)
+                f.attrs["n_total_optical"] = int(n_optical)
+                f.attrs["bns_events_total"] = int(source_counts.get("bns", 0))
+                f.attrs["bns_events_written"] = int(source_counts.get("bns", 0))
+                f.attrs["nsbh_events_total"] = int(source_counts.get("nsbh", 0))
+                f.attrs["nsbh_events_written"] = int(source_counts.get("nsbh", 0))
+                f.attrs["time_zero_anchor"] = "first_detection"
+                f.attrs["first_detection_rule"] = str(
+                    src.attrs.get(
+                        "first_detection_policy",
+                        "psfflux_snr5_then_photflag_then_head_mjd_detect_first",
+                    )
+                )
+                f.attrs["time_scale_divisor_days"] = float(
+                    src.attrs.get("time_scale_divisor_days", 100.0)
+                )
+                f.attrs["time_zero_version"] = "fd_v1"
+                f.attrs["snr_threshold"] = float(snr_threshold)
+                f.attrs["detection_photflags"] = "unused"
+                f.attrs["fixed_offset_days"] = 0.0
+                f.attrs["num_workers"] = 1
+                f.attrs["time_zero_base_semantics"] = "first_detection_mjd"
+                f.attrs["time_unit"] = "mjd_days"
+                f.attrs["runtime_offset_applied"] = 0
+                f.attrs["write_meta_features"] = int(bool(write_meta_features))
+                f.attrs["min_nobs_stage"] = "post_merge"
+                f.attrs["slot_is_detection_semantics"] = (
+                    f"derived_snr_gt_{float(snr_threshold):g}_any_band"
+                )
+                f.attrs["meta_n_obs_semantics"] = "formatted_observation_count"
+                f.attrs["meta_n_det_snr5_semantics"] = (
+                    "formatted_detection_count_snr_gt_threshold"
+                )
+                _copy_albef_root_attrs(src, f)
+                write_luptitude_metadata_attrs(
+                    h5_obj=f,
+                    fluxcal_zp=float(src.attrs.get("fluxcal_zp", 27.5)),
+                    psfflux_zp=psfflux_zp,
+                    fluxcal_to_psfflux_factor=fluxcal_to_psfflux_factor,
+                    lupt_k=lupt_k,
+                    lupt_m5_mag=lupt_m5_mag,
+                    lupt_f5sigma_njy=lupt_f5sigma_njy,
+                    lupt_b_njy=lupt_b_njy,
+                )
+        except Exception:
+            if tmp_h5.exists():
+                tmp_h5.unlink()
+            raise
+
+    if output_h5.exists():
+        if bool(archive_existing):
+            archive_dir = output_h5.parent / "archive"
+            archive_dir.mkdir(parents=True, exist_ok=True)
+            archive_path = archive_dir / f"{output_h5.name}.pre_albef_import"
+            if archive_path.exists():
+                archive_path.unlink()
+            os.replace(output_h5, archive_path)
+        else:
+            output_h5.unlink()
+    os.replace(tmp_h5, output_h5)
+    print(f"[POS-ALBEF] Saved: {output_h5} (n_optical={n_optical}, n_gw={unique_parents.size})")
+
+
 def create_negative_h5(
     output_h5: Path,
     neg_sim_root: Path,
@@ -1888,6 +2287,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--build_positive", action="store_true")
     p.add_argument("--build_negative", action="store_true")
+    p.add_argument("--build_positive_from_albef", action="store_true")
+    p.add_argument("--albef_source_h5", type=str, default=None)
+    p.add_argument("--albef_enforce_positive_only", type=str, default="true")
+    p.add_argument("--skip_archive", action="store_true")
 
     p.add_argument("--output_pos_h5", type=str, default=None)
     p.add_argument("--output_neg_h5", type=str, default=None)
@@ -2010,13 +2413,36 @@ def main():
 
     build_pos = bool(args.build_positive)
     build_neg = bool(args.build_negative)
-    if not build_pos and not build_neg:
+    build_pos_from_albef = bool(args.build_positive_from_albef)
+    if build_pos and build_pos_from_albef:
+        raise ValueError("Use either --build_positive or --build_positive_from_albef, not both.")
+    if not build_pos and not build_neg and not build_pos_from_albef:
         if args.output_pos_h5 is not None:
             build_pos = True
         if args.output_neg_h5 is not None:
             build_neg = True
-    if not build_pos and not build_neg:
-        raise ValueError("Nothing to do. Set --build_positive/--build_negative or provide output paths.")
+    if not build_pos and not build_neg and not build_pos_from_albef:
+        raise ValueError(
+            "Nothing to do. Set --build_positive/--build_negative/"
+            "--build_positive_from_albef or provide output paths."
+        )
+
+    if build_pos_from_albef:
+        if args.output_pos_h5 is None:
+            raise ValueError("--output_pos_h5 is required when building positive dataset from ALBEF.")
+        if args.albef_source_h5 is None:
+            raise ValueError("--albef_source_h5 is required when using --build_positive_from_albef.")
+        create_positive_h5_from_albef(
+            output_h5=Path(args.output_pos_h5),
+            albef_source_h5=Path(args.albef_source_h5),
+            snr_threshold=float(args.snr_threshold),
+            write_meta_features=bool(write_meta_features),
+            buffer_limit=int(args.buffer_limit),
+            enforce_positive_only=parse_bool_arg(
+                args.albef_enforce_positive_only, name="--albef_enforce_positive_only"
+            ),
+            archive_existing=not bool(args.skip_archive),
+        )
 
     if build_pos:
         if args.output_pos_h5 is None:
