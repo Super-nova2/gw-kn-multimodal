@@ -82,8 +82,8 @@
   "stage_to_jobfs": true,
   "redshift_analysis_enable": true,
   "redshift_catalogs": {
-    "bns": "<REPO_ROOT>/dataset/O5_sim_bns_test/injections_final.csv",
-    "nsbh": "<REPO_ROOT>/dataset/O5_sim_nsbh_test/injections_full.csv"
+    "bns": "<BASE_DIR>/GWSamplegen/outputs/production_rubin_dual/bns_test_seed_42/pos_catalog.csv",
+    "nsbh": "<BASE_DIR>/GWSamplegen/outputs/production_rubin_dual/nsbh_test_seed_42/pos_catalog.csv"
   },
   "redshift_bin_edges": [
     0.0,

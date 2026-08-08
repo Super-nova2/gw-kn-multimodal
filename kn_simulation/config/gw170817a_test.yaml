@@ -1,0 +1,26 @@
+# GW170817A bright-source ToO test adapter (reference config).
+# This file is a configuration reference for the GW170817 v2 pipeline; it is not
+# loaded by kn_simulation.Profile (which only accepts bns/nsbh production profiles).
+name: gw170817a_test
+source: bns
+split: test
+paths:
+  run_dir: /fred/oz016/bgao_kn/data/GW_real_events/GW_data/GW170817A/lsst_redshift_experiment
+  skymap_dir: /fred/oz016/bgao_kn/data/skymap/gw170817a
+  opsim_db: /fred/oz016/bgao_kn/data/rubin_sim/baseline_v5.1/baseline_v5.1.1_10yrs.db
+  sndata_root: /fred/oz016/bgao_kn/SNANA/SNDATA_ROOT
+  snana_bin_dir: /fred/oz016/bgao_kn/SNANA/SNANA/bin
+  log_dir: /fred/oz016/bgao_kn/logs/kn_simulation_dual/gw170817a_test
+snana:
+  sim_name: LSST_KN_GW170817A
+  template_input: /fred/oz016/bgao_kn/gw-kn-multimodal/kn_simulation/templates/bns.input
+  too_config: /fred/oz016/bgao_kn/gw-kn-multimodal/kn_simulation/config/rubin_too_2024.yaml
+  coordinate_mode: posterior_test
+  samples_per_event: 64
+  sampling_nside: 256
+  credible_level: 0.9
+  cosmology: Planck15
+catalog:
+  seed: 170817
+  mjd_min: 61000.0
+  mjd_max: 64500.0

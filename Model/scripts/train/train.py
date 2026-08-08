@@ -3690,6 +3690,12 @@ def train(args):
                             best_val_metrics["val_hard_gallery"] = hard_gallery
                         best_val_metrics["neg_gw_strata"] = strata_m
                         best_val_metrics["neg_gw_guardrail"] = neg_gw_guardrail
+                        best_val_metrics["val_neg_gw_min_recall"] = float(
+                            neg_gw_guardrail["min_recall"]
+                        )
+                        best_val_metrics["val_neg_gw_guardrail_met"] = int(
+                            bool(neg_gw_guardrail["met"])
+                        )
                         epochs_no_improve = 0
                         best_ckpt = os.path.join(args.ckpt_path, "ALBEF", "albef_best.pth")
                         os.makedirs(os.path.dirname(best_ckpt), exist_ok=True)

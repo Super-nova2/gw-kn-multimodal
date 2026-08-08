@@ -1,7 +1,7 @@
 # GWSamplegen to Rubin/SNANA production pipeline
 
 This is the maintained optical-simulation entry point. The repository's
-`dataset/` directory is historical and is not imported by this pipeline.
+Historical `dataset/` has been backed up to `$BASE_DIR/backups/` and removed; GW170817 scripts live in `kn_simulation/gw170817a/`.
 
 The supported data flow is:
 

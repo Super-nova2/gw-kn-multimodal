@@ -10,7 +10,7 @@ import torch
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MODEL_DIR = REPO_ROOT / "Model"
 SCRIPT_DIR = MODEL_DIR / "scripts" / "eval"
-GW170817A_DATASET_DIR = REPO_ROOT / "dataset" / "GW170817A_lsst"
+GW170817A_DATASET_DIR = REPO_ROOT / "kn_simulation" / "gw170817a"
 
 for path in (MODEL_DIR, SCRIPT_DIR, GW170817A_DATASET_DIR):
     path_s = str(path)

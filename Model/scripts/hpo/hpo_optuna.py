@@ -119,11 +119,24 @@ MAGIKS_ARG_KEYS = {
     "proj_dropout",
     "feature_dropout",
     "itc_weight",
+    "itc_extra_negative_enable",
     "cls_weight",
     "cls_pos_weight",
     "cls_neg_weight",
     "cls_extra_neg_weight",
+    "cls_aligned_pos_weight",
+    "cls_neg_gw_weight",
+    "cls_mismatched_weight",
+    "cls_external_neg_weight",
     "cls_ramp_epochs",
+    "staged_training_enable",
+    "stage_alignment_epochs",
+    "stage_head_epochs",
+    "stage_joint_itc_start_weight",
+    "stage_joint_itc_end_weight",
+    "encoder_lr_ratio",
+    "neg_gw_guardrail_enable",
+    "neg_gw_guardrail_recall",
     "retrieval_start_epoch",
     "gallery_loss_weight",
     "gallery_loss_ramp_epochs",
@@ -160,6 +173,7 @@ MAGIKS_ARG_KEYS = {
     "supcon_margin",
     "samples_per_gw",
     "min_lc_per_gw",
+    "neg_gw_pair_ratio",
     "mis_neg_dt_window_days",
     "mask_itc",
     "hard_neg_start_epoch",
@@ -304,6 +318,8 @@ SUPPORTED_OBJECTIVE_COMPONENTS = {
     "val_hard_gallery_macro_recall_at_1",
     "val_hard_gallery_macro_retrieval_score",
     "val_itc_acc",
+    "val_neg_gw_min_recall",
+    "val_neg_gw_guardrail_met",
 }
 
 METRIC_SHORT_NAMES = {
@@ -319,6 +335,8 @@ METRIC_SHORT_NAMES = {
     "val_hard_gallery_macro_mrr": "HardMacroMRR",
     "val_hard_gallery_macro_recall_at_1": "HardMacroR@1",
     "val_hard_gallery_macro_retrieval_score": "HardMacroScore",
+    "val_neg_gw_min_recall": "NegGWMinRecall",
+    "val_neg_gw_guardrail_met": "NegGWGuardrail",
 }
 
 def _resolve_path(path: str) -> str:
@@ -631,7 +649,56 @@ def _curriculum_full_epoch(start_epoch: int, ramp_epochs: int) -> int:
     return int(start_epoch) + int(ramp_epochs) - 1
 
 
+def apply_batch_size_step_derivation(config: Dict[str, Any]) -> None:
+    """Derive event-level train/val steps when batch_size changes.
+
+    Keeps the same approximate number of positive-event draws per epoch as the
+    default 1024-batch / 100-step setup (about 20,500 positive events).
+    """
+    if "batch_size" not in config:
+        return
+    batch_size = int(config["batch_size"])
+    samples_per_gw = int(config.get("samples_per_gw", 4))
+    neg_ratio = float(config.get("neg_gw_pair_ratio", 0.2))
+    if batch_size <= 0 or samples_per_gw <= 0:
+        raise ValueError("batch_size and samples_per_gw must be > 0")
+    if not 0.0 <= neg_ratio < 1.0:
+        raise ValueError("neg_gw_pair_ratio must be in [0, 1)")
+    events_per_batch = int(batch_size * (1.0 - neg_ratio)) // samples_per_gw
+    if events_per_batch < 1:
+        raise ValueError(
+            "batch_size is too small for the requested samples_per_gw and neg_gw_pair_ratio"
+        )
+    config["val_batch_size"] = batch_size
+    config["steps_per_epoch"] = max(1, int(round(20500.0 / events_per_batch)))
+    config["val_steps_per_epoch"] = max(
+        1, int(round(config["steps_per_epoch"] * 0.16))
+    )
+
+
 def _apply_three_stage_constraints(config: Dict[str, Any]) -> None:
+    if bool(config.get("staged_training_enable", False)):
+        alignment_epochs = int(config.get("stage_alignment_epochs", 8))
+        head_epochs = int(config.get("stage_head_epochs", 4))
+        if alignment_epochs < 0 or head_epochs < 0:
+            raise ValueError("stage_alignment_epochs and stage_head_epochs must be >= 0")
+        epochs = int(config.get("epochs", 1))
+        if alignment_epochs + head_epochs >= epochs:
+            raise ValueError(
+                "staged training stages do not fit within this trial: "
+                f"epochs={epochs}, stage_alignment_epochs={alignment_epochs}, "
+                f"stage_head_epochs={head_epochs}"
+            )
+
+    guardrail_recall = float(config.get("neg_gw_guardrail_recall", 0.9))
+    if not 0.0 < guardrail_recall <= 1.0:
+        raise ValueError("neg_gw_guardrail_recall must be in (0, 1].")
+
+    lr = float(config.get("lr", 0.0) or 0.0)
+    min_lr = float(config.get("min_lr", 0.0) or 0.0)
+    if lr > 0.0 and min_lr >= lr:
+        raise ValueError(f"min_lr ({min_lr}) must be strictly less than lr ({lr})")
+
     cls_start = int(config.get("cls_start_epoch", 0))
     cls_ramp = int(config.get("cls_ramp_epochs", 0))
     if "retrieval_start_after_cls_epochs" in config:
@@ -724,6 +791,9 @@ def build_trial_config(trial: optuna.Trial, hpo_cfg: Dict[str, Any], base_cfg: D
         _apply_balanced_model_capacity(config, balanced_model_capacity)
 
     config.update(fixed_overrides)
+
+    if "batch_size" in sampled or "batch_size" in fixed_overrides:
+        apply_batch_size_step_derivation(config)
 
     if augment_enable is not None:
         if augment_enable:

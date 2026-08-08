@@ -8,14 +8,14 @@
 #SBATCH --mem=200G
 #SBATCH --gres=gpu:1
 #SBATCH --time=168:00:00
-#SBATCH --partition=gpu
+#SBATCH --partition=milan-gpu
 #SBATCH --tmp=180G
 
 set -euo pipefail
 
 SCRIPT_SUBDIR="Model/scripts/hpo"
 SCRIPT_REL_PATH="Model/scripts/hpo/hpo_train.sh"
-DEFAULT_HPO_CONFIG_REL="Model/args/hpo/hpo_v5_fusion.json"
+DEFAULT_HPO_CONFIG_REL="Model/args/hpo/hpo_v6_main_guardrail85.json"
 REPO_NAME="gw-kn-multimodal"
 if [[ -n "${SLURM_JOB_ID:-}" && -n "${SLURM_SUBMIT_DIR:-}" ]]; then
     if [[ "$(basename "${SLURM_SUBMIT_DIR}")" == "${REPO_NAME}" ]]; then

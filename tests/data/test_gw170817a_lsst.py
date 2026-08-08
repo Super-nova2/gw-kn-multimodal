@@ -11,7 +11,7 @@ import numpy as np
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-DATASET_DIR = REPO_ROOT / "dataset" / "GW170817A_lsst"
+DATASET_DIR = REPO_ROOT / "kn_simulation" / "gw170817a"
 for path in (REPO_ROOT / "Model", DATASET_DIR):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
@@ -142,6 +142,11 @@ class GW170817ALSSTTests(unittest.TestCase):
                 credible_level=0.42,
                 scalar=np.asarray([1.4, 1.3, 0.0, 0.0, 0.7, 0.22, 0.02], dtype=np.float32),
                 skymap=skymap,
+                event_uid="gw170817a_7",
+                simulation_id=7,
+                sample_class="positive",
+                mej_dynamic=0.016,
+                mej_wind=0.024,
             )
         ]
 
@@ -163,6 +168,11 @@ class GW170817ALSSTTests(unittest.TestCase):
             with h5py.File(h5_path, "r") as f:
                 self.assertEqual(f["events/gw_data/scalars"].shape, (1, 7))
                 self.assertEqual(f["events/gw_data/skymaps"].shape, (1, 7, 19200))
+                self.assertEqual(f["events/gw_data/event_uid"][0], b"gw170817a_7")
+                self.assertEqual(f["events/gw_data/simulation_id"][0], 7)
+                self.assertEqual(f["events/gw_data/sample_class"][0], b"positive")
+                self.assertAlmostEqual(float(f["events/gw_data/mej_dynamic"][0]), 0.016)
+                self.assertAlmostEqual(float(f["events/gw_data/mej_wind"][0]), 0.024)
                 self.assertEqual(f["events/gw_data/redshift"][0], 0.05)
                 self.assertEqual(f["events/gw_data/redshift_bin"][0], 2)
                 self.assertEqual(f["events/optical_data/parent_gw_idx"][0], 0)

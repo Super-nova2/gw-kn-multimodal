@@ -236,7 +236,13 @@ def build_parser():
         help="Directory containing <simulation_id>.fits sky maps",
     )
     parser.add_argument("--sim_name", default="LSST_KN_BNS")
-    parser.add_argument("--sim_ids", nargs="+", type=int, required=True)
+    parser.add_argument("--sim_ids", nargs="+", type=int, required=False)
+    parser.add_argument(
+        "--sim-id-file",
+        type=Path,
+        default=None,
+        help="Optional file with one simulation_id per line (alternative to --sim_ids).",
+    )
     parser.add_argument(
         "--GW_catalog",
         required=True,
@@ -297,7 +303,14 @@ def main(argv=None):
         path_sndata_sim_list.touch(exist_ok=True)
     opsim_stem = Path(args.Opsim).stem
     catalog = pd.read_csv(args.GW_catalog)
-    network_snr_by_id = _validate_requested_network_snr(catalog, args.sim_ids)
+    if args.sim_id_file is not None:
+        with open(args.sim_id_file, "r", encoding="utf-8") as handle:
+            sim_ids = [int(line.strip()) for line in handle if line.strip()]
+        if not sim_ids:
+            raise ValueError(f"sim-id file is empty: {args.sim_id_file}")
+    else:
+        sim_ids = args.sim_ids
+    network_snr_by_id = _validate_requested_network_snr(catalog, sim_ids)
     cosmology = getattr(astropy_cosmology, args.cosmology, None)
     if cosmology is None or not hasattr(cosmology, "luminosity_distance"):
         raise ValueError(f"Unknown Astropy cosmology: {args.cosmology}")
@@ -315,7 +328,7 @@ def main(argv=None):
     condition_library = None
 
     artifacts = {}
-    for sim_id in args.sim_ids:
+    for sim_id in sim_ids:
         print(f"\nProcessing simulation ID: {sim_id}")
         sim_id = int(sim_id)
         network_snr = network_snr_by_id[sim_id]
@@ -357,7 +370,11 @@ def main(argv=None):
         }
 
         try:
-            sky_map_path = Path(args.skymap_path) / f"{sim_id}.fits"
+            row_skymap = row.get("skymap_path")
+            if isinstance(row_skymap, str) and row_skymap.strip():
+                sky_map_path = Path(row_skymap)
+            else:
+                sky_map_path = Path(args.skymap_path) / f"{sim_id}.fits"
             sky_map = read_sky_map(sky_map_path, moc=True)
             print(
                 "Distance mean:",

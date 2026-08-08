@@ -33,7 +33,7 @@ if [[ ! -f "${SCRIPT_PATH}" ]]; then
     exit 1
 fi
 
-PROFILE="${PROFILE:-astro_test}"       # test_aug | final_train | astro_test
+PROFILE="${PROFILE:-astro_test}"       # final_train | astro_test
 DATASET_MODE="${DATASET_MODE:-}"        # train | test
 
 BUFFER_LIMIT="${BUFFER_LIMIT:-2000}"
@@ -58,28 +58,6 @@ LUPT_M5_MAG="${LUPT_M5_MAG:-23.9,25.0,24.7,24.0,23.3,22.1}"
 
 set_profile_defaults() {
     case "$PROFILE" in
-        test_aug)
-            DATASET_MODE="${DATASET_MODE:-test}"
-            BNS_MAX_NEG_GW="${BNS_MAX_NEG_GW:-1500}"
-            BNS_MAX_NEG_TYPE1_GW="${BNS_MAX_NEG_TYPE1_GW:-500}"
-            BNS_MAX_NEG_TYPE2_GW="${BNS_MAX_NEG_TYPE2_GW:-1000}"
-            NSBH_MAX_NEG_GW="${NSBH_MAX_NEG_GW:-1000}"
-            NSBH_MAX_NEG_TYPE1_GW="${NSBH_MAX_NEG_TYPE1_GW:-500}"
-            NSBH_MAX_NEG_TYPE2_GW="${NSBH_MAX_NEG_TYPE2_GW:-500}"
-            BNS_FULL_CATALOG_PATH="${BNS_FULL_CATALOG_PATH:-${REPO_ROOT}/dataset/O5_sim_bns/injections_final.csv}"
-            BNS_SKYMAP_DIR="${BNS_SKYMAP_DIR:-${BASE_DIR}/data/skymap/bns_skymap_v0}"
-            BNS_SIM_ROOT="${BNS_SIM_ROOT:-${BASE_DIR}/SNANA/SNDATA_ROOT/SIM/LSST_KN_BNS}"
-            BNS_SIM_NAME="${BNS_SIM_NAME:-LSST_KN_BNS}"
-            BNS_SUCCESS_IDS_PATH="${BNS_SUCCESS_IDS_PATH:-${BASE_DIR}/data/LSST_KN_BNS/success_sim_ids.txt}"
-
-            NSBH_FULL_CATALOG_PATH="${NSBH_FULL_CATALOG_PATH:-${REPO_ROOT}/dataset/O5_sim_nsbh_aug/injections_full.csv}"
-            NSBH_SKYMAP_DIR="${NSBH_SKYMAP_DIR:-${BASE_DIR}/data/skymap/nsbh_skymap}"
-            NSBH_SIM_ROOT="${NSBH_SIM_ROOT:-${BASE_DIR}/SNANA/SNDATA_ROOT/SIM/LSST_KN_NSBH_AUG}"
-            NSBH_SIM_NAME="${NSBH_SIM_NAME:-LSST_KN_NSBH_AUG}"
-            NSBH_SUCCESS_IDS_PATH="${NSBH_SUCCESS_IDS_PATH:-${BASE_DIR}/data/LSST_KN_NSBH_AUG/success_sim_ids.txt}"
-
-            OUTPUT_H5_PATH="${OUTPUT_H5_PATH:-${BASE_DIR}/data/ALBEF_dataset/combined_dataset_${DATASET_MODE}.h5}"
-            ;;
         final_train)
             DATASET_MODE="${DATASET_MODE:-train}"
             BNS_MAX_NEG_GW="${BNS_MAX_NEG_GW:-10000}"
@@ -125,7 +103,7 @@ set_profile_defaults() {
             OUTPUT_H5_PATH="${OUTPUT_H5_PATH:-${BASE_DIR}/data/ALBEF_dataset/combined_dataset_astro_${DATASET_MODE}.h5}"
             ;;
         *)
-            echo "Unsupported PROFILE=$PROFILE. Use PROFILE=test_aug, PROFILE=final_train, or PROFILE=astro_test."
+            echo "Unsupported PROFILE=$PROFILE. Use PROFILE=final_train or PROFILE=astro_test."
             exit 1
             ;;
     esac
@@ -250,19 +228,12 @@ PY_VALIDATE_H5
 
 set_profile_defaults
 
-if [[ "$PROFILE" == "final_train" || "$PROFILE" == "astro_test" ]]; then
-    BNS_BUNDLE_ROOT="${BASE_DIR}/GWSamplegen/outputs/production_rubin_dual/bns_${DATASET_MODE}_seed_42"
-    NSBH_BUNDLE_ROOT="${BASE_DIR}/GWSamplegen/outputs/production_rubin_dual/nsbh_${DATASET_MODE}_seed_42"
-    BNS_NEGATIVE_CATALOG_PATH="${BNS_NEGATIVE_CATALOG_PATH:-${BNS_BUNDLE_ROOT}/neg_catalog.csv}"
-    BNS_NEGATIVE_SKYMAP_DIR="${BNS_NEGATIVE_SKYMAP_DIR:-${BASE_DIR}/data/skymap/negative/bns_skymap_${DATASET_MODE}}"
-    NSBH_NEGATIVE_CATALOG_PATH="${NSBH_NEGATIVE_CATALOG_PATH:-${NSBH_BUNDLE_ROOT}/neg_catalog.csv}"
-    NSBH_NEGATIVE_SKYMAP_DIR="${NSBH_NEGATIVE_SKYMAP_DIR:-${BASE_DIR}/data/skymap/negative/nsbh_skymap_${DATASET_MODE}}"
-else
-    : "${BNS_NEGATIVE_CATALOG_PATH:?test_aug requires BNS_NEGATIVE_CATALOG_PATH}"
-    : "${BNS_NEGATIVE_SKYMAP_DIR:?test_aug requires BNS_NEGATIVE_SKYMAP_DIR}"
-    : "${NSBH_NEGATIVE_CATALOG_PATH:?test_aug requires NSBH_NEGATIVE_CATALOG_PATH}"
-    : "${NSBH_NEGATIVE_SKYMAP_DIR:?test_aug requires NSBH_NEGATIVE_SKYMAP_DIR}"
-fi
+BNS_BUNDLE_ROOT="${BASE_DIR}/GWSamplegen/outputs/production_rubin_dual/bns_${DATASET_MODE}_seed_42"
+NSBH_BUNDLE_ROOT="${BASE_DIR}/GWSamplegen/outputs/production_rubin_dual/nsbh_${DATASET_MODE}_seed_42"
+BNS_NEGATIVE_CATALOG_PATH="${BNS_NEGATIVE_CATALOG_PATH:-${BNS_BUNDLE_ROOT}/neg_catalog.csv}"
+BNS_NEGATIVE_SKYMAP_DIR="${BNS_NEGATIVE_SKYMAP_DIR:-${BASE_DIR}/data/skymap/negative/bns_skymap_${DATASET_MODE}}"
+NSBH_NEGATIVE_CATALOG_PATH="${NSBH_NEGATIVE_CATALOG_PATH:-${NSBH_BUNDLE_ROOT}/neg_catalog.csv}"
+NSBH_NEGATIVE_SKYMAP_DIR="${NSBH_NEGATIVE_SKYMAP_DIR:-${BASE_DIR}/data/skymap/negative/nsbh_skymap_${DATASET_MODE}}"
 
 if [[ "$DATASET_MODE" != "train" && "$DATASET_MODE" != "test" ]]; then
     echo "DATASET_MODE must be train or test, got: $DATASET_MODE"

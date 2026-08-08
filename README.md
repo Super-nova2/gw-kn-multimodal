@@ -41,7 +41,6 @@ gw-kn-multimodal/
 │   ├── src/                            # Python 实现
 │   ├── profiles/                       # BNS/NSBH train/test 配置
 │   └── runs/                           # Git 忽略的运行目录
-├── dataset/                            # 冻结的历史数据与旧模拟流程
 └── docs/                               # 设计说明与实验记录
 ```
 
@@ -114,7 +113,7 @@ bash Model/scripts/data/submit_create_dataset_bns_nsbh.sh
 
 常用环境变量：
 
-- `PROFILE=test_aug|final_train`
+- `PROFILE=final_train|astro_test`
 - `DATASET_MODE=train|test`
 - `OUTPUT_H5_PATH=/path/to/output.h5`
 - `NUM_WORKERS=6`
@@ -237,7 +236,7 @@ bash optical_only/scripts/train/train.sh optical_only/args/optical_only_kn_v16.j
 - 迁移环境前需重新从 `.json.example` 模板生成配置文件。
 - 新的光学模拟统一从 `kn_simulation/bin/kn-sim` 进入，并依赖外部
   SNANA、OpSim 数据和数据库文件。
-- `dataset/` 是保留给旧实验、GW170817A 和现有模型消费者的历史目录；
+- `dataset/` 历史目录已备份至 `$BASE_DIR/backups/` 并从仓库移除；GW170817 脚本位于 `kn_simulation/gw170817a/`。
   新的生产任务不应从该目录调用脚本。
 - 部分 notebook 与实验文档保留了研究期的路径习惯，跑之前建议先核对。
 

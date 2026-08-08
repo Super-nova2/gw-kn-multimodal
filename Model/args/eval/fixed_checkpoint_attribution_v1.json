@@ -16,10 +16,13 @@
   "neg_group": "ELASTICC/optical_data",
   "nonkn_cls_base_field": "zero_time_mjd_cls_base",
   "physical_catalogs": {
-    "bns": "/fred/oz016/bgao_kn/gw-kn-multimodal/dataset/O5_sim_bns_test/injections_final.csv",
-    "nsbh": "/fred/oz016/bgao_kn/gw-kn-multimodal/dataset/O5_sim_nsbh_test/injections_full.csv"
+    "bns": "/fred/oz016/bgao_kn/GWSamplegen/outputs/production_rubin_dual/bns_test_seed_42/pos_catalog.csv",
+    "nsbh": "/fred/oz016/bgao_kn/GWSamplegen/outputs/production_rubin_dual/nsbh_test_seed_42/pos_catalog.csv"
   },
-  "comparison_window": [-0.1, 0.2],
+  "comparison_window": [
+    -0.1,
+    0.2
+  ],
   "device": "cuda",
   "amp_dtype": "bf16",
   "negative_sample_strategy": "block_random",

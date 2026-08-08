@@ -41,7 +41,6 @@ gw-kn-multimodal/
 │   ├── src/                          # Python implementation
 │   ├── profiles/                     # BNS/NSBH train/test profiles
 │   └── runs/                         # Git-ignored runtime directories
-├── dataset/                          # Frozen historical data and workflows
 └── docs/                             # Design notes and experiment records
 ```
 
@@ -116,7 +115,7 @@ Key environment variables:
 
 | Variable | Options |
 |----------|---------|
-| `PROFILE` | `test_aug`, `final_train` |
+| `PROFILE` | `final_train`, `astro_test` |
 | `DATASET_MODE` | `train`, `test` |
 | `OUTPUT_H5_PATH` | `/path/to/output.h5` |
 | `NUM_WORKERS` | e.g. `6` |
