@@ -256,6 +256,23 @@ def load_gw_source_type_table(h5_path, device, required=False):
     return torch.from_numpy(codes.astype(np.int64, copy=False)).to(device=device)
 
 
+def load_gw_neg_type_table(h5_path, device, required=False):
+    """Load per-event negative-GW type codes."""
+    ds_path = "events/gw_data/neg_type"
+    with h5py.File(h5_path, "r") as f:
+        n_gw = int(f["events/gw_data/scalars"].shape[0])
+        if ds_path not in f:
+            if required:
+                raise KeyError(f"Required field missing: {ds_path} in {h5_path}")
+            return None
+        values = np.asarray(f[ds_path][:], dtype=np.int64).reshape(-1)
+    if values.shape[0] != n_gw:
+        raise ValueError(
+            f"neg_type length mismatch: got {values.shape[0]}, expected {n_gw}"
+        )
+    return torch.from_numpy(values).to(device=device)
+
+
 def _collect_dataset_window_metadata(args) -> Dict[str, object]:
     return {
         "train_positive": _read_optical_h5_window_metadata(getattr(args, "data_path", None)),
@@ -545,6 +562,73 @@ def sample_mismatched_negatives(
     return mis_idx
 
 
+
+
+def build_itc_pair_mask(gw_indices, pair_is_neg_gw, min_pairs_per_gw=2):
+    """Keep only positive GW events with enough optical views for SupCon."""
+    gw_indices = torch.as_tensor(gw_indices).reshape(-1)
+    pair_is_neg_gw = torch.as_tensor(
+        pair_is_neg_gw, device=gw_indices.device, dtype=torch.bool
+    ).reshape(-1)
+    if gw_indices.numel() != pair_is_neg_gw.numel():
+        raise ValueError("gw_indices and pair_is_neg_gw must have equal length.")
+    _, inverse, counts = torch.unique(
+        gw_indices, return_inverse=True, return_counts=True
+    )
+    eligible_count = counts[inverse] >= max(1, int(min_pairs_per_gw))
+    return (~pair_is_neg_gw) & eligible_count
+
+
+def _parameter_stage_role(name):
+    name = str(name).replace("_orig_mod.", "")
+    if name == "log_temp":
+        return "temperature"
+    if name.startswith("fusion.") or "gw_encoder.skymap_seq_proj." in name:
+        return "head"
+    return "encoder"
+
+
+def configure_model_for_stage(model, args, stage):
+    """Freeze/unfreeze model parts for the resolved training stage."""
+    if not is_staged_training_enabled(args):
+        for parameter in model.parameters():
+            parameter.requires_grad = True
+        return
+    for name, parameter in model.named_parameters():
+        role = _parameter_stage_role(name)
+        if stage == "alignment":
+            parameter.requires_grad = role in {"encoder", "temperature"}
+        elif stage == "head":
+            parameter.requires_grad = role == "head"
+        else:
+            parameter.requires_grad = role in {"encoder", "head"}
+
+
+def build_optimizer_param_groups(model, args):
+    """Build stage-aware AdamW groups and exclude norm/bias/temp from decay."""
+    grouped = {}
+    for name, parameter in model.named_parameters():
+        clean_name = str(name).replace("_orig_mod.", "")
+        role = _parameter_stage_role(clean_name)
+        no_decay = (
+            parameter.ndim < 2
+            or clean_name.endswith(".bias")
+            or "norm" in clean_name.lower()
+            or "bn" in clean_name.lower()
+            or role == "temperature"
+        )
+        key = (role, no_decay)
+        grouped.setdefault(key, []).append(parameter)
+
+    groups = []
+    for (role, no_decay), parameters in sorted(grouped.items()):
+        groups.append({
+            "params": parameters,
+            "lr": float(args.lr),
+            "weight_decay": 0.0 if no_decay else float(args.weight_decay),
+            "stage_role": role,
+        })
+    return groups
 def sample_mis_neg_dt_days(batch_size, device, window_days=30.0):
     """Synthetic time delta for mismatched negatives: Uniform(0, window_days) days."""
     return torch.rand(batch_size, device=device, dtype=torch.float32) * window_days
@@ -704,25 +788,87 @@ def augment_optical_data(opt_t, opt_v, opt_mask, opt_err, training=True,
 
     return opt_t, opt_v, opt_mask, opt_err
 
+def is_staged_training_enabled(args):
+    return bool(getattr(args, "staged_training_enable", False))
+
+
+def resolve_training_stage(args, epoch):
+    """Resolve alignment, frozen-head, or joint fine-tuning for an epoch."""
+    if not is_staged_training_enabled(args):
+        return "legacy"
+    epoch = int(epoch)
+    itc_enabled = float(getattr(args, "itc_weight", 0.0)) > 0.0
+    cls_enabled = float(getattr(args, "cls_weight", 0.0)) > 0.0
+    alignment_epochs = max(0, int(getattr(args, "stage_alignment_epochs", 8)))
+    head_epochs = max(0, int(getattr(args, "stage_head_epochs", 4)))
+
+    if itc_enabled and cls_enabled:
+        if epoch < alignment_epochs:
+            return "alignment"
+        if epoch < alignment_epochs + head_epochs:
+            return "head"
+        return "joint"
+    if itc_enabled:
+        return "alignment"
+    if cls_enabled:
+        return "head" if epoch < head_epochs else "joint"
+    return "joint"
+
+
+def _common_lr_scale(args, step, steps_per_epoch):
+    total_steps = max(1, int(args.epochs) * int(steps_per_epoch))
+    warmup_steps = max(0, int(args.warmup_epochs) * int(steps_per_epoch))
+    min_lr = args.min_lr if args.min_lr is not None else 0.0
+    min_lr_ratio = min(float(min_lr) / float(args.lr), 1.0)
+    if warmup_steps > 0 and step < warmup_steps:
+        return float(step + 1) / float(max(1, warmup_steps))
+    progress = (step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+    progress = min(1.0, max(0.0, progress))
+    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+    return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
+
+
 def build_lr_scheduler(optimizer, args, steps_per_epoch, start_step):
     if args.lr_scheduler == "none":
         return None
-    total_steps = max(1, args.epochs * steps_per_epoch)
-    warmup_steps = max(0, args.warmup_epochs * steps_per_epoch)
-    min_lr = args.min_lr if args.min_lr is not None else 0.0
-    min_lr_ratio = min(min_lr / args.lr, 1.0)
 
-    def lr_lambda(step):
-        if warmup_steps > 0 and step < warmup_steps:
-            return float(step + 1) / float(max(1, warmup_steps))
-        progress = (step - warmup_steps) / float(max(1, total_steps - warmup_steps))
-        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
-        return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
+    def make_lr_lambda(role):
+        def lr_lambda(step):
+            common = _common_lr_scale(args, step, steps_per_epoch)
+            if not is_staged_training_enabled(args):
+                return common
+            epoch = min(
+                int(getattr(args, "epochs", 1)) - 1,
+                max(0, int(step) // max(1, int(steps_per_epoch))),
+            )
+            stage = resolve_training_stage(args, epoch)
+            if role == "encoder":
+                if stage == "head":
+                    return 0.0
+                if stage == "joint":
+                    return common * float(getattr(args, "encoder_lr_ratio", 0.1))
+                return common
+            if role == "head":
+                return 0.0 if stage == "alignment" else common
+            if role == "temperature":
+                return common if stage == "alignment" else 0.0
+            return common
+        return lr_lambda
 
-    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda, last_epoch=start_step - 1)
+    lambdas = [
+        make_lr_lambda(group.get("stage_role", "all"))
+        for group in optimizer.param_groups
+    ]
+    return torch.optim.lr_scheduler.LambdaLR(
+        optimizer, lambdas, last_epoch=start_step - 1
+    )
 
 
 def compute_cls_weight(args, epoch):
+    if is_staged_training_enabled(args):
+        if float(getattr(args, "cls_weight", 0.0)) <= 0.0:
+            return 0.0
+        return 0.0 if resolve_training_stage(args, epoch) == "alignment" else float(args.cls_weight)
     if epoch < args.cls_start_epoch:
         return 0.0
     if args.cls_ramp_epochs <= 0:
@@ -736,7 +882,6 @@ def is_cls_branch_enabled(args):
 
 def is_gallery_enabled(args):
     return float(getattr(args, "gallery_loss_weight", 0.0)) > 0.0
-
 
 def compute_gallery_loss_weight(args, epoch):
     target = float(getattr(args, "gallery_loss_weight", 0.0))
@@ -800,6 +945,29 @@ def is_cls_active(epoch, args):
 
 
 def compute_itc_weight(args, epoch):
+    if is_staged_training_enabled(args):
+        base = float(getattr(args, "itc_weight", 0.0))
+        if base <= 0.0:
+            return 0.0
+        stage = resolve_training_stage(args, epoch)
+        if stage == "head":
+            return 0.0
+        if stage == "alignment":
+            return base
+        joint_start = max(
+            0, int(getattr(args, "stage_alignment_epochs", 8))
+        ) + max(0, int(getattr(args, "stage_head_epochs", 4)))
+        joint_epochs = max(1, int(getattr(args, "epochs", 1)) - joint_start)
+        progress = min(
+            1.0,
+            max(
+                0.0,
+                (int(epoch) - joint_start) / float(max(1, joint_epochs - 1)),
+            ),
+        )
+        start = float(getattr(args, "stage_joint_itc_start_weight", 0.5))
+        end = float(getattr(args, "stage_joint_itc_end_weight", 0.25))
+        return base * (start + (end - start) * progress)
     if args.itc_decay_epochs <= 0 or args.itc_decay_ratio <= 0:
         return args.itc_weight
     if epoch < args.itc_decay_start_epoch:
@@ -836,7 +1004,17 @@ def compute_best_ckpt_stage_epochs(args):
     if str(getattr(args, "lr_scheduler", "none")) != "none" and warmup_epochs > 0:
         stage_epochs["lr_warmup"] = compute_curriculum_full_epoch(0, warmup_epochs)
 
-    if is_cls_branch_enabled(args):
+    if is_staged_training_enabled(args):
+        itc_enabled = float(getattr(args, "itc_weight", 0.0)) > 0.0
+        cls_enabled = is_cls_branch_enabled(args)
+        if cls_enabled:
+            joint_start = max(0, int(getattr(args, "stage_head_epochs", 4)))
+            if itc_enabled:
+                joint_start += max(
+                    0, int(getattr(args, "stage_alignment_epochs", 8))
+                )
+            stage_epochs["joint_finetune_start"] = joint_start
+    elif is_cls_branch_enabled(args):
         stage_epochs["classification"] = compute_curriculum_full_epoch(
             getattr(args, "cls_start_epoch", 0),
             getattr(args, "cls_ramp_epochs", 0),
@@ -861,6 +1039,8 @@ def compute_best_ckpt_stage_epochs(args):
             )
 
     if (
+        not is_staged_training_enabled(args)
+        and
         float(getattr(args, "itc_weight", 0.0)) > 0.0
         and int(getattr(args, "itc_decay_epochs", 0)) > 0
         and float(getattr(args, "itc_decay_ratio", 0.0)) > 0.0
@@ -993,19 +1173,58 @@ def describe_best_ckpt_selection_pending(args, epoch):
         reason = "waiting for metric/manual start constraint"
     return f"waiting until epoch {selection_epoch + 1}; {reason}."
 
-def compute_weighted_cls_loss(pos_loss, hard_loss, neg_loss, has_negatives, args):
-    pos_weight = args.cls_pos_weight
-    neg_weight = args.cls_neg_weight
-    extra_neg_weight = args.cls_extra_neg_weight
+def compute_weighted_cls_loss(
+    aligned_pos_loss,
+    neg_gw_loss,
+    mismatched_loss,
+    external_loss,
+    args,
+):
+    """Combine four semantically distinct classification buckets.
 
-    if has_negatives:
-        denom = max(1e-8, pos_weight + neg_weight + extra_neg_weight)
-        return (
-            pos_weight * pos_loss + neg_weight * hard_loss + extra_neg_weight * neg_loss
-        ) / denom
+    Buckets:
+      1. aligned positive GW -> its own KN optical sample
+      2. neg-GW -> source-matched KN optical sample
+      3. positive GW -> another GW's optical sample (mismatched)
+      4. positive GW -> external non-KN optical sample
 
-    denom = max(1e-8, pos_weight + neg_weight)
-    return (pos_weight * pos_loss + neg_weight * hard_loss) / denom
+    Each loss may be ``None`` when the corresponding sample type is absent
+    from the current batch (for example, no external negatives).
+    """
+    weights = {
+        "aligned": float(
+            getattr(args, "cls_aligned_pos_weight", getattr(args, "cls_pos_weight", 1.0))
+        ),
+        "neg_gw": float(
+            getattr(args, "cls_neg_gw_weight", getattr(args, "cls_neg_weight", 1.0))
+        ),
+        "mismatched": float(
+            getattr(args, "cls_mismatched_weight", getattr(args, "cls_neg_weight", 1.0))
+        ),
+        "external": float(
+            getattr(args, "cls_external_neg_weight", getattr(args, "cls_extra_neg_weight", 1.0))
+        ),
+    }
+    if any(value < 0.0 for value in weights.values()):
+        raise ValueError("Classification bucket weights must be non-negative.")
+
+    parts = []
+    if aligned_pos_loss is not None:
+        parts.append((weights["aligned"], aligned_pos_loss))
+    if neg_gw_loss is not None:
+        parts.append((weights["neg_gw"], neg_gw_loss))
+    if mismatched_loss is not None:
+        parts.append((weights["mismatched"], mismatched_loss))
+    if external_loss is not None:
+        parts.append((weights["external"], external_loss))
+
+    if not parts:
+        return torch.zeros((), dtype=torch.float32)
+
+    denom = sum(weight for weight, _ in parts)
+    if denom <= 0.0:
+        raise ValueError("At least one classification bucket weight must be > 0.")
+    return sum(weight * loss for weight, loss in parts) / denom
 
 
 def compute_fusion_gallery_nce_loss(scores, positive_mask):
@@ -1436,6 +1655,53 @@ def is_checkpoint_score_improved(current_score, previous_best, min_delta):
         float(previous_best) + float(min_delta)
     )
 
+
+NEG_GW_STRATA_KEYS = ("bns_type1", "bns_type2", "nsbh_type1", "nsbh_type2")
+
+
+def resolve_neg_gw_guardrail(args, val_metrics):
+    """Resolve the stratified negative-GW recall guardrail.
+
+    The guardrail is only meaningful when the validation set contains
+    negative-GW pairs. All four ``source_type x neg_type`` strata must be
+    populated and every stratum recall must be at least
+    ``neg_gw_guardrail_recall``.
+    """
+    enabled = bool(getattr(args, "neg_gw_guardrail_enable", False))
+    threshold = float(getattr(args, "neg_gw_guardrail_recall", 0.90))
+    strata = (val_metrics or {}).get("neg_gw_strata", {})
+
+    recalls = []
+    counts = []
+    for key in NEG_GW_STRATA_KEYS:
+        item = strata.get(key)
+        if item is None:
+            recalls.append(0.0)
+            counts.append(0)
+        else:
+            recalls.append(float(item.get("recall", 0.0)))
+            counts.append(int(item.get("count", 0)))
+
+    min_recall = min(recalls) if recalls else 0.0
+    populated = len(recalls) == len(NEG_GW_STRATA_KEYS) and all(count > 0 for count in counts)
+    met = (not enabled) or (populated and min_recall + 1.0e-9 >= threshold)
+
+    reason = None
+    if enabled and not met:
+        if not populated:
+            reason = "missing or empty neg-GW validation stratum"
+        else:
+            reason = f"min recall {min_recall:.4f} < threshold {threshold:.4f}"
+
+    return {
+        "enabled": enabled,
+        "threshold": threshold,
+        "min_recall": min_recall,
+        "met": bool(met),
+        "reason": reason,
+    }
+
+
 def evaluate(
     model,
     val_loader,
@@ -1445,12 +1711,17 @@ def evaluate(
     amp_dtype=torch.float32,
     gw_event_time_mjd_table=None,
     gw_source_type_table=None,
+    gw_neg_type_table=None,
 ):
     from metrics import (compute_retrieval_metrics,
                          compute_classification_metrics,
                          compute_embedding_metrics)
 
     model.eval()
+    val_sampler = getattr(val_loader, "batch_sampler", None)
+    val_has_neg_gw_pairs = bool(
+        getattr(val_sampler, "n_neg_per_batch", 0) > 0
+    )
     has_negatives = args.neg_data_path is not None
     cls_branch_enabled = is_cls_branch_enabled(args)
     ref_time_cache = None
@@ -1469,6 +1740,7 @@ def evaluate(
     val_gallery_hard = 0.0
     val_itc_acc = 0.0
     val_pos_acc = 0.0
+    val_neg_gw_acc = 0.0
     val_hard_acc = 0.0
     val_neg_acc = 0.0
     val_total_acc = 0.0
@@ -1488,8 +1760,16 @@ def evaluate(
         "hard": {"sum": 0.0, "sum_sq": 0.0, "count": 0},
         "extra": {"sum": 0.0, "sum_sq": 0.0, "count": 0},
     }
+    neg_gw_probabilities = {
+        ("bns", 1): [], ("bns", 2): [],
+        ("nsbh", 1): [], ("nsbh", 2): [],
+    }
     with torch.no_grad():
         for batch_data in val_loader:
+            pair_is_neg_gw = None
+            if val_has_neg_gw_pairs:
+                pair_is_neg_gw = batch_data[-1]
+                batch_data = batch_data[:-1]
             _opt_zero_time_mjd_base = None
             _neg_zero_time_mjd_base = None
             _neg_zero_time_mjd_cls_base = None
@@ -1535,6 +1815,22 @@ def evaluate(
             opt_err = opt_err.to(device, non_blocking=True)
             opt_coords = opt_coords.to(device, non_blocking=True)
             gw_indices = gw_indices.to(device, non_blocking=True).long()
+            if pair_is_neg_gw is None:
+                pair_is_neg_gw = torch.zeros(
+                    gw_indices.shape[0], device=device, dtype=torch.bool
+                )
+            else:
+                pair_is_neg_gw = pair_is_neg_gw.to(
+                    device, non_blocking=True
+                ).bool()
+            itc_pair_mask = build_itc_pair_mask(
+                gw_indices, pair_is_neg_gw,
+                min_pairs_per_gw=args.min_lc_per_gw,
+            )
+            if not bool(itc_pair_mask.any()):
+                raise ValueError(
+                    "Validation batch has no multi-positive GW event for ITC."
+                )
             batch_event_time_mjd = None
             if gw_event_time_mjd_table is not None:
                 batch_event_time_mjd = gw_event_time_mjd_table[gw_indices]
@@ -1571,41 +1867,49 @@ def evaluate(
                 g, z_l, h_l, H_gw = model.encode(
                     gw_s, gw_m, opt_coords, opt_t, opt_v, opt_ref_t, opt_mask, opt_err
                 )
-                extra_neg_z_itc = None
-                extra_neg_event_time_mjd = None
-                if has_negatives and not cls_branch_enabled:
-                    neg_zero_time_mjd_for_itc = _neg_zero_time_mjd_cls_base
-                    if neg_zero_time_mjd_for_itc is None:
-                        neg_zero_time_mjd_for_itc = _neg_zero_time_mjd_base
-                    with torch.no_grad():
-                        extra_neg_z_itc, _ = model.encode_optical(
-                            neg_coords, neg_t, neg_v, opt_ref_t, neg_mask, neg_err,
-                        )
-                    extra_neg_event_time_mjd = neg_zero_time_mjd_for_itc
+                itc_g = g[itc_pair_mask]
+                itc_z_l = z_l[itc_pair_mask]
+                itc_gw_indices = gw_indices[itc_pair_mask]
+                itc_gw_event_time = (
+                    batch_event_time_mjd[itc_pair_mask]
+                    if batch_event_time_mjd is not None else None
+                )
+                itc_opt_first_detection = (
+                    _opt_first_detection_mjd[itc_pair_mask]
+                    if _opt_first_detection_mjd is not None else None
+                )
                 if args.itc_loss_type == "supcon":
                     itc_loss, sim_g2o, sim_g2o_for_loss = model.compute_supcon_loss(
-                        g, z_l, gw_indices, margin=args.supcon_margin,
-                        gw_event_time_mjd=batch_event_time_mjd,
+                        itc_g,
+                        itc_z_l,
+                        itc_gw_indices,
+                        margin=args.supcon_margin,
+                        gw_event_time_mjd=itc_gw_event_time,
                         opt_event_time_mjd=resolve_optical_candidate_time_mjd(
-                            _opt_first_detection_mjd, batch_event_time_mjd
+                            itc_opt_first_detection, itc_gw_event_time
                         ),
-                        extra_neg_z=extra_neg_z_itc,
-                        extra_neg_opt_event_time_mjd=extra_neg_event_time_mjd,
+                        extra_neg_z=None,
+                        extra_neg_opt_event_time_mjd=None,
                     )
                 else:
                     itc_loss, sim_g2o, sim_g2o_for_loss = model.compute_itc_loss(
-                        g, z_l, gw_indices,
-                        gw_event_time_mjd=batch_event_time_mjd,
+                        itc_g,
+                        itc_z_l,
+                        itc_gw_indices,
+                        gw_event_time_mjd=itc_gw_event_time,
                         opt_event_time_mjd=resolve_optical_candidate_time_mjd(
-                            _opt_first_detection_mjd, batch_event_time_mjd
+                            itc_opt_first_detection, itc_gw_event_time
                         ),
-                        extra_neg_z=extra_neg_z_itc,
-                        extra_neg_opt_event_time_mjd=extra_neg_event_time_mjd,
+                        extra_neg_z=None,
+                        extra_neg_opt_event_time_mjd=None,
                     )
 
-                # Extract L2-normalized projected features for embedding metrics
-                feat_g, feat_o = model.get_contrastive_embeddings(g, z_l)
-                labels_pos = torch.ones(batch_size, device=device, dtype=torch.long)
+                feat_g, feat_o = model.get_contrastive_embeddings(
+                    itc_g, itc_z_l
+                )
+                pos_mask = ~pair_is_neg_gw
+                neg_gw_mask = pair_is_neg_gw
+                labels_pos = pos_mask.to(dtype=torch.long)
                 labels_neg = torch.zeros(batch_size, device=device, dtype=torch.long)
                 gallery_loss = torch.zeros((), device=device)
                 gallery_hard_loss = torch.zeros((), device=device)
@@ -1629,7 +1933,24 @@ def evaluate(
                         gw_s=gw_s, gw_m=gw_m, opt_coords=opt_coords,
                         dt_days=dt_pos,
                     )
-                    pos_loss = model.cls_criterion(logits_pos, labels_pos)
+                    if pos_mask.any():
+                        aligned_pos_loss = model.cls_criterion(
+                            logits_pos[pos_mask],
+                            torch.ones(
+                                int(pos_mask.sum()), device=device, dtype=torch.long
+                            ),
+                        )
+                    else:
+                        aligned_pos_loss = None
+                    if neg_gw_mask.any():
+                        neg_gw_loss = model.cls_criterion(
+                            logits_pos[neg_gw_mask],
+                            torch.zeros(
+                                int(neg_gw_mask.sum()), device=device, dtype=torch.long
+                            ),
+                        )
+                    else:
+                        neg_gw_loss = None
 
                     mis_idx = sample_mismatched_negatives(
                         batch_size, device, samples_per_gw=args.samples_per_gw,
@@ -1693,7 +2014,7 @@ def evaluate(
                         neg_loss = None
 
                     cls_loss = compute_weighted_cls_loss(
-                        pos_loss, hard_loss, neg_loss, has_negatives, args
+                        aligned_pos_loss, neg_gw_loss, hard_loss, neg_loss, args
                     )
                     gallery_loss = torch.zeros((), device=device)
                     gallery_hard_loss = torch.zeros((), device=device)
@@ -1706,7 +2027,8 @@ def evaluate(
                     logits_pos = torch.zeros((batch_size, 2), device=device, dtype=g.dtype)
                     logits_hard = torch.zeros((batch_size, 2), device=device, dtype=g.dtype)
                     logits_neg = torch.zeros((batch_size, 2), device=device, dtype=g.dtype) if has_negatives else None
-                    pos_loss = torch.zeros((), device=device)
+                    aligned_pos_loss = torch.zeros((), device=device)
+                    neg_gw_loss = None
                     hard_loss = torch.zeros((), device=device)
                     neg_loss = torch.zeros((), device=device) if has_negatives else None
                     cls_loss = torch.zeros((), device=device)
@@ -1889,25 +2211,34 @@ def evaluate(
                     (ext_count,), -1,
                     device=gw_indices.device, dtype=gw_indices.dtype,
                 )
-                batch_ret_gw = torch.cat([gw_indices, ext_gw_indices], dim=0)
+                batch_ret_gw = torch.cat([itc_gw_indices, ext_gw_indices], dim=0)
                 batch_ret = compute_retrieval_metrics(
                     sim_ext, batch_ret_gw, ks=(1, 5, 10)
                 )
             else:
                 batch_ret = compute_retrieval_metrics(
-                    sim_ext, gw_indices, ks=(1, 5, 10)
+                    sim_ext, itc_gw_indices, ks=(1, 5, 10)
                 )
             retrieval_metrics_accum.append(batch_ret)
 
             # --- ITC accuracy (in-batch only) ---
             itc_preds = sim_g2o_d.argmax(dim=1)
-            anchor_gw = gw_indices
-            pred_gw = gw_indices[itc_preds]
+            anchor_gw = itc_gw_indices
+            pred_gw = itc_gw_indices[itc_preds]
             itc_acc = (anchor_gw == pred_gw).float().mean().item()
 
             if cls_logits_available:
-                pos_acc = (logits_pos.argmax(dim=1) == labels_pos).float().mean().item()
-                acc_parts = [pos_acc]
+                pos_acc = 0.0
+                neg_gw_acc = 0.0
+                if pos_mask.any():
+                    pos_acc = (
+                        logits_pos[pos_mask].argmax(dim=1) == 1
+                    ).float().mean().item()
+                if neg_gw_mask.any():
+                    neg_gw_acc = (
+                        logits_pos[neg_gw_mask].argmax(dim=1) == 0
+                    ).float().mean().item()
+                acc_parts = [pos_acc, neg_gw_acc]
                 hard_acc = 0.0
                 if cls_hard_logits_available:
                     hard_acc = (logits_hard.argmax(dim=1) == labels_neg).float().mean().item()
@@ -1919,12 +2250,14 @@ def evaluate(
                 total_acc = sum(acc_parts) / float(max(1, len(acc_parts)))
             else:
                 pos_acc = 0.0
+                neg_gw_acc = 0.0
                 hard_acc = 0.0
                 neg_acc = 0.0
                 total_acc = 0.0
 
             val_itc_acc += itc_acc
             val_pos_acc += pos_acc
+            val_neg_gw_acc += neg_gw_acc
             val_hard_acc += hard_acc
             val_neg_acc += neg_acc
             val_total_acc += total_acc
@@ -1932,30 +2265,59 @@ def evaluate(
 
             # --- Accumulate for global classification + embedding metrics ---
             if cls_metrics_enabled and cls_logits_available:
-                pos_probs = torch.softmax(logits_pos.detach().float(), dim=1)[:, 1]
-                all_cls_probs.append(pos_probs.cpu())
-                all_cls_labels.append(labels_pos.cpu())
-                all_cls_sources.extend(['pos'] * batch_size)
+                pair_probs = torch.softmax(logits_pos.detach().float(), dim=1)[:, 1]
+                if pos_mask.any():
+                    pos_probs = pair_probs[pos_mask]
+                    all_cls_probs.append(pos_probs.cpu())
+                    all_cls_labels.append(
+                        torch.ones(int(pos_mask.sum()), dtype=torch.long).cpu()
+                    )
+                    all_cls_sources.extend(["aligned"] * int(pos_mask.sum()))
+                if neg_gw_mask.any():
+                    neg_gw_probs = pair_probs[neg_gw_mask]
+                    all_cls_probs.append(neg_gw_probs.cpu())
+                    all_cls_labels.append(
+                        torch.zeros(int(neg_gw_mask.sum()), dtype=torch.long).cpu()
+                    )
+                    all_cls_sources.extend(["neg_gw"] * int(neg_gw_mask.sum()))
+                if pair_is_neg_gw.any():
+                    if gw_source_type_table is None or gw_neg_type_table is None:
+                        raise ValueError(
+                            "Negative-GW validation requires source_type and neg_type tables."
+                        )
+                    source_codes = gw_source_type_table[gw_indices]
+                    neg_types_batch = gw_neg_type_table[gw_indices]
+                    for source_code, source_name in ((0, "bns"), (1, "nsbh")):
+                        for neg_type in (1, 2):
+                            stratum_mask = (
+                                pair_is_neg_gw
+                                & (source_codes == source_code)
+                                & (neg_types_batch == neg_type)
+                            )
+                            if stratum_mask.any():
+                                neg_gw_probabilities[(source_name, neg_type)].append(
+                                    pair_probs[stratum_mask].cpu()
+                                )
 
                 if cls_hard_logits_available:
                     hard_probs = torch.softmax(logits_hard.detach().float(), dim=1)[:, 1]
                     all_cls_probs.append(hard_probs.cpu())
                     all_cls_labels.append(labels_neg[:batch_size].cpu())
-                    all_cls_sources.extend(['hard'] * batch_size)
+                    all_cls_sources.extend(['mismatched'] * batch_size)
 
                 if has_negatives and cls_extra_neg_logits_available:
                     neg_probs_val = torch.softmax(logits_neg.detach().float(), dim=1)[:, 1]
                     all_cls_probs.append(neg_probs_val.cpu())
                     all_cls_labels.append(labels_neg[:batch_size].cpu())
-                    all_cls_sources.extend(['neg'] * batch_size)
+                    all_cls_sources.extend(['external'] * batch_size)
 
             all_feat_g.append(feat_g.detach().cpu())
             all_feat_o.append(feat_o.detach().cpu())
-            all_gw_indices.append(gw_indices.cpu())
+            all_gw_indices.append(itc_gw_indices.cpu())
 
             # Memory cleanup in validation loop
             del g, z_l, h_l, sim_g2o, sim_g2o_d, itc_loss, cls_loss, total_loss
-            del logits_pos, logits_hard, pos_loss, hard_loss, feat_g, feat_o
+            del logits_pos, logits_hard, aligned_pos_loss, neg_gw_loss, hard_loss, feat_g, feat_o
             if has_negatives:
                 del logits_neg, neg_loss
 
@@ -1983,6 +2345,22 @@ def evaluate(
     else:
         cls_metrics = {}
 
+    neg_gw_strata = {}
+    populated_recalls = []
+    for (source, neg_type), probability_blocks in neg_gw_probabilities.items():
+        key = f"{source}_type{neg_type}"
+        if probability_blocks:
+            probabilities = torch.cat(probability_blocks)
+            recall = float((probabilities < 0.5).float().mean().item())
+            count = int(probabilities.numel())
+            populated_recalls.append(recall)
+        else:
+            recall = 0.0
+            count = 0
+        neg_gw_strata[key] = {"recall": recall, "count": count}
+    neg_gw_strata["min_recall"] = (
+        min(populated_recalls) if len(populated_recalls) == 4 else 0.0
+    )
     # Global embedding metrics
     emb_metrics = compute_embedding_metrics(
         torch.cat(all_feat_g),
@@ -2000,10 +2378,12 @@ def evaluate(
         "pos_acc": val_pos_acc / val_batches,
         "hard_acc": val_hard_acc / val_batches,
         "neg_acc": val_neg_acc / val_batches,
+        "neg_gw_acc": val_neg_gw_acc / val_batches,
         "total_acc": val_total_acc / val_batches,
         "retrieval": retrieval,
         "classification": cls_metrics,
         "embedding": emb_metrics,
+        "neg_gw_strata": neg_gw_strata,
     }
     if any(int(v.get("count", 0)) > 0 for v in dt_stats.values()):
         metrics["time_delta"] = _finalize_time_delta_stats(dt_stats)
@@ -2067,6 +2447,26 @@ def train(args):
 
     if args.hardneg_min_candidates < 1:
         raise ValueError("hardneg_min_candidates must be >= 1.")
+    if int(getattr(args, "stage_alignment_epochs", 8)) < 0:
+        raise ValueError("stage_alignment_epochs must be >= 0.")
+    if int(getattr(args, "stage_head_epochs", 4)) < 0:
+        raise ValueError("stage_head_epochs must be >= 0.")
+    if not 0.0 < float(getattr(args, "encoder_lr_ratio", 0.1)) <= 1.0:
+        raise ValueError("encoder_lr_ratio must be in (0, 1].")
+    for key in ("stage_joint_itc_start_weight", "stage_joint_itc_end_weight"):
+        value = float(getattr(args, key, 0.5 if key.endswith("start_weight") else 0.25))
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(f"{key} must be in [0, 1].")
+    if not 0.0 <= float(args.neg_gw_guardrail_recall) <= 1.0:
+        raise ValueError("neg_gw_guardrail_recall must be in [0, 1].")
+    for key in (
+        "cls_aligned_pos_weight",
+        "cls_neg_gw_weight",
+        "cls_mismatched_weight",
+        "cls_external_neg_weight",
+    ):
+        if float(getattr(args, key, 0.0)) < 0.0:
+            raise ValueError(f"{key} must be >= 0.")
     if args.gallery_hard_neg_topk < 1:
         raise ValueError("gallery_hard_neg_topk must be >= 1.")
     if args.gallery_hard_neg_weight < 0:
@@ -2380,7 +2780,7 @@ def train(args):
         model = torch.compile(model)
         print("Model compiled with torch.compile() for optimized execution.")
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    optimizer = torch.optim.AdamW(build_optimizer_param_groups(model, args))
     start_epoch = 0
     global_step = 0
     if args.resume is not None:
@@ -2420,6 +2820,9 @@ def train(args):
     gw_source_type_table = load_gw_source_type_table(
         args.data_path, device, required=True
     )
+    gw_neg_type_table = load_gw_neg_type_table(
+        args.data_path, device, required=True
+    )
     print(
         "Mismatched-negative policy: prefer a different GW of the same source type."
     )
@@ -2453,6 +2856,18 @@ def train(args):
 
     for epoch in range(start_epoch, args.epochs):
         epoch_total = 0.0
+        training_stage = resolve_training_stage(args, epoch)
+        configure_model_for_stage(model, args, training_stage)
+        batch_sampler = getattr(train_loader, "batch_sampler", None)
+        if hasattr(batch_sampler, "set_stage"):
+            batch_sampler.set_stage(
+                "alignment" if training_stage == "alignment" else "joint"
+            )
+        print(
+            f"Training stage: {training_stage} | "
+            f"ITC weight={compute_itc_weight(args, epoch):.4f} | "
+            f"CLS weight={compute_cls_weight(args, epoch):.4f}"
+        )
         epoch_itc = 0.0
         epoch_cls = 0.0
         ref_time_cache = None
@@ -2549,7 +2964,9 @@ def train(args):
                 pair_is_neg_gw = pair_is_neg_gw.to(
                     device, non_blocking=True
                 ).bool()
-            itc_pair_mask = ~pair_is_neg_gw
+            itc_pair_mask = build_itc_pair_mask(
+                gw_indices, pair_is_neg_gw, min_pairs_per_gw=args.min_lc_per_gw
+            )
             if not bool(itc_pair_mask.any()):
                 raise ValueError("Each training batch must retain at least one positive GW-optical pair")
             batch_event_time_mjd = None
@@ -2616,7 +3033,7 @@ def train(args):
                 )
                 extra_neg_z_itc = None
                 extra_neg_event_time_mjd = None
-                if has_negatives and not cls_branch_enabled:
+                if has_negatives and bool(getattr(args, "itc_extra_negative_enable", False)):
                     neg_zero_time_mjd_for_itc = _neg_zero_time_mjd_cls_base
                     if neg_zero_time_mjd_for_itc is None:
                         neg_zero_time_mjd_for_itc = _neg_zero_time_mjd_base
@@ -2657,7 +3074,9 @@ def train(args):
                         extra_neg_opt_event_time_mjd=extra_neg_event_time_mjd,
                     )
 
-                labels_pos = (~pair_is_neg_gw).to(dtype=torch.long)
+                pos_mask = ~pair_is_neg_gw
+                neg_gw_mask = pair_is_neg_gw
+                labels_pos = pos_mask.to(dtype=torch.long)
                 labels_neg = torch.zeros(batch_size, device=device, dtype=torch.long)
                 gallery_loss = torch.zeros((), device=device)
                 gallery_hard_loss = torch.zeros((), device=device)
@@ -2675,7 +3094,24 @@ def train(args):
                         gw_s=gw_s, gw_m=gw_m, opt_coords=opt_coords,
                         dt_days=dt_pos,
                     )
-                    pos_loss = model.cls_criterion(logits_pos, labels_pos)
+                    if pos_mask.any():
+                        aligned_pos_loss = model.cls_criterion(
+                            logits_pos[pos_mask],
+                            torch.ones(
+                                int(pos_mask.sum()), device=device, dtype=torch.long
+                            ),
+                        )
+                    else:
+                        aligned_pos_loss = None
+                    if neg_gw_mask.any():
+                        neg_gw_loss = model.cls_criterion(
+                            logits_pos[neg_gw_mask],
+                            torch.zeros(
+                                int(neg_gw_mask.sum()), device=device, dtype=torch.long
+                            ),
+                        )
+                    else:
+                        neg_gw_loss = None
 
                     mis_idx = sample_mismatched_negatives(
                         batch_size, device, samples_per_gw=args.samples_per_gw,
@@ -2738,7 +3174,7 @@ def train(args):
                         neg_loss = None
 
                     cls_loss = compute_weighted_cls_loss(
-                        pos_loss, hard_loss, neg_loss, has_negatives, args
+                        aligned_pos_loss, neg_gw_loss, hard_loss, neg_loss, args
                     )
 
                     gallery_loss = torch.zeros((), device=device)
@@ -2752,7 +3188,8 @@ def train(args):
                     logits_pos = torch.zeros((batch_size, 2), device=device, dtype=g.dtype)
                     logits_hard = torch.zeros((batch_size, 2), device=device, dtype=g.dtype)
                     logits_neg = torch.zeros((batch_size, 2), device=device, dtype=g.dtype) if has_negatives else None
-                    pos_loss = torch.zeros((), device=device)
+                    aligned_pos_loss = torch.zeros((), device=device)
+                    neg_gw_loss = None
                     hard_loss = torch.zeros((), device=device)
                     neg_loss = torch.zeros((), device=device) if has_negatives else None
                     cls_loss = torch.zeros((), device=device)
@@ -2900,7 +3337,10 @@ def train(args):
 
             total_val = total_loss.item()
             itc_val = itc_loss.item()
-            pos_loss_val = pos_loss.item()
+            aligned_pos_loss_val = aligned_pos_loss.item()
+            neg_gw_loss_val = (
+                neg_gw_loss.item() if neg_gw_loss is not None else 0.0
+            )
             hard_loss_val = hard_loss.item()
             if has_negatives:
                 neg_loss_val = neg_loss.item()
@@ -2920,13 +3360,23 @@ def train(args):
                 itc_acc = (itc_gw_indices == pred_gw).float().mean().item()
 
                 if cls_branch_enabled:
-                    pos_acc = (logits_pos.argmax(dim=1) == labels_pos).float().mean().item()
+                    pos_acc = 0.0
+                    neg_gw_acc = 0.0
+                    if pos_mask.any():
+                        pos_acc = (
+                            logits_pos[pos_mask].argmax(dim=1) == 1
+                        ).float().mean().item()
+                    if neg_gw_mask.any():
+                        neg_gw_acc = (
+                            logits_pos[neg_gw_mask].argmax(dim=1) == 0
+                        ).float().mean().item()
                     hard_acc = (logits_hard.argmax(dim=1) == labels_neg).float().mean().item()
                     neg_acc = None
                     if has_negatives:
                         neg_acc = (logits_neg.argmax(dim=1) == labels_neg).float().mean().item()
                 else:
                     pos_acc = 0.0
+                    neg_gw_acc = 0.0
                     hard_acc = 0.0
                     neg_acc = 0.0 if has_negatives else None
                 current_temp = model.log_temp.exp().item()
@@ -2942,12 +3392,14 @@ def train(args):
                 writer.add_scalar('Train/Batch_Gallery_Loss', gallery_loss_val, global_step)
                 writer.add_scalar('Train/Batch_GalleryHard_Loss', gallery_hard_loss_val, global_step)
                 writer.add_scalar('Train/Batch_GalleryHard_Weight', gallery_hard_weight, global_step)
-                writer.add_scalar('Train/Batch_Pos_Loss', pos_loss_val, global_step)
+                writer.add_scalar('Train/Batch_AlignedPos_Loss', aligned_pos_loss_val, global_step)
+                writer.add_scalar('Train/Batch_NegGW_Loss', neg_gw_loss_val, global_step)
                 writer.add_scalar('Train/Batch_HardNeg_Loss', hard_loss_val, global_step)
                 if has_negatives:
                     writer.add_scalar('Train/Batch_ExtraNeg_Loss', neg_loss_val, global_step)
                 writer.add_scalar('Train/Batch_ITC_Acc', itc_acc, global_step)
-                writer.add_scalar('Train/Batch_Pos_Acc', pos_acc, global_step)
+                writer.add_scalar('Train/Batch_AlignedPos_Acc', pos_acc, global_step)
+                writer.add_scalar('Train/Batch_NegGW_Acc', neg_gw_acc, global_step)
                 writer.add_scalar('Train/Batch_HardNeg_Acc', hard_acc, global_step)
                 if has_negatives and neg_acc is not None:
                     writer.add_scalar('Train/Batch_ExtraNeg_Acc', neg_acc, global_step)
@@ -2985,7 +3437,7 @@ def train(args):
 
             # Memory cleanup: delete large tensors to free memory
             del g, z_l, h_l, sim_g2o, sim_g2o_detached, itc_loss, total_loss
-            del logits_pos, logits_hard, pos_loss, hard_loss, cls_loss, gallery_loss, gallery_hard_loss
+            del logits_pos, logits_hard, aligned_pos_loss, neg_gw_loss, hard_loss, cls_loss, gallery_loss, gallery_hard_loss
             if has_negatives:
                 del logits_neg, neg_loss
             
@@ -3026,6 +3478,7 @@ def train(args):
                 epoch,
                 amp_dtype=amp_dtype,
                 gw_event_time_mjd_table=gw_event_time_mjd_table,
+                gw_neg_type_table=gw_neg_type_table,
                 gw_source_type_table=gw_source_type_table,
             )
             _close_loader_dataset_handles(
@@ -3062,7 +3515,10 @@ def train(args):
                 for k in ('auroc', 'auprc', 'f1_optimal', 'f1_threshold', 'ece'):
                     if k in cls_m:
                         writer.add_scalar(f'Val/Classification/{k}', cls_m[k], epoch)
-                for k in ('acc_pos', 'acc_hard', 'acc_neg', 'acc_neg_gw', 'acc_total'):
+                for k in (
+                    'acc_aligned', 'acc_neg_gw', 'acc_mismatched',
+                    'acc_external', 'acc_total',
+                ):
                     if k in cls_m:
                         writer.add_scalar(f'Val/Classification/{k}', cls_m[k], epoch)
 
@@ -3140,18 +3596,61 @@ def train(args):
                     epoch,
                 )
 
+                neg_gw_guardrail = resolve_neg_gw_guardrail(args, val_metrics)
+                guardrail_active = (
+                    bool(neg_gw_guardrail["enabled"])
+                    and train_neg_gw_ratio > 0.0
+                )
+                strata_m = val_metrics.get("neg_gw_strata", {})
+                for key in NEG_GW_STRATA_KEYS:
+                    item = strata_m.get(key)
+                    if item:
+                        writer.add_scalar(
+                            f"Val/NegGW/{key}_recall",
+                            float(item.get("recall", 0.0)),
+                            epoch,
+                        )
+                        writer.add_scalar(
+                            f"Val/NegGW/{key}_count",
+                            int(item.get("count", 0)),
+                            epoch,
+                        )
+                writer.add_scalar(
+                    "Val/NegGW/MinRecall",
+                    float(neg_gw_guardrail["min_recall"]),
+                    epoch,
+                )
+                writer.add_scalar(
+                    "Val/NegGW/GuardrailMet",
+                    int(neg_gw_guardrail["met"]),
+                    epoch,
+                )
+
                 if not best_selection_eligible:
                     print(
                         "  Best-CKPT selection pending: "
                         f"{describe_best_ckpt_selection_pending(args, epoch)}"
                     )
                 else:
-                    prev_best = best_val_score
-                    improved = is_checkpoint_score_improved(
-                        current_selection_score,
-                        prev_best,
-                        args.early_stop_min_delta,
+                    guardrail_blocked = (
+                        guardrail_active and not neg_gw_guardrail["met"]
                     )
+                    if guardrail_blocked:
+                        reason = neg_gw_guardrail["reason"] or "unknown"
+                        print(
+                            "  Neg-GW guardrail not met; checkpoint selection and "
+                            f"early stopping paused: {reason} "
+                            f"(min recall={neg_gw_guardrail['min_recall']:.4f}, "
+                            f"threshold={neg_gw_guardrail['threshold']:.4f})"
+                        )
+                        improved = False
+                    else:
+                        prev_best = best_val_score
+                        improved = is_checkpoint_score_improved(
+                            current_selection_score,
+                            prev_best,
+                            args.early_stop_min_delta,
+                        )
                     if improved:
                         best_val_score = current_selection_score
                         best_epoch_idx = int(epoch)
@@ -3189,6 +3688,8 @@ def train(args):
                                 "val_hard_gallery_macro_retrieval_score"
                             ] = hard_gallery["selection_score"]
                             best_val_metrics["val_hard_gallery"] = hard_gallery
+                        best_val_metrics["neg_gw_strata"] = strata_m
+                        best_val_metrics["neg_gw_guardrail"] = neg_gw_guardrail
                         epochs_no_improve = 0
                         best_ckpt = os.path.join(args.ckpt_path, "ALBEF", "albef_best.pth")
                         os.makedirs(os.path.dirname(best_ckpt), exist_ok=True)
@@ -3207,16 +3708,21 @@ def train(args):
                             'dataset_window_metadata': getattr(args, "_dataset_window_metadata", None),
                             'effective_input_window_metadata': getattr(args, "_effective_input_window_metadata", None),
                             'validation_hard_gallery': val_metrics.get("hard_gallery"),
+                            'neg_gw_strata': strata_m,
+                            'neg_gw_guardrail': neg_gw_guardrail,
                         }, best_ckpt)
                         print(
                             f"Saved best checkpoint ({args.best_ckpt_metric}="
                             f"{current_selection_score:.4f}, epoch={epoch+1}): {best_ckpt}"
                         )
                     else:
-                        epochs_no_improve += 1
-                        if args.early_stop_patience > 0 and epochs_no_improve >= args.early_stop_patience:
-                            print("Early stopping triggered.")
-                            stop_early = True
+                        if guardrail_blocked:
+                            print("  Neg-GW guardrail blocked; early stopping patience not consumed.")
+                        else:
+                            epochs_no_improve += 1
+                            if args.early_stop_patience > 0 and epochs_no_improve >= args.early_stop_patience:
+                                print("Early stopping triggered.")
+                                stop_early = True
 
                 best_score_str = "N/A" if best_val_score is None else f"{best_val_score:.4f}"
                 best_epoch_str = "N/A" if best_epoch_idx is None else str(best_epoch_idx + 1)
@@ -3310,6 +3816,10 @@ if __name__ == "__main__":
     parser.add_argument("--early_stop_patience", type=int, default=10)
     parser.add_argument("--early_stop_min_delta", type=float, default=1e-4,
                         help="Minimum improvement required on best_ckpt_metric to reset early stopping.")
+    parser.add_argument("--neg_gw_guardrail_enable", action=argparse.BooleanOptionalAction, default=False,
+                        help="Require all four neg-GW validation strata recalls to pass before selecting checkpoints.")
+    parser.add_argument("--neg_gw_guardrail_recall", type=float, default=0.9,
+                        help="Minimum per-stratum recall required by the neg-GW checkpoint guardrail.")
     parser.add_argument("--best_ckpt_metric", type=str, default="hard_gallery_macro_retrieval_score",
                         choices=[
                             "auprc", "auroc", "f1_optimal", "acc_total", "cls_composite_auprc_auroc",
@@ -3433,15 +3943,35 @@ if __name__ == "__main__":
     parser.add_argument("--itc_weight", type=float, default=1.0)
     parser.add_argument("--cls_weight", type=float, default=1.0)
     parser.add_argument("--cls_pos_weight", type=float, default=1.0,
-                        help="Positive class weight for CLS loss")
+                        help="Fallback positive class weight for CLS loss (legacy)")
     parser.add_argument("--cls_neg_weight", type=float, default=1.0,
-                        help="Negative class weight for CLS loss")
+                        help="Fallback negative class weight for CLS loss (legacy)")
     parser.add_argument("--cls_extra_neg_weight", type=float, default=1.0,
-                        help="Extra negative class weight for CLS loss")
+                        help="Fallback extra negative class weight for CLS loss (legacy)")
+    parser.add_argument("--cls_aligned_pos_weight", type=float, default=0.5,
+                        help="Aligned positive GW->own-KN bucket weight for CLS loss")
+    parser.add_argument("--cls_neg_gw_weight", type=float, default=0.2,
+                        help="neg-GW->source-matched KN bucket weight for CLS loss")
+    parser.add_argument("--cls_mismatched_weight", type=float, default=0.15,
+                        help="GW->other-GW optical mismatched bucket weight for CLS loss")
+    parser.add_argument("--cls_external_neg_weight", type=float, default=0.15,
+                        help="GW->external non-KN optical bucket weight for CLS loss")
     parser.add_argument("--neg_gw_pair_ratio", type=float, default=0.2,
                         help="Training batch fraction of classification-only negative-GW/positive-optical pairs.")
     parser.add_argument("--cls_ramp_epochs", type=int, default=0,
                         help="Epochs to ramp CLS weight from 0 to cls_weight (0 to disable)")
+    parser.add_argument("--staged_training_enable", action=argparse.BooleanOptionalAction, default=False,
+                        help="Enable A/B/C staged training with frozen-head warm-up and differential LR.")
+    parser.add_argument("--stage_alignment_epochs", type=int, default=8,
+                        help="Epochs for the ITC-only alignment stage (staged_training_enable=true).")
+    parser.add_argument("--stage_head_epochs", type=int, default=4,
+                        help="Epochs for the frozen-encoder head/classifier warm-up stage.")
+    parser.add_argument("--stage_joint_itc_start_weight", type=float, default=0.5,
+                        help="ITC weight fraction at the start of joint fine-tuning.")
+    parser.add_argument("--stage_joint_itc_end_weight", type=float, default=0.25,
+                        help="ITC weight fraction at the end of joint fine-tuning.")
+    parser.add_argument("--encoder_lr_ratio", type=float, default=0.1,
+                        help="Encoder LR multiplier relative to head LR during joint fine-tuning.")
     parser.add_argument("--retrieval_start_epoch", type=int, default=0,
                         help="Epoch to start retrieval/gallery training (0 = start from epoch 0).")
     parser.add_argument("--gallery_loss_weight", type=float, default=0.0,
@@ -3481,6 +4011,8 @@ if __name__ == "__main__":
                         help="Epochs to decay ITC weight (0 to disable)")
     parser.add_argument("--itc_decay_ratio", type=float, default=0.0,
                         help="Fractional decay of ITC weight by the end of itc_decay_epochs")
+    parser.add_argument("--itc_extra_negative_enable", action=argparse.BooleanOptionalAction, default=False,
+                        help="Include external non-KN optical samples as ITC negatives (default: off).")
     parser.add_argument("--itc_label_smoothing", type=float, default=0.0,
                         help="Label smoothing for ITC loss (0 to disable)")
     parser.add_argument("--itc_loss_type", type=str, default="infonce",

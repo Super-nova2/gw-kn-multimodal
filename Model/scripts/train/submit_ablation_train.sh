@@ -22,8 +22,8 @@ echo ""
 
 declare -A EXPERIMENTS=(
     ["full"]="MAGIKS_BNS_NSBH_full.json"
+    ["with_retrieval_loss"]="MAGIKS_BNS_NSBH_with_retrieval_loss.json"
     ["no_cls_loss"]="MAGIKS_BNS_NSBH_no_cls_loss.json"
-    ["no_gallery_loss"]="MAGIKS_BNS_NSBH_no_gallery_loss.json"
     ["no_itc_loss"]="MAGIKS_BNS_NSBH_no_itc_loss.json"
     ["no_cross_atten"]="MAGIKS_BNS_NSBH_no_cross_atten.json"
     ["no_fusion"]="MAGIKS_BNS_NSBH_no_fusion.json"
@@ -31,8 +31,8 @@ declare -A EXPERIMENTS=(
 
 SUBMIT_ORDER=(
     "full"
+    "with_retrieval_loss"
     "no_cls_loss"
-    "no_gallery_loss"
     "no_itc_loss"
     "no_cross_atten"
     "no_fusion"

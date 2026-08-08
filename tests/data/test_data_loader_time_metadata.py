@@ -114,3 +114,25 @@ class MixedNegativeGWSamplerTests(unittest.TestCase):
                 expected_options = {100, 101} if local_source[local_idx] == "bns" else {200, 201}
                 self.assertIn(opt_idx, expected_options)
         self.assertEqual(counts, {0: 4, 1: 4, 2: 4, 3: 4})
+
+    def test_source_optical_indices_are_numpy_arrays(self):
+        sampler = MixedGWBatchedSampler(
+            gw_to_lc_map={
+                10: [100, 102], 11: [101, 103],
+                20: [200, 202], 21: [201, 203],
+            },
+            neg_gw_indices=np.arange(4),
+            batch_size=8,
+            steps_per_epoch=1,
+            neg_gw_ratio=0.5,
+            neg_gw_source_types=np.asarray(["bns", "bns", "nsbh", "nsbh"]),
+            neg_gw_types=np.asarray([1, 2, 1, 2]),
+            gw_source_type_map={10: "bns", 11: "bns", 20: "nsbh", 21: "nsbh"},
+        )
+
+        self.assertIsInstance(sampler.gw_to_lc_map[10], np.ndarray)
+        self.assertIsInstance(sampler._optical_by_source["bns"], np.ndarray)
+        self.assertIsInstance(sampler._optical_by_source["nsbh"], np.ndarray)
+        self.assertEqual(
+            set(sampler._optical_by_source["bns"].tolist()), {100, 101, 102, 103}
+        )

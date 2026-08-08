@@ -718,6 +718,12 @@ class TestParseHDF5GWID(unittest.TestCase):
         self.assertEqual(source, "nsbh")
         self.assertEqual(event_id, 114)
 
+    def test_parse_stream_id(self):
+        from scripts.eval.eval_retrieval_comparison import _parse_hdf5_gw_id
+        source, event_id = _parse_hdf5_gw_id("bns_test_pos_15")
+        self.assertEqual(source, "bns_test_pos")
+        self.assertEqual(event_id, 15)
+
     def test_parse_bytes_input(self):
         from scripts.eval.eval_retrieval_comparison import _parse_hdf5_gw_id
         source, event_id = _parse_hdf5_gw_id(b"bns_42")
@@ -832,6 +838,25 @@ class TestBuildRedshiftMetadataFromCatalogs(unittest.TestCase):
         self.assertAlmostEqual(meta[0]["redshift"], 0.05)
         self.assertAlmostEqual(meta[1]["redshift"], 0.08)
         self.assertAlmostEqual(meta[2]["redshift"], 0.12)
+
+    def test_recovers_redshift_from_stream_specific_catalogs(self):
+        from scripts.eval.eval_retrieval_comparison import _build_redshift_metadata_from_catalogs
+        pos_path = self._make_catalog("bns_test_pos.csv", [
+            {"simulation_id": 6, "redshift": 0.05},
+        ])
+        neg_path = self._make_catalog("bns_test_neg.csv", [
+            {"simulation_id": 6, "redshift": 0.15},
+        ])
+        h5_path = self._make_h5("stream_test.h5", [
+            ("bns_test_pos_6", "bns"),
+            ("bns_test_neg_6", "bns"),
+        ])
+        catalogs = {"bns_test_pos": pos_path, "bns_test_neg": neg_path}
+        meta = _build_redshift_metadata_from_catalogs(
+            h5_path, catalogs, validate_scalars=False
+        )
+        self.assertAlmostEqual(meta[0]["redshift"], 0.05)
+        self.assertAlmostEqual(meta[1]["redshift"], 0.15)
 
     def test_unmatched_event_id_raises(self):
         from scripts.eval.eval_retrieval_comparison import _build_redshift_metadata_from_catalogs

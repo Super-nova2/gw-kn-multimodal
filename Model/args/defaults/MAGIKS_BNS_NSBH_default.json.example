@@ -127,5 +127,18 @@
   "persistent_workers": 1,
   "prefetch_factor": 4,
   "split_seed": 42,
-  "seed": 42
+  "seed": 42,
+  "staged_training_enable": true,
+  "stage_alignment_epochs": 8,
+  "stage_head_epochs": 4,
+  "stage_joint_itc_start_weight": 0.5,
+  "stage_joint_itc_end_weight": 0.25,
+  "encoder_lr_ratio": 0.1,
+  "itc_extra_negative_enable": false,
+  "neg_gw_guardrail_enable": true,
+  "neg_gw_guardrail_recall": 0.9,
+  "cls_aligned_pos_weight": 0.5,
+  "cls_neg_gw_weight": 0.2,
+  "cls_mismatched_weight": 0.15,
+  "cls_external_neg_weight": 0.15
 }

@@ -384,8 +384,9 @@ def _build_redshift_metadata_from_catalogs(
     """Recover redshift for each GW event from source catalogs.
 
     Reads HDF5 ``events/gw_data/ids`` and ``events/gw_data/source_type``,
-    parses each GW ID, and looks up the redshift in the appropriate source
-    catalog (BNS or NSBH).
+    parses each GW ID, and looks up the redshift in the appropriate stream
+    catalog (for example ``bns_test_pos`` or ``bns_test_neg``). Legacy
+    source-only catalog keys (``bns``/``nsbh``) remain supported.
 
     Args:
         test_data_path: Path to the combined HDF5 test dataset.
@@ -428,28 +429,33 @@ def _build_redshift_metadata_from_catalogs(
             source_str = source_str.decode("ascii")
 
         id_source, event_id = _parse_hdf5_gw_id(str(raw_id))
+        id_physical_source = id_source.split("_", 1)[0].strip().lower()
+        h5_physical_source = str(source_str).strip().lower()
 
-        # --- Fix 2: cross-check parsed-ID source against HDF5 source_type ---
-        if id_source != str(source_str):
+        # Stream-aware IDs (for example bns_test_pos_15) must agree with
+        # the physical source stored in HDF5.
+        if id_physical_source != h5_physical_source:
             raise ValueError(
                 f"GW ID source mismatch at index {idx}: "
-                f"ids={raw_id!r} parses to source={id_source!r}, "
+                f"ids={raw_id!r} parses to physical source={id_physical_source!r}, "
                 f"but source_type={source_str!r}"
             )
 
-        if str(source_str) not in redshift_catalogs:
+        catalog_key = id_source if id_source in redshift_catalogs else h5_physical_source
+        if catalog_key not in redshift_catalogs:
             raise ValueError(
-                f"No redshift catalog configured for source '{source_str}' "
+                f"No redshift catalog configured for stream '{id_source}' "
+                f"or source '{h5_physical_source}' "
                 f"(GW idx {idx}, id={raw_id}). Available: {list(redshift_catalogs.keys())}"
             )
 
-        catalog_path = redshift_catalogs[str(source_str)]
-        if str(source_str) not in catalog_maps:
-            catalog_maps[str(source_str)] = _load_catalog_redshift_map(catalog_path)
+        catalog_path = redshift_catalogs[catalog_key]
+        if catalog_key not in catalog_maps:
+            catalog_maps[catalog_key] = _load_catalog_redshift_map(catalog_path)
             if validate_scalars:
-                catalog_dfs[str(source_str)] = pd.read_csv(catalog_path)
+                catalog_dfs[catalog_key] = pd.read_csv(catalog_path)
 
-        z_map = catalog_maps[str(source_str)]
+        z_map = catalog_maps[catalog_key]
         if event_id not in z_map:
             raise ValueError(
                 f"Event ID {event_id} (source={source_str}, id={raw_id}) "
@@ -458,7 +464,7 @@ def _build_redshift_metadata_from_catalogs(
 
         # --- Fix 1: scalar consistency validation ---
         if validate_scalars and scalars_arr is not None:
-            cat_df = catalog_dfs[str(source_str)]
+            cat_df = catalog_dfs[catalog_key]
             cat_row = cat_df[cat_df["simulation_id"] == event_id]
             if len(cat_row) != 1:
                 raise ValueError(
@@ -468,9 +474,16 @@ def _build_redshift_metadata_from_catalogs(
             row = cat_row.iloc[0]
             gw_scalars = scalars_arr[idx]
             for cat_col, s_idx, transform in _SCALAR_VALIDATION_COLS:
-                if cat_col not in cat_df.columns:
-                    raise KeyError(f"Catalog {catalog_path} missing column '{cat_col}'")
-                catalog_val = float(row[cat_col])
+                resolved_col = cat_col
+                if cat_col == "inclination" and cat_col not in cat_df.columns:
+                    resolved_col = "theta_jn"
+                if resolved_col not in cat_df.columns:
+                    if cat_col in {"distmean", "diststd"}:
+                        continue
+                    raise KeyError(
+                        f"Catalog {catalog_path} missing scalar validation column '{cat_col}'"
+                    )
+                catalog_val = float(row[resolved_col])
                 scalar_val = float(gw_scalars[s_idx])
                 if transform == "direct":
                     expected = catalog_val
@@ -483,7 +496,7 @@ def _build_redshift_metadata_from_catalogs(
                 if not np.isclose(scalar_val, expected, rtol=_SCALAR_VALIDATION_RTOL, atol=_SCALAR_VALIDATION_ATOL):
                     raise ValueError(
                         f"Scalar mismatch for GW idx {idx} (id={raw_id}, source={source_str}): "
-                        f"catalog '{cat_col}' (scalar_idx={s_idx}, transform={transform}) → "
+                        f"catalog '{resolved_col}' (scalar_idx={s_idx}, transform={transform}) → "
                         f"expected={expected:.8g}, got scalar={scalar_val:.8g}. "
                         f"Check that the correct catalog is configured for source '{source_str}'."
                     )

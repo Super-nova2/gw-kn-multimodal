@@ -51,12 +51,12 @@ def make_args(**overrides):
 class BestCheckpointStabilityTests(unittest.TestCase):
     def test_ablation_configs_start_after_all_enabled_phases(self):
         cases = {
-            "full": 14,
-            "no_cls_loss": 14,
-            "no_gallery_loss": 9,
-            "no_itc_loss": 14,
-            "no_cross_atten": 14,
-            "no_hard_mining": 14,
+            "full": 12,
+            "with_retrieval_loss": 14,
+            "no_cls_loss": 4,
+            "no_gallery_loss": 12,
+            "no_itc_loss": 4,
+            "no_cross_atten": 12,
             "no_fusion": 4,
         }
         for config_name, expected_epoch in cases.items():

@@ -3,6 +3,8 @@ import os
 import sys
 import unittest
 
+import torch
+
 
 MODEL_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "Model"))
 if MODEL_DIR not in sys.path:
@@ -285,6 +287,93 @@ class GalleryHardConfigTests(unittest.TestCase):
         self.assertFalse(train.gallery_hard_neg_full_activation_reachable(args))
 
 
+class ClassificationLossBucketTests(unittest.TestCase):
+    def test_four_bucket_weights_are_normalized(self):
+        args = _args(
+            cls_aligned_pos_weight=0.5,
+            cls_neg_gw_weight=0.2,
+            cls_mismatched_weight=0.15,
+            cls_external_neg_weight=0.15,
+        )
+        losses = [
+            torch.tensor(1.0),
+            torch.tensor(2.0),
+            torch.tensor(3.0),
+            torch.tensor(4.0),
+        ]
+        out = train.compute_weighted_cls_loss(*losses, args)
+        expected = (0.5 * 1.0 + 0.2 * 2.0 + 0.15 * 3.0 + 0.15 * 4.0)
+        self.assertAlmostEqual(out.item(), expected)
+
+    def test_missing_buckets_are_renormalized(self):
+        args = _args(
+            cls_aligned_pos_weight=0.5,
+            cls_neg_gw_weight=0.2,
+            cls_mismatched_weight=0.15,
+            cls_external_neg_weight=0.15,
+        )
+        out = train.compute_weighted_cls_loss(
+            torch.tensor(1.0),
+            None,
+            torch.tensor(3.0),
+            None,
+            args,
+        )
+        expected = (0.5 * 1.0 + 0.15 * 3.0) / 0.65
+        self.assertAlmostEqual(out.item(), expected, places=6)
+
+    def test_legacy_weight_keys_are_used_as_fallback(self):
+        args = _args(
+            cls_pos_weight=1.0,
+            cls_neg_weight=2.0,
+            cls_extra_neg_weight=3.0,
+        )
+        out = train.compute_weighted_cls_loss(
+            torch.tensor(1.0),
+            torch.tensor(2.0),
+            torch.tensor(3.0),
+            torch.tensor(4.0),
+            args,
+        )
+        expected = (1.0 * 1.0 + 2.0 * 2.0 + 2.0 * 3.0 + 3.0 * 4.0) / 8.0
+        self.assertAlmostEqual(out.item(), expected)
+
+
+class NegGwGuardrailTests(unittest.TestCase):
+    def _metrics(self, recalls, counts):
+        strata = {
+            key: {"recall": float(recall), "count": int(count)}
+            for key, recall, count in zip(train.NEG_GW_STRATA_KEYS, recalls, counts)
+        }
+        return {"neg_gw_strata": strata}
+
+    def test_guardrail_passes_when_all_strata_meet_threshold(self):
+        args = _args(neg_gw_guardrail_enable=True, neg_gw_guardrail_recall=0.9)
+        metrics = self._metrics([0.95, 0.92, 0.98, 0.91], [10, 12, 8, 9])
+        info = train.resolve_neg_gw_guardrail(args, metrics)
+        self.assertTrue(info["met"])
+        self.assertAlmostEqual(info["min_recall"], 0.91)
+
+    def test_guardrail_fails_when_one_stratum_is_below_threshold(self):
+        args = _args(neg_gw_guardrail_enable=True, neg_gw_guardrail_recall=0.9)
+        metrics = self._metrics([0.95, 0.80, 0.98, 0.91], [10, 12, 8, 9])
+        info = train.resolve_neg_gw_guardrail(args, metrics)
+        self.assertFalse(info["met"])
+        self.assertIn("min recall", info["reason"])
+
+    def test_guardrail_fails_when_a_stratum_is_missing(self):
+        args = _args(neg_gw_guardrail_enable=True, neg_gw_guardrail_recall=0.9)
+        metrics = self._metrics([0.95, 0.95, 0.95], [10, 12, 8])
+        info = train.resolve_neg_gw_guardrail(args, metrics)
+        self.assertFalse(info["met"])
+        self.assertIn("missing", info["reason"])
+
+    def test_disabled_guardrail_is_always_met(self):
+        args = _args(neg_gw_guardrail_enable=False, neg_gw_guardrail_recall=0.9)
+        info = train.resolve_neg_gw_guardrail(args, {})
+        self.assertTrue(info["met"])
+
+
 class CurrentScheduleConfigTests(unittest.TestCase):
     REMOVED_TRAINING_KEYS = {
         "test_data_path",
@@ -309,11 +398,10 @@ class CurrentScheduleConfigTests(unittest.TestCase):
     RUN_CONFIGS = (
         "MAGIKS_BNS_NSBH_full.json",
         "MAGIKS_BNS_NSBH_hard_mining.json",
+        "MAGIKS_BNS_NSBH_with_retrieval_loss.json",
         "MAGIKS_BNS_NSBH_no_itc_loss.json",
-        "MAGIKS_BNS_NSBH_no_contrastive.json",
         "MAGIKS_BNS_NSBH_no_cls_loss.json",
         "MAGIKS_BNS_NSBH_no_cross_atten.json",
-        "MAGIKS_BNS_NSBH_no_hard_mining.json",
         "MAGIKS_BNS_NSBH_no_gallery_loss.json",
         "MAGIKS_BNS_NSBH_no_fusion.json",
     )
@@ -337,26 +425,31 @@ class CurrentScheduleConfigTests(unittest.TestCase):
     def test_default_uses_requested_three_stage_schedule(self):
         cfg = self._merged_config("MAGIKS_BNS_NSBH_full.json")
 
-        self.assertEqual(cfg["cls_start_epoch"], 5)
-        self.assertEqual(cfg["cls_ramp_epochs"], 5)
-        self.assertEqual(cfg["retrieval_start_epoch"], 10)
-        self.assertEqual(cfg["gallery_loss_ramp_epochs"], 5)
-        self.assertEqual(cfg["gallery_hard_neg_start_after_retrieval_epochs"], 10)
-        self.assertEqual(cfg["gallery_hard_neg_ramp_epochs"], 0)
+        self.assertTrue(cfg["staged_training_enable"])
+        self.assertEqual(cfg["stage_alignment_epochs"], 8)
+        self.assertEqual(cfg["stage_head_epochs"], 4)
+        self.assertEqual(cfg["stage_joint_itc_start_weight"], 0.5)
+        self.assertEqual(cfg["stage_joint_itc_end_weight"], 0.25)
+        self.assertEqual(cfg["encoder_lr_ratio"], 0.1)
+        self.assertTrue(cfg["neg_gw_guardrail_enable"])
+        self.assertEqual(cfg["neg_gw_guardrail_recall"], 0.9)
+        self.assertEqual(cfg["cls_aligned_pos_weight"], 0.5)
+        self.assertEqual(cfg["cls_neg_gw_weight"], 0.2)
+        self.assertEqual(cfg["cls_mismatched_weight"], 0.15)
+        self.assertEqual(cfg["cls_external_neg_weight"], 0.15)
 
-    def test_hard_mining_variant_uses_its_dedicated_ramp(self):
+    def test_hard_mining_variant_keeps_gallery_hard_mining_disabled(self):
         cfg = self._merged_config("MAGIKS_BNS_NSBH_hard_mining.json")
 
-        self.assertEqual(cfg["retrieval_start_epoch"], 10)
-        self.assertTrue(cfg["gallery_hard_neg_enable"])
-        self.assertEqual(cfg["gallery_hard_neg_start_after_retrieval_epochs"], 2)
-        self.assertEqual(cfg["gallery_hard_neg_ramp_epochs"], 3)
+        self.assertEqual(cfg["retrieval_start_epoch"], 0)
+        self.assertEqual(cfg["gallery_loss_weight"], 0.0)
+        self.assertFalse(cfg["gallery_hard_neg_enable"])
 
     def test_hard_disabled_ablations_keep_gallery_hard_mining_off(self):
         expected = {
-            "MAGIKS_BNS_NSBH_no_hard_mining.json": (10, 1.0),
-            "MAGIKS_BNS_NSBH_no_gallery_loss.json": (999, 0.0),
-            "MAGIKS_BNS_NSBH_no_fusion.json": (999, 0.0),
+            "MAGIKS_BNS_NSBH_hard_mining.json": (0, 0.0),
+            "MAGIKS_BNS_NSBH_no_gallery_loss.json": (0, 0.0),
+            "MAGIKS_BNS_NSBH_no_fusion.json": (0, 0.0),
         }
 
         for run_config, (retrieval_start, gallery_weight) in expected.items():

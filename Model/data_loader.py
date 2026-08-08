@@ -1158,11 +1158,15 @@ class MultiPositiveGWBatchedSampler(Sampler):
 
 
 class MixedGWBatchedSampler(Sampler):
-    """Build batches with classification-only negative-GW/KN pairs.
+    """Build event-level batches with positive and negative-GW pairs.
 
-    Negative GW events are balanced across available ``source_type x neg_type``
-    strata and are paired with a positive optical light curve from the same
-    source class.
+    Negative GW events are balanced across source_type x neg_type strata and
+    paired with positive optical curves from the same source class. Event pools
+    are exhausted before reshuffling.
+
+    Multi-light-curve positive events contribute samples_per_gw pairs.
+    Singleton events contribute one classification-only pair in head/joint
+    stages and are omitted during the alignment stage.
     """
 
     def __init__(
@@ -1176,30 +1180,51 @@ class MixedGWBatchedSampler(Sampler):
         neg_gw_source_types: np.ndarray = None,
         neg_gw_types: np.ndarray = None,
         gw_source_type_map: dict = None,
+        min_lc_per_gw: int = 2,
+        stage: str = "joint",
     ):
-        self.gw_to_lc_map = gw_to_lc_map
+        self.gw_to_lc_map = {
+            int(gw_id): np.asarray(list(optical_ids), dtype=np.int64)
+            for gw_id, optical_ids in gw_to_lc_map.items()
+        }
         self.neg_gw_local_indices = np.asarray(neg_gw_indices, dtype=np.int64)
         self.batch_size = int(batch_size)
         self.steps_per_epoch = int(steps_per_epoch)
         self.neg_gw_ratio = float(neg_gw_ratio)
         self.samples_per_gw = int(samples_per_gw)
+        self.min_lc_per_gw = max(1, int(min_lc_per_gw))
+        self.stage = str(stage).strip().lower()
         if not 0.0 <= self.neg_gw_ratio < 1.0:
             raise ValueError("neg_gw_ratio must be in [0, 1).")
+        if self.stage not in {"alignment", "head", "joint"}:
+            raise ValueError("stage must be 'alignment', 'head', or 'joint'.")
 
-        self.pos_gw_ids = list(gw_to_lc_map.keys())
+        self.pos_gw_ids = sorted(int(gw_id) for gw_id in gw_to_lc_map)
         self.n_neg_per_batch = int(self.batch_size * self.neg_gw_ratio)
         self.n_pos_per_batch = self.batch_size - self.n_neg_per_batch
         if self.samples_per_gw > 1:
-            self.n_gw_per_batch = self.n_pos_per_batch // self.samples_per_gw
-            self.n_pos_per_batch = self.n_gw_per_batch * self.samples_per_gw
-            self.n_neg_per_batch = self.batch_size - self.n_pos_per_batch
+            self.multi_pos_gw_ids = [
+                gw_id for gw_id in self.pos_gw_ids
+                if len(self.gw_to_lc_map[gw_id]) >= self.min_lc_per_gw
+            ]
+            self.single_pos_gw_ids = [
+                gw_id for gw_id in self.pos_gw_ids
+                if len(self.gw_to_lc_map[gw_id]) < self.min_lc_per_gw
+            ]
         else:
-            self.n_gw_per_batch = self.n_pos_per_batch
-        if self.n_gw_per_batch > len(self.pos_gw_ids):
+            self.multi_pos_gw_ids = list(self.pos_gw_ids)
+            self.single_pos_gw_ids = []
+        if not self.multi_pos_gw_ids:
             raise ValueError(
-                f"Not enough positive GW events. Need {self.n_gw_per_batch}, "
-                f"have {len(self.pos_gw_ids)}"
+                f"No positive GW events have >= {self.min_lc_per_gw} light curves."
             )
+
+        self._joint_multi_per_batch, self._joint_single_per_batch = (
+            self._resolve_joint_positive_quotas()
+        )
+        self._alignment_multi_per_batch = self.n_pos_per_batch // self.samples_per_gw
+        if self._alignment_multi_per_batch < 1:
+            raise ValueError("Batch does not have room for a multi-positive GW event.")
         if self.n_neg_per_batch and len(self.neg_gw_local_indices) == 0:
             raise ValueError("No negative GW indices provided for mixed sampling.")
 
@@ -1223,6 +1248,10 @@ class MixedGWBatchedSampler(Sampler):
                 self._optical_by_source.setdefault(source, []).extend(
                     int(idx) for idx in optical_ids
                 )
+            self._optical_by_source = {
+                source: np.asarray(indices, dtype=np.int64)
+                for source, indices in self._optical_by_source.items()
+            }
             missing_sources = sorted({key[0] for key in self._strata} - set(self._optical_by_source))
             if missing_sources:
                 raise ValueError(
@@ -1235,17 +1264,75 @@ class MixedGWBatchedSampler(Sampler):
         print(
             f"MixedGWBatchedSampler: {len(self.pos_gw_ids)} positive GW, "
             f"{len(self.neg_gw_local_indices)} negative GW in {len(self._stratum_keys)} strata, "
-            f"{self.n_pos_per_batch} pos/batch, {self.n_neg_per_batch} neg/batch"
+            f"{self.n_pos_per_batch} pos pairs/batch, {self.n_neg_per_batch} neg pairs/batch, "
+            f"joint positive events={self._joint_multi_per_batch} multi + "
+            f"{self._joint_single_per_batch} classification-only single"
         )
+
+    def _resolve_joint_positive_quotas(self):
+        """Fit multi-positive and singleton events into the positive pair budget."""
+        if self.samples_per_gw <= 1 or not self.single_pos_gw_ids:
+            return self.n_pos_per_batch // self.samples_per_gw, 0
+
+        best = None
+        for n_multi in range(1, self.n_pos_per_batch // self.samples_per_gw + 1):
+            n_single = self.n_pos_per_batch - n_multi * self.samples_per_gw
+            if n_single < 1:
+                continue
+            steps_multi = int(np.ceil(len(self.multi_pos_gw_ids) / float(n_multi)))
+            steps_single = int(np.ceil(len(self.single_pos_gw_ids) / float(n_single)))
+            score = (max(steps_multi, steps_single), abs(steps_multi - steps_single))
+            if best is None or score < best[0]:
+                best = (score, n_multi, n_single)
+        if best is None:
+            raise ValueError("Unable to allocate positive pair budget across event pools.")
+        return int(best[1]), int(best[2])
+
+    def set_stage(self, stage: str):
+        stage = str(stage).strip().lower()
+        if stage not in {"alignment", "head", "joint"}:
+            raise ValueError("stage must be 'alignment', 'head', or 'joint'.")
+        self.stage = stage
+
+    @staticmethod
+    def _draw_without_replacement(pool, count, state):
+        """Draw from a shuffled queue, reshuffling only after full exhaustion."""
+        pool = np.asarray(pool, dtype=np.int64)
+        if count <= 0:
+            return []
+        if pool.size == 0:
+            raise ValueError("Cannot draw from an empty event pool.")
+        drawn = []
+        while len(drawn) < count:
+            if state.get("values") is None or state["cursor"] >= len(state["values"]):
+                state["values"] = np.random.permutation(pool)
+                state["cursor"] = 0
+            take = min(count - len(drawn), len(state["values"]) - state["cursor"])
+            start = state["cursor"]
+            drawn.extend(state["values"][start:start + take].tolist())
+            state["cursor"] += take
+        return drawn
 
     def __iter__(self) -> Iterator[list]:
         stratum_cursor = int(np.random.randint(len(self._stratum_keys))) if self._stratum_keys else 0
+        multi_state = {"values": None, "cursor": 0}
+        single_state = {"values": None, "cursor": 0}
+        neg_states = {
+            key: {"values": None, "cursor": 0} for key in self._stratum_keys
+        }
         for _ in range(self.steps_per_epoch):
             pairs = []
-            batch_gw_ids = np.random.choice(
-                self.pos_gw_ids, self.n_gw_per_batch, replace=False
+            if self.stage == "alignment":
+                n_multi = self._alignment_multi_per_batch
+                n_single = 0
+            else:
+                n_multi = self._joint_multi_per_batch
+                n_single = self._joint_single_per_batch
+
+            batch_multi_ids = self._draw_without_replacement(
+                self.multi_pos_gw_ids, n_multi, multi_state
             )
-            for gw_id in batch_gw_ids:
+            for gw_id in batch_multi_ids:
                 optical_ids = self.gw_to_lc_map[gw_id]
                 if self.samples_per_gw > 1:
                     replace = len(optical_ids) < self.samples_per_gw
@@ -1254,9 +1341,18 @@ class MixedGWBatchedSampler(Sampler):
                 else:
                     pairs.append((int(np.random.choice(optical_ids)), -1))
 
+            batch_single_ids = self._draw_without_replacement(
+                self.single_pos_gw_ids, n_single, single_state
+            )
+            for gw_id in batch_single_ids:
+                optical_ids = self.gw_to_lc_map[gw_id]
+                pairs.append((int(np.random.choice(optical_ids)), -1))
+
             for offset in range(self.n_neg_per_batch):
                 key = self._stratum_keys[(stratum_cursor + offset) % len(self._stratum_keys)]
-                local_idx = int(np.random.choice(self._strata[key]))
+                local_idx = int(self._draw_without_replacement(
+                    self._strata[key], 1, neg_states[key]
+                )[0])
                 optical_idx = int(np.random.choice(self._optical_by_source[key[0]]))
                 pairs.append((optical_idx, local_idx))
             stratum_cursor += self.n_neg_per_batch
@@ -1265,6 +1361,7 @@ class MixedGWBatchedSampler(Sampler):
 
     def __len__(self):
         return self.steps_per_epoch
+
 
 
 class GWBatchedSampler(Sampler):
@@ -1732,17 +1829,8 @@ def create_supcon_dataloaders(
         source_type_map=source_type_map,
     )
 
-    if steps_per_epoch is None:
-        # Calculate based on total optical samples, not GW events
-        total_train_optical = sum(len(lcs) for lcs in train_map.values())
-        steps_per_epoch = max(1, total_train_optical // batch_size)
-
     if val_batch_size is None:
         val_batch_size = batch_size
-    if val_steps_per_epoch is None:
-        # Calculate based on total optical samples, not GW events
-        total_val_optical = sum(len(lcs) for lcs in val_map.values())
-        val_steps_per_epoch = max(1, total_val_optical // val_batch_size)
 
     if cache_in_memory:
         shared_dataset = RelationalHDF5Dataset(
@@ -1783,6 +1871,7 @@ def create_supcon_dataloaders(
             negative_h5_path=negative_h5_path,
             negative_group=negative_group,
             cache_in_memory=cache_in_memory,
+            use_neg_gw=use_train_neg_gw,
             return_zero_time_mjd=return_zero_time_mjd,
             nonkn_cls_base_field=nonkn_cls_base_field,
             extra_negative_timeaware_enable=extra_negative_timeaware_enable,
@@ -1796,37 +1885,124 @@ def create_supcon_dataloaders(
     if use_train_neg_gw:
         if train_dataset.neg_gw_indices is None or len(train_dataset.neg_gw_indices) == 0:
             raise ValueError(f"No negative GW events found in {h5_path}")
-        eligible_train_map = {
+
+        neg_sources = np.asarray(train_dataset.neg_gw_source_types)
+        neg_types = np.asarray(train_dataset.neg_gw_types, dtype=np.int8)
+        rng = np.random.default_rng(split_seed)
+        train_parts = []
+        val_parts = []
+        for source, neg_type in sorted({
+            (str(source), int(neg_type))
+            for source, neg_type in zip(neg_sources, neg_types)
+        }):
+            local = np.flatnonzero((neg_sources == source) & (neg_types == neg_type))
+            if local.size < 2:
+                raise ValueError(
+                    "Stratified negative-GW split requires at least two events "
+                    f"for source={source}, neg_type={neg_type}."
+                )
+            rng.shuffle(local)
+            val_count = min(
+                max(1, int(local.size * val_split)),
+                int(local.size) - 1,
+            )
+            val_parts.append(local[:val_count])
+            train_parts.append(local[val_count:])
+        train_neg_local = np.concatenate(train_parts)
+        val_neg_local = np.concatenate(val_parts)
+
+        train_sampler = MixedGWBatchedSampler(
+            gw_to_lc_map=train_map,
+            neg_gw_indices=train_neg_local,
+            batch_size=batch_size,
+            steps_per_epoch=1 if steps_per_epoch is None else steps_per_epoch,
+            neg_gw_ratio=float(train_neg_gw_ratio),
+            samples_per_gw=samples_per_gw,
+            neg_gw_source_types=neg_sources[train_neg_local],
+            neg_gw_types=neg_types[train_neg_local],
+            gw_source_type_map=source_type_map,
+            min_lc_per_gw=min_lc_per_gw,
+            stage="alignment",
+        )
+        val_sampler = MixedGWBatchedSampler(
+            gw_to_lc_map=val_map,
+            neg_gw_indices=val_neg_local,
+            batch_size=val_batch_size,
+            steps_per_epoch=1 if val_steps_per_epoch is None else val_steps_per_epoch,
+            neg_gw_ratio=float(train_neg_gw_ratio),
+            samples_per_gw=samples_per_gw,
+            neg_gw_source_types=neg_sources[val_neg_local],
+            neg_gw_types=neg_types[val_neg_local],
+            gw_source_type_map=source_type_map,
+            min_lc_per_gw=min_lc_per_gw,
+            stage="joint",
+        )
+
+        def required_event_steps(sampler, n_neg):
+            counts = [
+                int(np.ceil(
+                    len(sampler.multi_pos_gw_ids)
+                    / float(max(1, sampler._joint_multi_per_batch))
+                ))
+            ]
+            if sampler.single_pos_gw_ids:
+                counts.append(int(np.ceil(
+                    len(sampler.single_pos_gw_ids)
+                    / float(max(1, sampler._joint_single_per_batch))
+                )))
+            if sampler.n_neg_per_batch > 0:
+                counts.append(int(np.ceil(
+                    int(n_neg) / float(sampler.n_neg_per_batch)
+                )))
+            return max(counts)
+
+        if steps_per_epoch is None:
+            steps_per_epoch = required_event_steps(
+                train_sampler, len(train_neg_local)
+            )
+            train_sampler.steps_per_epoch = int(steps_per_epoch)
+        if val_steps_per_epoch is None:
+            val_steps_per_epoch = required_event_steps(
+                val_sampler, len(val_neg_local)
+            )
+            val_sampler.steps_per_epoch = int(val_steps_per_epoch)
+        print(
+            "Negative-GW stratified split: "
+            f"train={len(train_neg_local)}, val={len(val_neg_local)}"
+        )
+    else:
+        eligible_train = {
             gw_id: optical_ids for gw_id, optical_ids in train_map.items()
             if len(optical_ids) >= min_lc_per_gw
         }
-        neg_local = np.arange(len(train_dataset.neg_gw_indices), dtype=np.int64)
-        train_sampler = MixedGWBatchedSampler(
-            gw_to_lc_map=eligible_train_map,
-            neg_gw_indices=neg_local,
-            batch_size=batch_size,
-            steps_per_epoch=steps_per_epoch,
-            neg_gw_ratio=float(train_neg_gw_ratio),
-            samples_per_gw=samples_per_gw,
-            neg_gw_source_types=train_dataset.neg_gw_source_types,
-            neg_gw_types=train_dataset.neg_gw_types,
-            gw_source_type_map=source_type_map,
-        )
-    else:
+        eligible_val = {
+            gw_id: optical_ids for gw_id, optical_ids in val_map.items()
+            if len(optical_ids) >= min_lc_per_gw
+        }
+        if steps_per_epoch is None:
+            events_per_batch = max(1, batch_size // samples_per_gw)
+            steps_per_epoch = max(
+                1, int(np.ceil(len(eligible_train) / float(events_per_batch)))
+            )
+        if val_steps_per_epoch is None:
+            events_per_batch = max(1, val_batch_size // samples_per_gw)
+            val_steps_per_epoch = max(
+                1, int(np.ceil(len(eligible_val) / float(events_per_batch)))
+            )
         train_sampler = MultiPositiveGWBatchedSampler(
             gw_to_lc_map=train_map,
             batch_size=batch_size,
             samples_per_gw=samples_per_gw,
             steps_per_epoch=steps_per_epoch,
-            min_lc_per_gw=min_lc_per_gw
+            min_lc_per_gw=min_lc_per_gw,
         )
-    val_sampler = MultiPositiveGWBatchedSampler(
-        gw_to_lc_map=val_map,
-        batch_size=val_batch_size,
-        samples_per_gw=samples_per_gw,
-        steps_per_epoch=val_steps_per_epoch,
-        min_lc_per_gw=min_lc_per_gw
-    )
+        val_sampler = MultiPositiveGWBatchedSampler(
+            gw_to_lc_map=val_map,
+            batch_size=val_batch_size,
+            samples_per_gw=samples_per_gw,
+            steps_per_epoch=val_steps_per_epoch,
+            min_lc_per_gw=min_lc_per_gw,
+        )
 
     train_loader = _build_configured_dataloader(
         train_dataset,
