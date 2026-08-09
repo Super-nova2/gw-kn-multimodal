@@ -1,6 +1,6 @@
 {
   "study_name": "magiks_hpo_v6_main_guardrail85",
-  "n_trials": 24,
+  "n_trials": 30,
   "n_startup_trials": 8,
   "epochs_per_trial": 30,
   "output_dir": "<BASE_DIR>/data/model/hpo_results_bns_nsbh_v6_main_guardrail85",
@@ -26,17 +26,16 @@
     "itc_weight",
     "cls_weight",
     "fusion_physical_weight",
-    "warmup_epochs",
-    "weight_decay",
-    "min_lr"
+    "encoder_lr_ratio",
+    "stage_itc_epochs",
+    "weight_decay"
   ],
   "fixed_overrides": {
     "staged_training_enable": true,
-    "stage_alignment_epochs": 8,
-    "stage_head_epochs": 4,
+    "stage_cls_ramp_epochs": 4,
+    "stage_retrieval_ramp_epochs": 4,
     "stage_joint_itc_start_weight": 0.5,
     "stage_joint_itc_end_weight": 0.25,
-    "encoder_lr_ratio": 0.1,
     "itc_extra_negative_enable": false,
     "neg_gw_guardrail_enable": true,
     "neg_gw_guardrail_recall": 0.85,
@@ -47,8 +46,6 @@
     "neg_gw_pair_ratio": 0.2,
     "samples_per_gw": 4,
     "min_lc_per_gw": 2,
-    "retrieval_start_epoch": 10,
-    "gallery_loss_ramp_epochs": 5,
     "gallery_hard_neg_enable": false,
     "time_compat_weight": 0.6,
     "time_compat_tau_days": 30.0,
@@ -60,7 +57,9 @@
     "label_smoothing": 0.1,
     "fusion_spatial_weight": 1.0,
     "max_gallery_queries": 64,
-    "skip_epoch_checkpoints": true
+    "skip_epoch_checkpoints": true,
+    "warmup_epochs": 3,
+    "min_lr": 0.00002
   },
   "retrain_overrides": {
     "epochs": 100,
@@ -103,24 +102,10 @@
         2.5
       ]
     },
-    "warmup_epochs": {
-      "type": "categorical",
-      "choices": [
-        2,
-        5,
-        8
-      ]
-    },
     "weight_decay": {
       "type": "float",
       "low": 0.005,
       "high": 0.04,
-      "log": true
-    },
-    "min_lr": {
-      "type": "float",
-      "low": 1e-05,
-      "high": 0.0001,
       "log": true
     },
     "gallery_loss_weight": {
@@ -132,11 +117,28 @@
         1.5,
         2.0
       ]
+    },
+    "encoder_lr_ratio": {
+      "type": "categorical",
+      "choices": [
+        0.05,
+        0.1,
+        0.2,
+        0.3
+      ]
+    },
+    "stage_itc_epochs": {
+      "type": "categorical",
+      "choices": [
+        5,
+        6,
+        8
+      ]
     }
   },
   "constraints": {
-    "min_lr_less_than_lr": "min_lr upper bound 1e-4 < lr lower bound 2e-4",
-    "stage_fit": "stage_alignment_epochs + stage_head_epochs < epochs_per_trial",
+    "min_lr_less_than_lr": "fixed min_lr=2e-5 < lr lower bound 2e-4",
+    "stage_fit": "max(stage_itc_epochs)=8 + cls ramp=4 + retrieval ramp=4 < epochs_per_trial=30",
     "guardrail": "neg_gw_guardrail_recall=0.85 and HPO min metric val_neg_gw_min_recall>=0.85"
   }
 }

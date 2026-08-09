@@ -24,6 +24,10 @@ def _frame(event_ids, sample_class, dynamic, wind):
             "mass2_detector": np.full(count, 1.3),
             "spin1z": np.zeros(count),
             "spin2z": np.zeros(count),
+            "recovered_mass1_detector": np.full(count, 1.6),
+            "recovered_mass2_detector": np.full(count, 1.2),
+            "recovered_spin1z": np.full(count, 0.1),
+            "recovered_spin2z": np.full(count, -0.1),
             "inclination": np.zeros(count),
             "distmean": np.full(count, 100.0),
             "diststd": np.full(count, 10.0),
@@ -91,3 +95,7 @@ def test_prepare_source_uses_split_catalogs_and_collision_safe_identity(
     assert prepared.event_uid_by_event[-3] == "bns_train_neg_2"
     assert prepared.event_uid_by_event[2] == "bns_train_pos_2"
     assert prepared.n_filtered_non_success_mej_pos == 1
+    np.testing.assert_allclose(
+        prepared.gw_params[prepared.event_to_row[2], :4],
+        [1.6, 1.2, 0.1, -0.1],
+    )

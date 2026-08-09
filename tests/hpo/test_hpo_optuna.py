@@ -5,7 +5,13 @@ import unittest
 
 
 def load_hpo_module():
-    module_path = Path(__file__).resolve().parents[2] / "Model" / "scripts" / "hpo" / "hpo_optuna.py"
+    module_path = (
+        Path(__file__).resolve().parents[2]
+        / "Model"
+        / "scripts"
+        / "hpo"
+        / "hpo_optuna.py"
+    )
     spec = importlib.util.spec_from_file_location("hpo_optuna", module_path)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
@@ -23,7 +29,9 @@ class HpoObjectiveTests(unittest.TestCase):
             "val_auroc": 0.95,
         }
 
-        score = hpo.compute_objective_score(results, hpo.OBJECTIVE_PRESETS["fusion_gallery_priority"])
+        score = hpo.compute_objective_score(
+            results, hpo.OBJECTIVE_PRESETS["fusion_gallery_priority"]
+        )
 
         expected = (0.70 * 0.80) + (0.15 * 0.75) + (0.10 * 0.90) + (0.05 * 0.95)
         self.assertTrue(math.isclose(score, expected, rel_tol=0.0, abs_tol=1e-12))
@@ -42,7 +50,9 @@ class HpoObjectiveTests(unittest.TestCase):
             "val_auroc": 0.95,
         }
 
-        score = hpo.compute_objective_score(results, hpo.OBJECTIVE_PRESETS["fusion_gallery_priority"])
+        score = hpo.compute_objective_score(
+            results, hpo.OBJECTIVE_PRESETS["fusion_gallery_priority"]
+        )
 
         self.assertTrue(math.isnan(score))
 
@@ -53,8 +63,9 @@ class HpoV6ConfigTests(unittest.TestCase):
         required = {
             "neg_gw_pair_ratio",
             "staged_training_enable",
-            "stage_alignment_epochs",
-            "stage_head_epochs",
+            "stage_itc_epochs",
+            "stage_cls_ramp_epochs",
+            "stage_retrieval_ramp_epochs",
             "stage_joint_itc_start_weight",
             "stage_joint_itc_end_weight",
             "encoder_lr_ratio",
@@ -88,23 +99,33 @@ class HpoV6ConfigTests(unittest.TestCase):
 
     def test_stage_constraints_reject_overflow(self):
         hpo = load_hpo_module()
-        with self.assertRaisesRegex(ValueError, "staged training stages do not fit"):
-            hpo._apply_three_stage_constraints({
-                "staged_training_enable": True,
-                "stage_alignment_epochs": 20,
-                "stage_head_epochs": 4,
-                "epochs": 24,
-            })
+        with self.assertRaisesRegex(ValueError, "leaves no joint epoch"):
+            hpo._apply_curriculum_constraints(
+                {
+                    "staged_training_enable": True,
+                    "itc_weight": 1.0,
+                    "cls_weight": 1.0,
+                    "gallery_loss_weight": 1.0,
+                    "stage_itc_epochs": 20,
+                    "stage_cls_ramp_epochs": 4,
+                    "stage_retrieval_ramp_epochs": 4,
+                    "epochs": 24,
+                }
+            )
 
     def test_guardrail_threshold_constraint(self):
         hpo = load_hpo_module()
         with self.assertRaisesRegex(ValueError, "neg_gw_guardrail_recall"):
-            hpo._apply_three_stage_constraints({"neg_gw_guardrail_recall": 1.5})
+            hpo._apply_curriculum_constraints(
+                {"itc_weight": 1.0, "epochs": 100, "neg_gw_guardrail_recall": 1.5}
+            )
 
     def test_min_lr_must_be_less_than_lr(self):
         hpo = load_hpo_module()
         with self.assertRaisesRegex(ValueError, "min_lr"):
-            hpo._apply_three_stage_constraints({"lr": 2e-4, "min_lr": 2e-4})
+            hpo._apply_curriculum_constraints(
+                {"itc_weight": 1.0, "epochs": 100, "lr": 2e-4, "min_lr": 2e-4}
+            )
 
     def test_neg_gw_min_recall_is_supported_min_metric(self):
         hpo = load_hpo_module()

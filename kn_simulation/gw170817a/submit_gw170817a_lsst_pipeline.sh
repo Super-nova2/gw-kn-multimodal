@@ -46,7 +46,11 @@ REDSHIFTS="${REDSHIFTS:-0.01,0.02,0.03,0.05,0.08,0.12,0.16}"
 N_PER_REDSHIFT="${N_PER_REDSHIFT:-800,800,1200,1300,2000,3000,6000}"
 SEED="${SEED:-170817}"
 MIN_NOBS="${MIN_NOBS:-5}"
-SAMPLES_PER_EVENT="${SAMPLES_PER_EVENT:-64}"
+# Candidate budgets compensate for redshift-dependent cadence/detection losses.
+# The prepared catalog contains one GW parent per redshift; snana.py reads each
+# parents optical_candidate_count and samples that many fixed-redshift positions.
+SAMPLES_PER_EVENT="${SAMPLES_PER_EVENT:-1}"
+TARGET_PER_REDSHIFT="${TARGET_PER_REDSHIFT:-200}"
 SAMPLING_NSIDE="${SAMPLING_NSIDE:-256}"
 BATCH_SIZE="${BATCH_SIZE:-500}"
 NETWORK_SNR="${NETWORK_SNR:-32.4}"
@@ -129,7 +133,7 @@ if [[ "${STAGE}" == "all" || "${STAGE}" == "snana" ]]; then
   find "${OUTPUT_DIR}" -maxdepth 1 -name 'sim_ids_chunk_*' -print0 | sort -z | \
     xargs -0 -P "${NPROC}" -I{} bash -c '
       echo "Preparing chunk: $1"
-      python -u "$SNANA_PREPARE"         --GW_type bns         --sim-id-file "$1"         --GW_catalog "$CATALOG"         --skymap_path "$SKYMAP_DIR"         --sim_name "$SIM_NAME"         --Opsim "$OPSIM_DB"         --template_input "$TEMPLATE_INPUT"         --too_config "$TOO_CONFIG"         --coordinate_mode posterior_test         --samples_per_event "$SAMPLES_PER_EVENT"         --sampling_nside "$SAMPLING_NSIDE"         --cosmology Planck15         --outdir "$OUTPUT_DIR"         --sndata-sim-dir "$SNDATA_SIM_DIR"
+      python -u "$SNANA_PREPARE"         --GW_type bns         --sim-id-file "$1"         --GW_catalog "$CATALOG"         --skymap_path "$SKYMAP_DIR"         --sim_name "$SIM_NAME"         --Opsim "$OPSIM_DB"         --template_input "$TEMPLATE_INPUT"         --too_config "$TOO_CONFIG"         --coordinate_mode posterior_fixed_distance         --samples_per_event "$SAMPLES_PER_EVENT"         --sampling_nside "$SAMPLING_NSIDE"         --cosmology Planck15         --outdir "$OUTPUT_DIR"         --sndata-sim-dir "$SNDATA_SIM_DIR"
     ' _ {}
 fi
 
@@ -153,7 +157,9 @@ if [[ "${STAGE}" == "all" || "${STAGE}" == "h5" ]]; then
     --posterior-h5 "${POSTERIOR_H5}" \
     --posterior-dataset "${POSTERIOR_DATASET}" \
     --output-h5 "${OUTPUT_H5}" \
-    --min-nobs "${MIN_NOBS}"
+    --min-nobs "${MIN_NOBS}" \
+    --target-per-redshift "${TARGET_PER_REDSHIFT}" \
+    --selection-seed "${SEED}"
 fi
 
 echo "GW170817A pipeline finished."

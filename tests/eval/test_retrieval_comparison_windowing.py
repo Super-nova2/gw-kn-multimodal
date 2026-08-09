@@ -997,10 +997,10 @@ class TestScalarConsistencyValidation(unittest.TestCase):
         bns_path = self._make_catalog("bns.csv", [{
             "simulation_id": 6,
             "redshift": 0.05,
-            "mass1_detector": mass1,
-            "mass2_detector": mass2,
-            "spin1z": spin1z,
-            "spin2z": spin2z,
+            "recovered_mass1_detector": mass1,
+            "recovered_mass2_detector": mass2,
+            "recovered_spin1z": spin1z,
+            "recovered_spin2z": spin2z,
             "inclination": incl,
             "distmean": distmean,
             "diststd": diststd,
@@ -1024,10 +1024,10 @@ class TestScalarConsistencyValidation(unittest.TestCase):
         bns_path = self._make_catalog("bns.csv", [{
             "simulation_id": 6,
             "redshift": 0.05,
-            "mass1_detector": mass1,
-            "mass2_detector": mass2,
-            "spin1z": spin1z,
-            "spin2z": spin2z,
+            "recovered_mass1_detector": mass1,
+            "recovered_mass2_detector": mass2,
+            "recovered_spin1z": spin1z,
+            "recovered_spin2z": spin2z,
             "inclination": incl,
             "distmean": distmean,
             "diststd": diststd,
@@ -1042,7 +1042,7 @@ class TestScalarConsistencyValidation(unittest.TestCase):
                 h5_path, {"bns": bns_path}, validate_scalars=True,
             )
         self.assertIn("Scalar mismatch", str(ctx.exception))
-        self.assertIn("mass1_detector", str(ctx.exception))
+        self.assertIn("recovered_mass1_detector", str(ctx.exception))
 
     def test_scalar_validation_skipped_when_disabled(self):
         from scripts.eval.eval_retrieval_comparison import _build_redshift_metadata_from_catalogs

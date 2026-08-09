@@ -29,6 +29,7 @@ from rubin_too import (
     sample_coordinates_with_indices,
 )
 from sky_sampling import (
+    build_fixed_distance_coordinate_samples,
     build_posterior_coordinate_samples,
     build_test_coordinate_samples,
 )
@@ -124,10 +125,15 @@ def gen_input(injections, text, sim_id, gw_type="bns", sndata_sim_dir=None):
 def _coordinate_samples(args, injections, sky_map, sim_id):
     row = _event_row(injections, sim_id)
     seed = int(row["coordinate_seed"])
+    samples_per_event = int(row.get("optical_candidate_count", args.samples_per_event))
+    if samples_per_event < 1:
+        raise ValueError(
+            f"simulation_id={sim_id} has invalid optical_candidate_count={samples_per_event}"
+        )
     if args.coordinate_mode == "posterior_3d":
         return build_posterior_coordinate_samples(
             sky_map,
-            samples_per_event=args.samples_per_event,
+            samples_per_event=samples_per_event,
             level=args.level,
             nside=args.sampling_nside,
             seed=seed,
@@ -139,7 +145,17 @@ def _coordinate_samples(args, injections, sky_map, sim_id):
             true_ra=float(row["ra_deg"]),
             true_dec=float(row["dec_deg"]),
             true_distance_mpc=float(row["luminosity_distance"]),
-            samples_per_event=args.samples_per_event,
+            samples_per_event=samples_per_event,
+            level=args.level,
+            nside=args.sampling_nside,
+            seed=seed,
+        )
+
+    if args.coordinate_mode == "posterior_fixed_distance":
+        return build_fixed_distance_coordinate_samples(
+            sky_map,
+            distance_mpc=float(row["luminosity_distance"]),
+            samples_per_event=samples_per_event,
             level=args.level,
             nside=args.sampling_nside,
             seed=seed,
@@ -267,7 +283,7 @@ def build_parser():
     )
     parser.add_argument(
         "--coordinate_mode",
-        choices=("posterior_3d", "posterior_test"),
+        choices=("posterior_3d", "posterior_test", "posterior_fixed_distance"),
         default="posterior_3d",
     )
     parser.add_argument("--samples_per_event", type=int, default=64)
@@ -418,7 +434,9 @@ def main(argv=None):
             if redshift.ndim == 0:
                 redshift = np.full(len(ra), float(redshift), dtype=float)
             true_mask = np.asarray(is_true, dtype=bool)
-            if np.any(true_mask):
+            if args.coordinate_mode == "posterior_fixed_distance":
+                redshift[:] = float(row["redshift"])
+            elif np.any(true_mask):
                 redshift[true_mask] = float(row["redshift"])
 
             too_tile_index = np.full(len(ra), -1, dtype=int)
@@ -577,6 +595,16 @@ def main(argv=None):
                 gw_type=args.GW_type,
                 sndata_sim_dir=args.sndata_sim_dir,
             )
+            if args.coordinate_mode == "posterior_fixed_distance":
+                parent_redshift = float(row["redshift"])
+                redshift_min = max(1.0e-5, parent_redshift - 1.0e-4)
+                redshift_max = parent_redshift + 1.0e-4
+                text = re.sub(
+                    r"^(GENRANGE_REDSHIFT:\s*)\S+\s+\S+.*$",
+                    rf"\1 {redshift_min:.6f} {redshift_max:.6f}",
+                    text,
+                    flags=re.MULTILINE,
+                )
             input_file.write_text(text, encoding="utf-8")
             coordinate_frame.to_csv(coordinate_file, index=False)
 

@@ -5,8 +5,9 @@ import unittest
 
 import torch
 
-
-MODEL_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "Model"))
+MODEL_DIR = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "..", "Model")
+)
 if MODEL_DIR not in sys.path:
     sys.path.insert(0, MODEL_DIR)
 
@@ -34,6 +35,106 @@ def _args(**overrides):
     }
     values.update(overrides)
     return argparse.Namespace(**values)
+
+
+def _curriculum_args(**overrides):
+    values = {
+        "staged_training_enable": True,
+        "itc_weight": 1.0,
+        "cls_weight": 1.0,
+        "gallery_loss_weight": 1.0,
+        "stage_itc_epochs": 8,
+        "stage_cls_ramp_epochs": 4,
+        "stage_retrieval_ramp_epochs": 4,
+        "stage_joint_itc_start_weight": 0.5,
+        "stage_joint_itc_end_weight": 0.25,
+        "epochs": 100,
+    }
+    values.update(overrides)
+    return argparse.Namespace(**values)
+
+
+class SequentialCurriculumTests(unittest.TestCase):
+    def test_full_boundary_weights(self):
+        args = _curriculum_args()
+        expected = {
+            0: ("itc", 1.0, 0.0, 0.0),
+            7: ("itc", 1.0, 0.0, 0.0),
+            8: ("cls_intro", 0.0, 0.25, 0.0),
+            11: ("cls_intro", 0.0, 1.0, 0.0),
+            12: ("retrieval_intro", 0.0, 1.0, 0.25),
+            15: ("retrieval_intro", 0.0, 1.0, 1.0),
+            16: ("joint", 0.5, 1.0, 1.0),
+            99: ("joint", 0.25, 1.0, 1.0),
+        }
+        for epoch, (phase, itc, cls, retrieval) in expected.items():
+            with self.subTest(epoch=epoch):
+                state = train.resolve_sequential_curriculum(args, epoch)
+                self.assertEqual(state["phase"], phase)
+                self.assertAlmostEqual(state["weights"]["itc"], itc)
+                self.assertAlmostEqual(state["weights"]["cls"], cls)
+                self.assertAlmostEqual(state["weights"]["retrieval"], retrieval)
+
+    def test_disabled_losses_skip_their_phases(self):
+        cases = {
+            "no_retrieval": (
+                _curriculum_args(gallery_loss_weight=0.0),
+                ["itc", "cls_intro", "joint"],
+                12,
+            ),
+            "no_cls": (
+                _curriculum_args(cls_weight=0.0),
+                ["itc", "retrieval_intro", "joint"],
+                12,
+            ),
+            "no_itc": (
+                _curriculum_args(itc_weight=0.0),
+                ["cls_intro", "retrieval_intro", "joint"],
+                8,
+            ),
+            "no_fusion": (
+                _curriculum_args(cls_weight=0.0),
+                ["itc", "retrieval_intro", "joint"],
+                12,
+            ),
+            "no_cross": (
+                _curriculum_args(),
+                ["itc", "cls_intro", "retrieval_intro", "joint"],
+                16,
+            ),
+        }
+        for name, (args, phases, joint_start) in cases.items():
+            with self.subTest(name=name):
+                resolved = train.build_sequential_curriculum(args)
+                self.assertEqual([phase["name"] for phase in resolved], phases)
+                self.assertEqual(resolved[-1]["start"], joint_start)
+
+    def test_no_itc_is_end_to_end_and_itc_stays_zero(self):
+        args = _curriculum_args(itc_weight=0.0)
+        for epoch in range(args.epochs):
+            self.assertEqual(train.compute_itc_weight(args, epoch), 0.0)
+        state = train.resolve_sequential_curriculum(args, 0)
+        self.assertEqual(state["phase"], "cls_intro")
+        self.assertEqual(state["train_roles"], {"encoder", "head"})
+
+    def test_model_freezing_matches_phase_roles(self):
+        class TinyModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.encoder = torch.nn.Linear(2, 2)
+                self.fusion = torch.nn.Linear(2, 1)
+                self.log_temp = torch.nn.Parameter(torch.tensor(0.0))
+
+        model = TinyModel()
+        args = _curriculum_args()
+        train.configure_model_for_stage(model, args, "itc")
+        self.assertTrue(model.encoder.weight.requires_grad)
+        self.assertFalse(model.fusion.weight.requires_grad)
+        self.assertTrue(model.log_temp.requires_grad)
+        train.configure_model_for_stage(model, args, "cls_intro")
+        self.assertFalse(model.encoder.weight.requires_grad)
+        self.assertTrue(model.fusion.weight.requires_grad)
+        self.assertFalse(model.log_temp.requires_grad)
 
 
 class BestCheckpointEligibilityTests(unittest.TestCase):
@@ -134,9 +235,7 @@ class GalleryHardBestCkptGatingTests(unittest.TestCase):
             best_ckpt_metric="fusion_gallery_mrr",
             gallery_hard_neg_enable=False,
         )
-        self.assertTrue(
-            train.is_best_ckpt_selection_eligible(args, epoch=11)
-        )
+        self.assertTrue(train.is_best_ckpt_selection_eligible(args, epoch=11))
 
     def test_fusion_gallery_pending_during_hard_ramp(self):
         """Best ckpt NOT eligible while retrieval hard mining is still ramping."""
@@ -149,9 +248,7 @@ class GalleryHardBestCkptGatingTests(unittest.TestCase):
             gallery_hard_neg_weight=0.5,
         )
         # hard_start = 12, ramp to 13, so epoch 12 is partial (weight=0.25)
-        self.assertFalse(
-            train.is_best_ckpt_selection_eligible(args, epoch=12)
-        )
+        self.assertFalse(train.is_best_ckpt_selection_eligible(args, epoch=12))
 
     def test_fusion_gallery_eligible_after_hard_ramp(self):
         """Best ckpt eligible once retrieval hard mining reaches full weight."""
@@ -164,9 +261,7 @@ class GalleryHardBestCkptGatingTests(unittest.TestCase):
             gallery_hard_neg_weight=0.5,
         )
         # hard_start=12, ramp 2 epochs, full at epoch 13
-        self.assertTrue(
-            train.is_best_ckpt_selection_eligible(args, epoch=13)
-        )
+        self.assertTrue(train.is_best_ckpt_selection_eligible(args, epoch=13))
 
     def test_fusion_gallery_eligible_when_hard_ramp_cannot_reach_full_weight(self):
         """An unreachable hard ramp must not silently relax checkpoint gating."""
@@ -180,9 +275,7 @@ class GalleryHardBestCkptGatingTests(unittest.TestCase):
             epochs=13,
         )
         self.assertFalse(train.gallery_hard_neg_full_activation_reachable(args))
-        self.assertFalse(
-            train.is_best_ckpt_selection_eligible(args, epoch=12)
-        )
+        self.assertFalse(train.is_best_ckpt_selection_eligible(args, epoch=12))
 
     def test_alignment_only_eligible_immediately(self):
         """alignment_only (gallery_loss_weight=0) skips hard ramp gate."""
@@ -192,9 +285,7 @@ class GalleryHardBestCkptGatingTests(unittest.TestCase):
             gallery_hard_neg_enable=True,
             retrieval_start_epoch=999,
         )
-        self.assertTrue(
-            train.is_best_ckpt_selection_eligible(args, epoch=5)
-        )
+        self.assertTrue(train.is_best_ckpt_selection_eligible(args, epoch=5))
 
     def test_describe_pending_mentions_retrieval_hard_ramp(self):
         args = _args(
@@ -250,9 +341,14 @@ class GalleryHardConfigTests(unittest.TestCase):
 
     def test_hard_neg_full_activation_reachable_when_training_exceeds_full_epoch(self):
         args = _args(
+            staged_training_enable=True,
+            itc_weight=1.0,
+            cls_weight=1.0,
             gallery_hard_neg_enable=True,
             gallery_loss_weight=1.0,
-            retrieval_start_epoch=10,
+            stage_itc_epochs=8,
+            stage_cls_ramp_epochs=2,
+            stage_retrieval_ramp_epochs=1,
             gallery_hard_neg_start_after_retrieval_epochs=2,
             gallery_hard_neg_ramp_epochs=2,
             epochs=15,
@@ -261,9 +357,14 @@ class GalleryHardConfigTests(unittest.TestCase):
 
     def test_hard_neg_full_activation_unreachable_when_epochs_insufficient(self):
         args = _args(
+            staged_training_enable=True,
+            itc_weight=1.0,
+            cls_weight=1.0,
             gallery_hard_neg_enable=True,
             gallery_loss_weight=1.0,
-            retrieval_start_epoch=10,
+            stage_itc_epochs=8,
+            stage_cls_ramp_epochs=2,
+            stage_retrieval_ramp_epochs=1,
             gallery_hard_neg_start_after_retrieval_epochs=2,
             gallery_hard_neg_ramp_epochs=2,
             epochs=13,
@@ -302,7 +403,7 @@ class ClassificationLossBucketTests(unittest.TestCase):
             torch.tensor(4.0),
         ]
         out = train.compute_weighted_cls_loss(*losses, args)
-        expected = (0.5 * 1.0 + 0.2 * 2.0 + 0.15 * 3.0 + 0.15 * 4.0)
+        expected = 0.5 * 1.0 + 0.2 * 2.0 + 0.15 * 3.0 + 0.15 * 4.0
         self.assertAlmostEqual(out.item(), expected)
 
     def test_missing_buckets_are_renormalized(self):
@@ -422,12 +523,13 @@ class CurrentScheduleConfigTests(unittest.TestCase):
             json_config=os.path.join(root, run_config),
         )
 
-    def test_default_uses_requested_three_stage_schedule(self):
+    def test_default_uses_sequential_loss_schedule(self):
         cfg = self._merged_config("MAGIKS_BNS_NSBH_full.json")
 
         self.assertTrue(cfg["staged_training_enable"])
-        self.assertEqual(cfg["stage_alignment_epochs"], 8)
-        self.assertEqual(cfg["stage_head_epochs"], 4)
+        self.assertEqual(cfg["stage_itc_epochs"], 8)
+        self.assertEqual(cfg["stage_cls_ramp_epochs"], 4)
+        self.assertEqual(cfg["stage_retrieval_ramp_epochs"], 4)
         self.assertEqual(cfg["stage_joint_itc_start_weight"], 0.5)
         self.assertEqual(cfg["stage_joint_itc_end_weight"], 0.25)
         self.assertEqual(cfg["encoder_lr_ratio"], 0.1)
@@ -438,27 +540,23 @@ class CurrentScheduleConfigTests(unittest.TestCase):
         self.assertEqual(cfg["cls_mismatched_weight"], 0.15)
         self.assertEqual(cfg["cls_external_neg_weight"], 0.15)
         self.assertEqual(cfg["gallery_loss_weight"], 1.0)
-        self.assertEqual(cfg["retrieval_start_epoch"], 10)
-        self.assertEqual(cfg["gallery_loss_ramp_epochs"], 5)
 
     def test_hard_mining_variant_keeps_gallery_hard_mining_disabled(self):
         cfg = self._merged_config("MAGIKS_BNS_NSBH_hard_mining.json")
 
-        self.assertEqual(cfg["retrieval_start_epoch"], 10)
         self.assertEqual(cfg["gallery_loss_weight"], 1.0)
         self.assertFalse(cfg["gallery_hard_neg_enable"])
 
     def test_hard_disabled_ablations_keep_gallery_hard_mining_off(self):
         expected = {
-            "MAGIKS_BNS_NSBH_hard_mining.json": (10, 1.0),
-            "MAGIKS_BNS_NSBH_no_gallery_loss.json": (0, 0.0),
-            "MAGIKS_BNS_NSBH_no_fusion.json": (10, 1.0),
+            "MAGIKS_BNS_NSBH_hard_mining.json": 1.0,
+            "MAGIKS_BNS_NSBH_no_gallery_loss.json": 0.0,
+            "MAGIKS_BNS_NSBH_no_fusion.json": 1.0,
         }
 
-        for run_config, (retrieval_start, gallery_weight) in expected.items():
+        for run_config, gallery_weight in expected.items():
             with self.subTest(run_config=run_config):
                 cfg = self._merged_config(run_config)
-                self.assertEqual(cfg["retrieval_start_epoch"], retrieval_start)
                 self.assertEqual(cfg["gallery_loss_weight"], gallery_weight)
                 self.assertFalse(cfg["gallery_hard_neg_enable"])
 
@@ -490,7 +588,10 @@ class CurrentScheduleConfigTests(unittest.TestCase):
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
-            if not isinstance(node.func, ast.Attribute) or node.func.attr != "add_argument":
+            if (
+                not isinstance(node.func, ast.Attribute)
+                or node.func.attr != "add_argument"
+            ):
                 continue
             opts = [
                 arg.value
@@ -503,7 +604,11 @@ class CurrentScheduleConfigTests(unittest.TestCase):
                     dest = kw.value.value
             if dest is None and opts:
                 option_names = [opt for opt in opts if opt.startswith("-")]
-                dest = (option_names[-1] if option_names else opts[0]).lstrip("-").replace("-", "_")
+                dest = (
+                    (option_names[-1] if option_names else opts[0])
+                    .lstrip("-")
+                    .replace("-", "_")
+                )
             if dest:
                 parser_keys.add(dest)
 

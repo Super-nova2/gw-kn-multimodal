@@ -32,6 +32,7 @@ import json
 import time
 import warnings
 from typing import Any, Dict, List, Optional, Tuple
+
 warnings.filterwarnings("ignore", "Wswiglal-redir-stdio")
 
 
@@ -46,9 +47,7 @@ def _load_json_config_file(path: Optional[str]) -> Dict[str, Any]:
     if not isinstance(cfg, dict):
         raise ValueError(f"JSON config must contain an object: {path}")
     return {
-        k: v
-        for k, v in cfg.items()
-        if k not in BASH_ONLY_CONFIG_KEYS and v is not None
+        k: v for k, v in cfg.items() if k not in BASH_ONLY_CONFIG_KEYS and v is not None
     }
 
 
@@ -94,7 +93,9 @@ def _close_loader_dataset_handles(loader, *, cache_in_memory: bool, label: str) 
         print(f"{label}: closed {closed} lazy HDF5 handle(s) after evaluation.")
 
 
-DEFAULT_MTAN_LUPT_M5 = np.asarray([23.9, 25.0, 24.7, 24.0, 23.3, 22.1], dtype=np.float64)
+DEFAULT_MTAN_LUPT_M5 = np.asarray(
+    [23.9, 25.0, 24.7, 24.0, 23.3, 22.1], dtype=np.float64
+)
 
 
 def build_ref_time(batch_size, n_ref, ref_start, ref_end, device, dtype):
@@ -125,7 +126,9 @@ def parse_day_windows(text: str) -> List[float]:
             continue
         v = float(part)
         if v <= 0:
-            raise ValueError(f"Invalid hard-negative time window value: {v}. Must be > 0.")
+            raise ValueError(
+                f"Invalid hard-negative time window value: {v}. Must be > 0."
+            )
         vals.append(v)
     if not vals:
         raise ValueError("hardneg_time_window_days produced empty list.")
@@ -136,7 +139,9 @@ def parse_day_windows(text: str) -> List[float]:
 def parse_lupt_m5_mag_text(text: str) -> np.ndarray:
     parts = [p.strip() for p in str(text).split(",") if p.strip()]
     if len(parts) != 6:
-        raise ValueError("mtan_lupt_m5_mag must provide exactly 6 comma-separated values in order u,g,r,i,z,Y.")
+        raise ValueError(
+            "mtan_lupt_m5_mag must provide exactly 6 comma-separated values in order u,g,r,i,z,Y."
+        )
     try:
         vals = np.asarray([float(p) for p in parts], dtype=np.float64)
     except ValueError as exc:
@@ -183,7 +188,9 @@ def load_gw_event_time_mjd_table(h5_path, device, required=False):
     ds_path = "events/gw_data/event_time_mjd"
     if h5_path is None or not os.path.exists(h5_path):
         if required:
-            raise FileNotFoundError(f"data_path not found for event_time_mjd: {h5_path}")
+            raise FileNotFoundError(
+                f"data_path not found for event_time_mjd: {h5_path}"
+            )
         print(f"WARNING: data_path not found for event_time_mjd: {h5_path}")
         return None
 
@@ -250,7 +257,8 @@ def load_gw_source_type_table(h5_path, device, required=False):
     labels, codes = np.unique(np.asarray(source_names, dtype=str), return_inverse=True)
     counts = np.bincount(codes, minlength=len(labels))
     summary = ", ".join(
-        f"{label}={int(count)}" for label, count in zip(labels.tolist(), counts.tolist())
+        f"{label}={int(count)}"
+        for label, count in zip(labels.tolist(), counts.tolist())
     )
     print(f"Loaded GW source types for mismatched negatives: {summary}")
     return torch.from_numpy(codes.astype(np.int64, copy=False)).to(device=device)
@@ -275,22 +283,34 @@ def load_gw_neg_type_table(h5_path, device, required=False):
 
 def _collect_dataset_window_metadata(args) -> Dict[str, object]:
     return {
-        "train_positive": _read_optical_h5_window_metadata(getattr(args, "data_path", None)),
-        "train_negative": _read_optical_h5_window_metadata(getattr(args, "neg_data_path", None)),
+        "train_positive": _read_optical_h5_window_metadata(
+            getattr(args, "data_path", None)
+        ),
+        "train_negative": _read_optical_h5_window_metadata(
+            getattr(args, "neg_data_path", None)
+        ),
     }
 
 
 def _build_effective_input_window_metadata(args) -> Dict[str, object]:
     pos_meta = getattr(args, "_dataset_window_metadata", {}).get("train_positive", {})
-    dataset_window_start = pos_meta.get("time_window_start") if isinstance(pos_meta, dict) else None
-    dataset_window_end = pos_meta.get("time_window_end") if isinstance(pos_meta, dict) else None
+    dataset_window_start = (
+        pos_meta.get("time_window_start") if isinstance(pos_meta, dict) else None
+    )
+    dataset_window_end = (
+        pos_meta.get("time_window_end") if isinstance(pos_meta, dict) else None
+    )
     return build_effective_input_window_metadata(
         float(args.ref_start),
         float(args.ref_end),
         runtime_input_window_start=float(args.ref_start),
         runtime_input_window_end=float(args.ref_end),
-        dataset_window_start=(None if dataset_window_start is None else float(dataset_window_start)),
-        dataset_window_end=(None if dataset_window_end is None else float(dataset_window_end)),
+        dataset_window_start=(
+            None if dataset_window_start is None else float(dataset_window_start)
+        ),
+        dataset_window_end=(
+            None if dataset_window_end is None else float(dataset_window_end)
+        ),
     )
 
 
@@ -325,7 +345,9 @@ def resolve_mtan_runtime_config(args) -> Dict[str, object]:
                 if "lupt_k" in f.attrs:
                     cfg["mtan_lupt_k"] = float(f.attrs["lupt_k"])
                 if "lupt_m5_mag" in f.attrs:
-                    m5 = np.asarray(f.attrs["lupt_m5_mag"], dtype=np.float64).reshape(-1)
+                    m5 = np.asarray(f.attrs["lupt_m5_mag"], dtype=np.float64).reshape(
+                        -1
+                    )
                     if m5.shape == (6,) and np.all(np.isfinite(m5)):
                         cfg["mtan_lupt_m5_mag"] = m5
         except Exception as exc:
@@ -369,7 +391,9 @@ def _stop_cuda_timer(timer) -> float:
 
 def apply_time_offsets(opt_t, opt_mask, delta_days, scale_divisor):
     valid = (opt_mask.sum(dim=-1) > 0).to(dtype=opt_t.dtype)
-    shift = (delta_days.to(device=opt_t.device, dtype=opt_t.dtype) / float(scale_divisor)).unsqueeze(1)
+    shift = (
+        delta_days.to(device=opt_t.device, dtype=opt_t.dtype) / float(scale_divisor)
+    ).unsqueeze(1)
     return opt_t + shift * valid
 
 
@@ -381,7 +405,9 @@ def apply_hard_negative_time_shift(opt_t, opt_mask, delta_days, scale_divisor):
       delta_days = t_candidate_gw - t_anchor_gw
     """
     valid = (opt_mask.sum(dim=-1) > 0).to(dtype=opt_t.dtype)
-    shift = (delta_days.to(device=opt_t.device, dtype=opt_t.dtype) / float(scale_divisor)).unsqueeze(1)
+    shift = (
+        delta_days.to(device=opt_t.device, dtype=opt_t.dtype) / float(scale_divisor)
+    ).unsqueeze(1)
     return opt_t + shift * valid
 
 
@@ -396,13 +422,17 @@ def compute_time_delta_days(opt_zero_time_mjd, gw_anchor_time_mjd):
     return dt
 
 
-def resolve_optical_candidate_time_mjd(opt_first_detection_mjd, fallback_event_time_mjd):
+def resolve_optical_candidate_time_mjd(
+    opt_first_detection_mjd, fallback_event_time_mjd
+):
     """Return the optical first-detection MJD used for candidate timing."""
     del fallback_event_time_mjd
     return opt_first_detection_mjd
 
 
-def gather_candidate_optical_time_mjd(opt_first_detection_mjd, fallback_event_time_mjd, candidate_idx):
+def gather_candidate_optical_time_mjd(
+    opt_first_detection_mjd, fallback_event_time_mjd, candidate_idx
+):
     candidate_time = resolve_optical_candidate_time_mjd(
         opt_first_detection_mjd,
         fallback_event_time_mjd,
@@ -429,11 +459,17 @@ def encode_hard_negative_with_time_shift(
     Re-encode hard negatives after timeline shift to preserve absolute mismatch.
     """
     if candidate_zero_time_mjd is None or anchor_gw_time_mjd is None:
-        delta_days = torch.zeros((opt_t.size(0),), device=opt_t.device, dtype=torch.float32)
+        delta_days = torch.zeros(
+            (opt_t.size(0),), device=opt_t.device, dtype=torch.float32
+        )
         shifted_opt_t = opt_t
     else:
-        delta_days = compute_time_delta_days(candidate_zero_time_mjd, anchor_gw_time_mjd)
-        shifted_opt_t = apply_hard_negative_time_shift(opt_t, opt_mask, delta_days, scale_divisor)
+        delta_days = compute_time_delta_days(
+            candidate_zero_time_mjd, anchor_gw_time_mjd
+        )
+        shifted_opt_t = apply_hard_negative_time_shift(
+            opt_t, opt_mask, delta_days, scale_divisor
+        )
     z_l_hard, h_l_hard = model.encode_optical(
         opt_coords, shifted_opt_t, opt_v, opt_ref_t, opt_mask, opt_err
     )
@@ -471,7 +507,7 @@ def _finalize_time_delta_stats(stats):
         mean = entry["sum"] / float(count)
         var = max(0.0, entry["sum_sq"] / float(count) - mean * mean)
         out[f"{key}_mean"] = float(mean)
-        out[f"{key}_std"] = float(var ** 0.5)
+        out[f"{key}_std"] = float(var**0.5)
     return out
 
 
@@ -486,7 +522,6 @@ def summarize_abs_time_delta_quantiles(dt_days, quantiles=(0.5, 0.9, 0.95)):
     for i, qq in enumerate(quantiles):
         out[f"p{int(qq * 100):02d}"] = float(q_vals[i].item())
     return out
-
 
 
 def sample_mismatched_negatives(
@@ -553,15 +588,13 @@ def sample_mismatched_negatives(
         for i in range(batch_size):
             my_group = i // samples_per_gw
             candidates = [g for g in range(n_gw) if g != my_group]
-            chosen_group = candidates[torch.randint(
-                0, len(candidates), (1,), device=device
-            ).item()]
+            chosen_group = candidates[
+                torch.randint(0, len(candidates), (1,), device=device).item()
+            ]
             offset = torch.randint(0, samples_per_gw, (1,), device=device).item()
             mis_idx[i] = chosen_group * samples_per_gw + offset
 
     return mis_idx
-
-
 
 
 def build_itc_pair_mask(gw_indices, pair_is_neg_gw, min_pairs_per_gw=2):
@@ -594,12 +627,15 @@ def configure_model_for_stage(model, args, stage):
         for parameter in model.parameters():
             parameter.requires_grad = True
         return
+    itc_enabled = float(getattr(args, "itc_weight", 0.0)) > 0.0
     for name, parameter in model.named_parameters():
         role = _parameter_stage_role(name)
-        if stage == "alignment":
+        if stage == "itc":
             parameter.requires_grad = role in {"encoder", "temperature"}
-        elif stage == "head":
-            parameter.requires_grad = role == "head"
+        elif stage in {"cls_intro", "retrieval_intro"}:
+            parameter.requires_grad = role in (
+                {"head"} if itc_enabled else {"encoder", "head"}
+            )
         else:
             parameter.requires_grad = role in {"encoder", "head"}
 
@@ -622,19 +658,30 @@ def build_optimizer_param_groups(model, args):
 
     groups = []
     for (role, no_decay), parameters in sorted(grouped.items()):
-        groups.append({
-            "params": parameters,
-            "lr": float(args.lr),
-            "weight_decay": 0.0 if no_decay else float(args.weight_decay),
-            "stage_role": role,
-        })
+        groups.append(
+            {
+                "params": parameters,
+                "lr": float(args.lr),
+                "weight_decay": 0.0 if no_decay else float(args.weight_decay),
+                "stage_role": role,
+            }
+        )
     return groups
+
+
 def sample_mis_neg_dt_days(batch_size, device, window_days=30.0):
     """Synthetic time delta for mismatched negatives: Uniform(0, window_days) days."""
     return torch.rand(batch_size, device=device, dtype=torch.float32) * window_days
 
-def augment_gw_data(gw_s, gw_m, training=True,
-                    noise_std=0.05, scalar_jitter=0.02, channel_dropout_prob=0.1):
+
+def augment_gw_data(
+    gw_s,
+    gw_m,
+    training=True,
+    noise_std=0.05,
+    scalar_jitter=0.02,
+    channel_dropout_prob=0.1,
+):
     """
     GW数据增强函数，增加训练样本的有效多样性。
 
@@ -711,11 +758,14 @@ def compute_credible_level(gw_m, opt_coords):
 
     ra = coords[:, 0]
     dec = coords[:, 1]
-    opt_xyz = torch.stack([
-        torch.cos(dec) * torch.cos(ra),
-        torch.cos(dec) * torch.sin(ra),
-        torch.sin(dec)
-    ], dim=-1)  # [B, 3]
+    opt_xyz = torch.stack(
+        [
+            torch.cos(dec) * torch.cos(ra),
+            torch.cos(dec) * torch.sin(ra),
+            torch.sin(dec),
+        ],
+        dim=-1,
+    )  # [B, 3]
 
     pix_xyz = gw_m[:, :3, :]  # [B, 3, 19200]
     dot = torch.bmm(opt_xyz.unsqueeze(1), pix_xyz).squeeze(1)  # [B, 19200]
@@ -723,18 +773,27 @@ def compute_credible_level(gw_m, opt_coords):
 
     dA = gw_m[:, 3, :]  # [B, 19200]
     dP = gw_m[:, 4, :]  # [B, 19200]
-    dA = torch.nan_to_num(dA.to(torch.float32), nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
-    dP = torch.nan_to_num(dP.to(torch.float32), nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
+    dA = torch.nan_to_num(
+        dA.to(torch.float32), nan=0.0, posinf=0.0, neginf=0.0
+    ).clamp_min(0.0)
+    dP = torch.nan_to_num(
+        dP.to(torch.float32), nan=0.0, posinf=0.0, neginf=0.0
+    ).clamp_min(0.0)
     density = dP / dA.clamp_min(torch.finfo(dP.dtype).eps)
-    density_at_opt = density[torch.arange(density.size(0), device=density.device), nearest_idx]  # [B]
+    density_at_opt = density[
+        torch.arange(density.size(0), device=density.device), nearest_idx
+    ]  # [B]
 
     # Credible level: posterior mass with density >= density at the optical position.
     total_probability = dP.sum(dim=-1).clamp_min(torch.finfo(dP.dtype).eps)
-    cred_level = torch.where(
-        density >= density_at_opt.unsqueeze(-1),
-        dP,
-        torch.zeros_like(dP),
-    ).sum(dim=-1) / total_probability  # [B]
+    cred_level = (
+        torch.where(
+            density >= density_at_opt.unsqueeze(-1),
+            dP,
+            torch.zeros_like(dP),
+        ).sum(dim=-1)
+        / total_probability
+    )  # [B]
     return cred_level.unsqueeze(-1)  # [B, 1]
 
 
@@ -749,9 +808,17 @@ def _model_requires_cred_level(model) -> bool:
     return bool(getattr(base, "dual_fusion", False))
 
 
-def augment_optical_data(opt_t, opt_v, opt_mask, opt_err, training=True,
-                         time_jitter=0.0, flux_noise=0.0,
-                         obs_dropout=0.0, band_dropout=0.0):
+def augment_optical_data(
+    opt_t,
+    opt_v,
+    opt_mask,
+    opt_err,
+    training=True,
+    time_jitter=0.0,
+    flux_noise=0.0,
+    obs_dropout=0.0,
+    band_dropout=0.0,
+):
     """
     Optical data augmentation to improve generalization.
     """
@@ -778,7 +845,9 @@ def augment_optical_data(opt_t, opt_v, opt_mask, opt_err, training=True,
                 opt_err = opt_err.masked_fill(drop_mask, 0.0)
 
     if band_dropout > 0:
-        band_mask = torch.rand(opt_v.size(0), opt_v.size(2), device=opt_v.device) < band_dropout
+        band_mask = (
+            torch.rand(opt_v.size(0), opt_v.size(2), device=opt_v.device) < band_dropout
+        )
         if band_mask.any():
             band_mask = band_mask[:, None, :]
             opt_mask = opt_mask.masked_fill(band_mask, 0)
@@ -788,31 +857,150 @@ def augment_optical_data(opt_t, opt_v, opt_mask, opt_err, training=True,
 
     return opt_t, opt_v, opt_mask, opt_err
 
+
 def is_staged_training_enabled(args):
     return bool(getattr(args, "staged_training_enable", False))
 
 
+def build_sequential_curriculum(args):
+    """Build enabled loss phases in order, using 0-based half-open ranges."""
+    if not is_staged_training_enabled(args):
+        return []
+    enabled = {
+        "itc": float(getattr(args, "itc_weight", 0.0)) > 0.0,
+        "cls_intro": float(getattr(args, "cls_weight", 0.0)) > 0.0,
+        "retrieval_intro": float(getattr(args, "gallery_loss_weight", 0.0)) > 0.0,
+    }
+    durations = {
+        "itc": max(0, int(getattr(args, "stage_itc_epochs", 8))),
+        "cls_intro": max(0, int(getattr(args, "stage_cls_ramp_epochs", 4))),
+        "retrieval_intro": max(0, int(getattr(args, "stage_retrieval_ramp_epochs", 4))),
+    }
+    phases = []
+    start = 0
+    for name in ("itc", "cls_intro", "retrieval_intro"):
+        if enabled[name] and durations[name] > 0:
+            phases.append(
+                {"name": name, "start": start, "end": start + durations[name]}
+            )
+            start += durations[name]
+    phases.append(
+        {"name": "joint", "start": start, "end": int(getattr(args, "epochs", 1))}
+    )
+    return phases
+
+
+def get_curriculum_phase_start(args, phase_name):
+    for phase in build_sequential_curriculum(args):
+        if phase["name"] == phase_name:
+            return phase["start"]
+    return int(getattr(args, "epochs", 1))
+
+
+def resolve_sequential_curriculum(args, epoch):
+    """Resolve phase, weights, and trainable roles for one sequential epoch."""
+    epoch = int(epoch)
+    phases = build_sequential_curriculum(args)
+    if not phases:
+        raise ValueError("Sequential curriculum requires staged_training_enable=true.")
+    phase = next(
+        (item for item in phases if item["start"] <= epoch < item["end"]), phases[-1]
+    )
+    name = phase["name"]
+    itc_target = max(0.0, float(getattr(args, "itc_weight", 0.0)))
+    cls_target = max(0.0, float(getattr(args, "cls_weight", 0.0)))
+    retrieval_target = max(0.0, float(getattr(args, "gallery_loss_weight", 0.0)))
+    weights = {"itc": 0.0, "cls": 0.0, "retrieval": 0.0}
+    if name == "itc":
+        weights["itc"] = itc_target
+    elif name == "cls_intro":
+        progress = (epoch - phase["start"] + 1) / float(
+            max(1, phase["end"] - phase["start"])
+        )
+        weights["cls"] = cls_target * min(1.0, progress)
+    elif name == "retrieval_intro":
+        progress = (epoch - phase["start"] + 1) / float(
+            max(1, phase["end"] - phase["start"])
+        )
+        weights["cls"] = cls_target
+        weights["retrieval"] = retrieval_target * min(1.0, progress)
+    else:
+        weights["cls"] = cls_target
+        weights["retrieval"] = retrieval_target
+        if itc_target > 0.0:
+            joint_epochs = max(1, phase["end"] - phase["start"])
+            progress = min(
+                1.0,
+                max(0.0, (epoch - phase["start"]) / float(max(1, joint_epochs - 1))),
+            )
+            start_weight = float(getattr(args, "stage_joint_itc_start_weight", 0.5))
+            end_weight = float(getattr(args, "stage_joint_itc_end_weight", 0.25))
+            weights["itc"] = itc_target * (
+                start_weight + (end_weight - start_weight) * progress
+            )
+    itc_pretrained = itc_target > 0.0
+    if name == "itc":
+        roles = {"encoder", "temperature"}
+    elif name in {"cls_intro", "retrieval_intro"} and itc_pretrained:
+        roles = {"head"}
+    else:
+        roles = {"encoder", "head"}
+    return {
+        "phase": name,
+        "start": phase["start"],
+        "end": phase["end"],
+        "weights": weights,
+        "train_roles": roles,
+    }
+
+
+def format_sequential_curriculum(args):
+    parts = []
+    for phase in build_sequential_curriculum(args):
+        if phase["end"] > phase["start"]:
+            parts.append(f"{phase['name']}=epochs {phase['start'] + 1}-{phase['end']}")
+    return ", ".join(parts)
+
+
+def validate_sequential_curriculum(args):
+    if not is_staged_training_enabled(args):
+        return
+    for key in (
+        "stage_itc_epochs",
+        "stage_cls_ramp_epochs",
+        "stage_retrieval_ramp_epochs",
+    ):
+        if int(getattr(args, key, 0)) < 0:
+            raise ValueError(f"{key} must be >= 0.")
+    if not any(
+        float(getattr(args, key, 0.0)) > 0.0
+        for key in ("itc_weight", "cls_weight", "gallery_loss_weight")
+    ):
+        raise ValueError("Sequential curriculum has no enabled loss.")
+    phases = build_sequential_curriculum(args)
+    if phases[-1]["start"] >= int(getattr(args, "epochs", 1)):
+        raise ValueError(
+            "Sequential curriculum intro phases leave no joint-training epoch."
+        )
+    for phase in phases:
+        if phase["end"] <= phase["start"]:
+            continue
+        state = resolve_sequential_curriculum(args, phase["start"])
+        if not any(value > 0.0 for value in state["weights"].values()):
+            raise ValueError(
+                f"Sequential phase {phase['name']!r} has no effective loss."
+            )
+        if not state["train_roles"]:
+            raise ValueError(
+                f"Sequential phase {phase['name']!r} has no trainable gradient recipient."
+            )
+
+
 def resolve_training_stage(args, epoch):
-    """Resolve alignment, frozen-head, or joint fine-tuning for an epoch."""
+    """Resolve the active sequential loss phase for an epoch."""
     if not is_staged_training_enabled(args):
         return "legacy"
-    epoch = int(epoch)
-    itc_enabled = float(getattr(args, "itc_weight", 0.0)) > 0.0
-    cls_enabled = float(getattr(args, "cls_weight", 0.0)) > 0.0
-    alignment_epochs = max(0, int(getattr(args, "stage_alignment_epochs", 8)))
-    head_epochs = max(0, int(getattr(args, "stage_head_epochs", 4)))
-
-    if itc_enabled and cls_enabled:
-        if epoch < alignment_epochs:
-            return "alignment"
-        if epoch < alignment_epochs + head_epochs:
-            return "head"
-        return "joint"
-    if itc_enabled:
-        return "alignment"
-    if cls_enabled:
-        return "head" if epoch < head_epochs else "joint"
-    return "joint"
+    return resolve_sequential_curriculum(args, epoch)["phase"]
 
 
 def _common_lr_scale(args, step, steps_per_epoch):
@@ -843,16 +1031,22 @@ def build_lr_scheduler(optimizer, args, steps_per_epoch, start_step):
             )
             stage = resolve_training_stage(args, epoch)
             if role == "encoder":
-                if stage == "head":
+                if (
+                    stage in {"cls_intro", "retrieval_intro"}
+                    and float(getattr(args, "itc_weight", 0.0)) > 0.0
+                ):
                     return 0.0
                 if stage == "joint":
+                    if float(getattr(args, "itc_weight", 0.0)) <= 0.0:
+                        return common
                     return common * float(getattr(args, "encoder_lr_ratio", 0.1))
                 return common
             if role == "head":
-                return 0.0 if stage == "alignment" else common
+                return 0.0 if stage == "itc" else common
             if role == "temperature":
-                return common if stage == "alignment" else 0.0
+                return common if stage == "itc" else 0.0
             return common
+
         return lr_lambda
 
     lambdas = [
@@ -866,15 +1060,14 @@ def build_lr_scheduler(optimizer, args, steps_per_epoch, start_step):
 
 def compute_cls_weight(args, epoch):
     if is_staged_training_enabled(args):
-        if float(getattr(args, "cls_weight", 0.0)) <= 0.0:
-            return 0.0
-        return 0.0 if resolve_training_stage(args, epoch) == "alignment" else float(args.cls_weight)
+        return resolve_sequential_curriculum(args, epoch)["weights"]["cls"]
     if epoch < args.cls_start_epoch:
         return 0.0
     if args.cls_ramp_epochs <= 0:
         return args.cls_weight
     progress = (epoch - args.cls_start_epoch + 1) / float(args.cls_ramp_epochs)
     return args.cls_weight * min(1.0, progress)
+
 
 def is_cls_branch_enabled(args):
     return float(getattr(args, "cls_weight", 0.0)) > 0.0
@@ -883,7 +1076,10 @@ def is_cls_branch_enabled(args):
 def is_gallery_enabled(args):
     return float(getattr(args, "gallery_loss_weight", 0.0)) > 0.0
 
+
 def compute_gallery_loss_weight(args, epoch):
+    if is_staged_training_enabled(args):
+        return resolve_sequential_curriculum(args, epoch)["weights"]["retrieval"]
     target = float(getattr(args, "gallery_loss_weight", 0.0))
     if target <= 0.0:
         return 0.0
@@ -935,6 +1131,8 @@ def is_retrieval_active(args, epoch):
     """Return True when retrieval/gallery training is active at the given epoch."""
     if not is_gallery_enabled(args):
         return False
+    if is_staged_training_enabled(args):
+        return compute_gallery_loss_weight(args, epoch) > 0.0
     start = int(getattr(args, "retrieval_start_epoch", 0))
     return int(epoch) >= start
 
@@ -946,28 +1144,7 @@ def is_cls_active(epoch, args):
 
 def compute_itc_weight(args, epoch):
     if is_staged_training_enabled(args):
-        base = float(getattr(args, "itc_weight", 0.0))
-        if base <= 0.0:
-            return 0.0
-        stage = resolve_training_stage(args, epoch)
-        if stage == "head":
-            return 0.0
-        if stage == "alignment":
-            return base
-        joint_start = max(
-            0, int(getattr(args, "stage_alignment_epochs", 8))
-        ) + max(0, int(getattr(args, "stage_head_epochs", 4)))
-        joint_epochs = max(1, int(getattr(args, "epochs", 1)) - joint_start)
-        progress = min(
-            1.0,
-            max(
-                0.0,
-                (int(epoch) - joint_start) / float(max(1, joint_epochs - 1)),
-            ),
-        )
-        start = float(getattr(args, "stage_joint_itc_start_weight", 0.5))
-        end = float(getattr(args, "stage_joint_itc_end_weight", 0.25))
-        return base * (start + (end - start) * progress)
+        return resolve_sequential_curriculum(args, epoch)["weights"]["itc"]
     if args.itc_decay_epochs <= 0 or args.itc_decay_ratio <= 0:
         return args.itc_weight
     if epoch < args.itc_decay_start_epoch:
@@ -1005,22 +1182,16 @@ def compute_best_ckpt_stage_epochs(args):
         stage_epochs["lr_warmup"] = compute_curriculum_full_epoch(0, warmup_epochs)
 
     if is_staged_training_enabled(args):
-        itc_enabled = float(getattr(args, "itc_weight", 0.0)) > 0.0
-        cls_enabled = is_cls_branch_enabled(args)
-        if cls_enabled:
-            joint_start = max(0, int(getattr(args, "stage_head_epochs", 4)))
-            if itc_enabled:
-                joint_start += max(
-                    0, int(getattr(args, "stage_alignment_epochs", 8))
-                )
-            stage_epochs["joint_finetune_start"] = joint_start
+        stage_epochs["joint_finetune_start"] = build_sequential_curriculum(args)[-1][
+            "start"
+        ]
     elif is_cls_branch_enabled(args):
         stage_epochs["classification"] = compute_curriculum_full_epoch(
             getattr(args, "cls_start_epoch", 0),
             getattr(args, "cls_ramp_epochs", 0),
         )
 
-    if is_gallery_enabled(args):
+    if is_gallery_enabled(args) and not is_staged_training_enabled(args):
         retrieval_start = int(getattr(args, "retrieval_start_epoch", 0))
         stage_epochs["fusion_gallery"] = compute_curriculum_full_epoch(
             retrieval_start,
@@ -1033,15 +1204,16 @@ def compute_best_ckpt_stage_epochs(args):
             hard_start = retrieval_start + int(
                 getattr(args, "gallery_hard_neg_start_after_retrieval_epochs", 2)
             )
-            stage_epochs["fusion_gallery_hard_negative"] = compute_curriculum_full_epoch(
-                hard_start,
-                getattr(args, "gallery_hard_neg_ramp_epochs", 2),
+            stage_epochs["fusion_gallery_hard_negative"] = (
+                compute_curriculum_full_epoch(
+                    hard_start,
+                    getattr(args, "gallery_hard_neg_ramp_epochs", 2),
+                )
             )
 
     if (
         not is_staged_training_enabled(args)
-        and
-        float(getattr(args, "itc_weight", 0.0)) > 0.0
+        and float(getattr(args, "itc_weight", 0.0)) > 0.0
         and int(getattr(args, "itc_decay_epochs", 0)) > 0
         and float(getattr(args, "itc_decay_ratio", 0.0)) > 0.0
     ):
@@ -1173,6 +1345,7 @@ def describe_best_ckpt_selection_pending(args, epoch):
         reason = "waiting for metric/manual start constraint"
     return f"waiting until epoch {selection_epoch + 1}; {reason}."
 
+
 def compute_weighted_cls_loss(
     aligned_pos_loss,
     neg_gw_loss,
@@ -1193,7 +1366,9 @@ def compute_weighted_cls_loss(
     """
     weights = {
         "aligned": float(
-            getattr(args, "cls_aligned_pos_weight", getattr(args, "cls_pos_weight", 1.0))
+            getattr(
+                args, "cls_aligned_pos_weight", getattr(args, "cls_pos_weight", 1.0)
+            )
         ),
         "neg_gw": float(
             getattr(args, "cls_neg_gw_weight", getattr(args, "cls_neg_weight", 1.0))
@@ -1202,7 +1377,11 @@ def compute_weighted_cls_loss(
             getattr(args, "cls_mismatched_weight", getattr(args, "cls_neg_weight", 1.0))
         ),
         "external": float(
-            getattr(args, "cls_external_neg_weight", getattr(args, "cls_extra_neg_weight", 1.0))
+            getattr(
+                args,
+                "cls_external_neg_weight",
+                getattr(args, "cls_extra_neg_weight", 1.0),
+            )
         ),
     }
     if any(value < 0.0 for value in weights.values()):
@@ -1230,7 +1409,9 @@ def compute_weighted_cls_loss(
 def compute_fusion_gallery_nce_loss(scores, positive_mask):
     """Multi-positive retrieval NCE over fusion-head candidate scores."""
     if scores.ndim != 2 or positive_mask.shape != scores.shape:
-        raise ValueError("scores and positive_mask must have matching shape [n_query, n_candidate].")
+        raise ValueError(
+            "scores and positive_mask must have matching shape [n_query, n_candidate]."
+        )
     positive_mask = positive_mask.to(device=scores.device, dtype=torch.bool)
     valid_rows = positive_mask.any(dim=1)
     if not valid_rows.any():
@@ -1240,7 +1421,9 @@ def compute_fusion_gallery_nce_loss(scores, positive_mask):
     pos_valid = positive_mask[valid_rows]
     neg_large = torch.finfo(scores_valid.dtype).min
     pos_scores = scores_valid.masked_fill(~pos_valid, neg_large)
-    return (torch.logsumexp(scores_valid, dim=1) - torch.logsumexp(pos_scores, dim=1)).mean()
+    return (
+        torch.logsumexp(scores_valid, dim=1) - torch.logsumexp(pos_scores, dim=1)
+    ).mean()
 
 
 def is_gallery_hard_neg_enabled(args):
@@ -1251,7 +1434,7 @@ def is_gallery_hard_neg_enabled(args):
 def compute_gallery_hard_neg_weight(args, epoch):
     """Compute ramp-ed weight for the retrieval hard-negative auxiliary loss.
 
-    Returns 0.0 when the hard-mining start epoch (``retrieval_start_epoch +
+    Returns 0.0 when the hard-mining start epoch (``retrieval phase start +
     gallery_hard_neg_start_after_retrieval_epochs``) has not been reached, then
     ramps linearly to ``gallery_hard_neg_weight`` over
     ``gallery_hard_neg_ramp_epochs``.
@@ -1260,7 +1443,7 @@ def compute_gallery_hard_neg_weight(args, epoch):
         return 0.0
     if float(getattr(args, "gallery_loss_weight", 0.0)) <= 0.0:
         return 0.0
-    retrieval_start = int(getattr(args, "retrieval_start_epoch", 0))
+    retrieval_start = get_curriculum_phase_start(args, "retrieval_intro")
     offset = int(getattr(args, "gallery_hard_neg_start_after_retrieval_epochs", 2))
     hard_start = retrieval_start + offset
     epoch = int(epoch)
@@ -1279,9 +1462,8 @@ def gallery_hard_neg_full_activation_reachable(args):
         return False
     if not is_gallery_enabled(args):
         return False
-    hard_start = (
-        int(getattr(args, "retrieval_start_epoch", 0))
-        + int(getattr(args, "gallery_hard_neg_start_after_retrieval_epochs", 2))
+    hard_start = get_curriculum_phase_start(args, "retrieval_intro") + int(
+        getattr(args, "gallery_hard_neg_start_after_retrieval_epochs", 2)
     )
     full_epoch = compute_curriculum_full_epoch(
         hard_start,
@@ -1335,14 +1517,18 @@ def compute_fusion_gallery_metrics(scores, positive_mask, ks=(1, 5)):
     metrics. Conditional metrics report performance over valid rows only.
     """
     if scores.ndim != 2 or positive_mask.shape != scores.shape:
-        raise ValueError("scores and positive_mask must have matching shape [n_query, n_candidate].")
+        raise ValueError(
+            "scores and positive_mask must have matching shape [n_query, n_candidate]."
+        )
     positive_mask = positive_mask.to(device=scores.device, dtype=torch.bool)
     valid_rows = positive_mask.any(dim=1)
     out = {f"fusion_gallery_recall_at_{int(k)}": 0.0 for k in ks}
     out.update({f"fusion_gallery_conditional_recall_at_{int(k)}": 0.0 for k in ks})
     out["fusion_gallery_mrr"] = 0.0
     out["fusion_gallery_conditional_mrr"] = 0.0
-    out["fusion_gallery_valid_query_fraction"] = float(valid_rows.float().mean().item()) if scores.size(0) else 0.0
+    out["fusion_gallery_valid_query_fraction"] = (
+        float(valid_rows.float().mean().item()) if scores.size(0) else 0.0
+    )
     out["fusion_gallery_candidate_recall_at_topk"] = 0.0
     if scores.size(0) == 0 or scores.size(1) == 0:
         return out
@@ -1355,17 +1541,27 @@ def compute_fusion_gallery_metrics(scores, positive_mask, ks=(1, 5)):
         hit = sorted_pos[:, :actual_k].any(dim=1).float()
         out[f"fusion_gallery_recall_at_{int(k)}"] = float(hit.mean().item())
         if valid_rows.any():
-            out[f"fusion_gallery_conditional_recall_at_{int(k)}"] = float(hit[valid_rows].mean().item())
+            out[f"fusion_gallery_conditional_recall_at_{int(k)}"] = float(
+                hit[valid_rows].mean().item()
+            )
 
     topk = min(max([int(k) for k in ks] or [1]), n_candidate)
-    out["fusion_gallery_candidate_recall_at_topk"] = float(sorted_pos[:, :topk].any(dim=1).float().mean().item())
+    out["fusion_gallery_candidate_recall_at_topk"] = float(
+        sorted_pos[:, :topk].any(dim=1).float().mean().item()
+    )
 
-    ranks = torch.arange(1, n_candidate + 1, device=scores.device, dtype=torch.float32).unsqueeze(0)
-    first_pos_rank = torch.where(
-        sorted_pos,
-        ranks.expand_as(sorted_pos),
-        torch.full_like(ranks.expand_as(sorted_pos), float("inf")),
-    ).min(dim=1).values
+    ranks = torch.arange(
+        1, n_candidate + 1, device=scores.device, dtype=torch.float32
+    ).unsqueeze(0)
+    first_pos_rank = (
+        torch.where(
+            sorted_pos,
+            ranks.expand_as(sorted_pos),
+            torch.full_like(ranks.expand_as(sorted_pos), float("inf")),
+        )
+        .min(dim=1)
+        .values
+    )
     reciprocal_rank = torch.where(
         torch.isfinite(first_pos_rank),
         1.0 / first_pos_rank,
@@ -1373,13 +1569,17 @@ def compute_fusion_gallery_metrics(scores, positive_mask, ks=(1, 5)):
     )
     out["fusion_gallery_mrr"] = float(reciprocal_rank.mean().item())
     if valid_rows.any():
-        out["fusion_gallery_conditional_mrr"] = float(reciprocal_rank[valid_rows].mean().item())
+        out["fusion_gallery_conditional_mrr"] = float(
+            reciprocal_rank[valid_rows].mean().item()
+        )
     return out
 
 
 def select_gallery_topk(scores, positive_mask, topk, force_include_positives=False):
     if scores.ndim != 2 or positive_mask.shape != scores.shape:
-        raise ValueError("scores and positive_mask must have matching shape [n_query, n_candidate].")
+        raise ValueError(
+            "scores and positive_mask must have matching shape [n_query, n_candidate]."
+        )
     positive_mask = positive_mask.to(device=scores.device, dtype=torch.bool)
     k = min(max(1, int(topk)), int(scores.size(1)))
     topk_indices = scores.topk(k, dim=1).indices
@@ -1396,7 +1596,9 @@ def select_gallery_topk(scores, positive_mask, topk, force_include_positives=Fal
             selected_pos = positive_mask[row, selected]
             replaceable = torch.nonzero(~selected_pos, as_tuple=False).flatten()
             if replaceable.numel() == 0:
-                replace_slot = torch.tensor(k - 1, device=scores.device, dtype=torch.long)
+                replace_slot = torch.tensor(
+                    k - 1, device=scores.device, dtype=torch.long
+                )
             else:
                 selected_scores = scores[row, selected[replaceable]]
                 replace_slot = replaceable[selected_scores.argmin()]
@@ -1417,12 +1619,16 @@ def _row_standardize_scores(scores):
 def compute_residual_rerank_loss(s_itc, s_fusion, positive_mask, lambda_=0.5):
     """NCE loss over row-normalized ITC and fusion scores for reranking."""
     if s_itc.shape != s_fusion.shape or positive_mask.shape != s_itc.shape:
-        raise ValueError("s_itc, s_fusion, and positive_mask must have matching shape [n_query, n_candidate].")
+        raise ValueError(
+            "s_itc, s_fusion, and positive_mask must have matching shape [n_query, n_candidate]."
+        )
     positive_mask = positive_mask.to(device=s_itc.device, dtype=torch.bool)
     valid_rows = positive_mask.any(dim=1)
     if not valid_rows.any():
         return (s_itc.sum() + s_fusion.sum()) * 0.0
-    combined = _row_standardize_scores(s_itc[valid_rows]) + float(lambda_) * _row_standardize_scores(s_fusion[valid_rows])
+    combined = _row_standardize_scores(s_itc[valid_rows]) + float(
+        lambda_
+    ) * _row_standardize_scores(s_fusion[valid_rows])
     return compute_fusion_gallery_nce_loss(combined, positive_mask[valid_rows])
 
 
@@ -1445,7 +1651,9 @@ def build_gallery_time_delta_matrix(
         return None
 
     query = query_event_time_mjd.to(torch.float32).reshape(-1, 1)
-    candidate = candidate_event_time_mjd.to(device=query.device, dtype=torch.float32).reshape(1, -1)
+    candidate = candidate_event_time_mjd.to(
+        device=query.device, dtype=torch.float32
+    ).reshape(1, -1)
     dt = candidate - query
     dt = torch.where(torch.isfinite(dt), dt, torch.zeros_like(dt))
 
@@ -1460,7 +1668,9 @@ def build_gallery_time_delta_matrix(
 
     window_days = float(distractor_time_window_days)
     if window_days <= 0:
-        raise ValueError("gallery_distractor_time_window_days must be > 0 for synthetic_after_gw mode.")
+        raise ValueError(
+            "gallery_distractor_time_window_days must be > 0 for synthetic_after_gw mode."
+        )
 
     if positive_mask is None:
         positive_mask_t = torch.zeros_like(dt, dtype=torch.bool)
@@ -1504,7 +1714,10 @@ def compute_fusion_gallery_score_matrix(
 
     max_pairs = max(1, int(chunk_size))
     # Balance query and candidate chunk sizes proportionally
-    q_chunk = min(n_query, max(1, int(math.sqrt(max_pairs * max(1, n_query / max(1, n_candidate))))))
+    q_chunk = min(
+        n_query,
+        max(1, int(math.sqrt(max_pairs * max(1, n_query / max(1, n_candidate))))),
+    )
     c_chunk = max(1, max_pairs // q_chunk)
 
     scores = torch.empty((n_query, n_candidate), dtype=g.dtype, device=g.device)
@@ -1581,7 +1794,9 @@ def compute_fusion_gallery_score_matrix(
                 opt_coords=coords_pair,
                 dt_days=dt_pair,
             )
-            scores[q_start:q_end, c_start:c_end] = (logits[:, 1] - logits[:, 0]).reshape(n_q, n_c)
+            scores[q_start:q_end, c_start:c_end] = (
+                logits[:, 1] - logits[:, 0]
+            ).reshape(n_q, n_c)
 
     return scores
 
@@ -1590,9 +1805,12 @@ def build_pairwise_time_delta_matrix(query_event_time_mjd, candidate_event_time_
     if query_event_time_mjd is None or candidate_event_time_mjd is None:
         return None
     query = query_event_time_mjd.to(torch.float32).reshape(-1, 1)
-    candidate = candidate_event_time_mjd.to(device=query.device, dtype=torch.float32).reshape(1, -1)
+    candidate = candidate_event_time_mjd.to(
+        device=query.device, dtype=torch.float32
+    ).reshape(1, -1)
     dt = candidate - query
     return torch.where(torch.isfinite(dt), dt, torch.zeros_like(dt))
+
 
 def apply_temperature_schedule(model, args, epoch):
     if args.temp_schedule == "learned":
@@ -1601,10 +1819,13 @@ def apply_temperature_schedule(model, args, epoch):
         target_temp = args.temp_init
     else:
         progress = epoch / float(max(1, args.epochs - 1))
-        target_temp = args.temp_final + 0.5 * (args.temp_init - args.temp_final) * (1.0 + math.cos(math.pi * progress))
+        target_temp = args.temp_final + 0.5 * (args.temp_init - args.temp_final) * (
+            1.0 + math.cos(math.pi * progress)
+        )
     target_temp = max(args.temp_min, min(args.temp_max, target_temp))
     model.log_temp.data.fill_(math.log(target_temp))
     return target_temp
+
 
 def clamp_temperature(model, args):
     if args.temp_schedule != "learned":
@@ -1612,6 +1833,7 @@ def clamp_temperature(model, args):
     min_log = math.log(args.temp_min)
     max_log = math.log(args.temp_max)
     model.log_temp.data.clamp_(min_log, max_log)
+
 
 def compute_ckpt_selection_score(val_metrics, metric_name):
     """Compute best-checkpoint selection score from in-domain validation metrics."""
@@ -1643,9 +1865,7 @@ def compute_ckpt_selection_score(val_metrics, metric_name):
     if metric_name == "fusion_gallery_mrr":
         return float(ret_m.get("fusion_gallery_mrr", 0.0))
     if metric_name == "hard_gallery_macro_retrieval_score":
-        return float(
-            val_metrics.get("hard_gallery", {}).get("selection_score", 0.0)
-        )
+        return float(val_metrics.get("hard_gallery", {}).get("selection_score", 0.0))
 
     raise ValueError(f"Unsupported best_ckpt_metric: {metric_name}")
 
@@ -1683,7 +1903,9 @@ def resolve_neg_gw_guardrail(args, val_metrics):
             counts.append(int(item.get("count", 0)))
 
     min_recall = min(recalls) if recalls else 0.0
-    populated = len(recalls) == len(NEG_GW_STRATA_KEYS) and all(count > 0 for count in counts)
+    populated = len(recalls) == len(NEG_GW_STRATA_KEYS) and all(
+        count > 0 for count in counts
+    )
     met = (not enabled) or (populated and min_recall + 1.0e-9 >= threshold)
 
     reason = None
@@ -1713,15 +1935,15 @@ def evaluate(
     gw_source_type_table=None,
     gw_neg_type_table=None,
 ):
-    from metrics import (compute_retrieval_metrics,
-                         compute_classification_metrics,
-                         compute_embedding_metrics)
+    from metrics import (
+        compute_retrieval_metrics,
+        compute_classification_metrics,
+        compute_embedding_metrics,
+    )
 
     model.eval()
     val_sampler = getattr(val_loader, "batch_sampler", None)
-    val_has_neg_gw_pairs = bool(
-        getattr(val_sampler, "n_neg_per_batch", 0) > 0
-    )
+    val_has_neg_gw_pairs = bool(getattr(val_sampler, "n_neg_per_batch", 0) > 0)
     has_negatives = args.neg_data_path is not None
     cls_branch_enabled = is_cls_branch_enabled(args)
     ref_time_cache = None
@@ -1747,12 +1969,12 @@ def evaluate(
     val_batches = 0
 
     # Accumulators for new metrics (computed globally after all batches)
-    all_cls_probs = []    # predicted P(match) for classification metrics
-    all_cls_labels = []   # ground-truth labels for classification metrics
+    all_cls_probs = []  # predicted P(match) for classification metrics
+    all_cls_labels = []  # ground-truth labels for classification metrics
     all_cls_sources = []  # source tag per sample ('pos', 'hard', 'neg')
-    all_feat_g = []       # L2-normalized GW embeddings for embedding metrics
-    all_feat_o = []       # L2-normalized optical embeddings
-    all_gw_indices = []   # GW event indices
+    all_feat_g = []  # L2-normalized GW embeddings for embedding metrics
+    all_feat_o = []  # L2-normalized optical embeddings
+    all_gw_indices = []  # GW event indices
     retrieval_metrics_accum = []  # per-batch retrieval metric dicts
     fusion_gallery_metrics_accum = []
     dt_stats = {
@@ -1761,8 +1983,10 @@ def evaluate(
         "extra": {"sum": 0.0, "sum_sq": 0.0, "count": 0},
     }
     neg_gw_probabilities = {
-        ("bns", 1): [], ("bns", 2): [],
-        ("nsbh", 1): [], ("nsbh", 2): [],
+        ("bns", 1): [],
+        ("bns", 2): [],
+        ("nsbh", 1): [],
+        ("nsbh", 2): [],
     }
     with torch.no_grad():
         for batch_data in val_loader:
@@ -1777,35 +2001,114 @@ def evaluate(
             if has_negatives:
                 if len(batch_data) >= 17:
                     (
-                        gw_s, gw_m, opt_t, opt_v, opt_mask, opt_err, opt_coords, gw_indices,
-                        neg_t, neg_v, neg_mask, neg_err, neg_coords,
-                        _opt_zero_time_mjd_base, _neg_zero_time_mjd_base, _neg_zero_time_mjd_cls_base,
+                        gw_s,
+                        gw_m,
+                        opt_t,
+                        opt_v,
+                        opt_mask,
+                        opt_err,
+                        opt_coords,
+                        gw_indices,
+                        neg_t,
+                        neg_v,
+                        neg_mask,
+                        neg_err,
+                        neg_coords,
+                        _opt_zero_time_mjd_base,
+                        _neg_zero_time_mjd_base,
+                        _neg_zero_time_mjd_cls_base,
                         _opt_first_detection_mjd,
                     ) = batch_data[:17]
                 elif len(batch_data) >= 16:
                     (
-                        gw_s, gw_m, opt_t, opt_v, opt_mask, opt_err, opt_coords, gw_indices,
-                        neg_t, neg_v, neg_mask, neg_err, neg_coords,
-                        _opt_zero_time_mjd_base, _neg_zero_time_mjd_base, _neg_zero_time_mjd_cls_base,
+                        gw_s,
+                        gw_m,
+                        opt_t,
+                        opt_v,
+                        opt_mask,
+                        opt_err,
+                        opt_coords,
+                        gw_indices,
+                        neg_t,
+                        neg_v,
+                        neg_mask,
+                        neg_err,
+                        neg_coords,
+                        _opt_zero_time_mjd_base,
+                        _neg_zero_time_mjd_base,
+                        _neg_zero_time_mjd_cls_base,
                     ) = batch_data[:16]
                 elif len(batch_data) >= 15:
                     (
-                        gw_s, gw_m, opt_t, opt_v, opt_mask, opt_err, opt_coords, gw_indices,
-                        neg_t, neg_v, neg_mask, neg_err, neg_coords,
-                        _opt_zero_time_mjd_base, _neg_zero_time_mjd_base,
+                        gw_s,
+                        gw_m,
+                        opt_t,
+                        opt_v,
+                        opt_mask,
+                        opt_err,
+                        opt_coords,
+                        gw_indices,
+                        neg_t,
+                        neg_v,
+                        neg_mask,
+                        neg_err,
+                        neg_coords,
+                        _opt_zero_time_mjd_base,
+                        _neg_zero_time_mjd_base,
                     ) = batch_data[:15]
                 else:
                     (
-                        gw_s, gw_m, opt_t, opt_v, opt_mask, opt_err, opt_coords, gw_indices,
-                        neg_t, neg_v, neg_mask, neg_err, neg_coords,
+                        gw_s,
+                        gw_m,
+                        opt_t,
+                        opt_v,
+                        opt_mask,
+                        opt_err,
+                        opt_coords,
+                        gw_indices,
+                        neg_t,
+                        neg_v,
+                        neg_mask,
+                        neg_err,
+                        neg_coords,
                     ) = batch_data[:13]
             else:
                 if len(batch_data) >= 10:
-                    gw_s, gw_m, opt_t, opt_v, opt_mask, opt_err, opt_coords, gw_indices, _opt_zero_time_mjd_base, _opt_first_detection_mjd = batch_data[:10]
+                    (
+                        gw_s,
+                        gw_m,
+                        opt_t,
+                        opt_v,
+                        opt_mask,
+                        opt_err,
+                        opt_coords,
+                        gw_indices,
+                        _opt_zero_time_mjd_base,
+                        _opt_first_detection_mjd,
+                    ) = batch_data[:10]
                 elif len(batch_data) >= 9:
-                    gw_s, gw_m, opt_t, opt_v, opt_mask, opt_err, opt_coords, gw_indices, _opt_zero_time_mjd_base = batch_data[:9]
+                    (
+                        gw_s,
+                        gw_m,
+                        opt_t,
+                        opt_v,
+                        opt_mask,
+                        opt_err,
+                        opt_coords,
+                        gw_indices,
+                        _opt_zero_time_mjd_base,
+                    ) = batch_data[:9]
                 else:
-                    gw_s, gw_m, opt_t, opt_v, opt_mask, opt_err, opt_coords, gw_indices = batch_data
+                    (
+                        gw_s,
+                        gw_m,
+                        opt_t,
+                        opt_v,
+                        opt_mask,
+                        opt_err,
+                        opt_coords,
+                        gw_indices,
+                    ) = batch_data
 
             gw_s = gw_s.to(device, non_blocking=True)
             gw_m = gw_m.to(device, non_blocking=True)
@@ -1820,11 +2123,10 @@ def evaluate(
                     gw_indices.shape[0], device=device, dtype=torch.bool
                 )
             else:
-                pair_is_neg_gw = pair_is_neg_gw.to(
-                    device, non_blocking=True
-                ).bool()
+                pair_is_neg_gw = pair_is_neg_gw.to(device, non_blocking=True).bool()
             itc_pair_mask = build_itc_pair_mask(
-                gw_indices, pair_is_neg_gw,
+                gw_indices,
+                pair_is_neg_gw,
                 min_pairs_per_gw=args.min_lc_per_gw,
             )
             if not bool(itc_pair_mask.any()):
@@ -1845,11 +2147,17 @@ def evaluate(
                 neg_err = neg_err.to(device, non_blocking=True)
                 neg_coords = neg_coords.to(device, non_blocking=True)
                 if _neg_zero_time_mjd_base is not None:
-                    _neg_zero_time_mjd_base = _neg_zero_time_mjd_base.to(device, non_blocking=True)
+                    _neg_zero_time_mjd_base = _neg_zero_time_mjd_base.to(
+                        device, non_blocking=True
+                    )
                 if _neg_zero_time_mjd_cls_base is not None:
-                    _neg_zero_time_mjd_cls_base = _neg_zero_time_mjd_cls_base.to(device, non_blocking=True)
+                    _neg_zero_time_mjd_cls_base = _neg_zero_time_mjd_cls_base.to(
+                        device, non_blocking=True
+                    )
             if _opt_first_detection_mjd is not None:
-                _opt_first_detection_mjd = _opt_first_detection_mjd.to(device, non_blocking=True)
+                _opt_first_detection_mjd = _opt_first_detection_mjd.to(
+                    device, non_blocking=True
+                )
 
             batch_size = gw_s.size(0)
             if (
@@ -1858,12 +2166,19 @@ def evaluate(
                 or ref_time_cache.dtype != opt_t.dtype
             ):
                 ref_time_cache = build_ref_time(
-                    batch_size, args.n_ref, args.ref_start, args.ref_end, device, opt_t.dtype
+                    batch_size,
+                    args.n_ref,
+                    args.ref_start,
+                    args.ref_end,
+                    device,
+                    opt_t.dtype,
                 )
             opt_ref_t = ref_time_cache
             need_cred_level = _model_requires_cred_level(model)
 
-            with autocast(device_type='cuda', dtype=amp_dtype, enabled=(device.type == 'cuda')):
+            with autocast(
+                device_type="cuda", dtype=amp_dtype, enabled=(device.type == "cuda")
+            ):
                 g, z_l, h_l, H_gw = model.encode(
                     gw_s, gw_m, opt_coords, opt_t, opt_v, opt_ref_t, opt_mask, opt_err
                 )
@@ -1872,11 +2187,13 @@ def evaluate(
                 itc_gw_indices = gw_indices[itc_pair_mask]
                 itc_gw_event_time = (
                     batch_event_time_mjd[itc_pair_mask]
-                    if batch_event_time_mjd is not None else None
+                    if batch_event_time_mjd is not None
+                    else None
                 )
                 itc_opt_first_detection = (
                     _opt_first_detection_mjd[itc_pair_mask]
-                    if _opt_first_detection_mjd is not None else None
+                    if _opt_first_detection_mjd is not None
+                    else None
                 )
                 if args.itc_loss_type == "supcon":
                     itc_loss, sim_g2o, sim_g2o_for_loss = model.compute_supcon_loss(
@@ -1904,9 +2221,7 @@ def evaluate(
                         extra_neg_opt_event_time_mjd=None,
                     )
 
-                feat_g, feat_o = model.get_contrastive_embeddings(
-                    itc_g, itc_z_l
-                )
+                feat_g, feat_o = model.get_contrastive_embeddings(itc_g, itc_z_l)
                 pos_mask = ~pair_is_neg_gw
                 neg_gw_mask = pair_is_neg_gw
                 labels_pos = pos_mask.to(dtype=torch.long)
@@ -1923,14 +2238,31 @@ def evaluate(
                     cls_hard_logits_available = True
                     cls_extra_neg_logits_available = bool(has_negatives)
                     # Compute per-pair credible level for dual fusion
-                    cred_level = compute_credible_level(gw_m, opt_coords) if need_cred_level else None
-                    if _opt_first_detection_mjd is not None and batch_event_time_mjd is not None:
-                        dt_pos = compute_time_delta_days(_opt_first_detection_mjd, batch_event_time_mjd)
+                    cred_level = (
+                        compute_credible_level(gw_m, opt_coords)
+                        if need_cred_level
+                        else None
+                    )
+                    if (
+                        _opt_first_detection_mjd is not None
+                        and batch_event_time_mjd is not None
+                    ):
+                        dt_pos = compute_time_delta_days(
+                            _opt_first_detection_mjd, batch_event_time_mjd
+                        )
                     else:
-                        dt_pos = torch.zeros((batch_size,), device=device, dtype=torch.float32)
+                        dt_pos = torch.zeros(
+                            (batch_size,), device=device, dtype=torch.float32
+                        )
                     logits_pos = model.fusion_logits(
-                        g, h_l, z_l=z_l, H_gw=H_gw, cred_level=cred_level,
-                        gw_s=gw_s, gw_m=gw_m, opt_coords=opt_coords,
+                        g,
+                        h_l,
+                        z_l=z_l,
+                        H_gw=H_gw,
+                        cred_level=cred_level,
+                        gw_s=gw_s,
+                        gw_m=gw_m,
+                        opt_coords=opt_coords,
                         dt_days=dt_pos,
                     )
                     if pos_mask.any():
@@ -1953,14 +2285,18 @@ def evaluate(
                         neg_gw_loss = None
 
                     mis_idx = sample_mismatched_negatives(
-                        batch_size, device, samples_per_gw=args.samples_per_gw,
+                        batch_size,
+                        device,
+                        samples_per_gw=args.samples_per_gw,
                         gw_indices=gw_indices,
                         source_types=batch_source_types,
                     )
 
                     if mis_idx is None:
                         hard_loss = torch.zeros((), device=device)
-                        logits_hard = torch.zeros((batch_size, 2), device=device, dtype=g.dtype)
+                        logits_hard = torch.zeros(
+                            (batch_size, 2), device=device, dtype=g.dtype
+                        )
                     else:
                         h_l_mis = h_l[mis_idx].clone()
                         z_l_mis = z_l[mis_idx].clone()
@@ -1968,10 +2304,20 @@ def evaluate(
                         dt_mis = sample_mis_neg_dt_days(
                             batch_size, device, window_days=args.mis_neg_dt_window_days
                         )
-                        cred_level_mis = compute_credible_level(gw_m, coords_mis) if need_cred_level else None
+                        cred_level_mis = (
+                            compute_credible_level(gw_m, coords_mis)
+                            if need_cred_level
+                            else None
+                        )
                         logits_hard = model.fusion_logits(
-                            g, h_l_mis, z_l=z_l_mis, H_gw=H_gw, cred_level=cred_level_mis,
-                            gw_s=gw_s, gw_m=gw_m, opt_coords=coords_mis,
+                            g,
+                            h_l_mis,
+                            z_l=z_l_mis,
+                            H_gw=H_gw,
+                            cred_level=cred_level_mis,
+                            gw_s=gw_s,
+                            gw_m=gw_m,
+                            opt_coords=coords_mis,
                             dt_days=dt_mis,
                         )
                         hard_loss = model.cls_criterion(logits_hard, labels_neg)
@@ -1987,20 +2333,39 @@ def evaluate(
                         z_l_neg, h_l_neg = model.encode_optical(
                             neg_coords, neg_t, neg_v, opt_ref_t, neg_mask, neg_err
                         )
-                        cred_level_neg = compute_credible_level(gw_m, neg_coords) if need_cred_level else None
+                        cred_level_neg = (
+                            compute_credible_level(gw_m, neg_coords)
+                            if need_cred_level
+                            else None
+                        )
                         neg_event_time = (
-                            neg_zero_time_mjd_for_cls.to(device=device, dtype=torch.float32)
+                            neg_zero_time_mjd_for_cls.to(
+                                device=device, dtype=torch.float32
+                            )
                             if neg_zero_time_mjd_for_cls is not None
                             else None
                         )
                         dt_neg = (
-                            compute_time_delta_days(neg_event_time, batch_event_time_mjd)
-                            if (neg_event_time is not None and batch_event_time_mjd is not None)
-                            else torch.zeros((batch_size,), device=device, dtype=torch.float32)
+                            compute_time_delta_days(
+                                neg_event_time, batch_event_time_mjd
+                            )
+                            if (
+                                neg_event_time is not None
+                                and batch_event_time_mjd is not None
+                            )
+                            else torch.zeros(
+                                (batch_size,), device=device, dtype=torch.float32
+                            )
                         )
                         logits_neg = model.fusion_logits(
-                            g, h_l_neg, z_l=z_l_neg, H_gw=H_gw, cred_level=cred_level_neg,
-                            gw_s=gw_s, gw_m=gw_m, opt_coords=neg_coords,
+                            g,
+                            h_l_neg,
+                            z_l=z_l_neg,
+                            H_gw=H_gw,
+                            cred_level=cred_level_neg,
+                            gw_s=gw_s,
+                            gw_m=gw_m,
+                            opt_coords=neg_coords,
                             dt_days=dt_neg,
                         )
                         gallery_extra_h_l = h_l_neg
@@ -2019,14 +2384,19 @@ def evaluate(
                     gallery_loss = torch.zeros((), device=device)
                     gallery_hard_loss = torch.zeros((), device=device)
                     gallery_hard_weight = 0.0
-                    total_loss = (
-                        itc_weight * itc_loss
-                        + cls_weight * cls_loss
-                    )
+                    total_loss = itc_weight * itc_loss + cls_weight * cls_loss
                 else:
-                    logits_pos = torch.zeros((batch_size, 2), device=device, dtype=g.dtype)
-                    logits_hard = torch.zeros((batch_size, 2), device=device, dtype=g.dtype)
-                    logits_neg = torch.zeros((batch_size, 2), device=device, dtype=g.dtype) if has_negatives else None
+                    logits_pos = torch.zeros(
+                        (batch_size, 2), device=device, dtype=g.dtype
+                    )
+                    logits_hard = torch.zeros(
+                        (batch_size, 2), device=device, dtype=g.dtype
+                    )
+                    logits_neg = (
+                        torch.zeros((batch_size, 2), device=device, dtype=g.dtype)
+                        if has_negatives
+                        else None
+                    )
                     aligned_pos_loss = torch.zeros((), device=device)
                     neg_gw_loss = None
                     hard_loss = torch.zeros((), device=device)
@@ -2035,13 +2405,10 @@ def evaluate(
                     gallery_loss = torch.zeros((), device=device)
                     gallery_hard_loss = torch.zeros((), device=device)
                     gallery_hard_weight = 0.0
-                    need_extra_optical_features = (
-                        has_negatives
-                        and (
-                            gallery_loss_active
-                            or fusion_gallery_metrics_enabled
-                            or cls_metrics_enabled
-                        )
+                    need_extra_optical_features = has_negatives and (
+                        gallery_loss_active
+                        or fusion_gallery_metrics_enabled
+                        or cls_metrics_enabled
                     )
                     if need_extra_optical_features:
                         z_l_neg, h_l_neg = model.encode_optical(
@@ -2051,10 +2418,14 @@ def evaluate(
                         gallery_extra_z_l = z_l_neg
                         gallery_extra_coords = neg_coords
                         neg_event_time = (
-                            _neg_zero_time_mjd_cls_base.to(device=device, dtype=torch.float32)
+                            _neg_zero_time_mjd_cls_base.to(
+                                device=device, dtype=torch.float32
+                            )
                             if _neg_zero_time_mjd_cls_base is not None
                             else (
-                                _neg_zero_time_mjd_base.to(device=device, dtype=torch.float32)
+                                _neg_zero_time_mjd_base.to(
+                                    device=device, dtype=torch.float32
+                                )
                                 if _neg_zero_time_mjd_base is not None
                                 else None
                             )
@@ -2093,23 +2464,38 @@ def evaluate(
                         z_candidates.append(gallery_extra_z_l)
                         coords_candidates.append(gallery_extra_coords)
                         candidate_gw_indices.append(
-                            torch.full((batch_size,), -1, device=device, dtype=gw_indices.dtype)
+                            torch.full(
+                                (batch_size,), -1, device=device, dtype=gw_indices.dtype
+                            )
                         )
                         if batch_event_time_mjd is not None:
                             if gallery_extra_event_time is None:
                                 candidate_time_blocks.append(
-                                    torch.full((batch_size,), float("nan"), device=device, dtype=torch.float32)
+                                    torch.full(
+                                        (batch_size,),
+                                        float("nan"),
+                                        device=device,
+                                        dtype=torch.float32,
+                                    )
                                 )
                             else:
                                 candidate_time_blocks.append(
-                                    gallery_extra_event_time.to(device=device, dtype=torch.float32)
+                                    gallery_extra_event_time.to(
+                                        device=device, dtype=torch.float32
+                                    )
                                 )
                     h_gallery = torch.cat(h_candidates, dim=0)
                     z_gallery = torch.cat(z_candidates, dim=0)
                     coords_gallery = torch.cat(coords_candidates, dim=0)
                     gallery_gw_indices = torch.cat(candidate_gw_indices, dim=0)
-                    gallery_positive_mask = gw_indices.unsqueeze(1) == gallery_gw_indices.unsqueeze(0)
-                    gallery_candidate_time = torch.cat(candidate_time_blocks, dim=0) if candidate_time_blocks else None
+                    gallery_positive_mask = gw_indices.unsqueeze(
+                        1
+                    ) == gallery_gw_indices.unsqueeze(0)
+                    gallery_candidate_time = (
+                        torch.cat(candidate_time_blocks, dim=0)
+                        if candidate_time_blocks
+                        else None
+                    )
                     dt_gallery = build_gallery_time_delta_matrix(
                         batch_event_time_mjd,
                         gallery_candidate_time,
@@ -2130,17 +2516,24 @@ def evaluate(
                         need_cred_level=need_cred_level,
                         chunk_size=args.gallery_score_chunk_size,
                     )
-                    gallery_loss = compute_fusion_gallery_nce_loss(gallery_scores, gallery_positive_mask)
+                    gallery_loss = compute_fusion_gallery_nce_loss(
+                        gallery_scores, gallery_positive_mask
+                    )
                     if fusion_gallery_metrics_enabled:
                         fusion_gallery_metrics_accum.append(
-                            compute_fusion_gallery_metrics(gallery_scores.detach(), gallery_positive_mask, ks=(1, 5))
+                            compute_fusion_gallery_metrics(
+                                gallery_scores.detach(),
+                                gallery_positive_mask,
+                                ks=(1, 5),
+                            )
                         )
                     if gallery_loss_active and gallery_loss_weight > 0.0:
                         total_loss = total_loss + gallery_loss_weight * gallery_loss
                     gallery_hard_weight = compute_gallery_hard_neg_weight(args, epoch)
                     if gallery_hard_weight > 0.0:
                         gallery_hard_loss = compute_fusion_gallery_hard_nce_loss(
-                            gallery_scores, gallery_positive_mask,
+                            gallery_scores,
+                            gallery_positive_mask,
                             topk=int(args.gallery_hard_neg_topk),
                         )
                         total_loss = total_loss + (
@@ -2150,20 +2543,39 @@ def evaluate(
                         )
 
                 if cls_metrics_enabled and not cls_branch_enabled:
-                    cred_level = compute_credible_level(gw_m, opt_coords) if need_cred_level else None
-                    if _opt_first_detection_mjd is not None and batch_event_time_mjd is not None:
-                        dt_pos = compute_time_delta_days(_opt_first_detection_mjd, batch_event_time_mjd)
+                    cred_level = (
+                        compute_credible_level(gw_m, opt_coords)
+                        if need_cred_level
+                        else None
+                    )
+                    if (
+                        _opt_first_detection_mjd is not None
+                        and batch_event_time_mjd is not None
+                    ):
+                        dt_pos = compute_time_delta_days(
+                            _opt_first_detection_mjd, batch_event_time_mjd
+                        )
                     else:
-                        dt_pos = torch.zeros((batch_size,), device=device, dtype=torch.float32)
+                        dt_pos = torch.zeros(
+                            (batch_size,), device=device, dtype=torch.float32
+                        )
                     logits_pos = model.fusion_logits(
-                        g, h_l, z_l=z_l, H_gw=H_gw, cred_level=cred_level,
-                        gw_s=gw_s, gw_m=gw_m, opt_coords=opt_coords,
+                        g,
+                        h_l,
+                        z_l=z_l,
+                        H_gw=H_gw,
+                        cred_level=cred_level,
+                        gw_s=gw_s,
+                        gw_m=gw_m,
+                        opt_coords=opt_coords,
                         dt_days=dt_pos,
                     )
                     cls_logits_available = True
 
                     metric_neg_idx = sample_mismatched_negatives(
-                        batch_size, device, samples_per_gw=args.samples_per_gw,
+                        batch_size,
+                        device,
+                        samples_per_gw=args.samples_per_gw,
                         gw_indices=gw_indices,
                         source_types=batch_source_types,
                     )
@@ -2174,24 +2586,55 @@ def evaluate(
                         dt_metric_mis = sample_mis_neg_dt_days(
                             batch_size, device, window_days=args.mis_neg_dt_window_days
                         )
-                        cred_level_mis = compute_credible_level(gw_m, coords_mis) if need_cred_level else None
+                        cred_level_mis = (
+                            compute_credible_level(gw_m, coords_mis)
+                            if need_cred_level
+                            else None
+                        )
                         logits_hard = model.fusion_logits(
-                            g, h_l_mis, z_l=z_l_mis, H_gw=H_gw, cred_level=cred_level_mis,
-                            gw_s=gw_s, gw_m=gw_m, opt_coords=coords_mis,
+                            g,
+                            h_l_mis,
+                            z_l=z_l_mis,
+                            H_gw=H_gw,
+                            cred_level=cred_level_mis,
+                            gw_s=gw_s,
+                            gw_m=gw_m,
+                            opt_coords=coords_mis,
                             dt_days=dt_metric_mis,
                         )
                         cls_hard_logits_available = True
 
-                    if has_negatives and gallery_extra_h_l is not None and gallery_extra_z_l is not None:
-                        cred_level_neg = compute_credible_level(gw_m, neg_coords) if need_cred_level else None
+                    if (
+                        has_negatives
+                        and gallery_extra_h_l is not None
+                        and gallery_extra_z_l is not None
+                    ):
+                        cred_level_neg = (
+                            compute_credible_level(gw_m, neg_coords)
+                            if need_cred_level
+                            else None
+                        )
                         dt_neg_metric = (
-                            compute_time_delta_days(gallery_extra_event_time, batch_event_time_mjd)
-                            if (gallery_extra_event_time is not None and batch_event_time_mjd is not None)
-                            else torch.zeros((batch_size,), device=device, dtype=torch.float32)
+                            compute_time_delta_days(
+                                gallery_extra_event_time, batch_event_time_mjd
+                            )
+                            if (
+                                gallery_extra_event_time is not None
+                                and batch_event_time_mjd is not None
+                            )
+                            else torch.zeros(
+                                (batch_size,), device=device, dtype=torch.float32
+                            )
                         )
                         logits_neg = model.fusion_logits(
-                            g, gallery_extra_h_l, z_l=gallery_extra_z_l, H_gw=H_gw, cred_level=cred_level_neg,
-                            gw_s=gw_s, gw_m=gw_m, opt_coords=gallery_extra_coords,
+                            g,
+                            gallery_extra_h_l,
+                            z_l=gallery_extra_z_l,
+                            H_gw=H_gw,
+                            cred_level=cred_level_neg,
+                            gw_s=gw_s,
+                            gw_m=gw_m,
+                            opt_coords=gallery_extra_coords,
                             dt_days=dt_neg_metric,
                         )
                         cls_extra_neg_logits_available = True
@@ -2208,8 +2651,10 @@ def evaluate(
             if sim_ext.size(1) > sim_g2o_d.size(1):
                 ext_count = int(sim_ext.size(1) - sim_g2o_d.size(1))
                 ext_gw_indices = torch.full(
-                    (ext_count,), -1,
-                    device=gw_indices.device, dtype=gw_indices.dtype,
+                    (ext_count,),
+                    -1,
+                    device=gw_indices.device,
+                    dtype=gw_indices.dtype,
                 )
                 batch_ret_gw = torch.cat([itc_gw_indices, ext_gw_indices], dim=0)
                 batch_ret = compute_retrieval_metrics(
@@ -2232,20 +2677,27 @@ def evaluate(
                 neg_gw_acc = 0.0
                 if pos_mask.any():
                     pos_acc = (
-                        logits_pos[pos_mask].argmax(dim=1) == 1
-                    ).float().mean().item()
+                        (logits_pos[pos_mask].argmax(dim=1) == 1).float().mean().item()
+                    )
                 if neg_gw_mask.any():
                     neg_gw_acc = (
-                        logits_pos[neg_gw_mask].argmax(dim=1) == 0
-                    ).float().mean().item()
+                        (logits_pos[neg_gw_mask].argmax(dim=1) == 0)
+                        .float()
+                        .mean()
+                        .item()
+                    )
                 acc_parts = [pos_acc, neg_gw_acc]
                 hard_acc = 0.0
                 if cls_hard_logits_available:
-                    hard_acc = (logits_hard.argmax(dim=1) == labels_neg).float().mean().item()
+                    hard_acc = (
+                        (logits_hard.argmax(dim=1) == labels_neg).float().mean().item()
+                    )
                     acc_parts.append(hard_acc)
                 neg_acc = 0.0
                 if has_negatives and cls_extra_neg_logits_available:
-                    neg_acc = (logits_neg.argmax(dim=1) == labels_neg).float().mean().item()
+                    neg_acc = (
+                        (logits_neg.argmax(dim=1) == labels_neg).float().mean().item()
+                    )
                     acc_parts.append(neg_acc)
                 total_acc = sum(acc_parts) / float(max(1, len(acc_parts)))
             else:
@@ -2300,16 +2752,20 @@ def evaluate(
                                 )
 
                 if cls_hard_logits_available:
-                    hard_probs = torch.softmax(logits_hard.detach().float(), dim=1)[:, 1]
+                    hard_probs = torch.softmax(logits_hard.detach().float(), dim=1)[
+                        :, 1
+                    ]
                     all_cls_probs.append(hard_probs.cpu())
                     all_cls_labels.append(labels_neg[:batch_size].cpu())
-                    all_cls_sources.extend(['mismatched'] * batch_size)
+                    all_cls_sources.extend(["mismatched"] * batch_size)
 
                 if has_negatives and cls_extra_neg_logits_available:
-                    neg_probs_val = torch.softmax(logits_neg.detach().float(), dim=1)[:, 1]
+                    neg_probs_val = torch.softmax(logits_neg.detach().float(), dim=1)[
+                        :, 1
+                    ]
                     all_cls_probs.append(neg_probs_val.cpu())
                     all_cls_labels.append(labels_neg[:batch_size].cpu())
-                    all_cls_sources.extend(['external'] * batch_size)
+                    all_cls_sources.extend(["external"] * batch_size)
 
             all_feat_g.append(feat_g.detach().cpu())
             all_feat_o.append(feat_o.detach().cpu())
@@ -2317,7 +2773,15 @@ def evaluate(
 
             # Memory cleanup in validation loop
             del g, z_l, h_l, sim_g2o, sim_g2o_d, itc_loss, cls_loss, total_loss
-            del logits_pos, logits_hard, aligned_pos_loss, neg_gw_loss, hard_loss, feat_g, feat_o
+            del (
+                logits_pos,
+                logits_hard,
+                aligned_pos_loss,
+                neg_gw_loss,
+                hard_loss,
+                feat_g,
+                feat_o,
+            )
             if has_negatives:
                 del logits_neg, neg_loss
 
@@ -2330,17 +2794,21 @@ def evaluate(
     retrieval = {}
     if retrieval_metrics_accum:
         for key in retrieval_metrics_accum[0]:
-            retrieval[key] = sum(d[key] for d in retrieval_metrics_accum) / len(retrieval_metrics_accum)
+            retrieval[key] = sum(d[key] for d in retrieval_metrics_accum) / len(
+                retrieval_metrics_accum
+            )
     if fusion_gallery_metrics_accum:
         for key in fusion_gallery_metrics_accum[0]:
-            retrieval[key] = sum(d[key] for d in fusion_gallery_metrics_accum) / len(fusion_gallery_metrics_accum)
+            retrieval[key] = sum(d[key] for d in fusion_gallery_metrics_accum) / len(
+                fusion_gallery_metrics_accum
+            )
 
     # Global classification metrics
     if all_cls_probs:
         cls_metrics = compute_classification_metrics(
             torch.cat(all_cls_probs),
             torch.cat(all_cls_labels),
-            all_sources=all_cls_sources
+            all_sources=all_cls_sources,
         )
     else:
         cls_metrics = {}
@@ -2414,19 +2882,13 @@ def train(args):
                 "validation_gallery_enable requires val_split to be in (0, 1)."
             )
         if int(args.validation_gallery_queries_per_source) < 1:
-            raise ValueError(
-                "validation_gallery_queries_per_source must be >= 1."
-            )
+            raise ValueError("validation_gallery_queries_per_source must be >= 1.")
         if int(args.validation_gallery_trials) < 1:
             raise ValueError("validation_gallery_trials must be >= 1.")
         if float(args.validation_gallery_time_window_days) <= 0.0:
-            raise ValueError(
-                "validation_gallery_time_window_days must be > 0."
-            )
+            raise ValueError("validation_gallery_time_window_days must be > 0.")
         if not (0.0 < float(args.validation_gallery_credible_level_max) <= 1.0):
-            raise ValueError(
-                "validation_gallery_credible_level_max must be in (0, 1]."
-            )
+            raise ValueError("validation_gallery_credible_level_max must be in (0, 1].")
         metric_weight_sum = float(args.validation_gallery_mrr_weight) + float(
             args.validation_gallery_recall_at_1_weight
         )
@@ -2447,10 +2909,6 @@ def train(args):
 
     if args.hardneg_min_candidates < 1:
         raise ValueError("hardneg_min_candidates must be >= 1.")
-    if int(getattr(args, "stage_alignment_epochs", 8)) < 0:
-        raise ValueError("stage_alignment_epochs must be >= 0.")
-    if int(getattr(args, "stage_head_epochs", 4)) < 0:
-        raise ValueError("stage_head_epochs must be >= 0.")
     if not 0.0 < float(getattr(args, "encoder_lr_ratio", 0.1)) <= 1.0:
         raise ValueError("encoder_lr_ratio must be in (0, 1].")
     for key in ("stage_joint_itc_start_weight", "stage_joint_itc_end_weight"):
@@ -2495,18 +2953,25 @@ def train(args):
         raise ValueError("itc_decay_epochs must be >= 0.")
     if args.gallery_score_chunk_size < 1:
         raise ValueError("gallery_score_chunk_size must be >= 1.")
+    validate_sequential_curriculum(args)
+    if is_staged_training_enabled(args):
+        print(f"Sequential loss curriculum: {format_sequential_curriculum(args)}")
     validate_best_ckpt_selection_schedule(args)
     print(
         "Best-checkpoint stability schedule: "
         f"{format_best_ckpt_selection_schedule(args)}"
     )
-    args.gallery_distractor_time_mode = str(args.gallery_distractor_time_mode).strip().lower()
+    args.gallery_distractor_time_mode = (
+        str(args.gallery_distractor_time_mode).strip().lower()
+    )
     if args.gallery_distractor_time_mode in {"synthetic", "after_gw"}:
         args.gallery_distractor_time_mode = "synthetic_after_gw"
     if args.gallery_distractor_time_mode in {"real", "none"}:
         args.gallery_distractor_time_mode = "actual"
     if args.gallery_distractor_time_mode not in {"actual", "synthetic_after_gw"}:
-        raise ValueError("gallery_distractor_time_mode must be 'actual' or 'synthetic_after_gw'.")
+        raise ValueError(
+            "gallery_distractor_time_mode must be 'actual' or 'synthetic_after_gw'."
+        )
     if args.gallery_distractor_time_window_days <= 0:
         raise ValueError("gallery_distractor_time_window_days must be > 0.")
     if args.time_delta_cls_scale_days is None:
@@ -2517,17 +2982,22 @@ def train(args):
         raise ValueError("time_delta_cls_clip must be >= 0.")
     if args.mis_neg_dt_window_days <= 0:
         raise ValueError("mis_neg_dt_window_days must be > 0.")
-    args.fusion_mode = normalize_fusion_mode(getattr(args, "fusion_mode", None), dual_fusion=args.dual_fusion)
+    args.fusion_mode = normalize_fusion_mode(
+        getattr(args, "fusion_mode", None), dual_fusion=args.dual_fusion
+    )
     args.dual_fusion = args.fusion_mode != "legacy_g2o"
     args._hardneg_window_days = parse_day_windows(args.hardneg_time_window_days)
-
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     args._dataset_window_metadata = _collect_dataset_window_metadata(args)
     args._effective_input_window_metadata = _build_effective_input_window_metadata(args)
-    print(f"Dataset window metadata: {json.dumps(args._dataset_window_metadata, indent=2)}")
-    print(f"Effective input window metadata: {json.dumps(args._effective_input_window_metadata, indent=2)}")
+    print(
+        f"Dataset window metadata: {json.dumps(args._dataset_window_metadata, indent=2)}"
+    )
+    print(
+        f"Effective input window metadata: {json.dumps(args._effective_input_window_metadata, indent=2)}"
+    )
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -2562,14 +3032,24 @@ def train(args):
                 if np.any(has_kn == 0):
                     train_neg_gw_ratio = float(args.neg_gw_pair_ratio)
             if train_neg_gw_ratio == 0.0:
-                print("Negative-GW pairs disabled: the training H5 has no complete negative-GW schema/events.")
+                print(
+                    "Negative-GW pairs disabled: the training H5 has no complete negative-GW schema/events."
+                )
     elif float(args.neg_gw_pair_ratio) > 0.0:
-        print("Negative-GW pairs disabled because the classification branch is inactive.")
+        print(
+            "Negative-GW pairs disabled because the classification branch is inactive."
+        )
     print(f"Train negative-GW pair ratio: {train_neg_gw_ratio:.3f}")
-    print(f"CLS/gallery/time-compat optical first-detection metadata requested: {int(need_zero_time_mjd_for_cls)}")
+    print(
+        f"CLS/gallery/time-compat optical first-detection metadata requested: {int(need_zero_time_mjd_for_cls)}"
+    )
 
     timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-    log_dir = os.path.join(os.path.dirname(args.ckpt_path), "tb_logs", f"run_magiks_{timestamp}_pid{os.getpid()}")
+    log_dir = os.path.join(
+        os.path.dirname(args.ckpt_path),
+        "tb_logs",
+        f"run_magiks_{timestamp}_pid{os.getpid()}",
+    )
     writer = SummaryWriter(log_dir=log_dir)
     print(f"TensorBoard logging started at: {log_dir}")
     extra_neg_timeaware_enable = bool(args.neg_data_path is not None)
@@ -2597,9 +3077,7 @@ def train(args):
                 val_steps_per_epoch=args.val_steps_per_epoch,
                 val_split=args.val_split,
                 split_seed=args.split_seed,
-                val_split_stratify_by_source=bool(
-                    args.val_split_stratify_by_source
-                ),
+                val_split_stratify_by_source=bool(args.val_split_stratify_by_source),
                 return_split_maps=True,
                 num_workers=args.num_workers,
                 pin_memory=bool(args.pin_memory),
@@ -2640,9 +3118,7 @@ def train(args):
                 val_steps_per_epoch=args.val_steps_per_epoch,
                 val_split=args.val_split,
                 split_seed=args.split_seed,
-                val_split_stratify_by_source=bool(
-                    args.val_split_stratify_by_source
-                ),
+                val_split_stratify_by_source=bool(args.val_split_stratify_by_source),
                 return_split_maps=True,
                 num_workers=args.num_workers,
                 pin_memory=bool(args.pin_memory),
@@ -2674,8 +3150,8 @@ def train(args):
         if args.steps_per_epoch is not None:
             steps_per_epoch = args.steps_per_epoch
         else:
-            with h5py.File(args.data_path, 'r') as f:
-                total_optical = f['events/optical_data/values'].shape[0]
+            with h5py.File(args.data_path, "r") as f:
+                total_optical = f["events/optical_data/values"].shape[0]
             steps_per_epoch = total_optical // args.batch_size
             print(f"Dataset Size: {total_optical} | Steps/Epoch: {steps_per_epoch}")
 
@@ -2705,7 +3181,12 @@ def train(args):
 
     mtan_cfg = resolve_mtan_runtime_config(args)
     print("mTAN runtime config:")
-    print(json.dumps({k: (list(v) if isinstance(v, tuple) else v) for k, v in mtan_cfg.items()}, indent=2))
+    print(
+        json.dumps(
+            {k: (list(v) if isinstance(v, tuple) else v) for k, v in mtan_cfg.items()},
+            indent=2,
+        )
+    )
 
     model = MAGIKSModel(
         gw_scalar_dim=7,
@@ -2760,7 +3241,9 @@ def train(args):
         print("Using lightweight GW encoder (~100K params) to prevent overfitting.")
     print(f"Using fusion_mode={args.fusion_mode}.")
     if args.fusion_mode == "legacy_dual":
-        print("Legacy dual cross-attention fusion enabled with per-pair credible level.")
+        print(
+            "Legacy dual cross-attention fusion enabled with per-pair credible level."
+        )
     elif args.fusion_mode == "physical_dual_hgw":
         print(
             "Physical dual fusion enabled: GW-parameter->optical and "
@@ -2774,9 +3257,11 @@ def train(args):
     elif args.fusion_mode == "concat_proj":
         print("Ablation mode: no cross-attention, classifier on [proj_gw; proj_opt].")
     if not cls_branch_enabled:
-        print("Retrieval-only mode enabled: fusion/classification branch disabled; extra negatives go into contrastive loss.")
+        print(
+            "Retrieval-only mode enabled: fusion/classification branch disabled; extra negatives go into contrastive loss."
+        )
 
-    if hasattr(torch, 'compile'):
+    if hasattr(torch, "compile"):
         model = torch.compile(model)
         print("Model compiled with torch.compile() for optimized execution.")
 
@@ -2799,8 +3284,8 @@ def train(args):
                 ) from exc
             raise
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-        if 'scaler_state_dict' in ckpt:
-            scaler.load_state_dict(ckpt['scaler_state_dict'])
+        if "scaler_state_dict" in ckpt:
+            scaler.load_state_dict(ckpt["scaler_state_dict"])
         start_epoch = ckpt.get("epoch", -1) + 1
         global_step = start_epoch * steps_per_epoch
         print(f"Resumed from {args.resume} at epoch {start_epoch}.")
@@ -2820,12 +3305,8 @@ def train(args):
     gw_source_type_table = load_gw_source_type_table(
         args.data_path, device, required=True
     )
-    gw_neg_type_table = load_gw_neg_type_table(
-        args.data_path, device, required=True
-    )
-    print(
-        "Mismatched-negative policy: prefer a different GW of the same source type."
-    )
+    gw_neg_type_table = load_gw_neg_type_table(args.data_path, device, required=True)
+    print("Mismatched-negative policy: prefer a different GW of the same source type.")
     print(
         "Extra-negative time-aware sampling config: "
         f"windows_days={args._hardneg_window_days}, "
@@ -2861,12 +3342,13 @@ def train(args):
         batch_sampler = getattr(train_loader, "batch_sampler", None)
         if hasattr(batch_sampler, "set_stage"):
             batch_sampler.set_stage(
-                "alignment" if training_stage == "alignment" else "joint"
+                "alignment" if training_stage in {"alignment", "itc"} else "joint"
             )
         print(
             f"Training stage: {training_stage} | "
             f"ITC weight={compute_itc_weight(args, epoch):.4f} | "
-            f"CLS weight={compute_cls_weight(args, epoch):.4f}"
+            f"CLS weight={compute_cls_weight(args, epoch):.4f} | "
+            f"Retrieval weight={compute_gallery_loss_weight(args, epoch):.4f}"
         )
         epoch_itc = 0.0
         epoch_cls = 0.0
@@ -2888,18 +3370,15 @@ def train(args):
                     f"at epoch {epoch+1} (retrieval-only / fusion branch disabled)."
                 )
             else:
-                print(
-                    "Best-checkpoint selection activated "
-                    f"at epoch {epoch+1}."
-                )
+                print("Best-checkpoint selection activated " f"at epoch {epoch+1}.")
 
         pbar = tqdm(
             train_loader,
             desc=f"Epoch {epoch+1}/{args.epochs}",
             mininterval=0,
-            miniters=pbar_update_every
+            miniters=pbar_update_every,
         )
-        
+
         for batch_idx, batch_data in enumerate(pbar):
             pair_is_neg_gw = None
             if train_neg_gw_ratio > 0.0:
@@ -2912,43 +3391,124 @@ def train(args):
             if has_negatives:
                 if len(batch_data) >= 17:
                     (
-                        gw_s, gw_m, opt_t, opt_v, opt_mask, opt_err, opt_coords, gw_indices,
-                        neg_t, neg_v, neg_mask, neg_err, neg_coords,
-                        _opt_zero_time_mjd_base, _neg_zero_time_mjd_base, _neg_zero_time_mjd_cls_base,
+                        gw_s,
+                        gw_m,
+                        opt_t,
+                        opt_v,
+                        opt_mask,
+                        opt_err,
+                        opt_coords,
+                        gw_indices,
+                        neg_t,
+                        neg_v,
+                        neg_mask,
+                        neg_err,
+                        neg_coords,
+                        _opt_zero_time_mjd_base,
+                        _neg_zero_time_mjd_base,
+                        _neg_zero_time_mjd_cls_base,
                         _opt_first_detection_mjd,
                     ) = batch_data[:17]
                 elif len(batch_data) >= 16:
                     (
-                        gw_s, gw_m, opt_t, opt_v, opt_mask, opt_err, opt_coords, gw_indices,
-                        neg_t, neg_v, neg_mask, neg_err, neg_coords,
-                        _opt_zero_time_mjd_base, _neg_zero_time_mjd_base, _neg_zero_time_mjd_cls_base,
+                        gw_s,
+                        gw_m,
+                        opt_t,
+                        opt_v,
+                        opt_mask,
+                        opt_err,
+                        opt_coords,
+                        gw_indices,
+                        neg_t,
+                        neg_v,
+                        neg_mask,
+                        neg_err,
+                        neg_coords,
+                        _opt_zero_time_mjd_base,
+                        _neg_zero_time_mjd_base,
+                        _neg_zero_time_mjd_cls_base,
                     ) = batch_data[:16]
                 elif len(batch_data) >= 15:
                     (
-                        gw_s, gw_m, opt_t, opt_v, opt_mask, opt_err, opt_coords, gw_indices,
-                        neg_t, neg_v, neg_mask, neg_err, neg_coords,
-                        _opt_zero_time_mjd_base, _neg_zero_time_mjd_base,
+                        gw_s,
+                        gw_m,
+                        opt_t,
+                        opt_v,
+                        opt_mask,
+                        opt_err,
+                        opt_coords,
+                        gw_indices,
+                        neg_t,
+                        neg_v,
+                        neg_mask,
+                        neg_err,
+                        neg_coords,
+                        _opt_zero_time_mjd_base,
+                        _neg_zero_time_mjd_base,
                     ) = batch_data[:15]
                 else:
                     (
-                        gw_s, gw_m, opt_t, opt_v, opt_mask, opt_err, opt_coords, gw_indices,
-                        neg_t, neg_v, neg_mask, neg_err, neg_coords,
+                        gw_s,
+                        gw_m,
+                        opt_t,
+                        opt_v,
+                        opt_mask,
+                        opt_err,
+                        opt_coords,
+                        gw_indices,
+                        neg_t,
+                        neg_v,
+                        neg_mask,
+                        neg_err,
+                        neg_coords,
                     ) = batch_data[:13]
             else:
                 if len(batch_data) >= 10:
-                    gw_s, gw_m, opt_t, opt_v, opt_mask, opt_err, opt_coords, gw_indices, _opt_zero_time_mjd_base, _opt_first_detection_mjd = batch_data[:10]
+                    (
+                        gw_s,
+                        gw_m,
+                        opt_t,
+                        opt_v,
+                        opt_mask,
+                        opt_err,
+                        opt_coords,
+                        gw_indices,
+                        _opt_zero_time_mjd_base,
+                        _opt_first_detection_mjd,
+                    ) = batch_data[:10]
                 elif len(batch_data) >= 9:
-                    gw_s, gw_m, opt_t, opt_v, opt_mask, opt_err, opt_coords, gw_indices, _opt_zero_time_mjd_base = batch_data[:9]
+                    (
+                        gw_s,
+                        gw_m,
+                        opt_t,
+                        opt_v,
+                        opt_mask,
+                        opt_err,
+                        opt_coords,
+                        gw_indices,
+                        _opt_zero_time_mjd_base,
+                    ) = batch_data[:9]
                 else:
-                    gw_s, gw_m, opt_t, opt_v, opt_mask, opt_err, opt_coords, gw_indices = batch_data
+                    (
+                        gw_s,
+                        gw_m,
+                        opt_t,
+                        opt_v,
+                        opt_mask,
+                        opt_err,
+                        opt_coords,
+                        gw_indices,
+                    ) = batch_data
 
             gw_s = gw_s.to(device, non_blocking=True)
             gw_m = gw_m.to(device, non_blocking=True)
             gw_s, gw_m = augment_gw_data(
-                gw_s, gw_m, training=True,
+                gw_s,
+                gw_m,
+                training=True,
                 noise_std=args.gw_aug_noise,
                 scalar_jitter=args.gw_aug_jitter,
-                channel_dropout_prob=args.gw_aug_dropout
+                channel_dropout_prob=args.gw_aug_dropout,
             )
             opt_t = opt_t.to(device, non_blocking=True)
             opt_v = opt_v.to(device, non_blocking=True)
@@ -2961,14 +3521,14 @@ def train(args):
                     (gw_indices.shape[0],), device=device, dtype=torch.bool
                 )
             else:
-                pair_is_neg_gw = pair_is_neg_gw.to(
-                    device, non_blocking=True
-                ).bool()
+                pair_is_neg_gw = pair_is_neg_gw.to(device, non_blocking=True).bool()
             itc_pair_mask = build_itc_pair_mask(
                 gw_indices, pair_is_neg_gw, min_pairs_per_gw=args.min_lc_per_gw
             )
             if not bool(itc_pair_mask.any()):
-                raise ValueError("Each training batch must retain at least one positive GW-optical pair")
+                raise ValueError(
+                    "Each training batch must retain at least one positive GW-optical pair"
+                )
             batch_event_time_mjd = None
             if gw_event_time_mjd_table is not None:
                 batch_event_time_mjd = gw_event_time_mjd_table[gw_indices]
@@ -2983,30 +3543,44 @@ def train(args):
                 neg_err = neg_err.to(device, non_blocking=True)
                 neg_coords = neg_coords.to(device, non_blocking=True)
                 if _neg_zero_time_mjd_base is not None:
-                    _neg_zero_time_mjd_base = _neg_zero_time_mjd_base.to(device, non_blocking=True)
+                    _neg_zero_time_mjd_base = _neg_zero_time_mjd_base.to(
+                        device, non_blocking=True
+                    )
                 if _neg_zero_time_mjd_cls_base is not None:
-                    _neg_zero_time_mjd_cls_base = _neg_zero_time_mjd_cls_base.to(device, non_blocking=True)
+                    _neg_zero_time_mjd_cls_base = _neg_zero_time_mjd_cls_base.to(
+                        device, non_blocking=True
+                    )
             if _opt_first_detection_mjd is not None:
-                _opt_first_detection_mjd = _opt_first_detection_mjd.to(device, non_blocking=True)
+                _opt_first_detection_mjd = _opt_first_detection_mjd.to(
+                    device, non_blocking=True
+                )
             opt_t_raw = opt_t.clone()
             opt_v_raw = opt_v.clone()
             opt_mask_raw = opt_mask.clone()
             opt_err_raw = opt_err.clone()
 
             opt_t, opt_v, opt_mask, opt_err = augment_optical_data(
-                opt_t, opt_v, opt_mask, opt_err, training=True,
+                opt_t,
+                opt_v,
+                opt_mask,
+                opt_err,
+                training=True,
                 time_jitter=args.opt_aug_time_jitter,
                 flux_noise=args.opt_aug_noise,
                 obs_dropout=args.opt_aug_dropout,
-                band_dropout=args.opt_aug_band_dropout
+                band_dropout=args.opt_aug_band_dropout,
             )
             if has_negatives:
                 neg_t, neg_v, neg_mask, neg_err = augment_optical_data(
-                    neg_t, neg_v, neg_mask, neg_err, training=True,
+                    neg_t,
+                    neg_v,
+                    neg_mask,
+                    neg_err,
+                    training=True,
                     time_jitter=args.opt_aug_time_jitter,
                     flux_noise=args.opt_aug_noise,
                     obs_dropout=args.opt_aug_dropout,
-                    band_dropout=args.opt_aug_band_dropout
+                    band_dropout=args.opt_aug_band_dropout,
                 )
 
             batch_size = gw_s.size(0)
@@ -3017,29 +3591,43 @@ def train(args):
                 or ref_time_cache.dtype != opt_t.dtype
             ):
                 ref_time_cache = build_ref_time(
-                    batch_size, args.n_ref, args.ref_start, args.ref_end, device, opt_t.dtype
+                    batch_size,
+                    args.n_ref,
+                    args.ref_start,
+                    args.ref_end,
+                    device,
+                    opt_t.dtype,
                 )
             opt_ref_t = ref_time_cache
 
-            should_tb_log = (global_step % tb_log_interval == 0)
+            should_tb_log = global_step % tb_log_interval == 0
             should_perf_log = should_tb_log
             step_cpu_start = time.perf_counter() if should_perf_log else None
             optimizer.zero_grad(set_to_none=True)
             need_cred_level = _model_requires_cred_level(model)
 
-            with autocast(device_type='cuda', dtype=amp_dtype, enabled=(device.type == 'cuda')):
+            with autocast(
+                device_type="cuda", dtype=amp_dtype, enabled=(device.type == "cuda")
+            ):
                 g, z_l, h_l, H_gw = model.encode(
                     gw_s, gw_m, opt_coords, opt_t, opt_v, opt_ref_t, opt_mask, opt_err
                 )
                 extra_neg_z_itc = None
                 extra_neg_event_time_mjd = None
-                if has_negatives and bool(getattr(args, "itc_extra_negative_enable", False)):
+                if has_negatives and bool(
+                    getattr(args, "itc_extra_negative_enable", False)
+                ):
                     neg_zero_time_mjd_for_itc = _neg_zero_time_mjd_cls_base
                     if neg_zero_time_mjd_for_itc is None:
                         neg_zero_time_mjd_for_itc = _neg_zero_time_mjd_base
                     with torch.no_grad():
                         extra_neg_z_itc, _ = model.encode_optical(
-                            neg_coords, neg_t, neg_v, opt_ref_t, neg_mask, neg_err,
+                            neg_coords,
+                            neg_t,
+                            neg_v,
+                            opt_ref_t,
+                            neg_mask,
+                            neg_err,
                         )
                     extra_neg_event_time_mjd = neg_zero_time_mjd_for_itc
                 itc_g = g[itc_pair_mask]
@@ -3047,15 +3635,20 @@ def train(args):
                 itc_gw_indices = gw_indices[itc_pair_mask]
                 itc_gw_event_time = (
                     batch_event_time_mjd[itc_pair_mask]
-                    if batch_event_time_mjd is not None else None
+                    if batch_event_time_mjd is not None
+                    else None
                 )
                 itc_opt_first_detection = (
                     _opt_first_detection_mjd[itc_pair_mask]
-                    if _opt_first_detection_mjd is not None else None
+                    if _opt_first_detection_mjd is not None
+                    else None
                 )
                 if args.itc_loss_type == "supcon":
                     itc_loss, sim_g2o, sim_g2o_for_loss = model.compute_supcon_loss(
-                        itc_g, itc_z_l, itc_gw_indices, margin=args.supcon_margin,
+                        itc_g,
+                        itc_z_l,
+                        itc_gw_indices,
+                        margin=args.supcon_margin,
                         gw_event_time_mjd=itc_gw_event_time,
                         opt_event_time_mjd=resolve_optical_candidate_time_mjd(
                             itc_opt_first_detection, itc_gw_event_time
@@ -3065,7 +3658,9 @@ def train(args):
                     )
                 else:
                     itc_loss, sim_g2o, sim_g2o_for_loss = model.compute_itc_loss(
-                        itc_g, itc_z_l, itc_gw_indices,
+                        itc_g,
+                        itc_z_l,
+                        itc_gw_indices,
                         gw_event_time_mjd=itc_gw_event_time,
                         opt_event_time_mjd=resolve_optical_candidate_time_mjd(
                             itc_opt_first_detection, itc_gw_event_time
@@ -3084,14 +3679,31 @@ def train(args):
 
                 if cls_branch_enabled:
                     # Compute per-pair credible level for dual fusion
-                    cred_level = compute_credible_level(gw_m, opt_coords) if need_cred_level else None
-                    if _opt_first_detection_mjd is not None and batch_event_time_mjd is not None:
-                        dt_pos = compute_time_delta_days(_opt_first_detection_mjd, batch_event_time_mjd)
+                    cred_level = (
+                        compute_credible_level(gw_m, opt_coords)
+                        if need_cred_level
+                        else None
+                    )
+                    if (
+                        _opt_first_detection_mjd is not None
+                        and batch_event_time_mjd is not None
+                    ):
+                        dt_pos = compute_time_delta_days(
+                            _opt_first_detection_mjd, batch_event_time_mjd
+                        )
                     else:
-                        dt_pos = torch.zeros((batch_size,), device=device, dtype=torch.float32)
+                        dt_pos = torch.zeros(
+                            (batch_size,), device=device, dtype=torch.float32
+                        )
                     logits_pos = model.fusion_logits(
-                        g, h_l, z_l=z_l, H_gw=H_gw, cred_level=cred_level,
-                        gw_s=gw_s, gw_m=gw_m, opt_coords=opt_coords,
+                        g,
+                        h_l,
+                        z_l=z_l,
+                        H_gw=H_gw,
+                        cred_level=cred_level,
+                        gw_s=gw_s,
+                        gw_m=gw_m,
+                        opt_coords=opt_coords,
                         dt_days=dt_pos,
                     )
                     if pos_mask.any():
@@ -3114,14 +3726,18 @@ def train(args):
                         neg_gw_loss = None
 
                     mis_idx = sample_mismatched_negatives(
-                        batch_size, device, samples_per_gw=args.samples_per_gw,
+                        batch_size,
+                        device,
+                        samples_per_gw=args.samples_per_gw,
                         gw_indices=gw_indices,
                         source_types=batch_source_types,
                     )
 
                     if mis_idx is None:
                         hard_loss = torch.zeros((), device=device)
-                        logits_hard = torch.zeros((batch_size, 2), device=device, dtype=g.dtype)
+                        logits_hard = torch.zeros(
+                            (batch_size, 2), device=device, dtype=g.dtype
+                        )
                         dt_mis = None
                     else:
                         h_l_mis = h_l[mis_idx].clone()
@@ -3131,10 +3747,20 @@ def train(args):
                             batch_size, device, window_days=args.mis_neg_dt_window_days
                         )
 
-                        cred_level_mis = compute_credible_level(gw_m, coords_mis) if need_cred_level else None
+                        cred_level_mis = (
+                            compute_credible_level(gw_m, coords_mis)
+                            if need_cred_level
+                            else None
+                        )
                         logits_hard = model.fusion_logits(
-                            g, h_l_mis, z_l=z_l_mis, H_gw=H_gw, cred_level=cred_level_mis,
-                            gw_s=gw_s, gw_m=gw_m, opt_coords=coords_mis,
+                            g,
+                            h_l_mis,
+                            z_l=z_l_mis,
+                            H_gw=H_gw,
+                            cred_level=cred_level_mis,
+                            gw_s=gw_s,
+                            gw_m=gw_m,
+                            opt_coords=coords_mis,
                             dt_days=dt_mis,
                         )
                         hard_loss = model.cls_criterion(logits_hard, labels_neg)
@@ -3146,23 +3772,42 @@ def train(args):
                         z_l_neg, h_l_neg = model.encode_optical(
                             neg_coords, neg_t, neg_v, opt_ref_t, neg_mask, neg_err
                         )
-                        cred_level_neg = compute_credible_level(gw_m, neg_coords) if need_cred_level else None
+                        cred_level_neg = (
+                            compute_credible_level(gw_m, neg_coords)
+                            if need_cred_level
+                            else None
+                        )
                         neg_zero_time_mjd_for_cls = _neg_zero_time_mjd_cls_base
                         if neg_zero_time_mjd_for_cls is None:
                             neg_zero_time_mjd_for_cls = _neg_zero_time_mjd_base
                         neg_event_time = (
-                            neg_zero_time_mjd_for_cls.to(device=device, dtype=torch.float32)
+                            neg_zero_time_mjd_for_cls.to(
+                                device=device, dtype=torch.float32
+                            )
                             if neg_zero_time_mjd_for_cls is not None
                             else None
                         )
                         dt_neg = (
-                            compute_time_delta_days(neg_event_time, batch_event_time_mjd)
-                            if (neg_event_time is not None and batch_event_time_mjd is not None)
-                            else torch.zeros((batch_size,), device=device, dtype=torch.float32)
+                            compute_time_delta_days(
+                                neg_event_time, batch_event_time_mjd
+                            )
+                            if (
+                                neg_event_time is not None
+                                and batch_event_time_mjd is not None
+                            )
+                            else torch.zeros(
+                                (batch_size,), device=device, dtype=torch.float32
+                            )
                         )
                         logits_neg = model.fusion_logits(
-                            g, h_l_neg, z_l=z_l_neg, H_gw=H_gw, cred_level=cred_level_neg,
-                            gw_s=gw_s, gw_m=gw_m, opt_coords=neg_coords,
+                            g,
+                            h_l_neg,
+                            z_l=z_l_neg,
+                            H_gw=H_gw,
+                            cred_level=cred_level_neg,
+                            gw_s=gw_s,
+                            gw_m=gw_m,
+                            opt_coords=neg_coords,
                             dt_days=dt_neg,
                         )
                         neg_loss = model.cls_criterion(logits_neg, labels_neg)
@@ -3180,14 +3825,19 @@ def train(args):
                     gallery_loss = torch.zeros((), device=device)
                     gallery_hard_loss = torch.zeros((), device=device)
                     gallery_hard_weight = 0.0
-                    total_loss = (
-                        itc_weight * itc_loss
-                        + cls_weight * cls_loss
-                    )
+                    total_loss = itc_weight * itc_loss + cls_weight * cls_loss
                 else:
-                    logits_pos = torch.zeros((batch_size, 2), device=device, dtype=g.dtype)
-                    logits_hard = torch.zeros((batch_size, 2), device=device, dtype=g.dtype)
-                    logits_neg = torch.zeros((batch_size, 2), device=device, dtype=g.dtype) if has_negatives else None
+                    logits_pos = torch.zeros(
+                        (batch_size, 2), device=device, dtype=g.dtype
+                    )
+                    logits_hard = torch.zeros(
+                        (batch_size, 2), device=device, dtype=g.dtype
+                    )
+                    logits_neg = (
+                        torch.zeros((batch_size, 2), device=device, dtype=g.dtype)
+                        if has_negatives
+                        else None
+                    )
                     aligned_pos_loss = torch.zeros((), device=device)
                     neg_gw_loss = None
                     hard_loss = torch.zeros((), device=device)
@@ -3205,10 +3855,14 @@ def train(args):
                         gallery_extra_z_l = z_l_neg
                         gallery_extra_coords = neg_coords
                         neg_event_time = (
-                            _neg_zero_time_mjd_cls_base.to(device=device, dtype=torch.float32)
+                            _neg_zero_time_mjd_cls_base.to(
+                                device=device, dtype=torch.float32
+                            )
                             if _neg_zero_time_mjd_cls_base is not None
                             else (
-                                _neg_zero_time_mjd_base.to(device=device, dtype=torch.float32)
+                                _neg_zero_time_mjd_base.to(
+                                    device=device, dtype=torch.float32
+                                )
                                 if _neg_zero_time_mjd_base is not None
                                 else None
                             )
@@ -3229,7 +3883,8 @@ def train(args):
                     gallery_query_gw_m = gw_m[itc_pair_mask]
                     gallery_query_event_time = (
                         batch_event_time_mjd[itc_pair_mask]
-                        if batch_event_time_mjd is not None else None
+                        if batch_event_time_mjd is not None
+                        else None
                     )
                     h_candidates = [h_l[itc_pair_mask]]
                     z_candidates = [z_l[itc_pair_mask]]
@@ -3252,23 +3907,38 @@ def train(args):
                         z_candidates.append(gallery_extra_z_l)
                         coords_candidates.append(gallery_extra_coords)
                         candidate_gw_indices.append(
-                            torch.full((batch_size,), -1, device=device, dtype=gw_indices.dtype)
+                            torch.full(
+                                (batch_size,), -1, device=device, dtype=gw_indices.dtype
+                            )
                         )
                         if batch_event_time_mjd is not None:
                             if gallery_extra_event_time is None:
                                 candidate_time_blocks.append(
-                                    torch.full((batch_size,), float("nan"), device=device, dtype=torch.float32)
+                                    torch.full(
+                                        (batch_size,),
+                                        float("nan"),
+                                        device=device,
+                                        dtype=torch.float32,
+                                    )
                                 )
                             else:
                                 candidate_time_blocks.append(
-                                    gallery_extra_event_time.to(device=device, dtype=torch.float32)
+                                    gallery_extra_event_time.to(
+                                        device=device, dtype=torch.float32
+                                    )
                                 )
                     h_gallery = torch.cat(h_candidates, dim=0)
                     z_gallery = torch.cat(z_candidates, dim=0)
                     coords_gallery = torch.cat(coords_candidates, dim=0)
                     gallery_gw_indices = torch.cat(candidate_gw_indices, dim=0)
-                    gallery_pos_mask_full = itc_gw_indices.unsqueeze(1) == gallery_gw_indices.unsqueeze(0)
-                    gallery_candidate_time = torch.cat(candidate_time_blocks, dim=0) if candidate_time_blocks else None
+                    gallery_pos_mask_full = itc_gw_indices.unsqueeze(
+                        1
+                    ) == gallery_gw_indices.unsqueeze(0)
+                    gallery_candidate_time = (
+                        torch.cat(candidate_time_blocks, dim=0)
+                        if candidate_time_blocks
+                        else None
+                    )
                     dt_gallery = build_gallery_time_delta_matrix(
                         gallery_query_event_time,
                         gallery_candidate_time,
@@ -3284,7 +3954,11 @@ def train(args):
                     if max_queries > 0 and n_q_total > max_queries:
                         q_idx = torch.randperm(n_q_total, device=device)[:max_queries]
                         g_q = gallery_query_g[q_idx]
-                        H_q = gallery_query_H[q_idx] if gallery_query_H is not None else None
+                        H_q = (
+                            gallery_query_H[q_idx]
+                            if gallery_query_H is not None
+                            else None
+                        )
                         gw_s_q = gallery_query_gw_s[q_idx]
                         gw_m_q = gallery_query_gw_m[q_idx]
                         dt_q = dt_gallery[q_idx, :] if dt_gallery is not None else None
@@ -3310,13 +3984,16 @@ def train(args):
                         need_cred_level=need_cred_level,
                         chunk_size=args.gallery_score_chunk_size,
                     )
-                    gallery_loss = compute_fusion_gallery_nce_loss(gallery_scores, gallery_pos_mask)
+                    gallery_loss = compute_fusion_gallery_nce_loss(
+                        gallery_scores, gallery_pos_mask
+                    )
                     if gallery_loss_weight > 0.0:
                         total_loss = total_loss + gallery_loss_weight * gallery_loss
                     gallery_hard_weight = compute_gallery_hard_neg_weight(args, epoch)
                     if gallery_hard_weight > 0.0:
                         gallery_hard_loss = compute_fusion_gallery_hard_nce_loss(
-                            gallery_scores, gallery_pos_mask,
+                            gallery_scores,
+                            gallery_pos_mask,
                             topk=int(args.gallery_hard_neg_topk),
                         )
                         total_loss = total_loss + (
@@ -3328,7 +4005,9 @@ def train(args):
             scaler.scale(total_loss).backward()
             if args.grad_clip_norm > 0:
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.grad_clip_norm)
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), max_norm=args.grad_clip_norm
+                )
             scaler.step(optimizer)
             scaler.update()
             if lr_scheduler is not None:
@@ -3338,9 +4017,7 @@ def train(args):
             total_val = total_loss.item()
             itc_val = itc_loss.item()
             aligned_pos_loss_val = aligned_pos_loss.item()
-            neg_gw_loss_val = (
-                neg_gw_loss.item() if neg_gw_loss is not None else 0.0
-            )
+            neg_gw_loss_val = neg_gw_loss.item() if neg_gw_loss is not None else 0.0
             hard_loss_val = hard_loss.item()
             if has_negatives:
                 neg_loss_val = neg_loss.item()
@@ -3364,16 +4041,29 @@ def train(args):
                     neg_gw_acc = 0.0
                     if pos_mask.any():
                         pos_acc = (
-                            logits_pos[pos_mask].argmax(dim=1) == 1
-                        ).float().mean().item()
+                            (logits_pos[pos_mask].argmax(dim=1) == 1)
+                            .float()
+                            .mean()
+                            .item()
+                        )
                     if neg_gw_mask.any():
                         neg_gw_acc = (
-                            logits_pos[neg_gw_mask].argmax(dim=1) == 0
-                        ).float().mean().item()
-                    hard_acc = (logits_hard.argmax(dim=1) == labels_neg).float().mean().item()
+                            (logits_pos[neg_gw_mask].argmax(dim=1) == 0)
+                            .float()
+                            .mean()
+                            .item()
+                        )
+                    hard_acc = (
+                        (logits_hard.argmax(dim=1) == labels_neg).float().mean().item()
+                    )
                     neg_acc = None
                     if has_negatives:
-                        neg_acc = (logits_neg.argmax(dim=1) == labels_neg).float().mean().item()
+                        neg_acc = (
+                            (logits_neg.argmax(dim=1) == labels_neg)
+                            .float()
+                            .mean()
+                            .item()
+                        )
                 else:
                     pos_acc = 0.0
                     neg_gw_acc = 0.0
@@ -3386,64 +4076,101 @@ def train(args):
                 step_time_ms = (time.perf_counter() - step_cpu_start) * 1000.0
 
             if should_tb_log:
-                writer.add_scalar('Train/Batch_Total_Loss', total_val, global_step)
-                writer.add_scalar('Train/Batch_ITC_Loss', itc_val, global_step)
-                writer.add_scalar('Train/Batch_CLS_Loss', cls_val, global_step)
-                writer.add_scalar('Train/Batch_Gallery_Loss', gallery_loss_val, global_step)
-                writer.add_scalar('Train/Batch_GalleryHard_Loss', gallery_hard_loss_val, global_step)
-                writer.add_scalar('Train/Batch_GalleryHard_Weight', gallery_hard_weight, global_step)
-                writer.add_scalar('Train/Batch_AlignedPos_Loss', aligned_pos_loss_val, global_step)
-                writer.add_scalar('Train/Batch_NegGW_Loss', neg_gw_loss_val, global_step)
-                writer.add_scalar('Train/Batch_HardNeg_Loss', hard_loss_val, global_step)
+                writer.add_scalar("Train/Batch_Total_Loss", total_val, global_step)
+                writer.add_scalar("Train/Batch_ITC_Loss", itc_val, global_step)
+                writer.add_scalar("Train/Batch_CLS_Loss", cls_val, global_step)
+                writer.add_scalar(
+                    "Train/Batch_Gallery_Loss", gallery_loss_val, global_step
+                )
+                writer.add_scalar(
+                    "Train/Batch_GalleryHard_Loss", gallery_hard_loss_val, global_step
+                )
+                writer.add_scalar(
+                    "Train/Batch_GalleryHard_Weight", gallery_hard_weight, global_step
+                )
+                writer.add_scalar(
+                    "Train/Batch_AlignedPos_Loss", aligned_pos_loss_val, global_step
+                )
+                writer.add_scalar(
+                    "Train/Batch_NegGW_Loss", neg_gw_loss_val, global_step
+                )
+                writer.add_scalar(
+                    "Train/Batch_HardNeg_Loss", hard_loss_val, global_step
+                )
                 if has_negatives:
-                    writer.add_scalar('Train/Batch_ExtraNeg_Loss', neg_loss_val, global_step)
-                writer.add_scalar('Train/Batch_ITC_Acc', itc_acc, global_step)
-                writer.add_scalar('Train/Batch_AlignedPos_Acc', pos_acc, global_step)
-                writer.add_scalar('Train/Batch_NegGW_Acc', neg_gw_acc, global_step)
-                writer.add_scalar('Train/Batch_HardNeg_Acc', hard_acc, global_step)
+                    writer.add_scalar(
+                        "Train/Batch_ExtraNeg_Loss", neg_loss_val, global_step
+                    )
+                writer.add_scalar("Train/Batch_ITC_Acc", itc_acc, global_step)
+                writer.add_scalar("Train/Batch_AlignedPos_Acc", pos_acc, global_step)
+                writer.add_scalar("Train/Batch_NegGW_Acc", neg_gw_acc, global_step)
+                writer.add_scalar("Train/Batch_HardNeg_Acc", hard_acc, global_step)
                 if has_negatives and neg_acc is not None:
-                    writer.add_scalar('Train/Batch_ExtraNeg_Acc', neg_acc, global_step)
-                writer.add_scalar('Train/Itc_Weight', itc_weight, global_step)
-                writer.add_scalar('Train/Cls_Weight', cls_weight, global_step)
-                writer.add_scalar('Train/Temperature', current_temp, global_step)
-                writer.add_scalar('Train/Learning_Rate', optimizer.param_groups[0]['lr'], global_step)
+                    writer.add_scalar("Train/Batch_ExtraNeg_Acc", neg_acc, global_step)
+                writer.add_scalar("Train/Itc_Weight", itc_weight, global_step)
+                writer.add_scalar("Train/Cls_Weight", cls_weight, global_step)
+                writer.add_scalar("Train/Temperature", current_temp, global_step)
+                writer.add_scalar(
+                    "Train/Learning_Rate", optimizer.param_groups[0]["lr"], global_step
+                )
                 if dt_mis is not None and batch_event_time_mjd is not None:
                     dt_mis_mean, dt_mis_std = summarize_time_delta(dt_mis)
-                    writer.add_scalar('Train/TimeShift/mis_delta_days_mean', dt_mis_mean, global_step)
-                    writer.add_scalar('Train/TimeShift/mis_delta_days_std', dt_mis_std, global_step)
-                    mis_q = summarize_abs_time_delta_quantiles(dt_mis, quantiles=(0.5, 0.9, 0.95))
-                    writer.add_scalar('Train/TimeShift/mis_delta_abs_p50', mis_q["p50"], global_step)
-                    writer.add_scalar('Train/TimeShift/mis_delta_abs_p90', mis_q["p90"], global_step)
-                    writer.add_scalar('Train/TimeShift/mis_delta_abs_p95', mis_q["p95"], global_step)
-                writer.add_scalar('Train/Perf/step_time_ms', step_time_ms, global_step)
+                    writer.add_scalar(
+                        "Train/TimeShift/mis_delta_days_mean", dt_mis_mean, global_step
+                    )
+                    writer.add_scalar(
+                        "Train/TimeShift/mis_delta_days_std", dt_mis_std, global_step
+                    )
+                    mis_q = summarize_abs_time_delta_quantiles(
+                        dt_mis, quantiles=(0.5, 0.9, 0.95)
+                    )
+                    writer.add_scalar(
+                        "Train/TimeShift/mis_delta_abs_p50", mis_q["p50"], global_step
+                    )
+                    writer.add_scalar(
+                        "Train/TimeShift/mis_delta_abs_p90", mis_q["p90"], global_step
+                    )
+                    writer.add_scalar(
+                        "Train/TimeShift/mis_delta_abs_p95", mis_q["p95"], global_step
+                    )
+                writer.add_scalar("Train/Perf/step_time_ms", step_time_ms, global_step)
 
             if batch_idx % 100 == 0:
                 postfix = {
-                    'Total': f"{total_val:.4f}",
-                    'ITC': f"{itc_val:.4f}",
-                    'CLS': f"{cls_val:.4f}",
-                    'ITC_Acc': f"{itc_acc:.2f}"
+                    "Total": f"{total_val:.4f}",
+                    "ITC": f"{itc_val:.4f}",
+                    "CLS": f"{cls_val:.4f}",
+                    "ITC_Acc": f"{itc_acc:.2f}",
                 }
                 if dt_mis is not None and batch_event_time_mjd is not None:
                     dt_mis_mean, _ = summarize_time_delta(dt_mis)
-                    postfix['mis_dt'] = f"{dt_mis_mean:.2f}"
+                    postfix["mis_dt"] = f"{dt_mis_mean:.2f}"
                 if args.gallery_loss_weight > 0:
-                    postfix['Gallery'] = f"{gallery_loss_val:.4f}"
+                    postfix["Gallery"] = f"{gallery_loss_val:.4f}"
                     if gallery_hard_weight > 0:
-                        postfix['GalleryHard'] = f"{gallery_hard_loss_val:.4f}"
+                        postfix["GalleryHard"] = f"{gallery_hard_loss_val:.4f}"
                 if last_selection_score is not None:
                     postfix[f"{args.best_ckpt_metric}"] = f"{last_selection_score:.4f}"
                 pbar.set_postfix(postfix)
 
             # Memory cleanup: delete large tensors to free memory
             del g, z_l, h_l, sim_g2o, sim_g2o_detached, itc_loss, total_loss
-            del logits_pos, logits_hard, aligned_pos_loss, neg_gw_loss, hard_loss, cls_loss, gallery_loss, gallery_hard_loss
+            del (
+                logits_pos,
+                logits_hard,
+                aligned_pos_loss,
+                neg_gw_loss,
+                hard_loss,
+                cls_loss,
+                gallery_loss,
+                gallery_hard_loss,
+            )
             if has_negatives:
                 del logits_neg, neg_loss
-            
+
             # Periodic aggressive memory cleanup every 50 batches
             if batch_idx % 50 == 0:
-                if device.type == 'cuda':
+                if device.type == "cuda":
                     torch.cuda.empty_cache()
                 gc.collect()
 
@@ -3452,7 +4179,7 @@ def train(args):
         # End of epoch cleanup
         pbar.close()
         del pbar
-        
+
         avg_total = epoch_total / len(train_loader)
         avg_itc = epoch_itc / len(train_loader)
         avg_cls = epoch_cls / len(train_loader)
@@ -3461,10 +4188,10 @@ def train(args):
             f"ITC: {avg_itc:.4f} | CLS: {avg_cls:.4f}"
         )
 
-        writer.add_scalar('Train/Epoch_Total_Loss', avg_total, epoch)
-        writer.add_scalar('Train/Epoch_ITC_Loss', avg_itc, epoch)
-        writer.add_scalar('Train/Epoch_CLS_Loss', avg_cls, epoch)
-        
+        writer.add_scalar("Train/Epoch_Total_Loss", avg_total, epoch)
+        writer.add_scalar("Train/Epoch_ITC_Loss", avg_itc, epoch)
+        writer.add_scalar("Train/Epoch_CLS_Loss", avg_cls, epoch)
+
         # Flush tensorboard to prevent memory accumulation
         writer.flush()
 
@@ -3500,35 +4227,44 @@ def train(args):
                     f"Val Avg Total: {val_metrics['total']:.4f} | "
                     f"ITC: {val_metrics['itc']:.4f} | CLS: {val_metrics['cls']:.4f}"
                 )
-                writer.add_scalar('Val/Epoch_Total_Loss', val_metrics['total'], epoch)
-                writer.add_scalar('Val/Epoch_ITC_Loss', val_metrics['itc'], epoch)
-                writer.add_scalar('Val/Epoch_CLS_Loss', val_metrics['cls'], epoch)
-                writer.add_scalar('Val/Epoch_Gallery_Loss', val_metrics.get('gallery', 0.0), epoch)
-                writer.add_scalar('Val/Epoch_GalleryHard_Loss', val_metrics.get('gallery_hard', 0.0), epoch)
+                writer.add_scalar("Val/Epoch_Total_Loss", val_metrics["total"], epoch)
+                writer.add_scalar("Val/Epoch_ITC_Loss", val_metrics["itc"], epoch)
+                writer.add_scalar("Val/Epoch_CLS_Loss", val_metrics["cls"], epoch)
+                writer.add_scalar(
+                    "Val/Epoch_Gallery_Loss", val_metrics.get("gallery", 0.0), epoch
+                )
+                writer.add_scalar(
+                    "Val/Epoch_GalleryHard_Loss",
+                    val_metrics.get("gallery_hard", 0.0),
+                    epoch,
+                )
                 # Retrieval metrics
-                ret = val_metrics.get('retrieval', {})
+                ret = val_metrics.get("retrieval", {})
                 for k, v in ret.items():
-                    writer.add_scalar(f'Val/Retrieval/{k}', v, epoch)
+                    writer.add_scalar(f"Val/Retrieval/{k}", v, epoch)
 
                 # Classification metrics
-                cls_m = val_metrics.get('classification', {})
-                for k in ('auroc', 'auprc', 'f1_optimal', 'f1_threshold', 'ece'):
+                cls_m = val_metrics.get("classification", {})
+                for k in ("auroc", "auprc", "f1_optimal", "f1_threshold", "ece"):
                     if k in cls_m:
-                        writer.add_scalar(f'Val/Classification/{k}', cls_m[k], epoch)
+                        writer.add_scalar(f"Val/Classification/{k}", cls_m[k], epoch)
                 for k in (
-                    'acc_aligned', 'acc_neg_gw', 'acc_mismatched',
-                    'acc_external', 'acc_total',
+                    "acc_aligned",
+                    "acc_neg_gw",
+                    "acc_mismatched",
+                    "acc_external",
+                    "acc_total",
                 ):
                     if k in cls_m:
-                        writer.add_scalar(f'Val/Classification/{k}', cls_m[k], epoch)
+                        writer.add_scalar(f"Val/Classification/{k}", cls_m[k], epoch)
 
                 # Embedding quality metrics
-                emb = val_metrics.get('embedding', {})
+                emb = val_metrics.get("embedding", {})
                 for k, v in emb.items():
-                    writer.add_scalar(f'Val/Embedding/{k}', v, epoch)
+                    writer.add_scalar(f"Val/Embedding/{k}", v, epoch)
                 dt_m = val_metrics.get("time_delta", {})
                 for key, value in dt_m.items():
-                    writer.add_scalar(f'Val/TimeShift/{key}', value, epoch)
+                    writer.add_scalar(f"Val/TimeShift/{key}", value, epoch)
                 hard_gallery = val_metrics.get("hard_gallery", {})
                 if hard_gallery:
                     writer.add_scalar(
@@ -3570,14 +4306,14 @@ def train(args):
                         f"score={hard_gallery['selection_score']:.4f}"
                     )
                 # Print summary of new metrics
-                r1 = ret.get('g2o_recall_at_1', 0)
-                r5 = ret.get('g2o_recall_at_5', 0)
-                mrr = ret.get('g2o_mrr', 0)
-                fr1 = ret.get('fusion_gallery_recall_at_1', 0)
-                fmrr = ret.get('fusion_gallery_mrr', 0)
-                auroc = cls_m.get('auroc', 0)
-                auprc = cls_m.get('auprc', 0)
-                align = emb.get('alignment', 0)
+                r1 = ret.get("g2o_recall_at_1", 0)
+                r5 = ret.get("g2o_recall_at_5", 0)
+                mrr = ret.get("g2o_mrr", 0)
+                fr1 = ret.get("fusion_gallery_recall_at_1", 0)
+                fmrr = ret.get("fusion_gallery_mrr", 0)
+                auroc = cls_m.get("auroc", 0)
+                auprc = cls_m.get("auprc", 0)
+                align = emb.get("alignment", 0)
                 print(
                     f"  Retrieval: R@1={r1:.4f} R@5={r5:.4f} MRR={mrr:.4f} | "
                     f"FusionGallery: R@1={fr1:.4f} MRR={fmrr:.4f} | "
@@ -3591,15 +4327,14 @@ def train(args):
                 last_selection_score = float(current_selection_score)
                 is_best_epoch = False
                 writer.add_scalar(
-                    f'Val/BestCkpt/{args.best_ckpt_metric}',
+                    f"Val/BestCkpt/{args.best_ckpt_metric}",
                     float(current_selection_score),
                     epoch,
                 )
 
                 neg_gw_guardrail = resolve_neg_gw_guardrail(args, val_metrics)
                 guardrail_active = (
-                    bool(neg_gw_guardrail["enabled"])
-                    and train_neg_gw_ratio > 0.0
+                    bool(neg_gw_guardrail["enabled"]) and train_neg_gw_ratio > 0.0
                 )
                 strata_m = val_metrics.get("neg_gw_strata", {})
                 for key in NEG_GW_STRATA_KEYS:
@@ -3632,9 +4367,7 @@ def train(args):
                         f"{describe_best_ckpt_selection_pending(args, epoch)}"
                     )
                 else:
-                    guardrail_blocked = (
-                        guardrail_active and not neg_gw_guardrail["met"]
-                    )
+                    guardrail_blocked = guardrail_active and not neg_gw_guardrail["met"]
                     if guardrail_blocked:
                         reason = neg_gw_guardrail["reason"] or "unknown"
                         print(
@@ -3655,35 +4388,53 @@ def train(args):
                         best_val_score = current_selection_score
                         best_epoch_idx = int(epoch)
                         is_best_epoch = True
-                        retrieval_metrics = val_metrics.get('retrieval', {})
-                        classification_metrics = val_metrics.get('classification', {})
+                        retrieval_metrics = val_metrics.get("retrieval", {})
+                        classification_metrics = val_metrics.get("classification", {})
                         best_val_metrics = {
                             "best_ckpt_metric": args.best_ckpt_metric,
                             "best_ckpt_score": current_selection_score,
-                            "best_val_acc_total": classification_metrics.get('acc_total', 0),
-                            "best_val_loss": val_metrics['total'],
+                            "best_val_acc_total": classification_metrics.get(
+                                "acc_total", 0
+                            ),
+                            "best_val_loss": val_metrics["total"],
                             "best_epoch": epoch,
                             "best_epoch_1based": epoch + 1,
                             "best_tracking_start_epoch": best_tracking_start_epoch,
                             "best_tracking_start_epoch_1based": (
-                                best_tracking_start_epoch + 1 if best_tracking_start_epoch is not None else None
+                                best_tracking_start_epoch + 1
+                                if best_tracking_start_epoch is not None
+                                else None
                             ),
-                            "val_itc_loss": val_metrics.get('itc', 0),
-                            "val_cls_loss": val_metrics.get('cls', 0),
-                            "val_recall_at_1": val_metrics.get('retrieval', {}).get('g2o_recall_at_1', 0),
-                            "val_recall_at_5": val_metrics.get('retrieval', {}).get('g2o_recall_at_5', 0),
-                            "val_mrr": val_metrics.get('retrieval', {}).get('g2o_mrr', 0),
-                            "val_auroc": val_metrics.get('classification', {}).get('auroc', 0),
-                            "val_auprc": val_metrics.get('classification', {}).get('auprc', 0),
+                            "val_itc_loss": val_metrics.get("itc", 0),
+                            "val_cls_loss": val_metrics.get("cls", 0),
+                            "val_recall_at_1": val_metrics.get("retrieval", {}).get(
+                                "g2o_recall_at_1", 0
+                            ),
+                            "val_recall_at_5": val_metrics.get("retrieval", {}).get(
+                                "g2o_recall_at_5", 0
+                            ),
+                            "val_mrr": val_metrics.get("retrieval", {}).get(
+                                "g2o_mrr", 0
+                            ),
+                            "val_auroc": val_metrics.get("classification", {}).get(
+                                "auroc", 0
+                            ),
+                            "val_auprc": val_metrics.get("classification", {}).get(
+                                "auprc", 0
+                            ),
                         }
                         for metric_name in sorted(FUSION_GALLERY_BEST_CKPT_METRICS):
-                            best_val_metrics[f"val_{metric_name}"] = retrieval_metrics.get(metric_name, 0)
+                            best_val_metrics[f"val_{metric_name}"] = (
+                                retrieval_metrics.get(metric_name, 0)
+                            )
                         hard_gallery = val_metrics.get("hard_gallery", {})
                         if hard_gallery:
-                            best_val_metrics["val_hard_gallery_macro_mrr"] = hard_gallery["macro_mrr"]
-                            best_val_metrics["val_hard_gallery_macro_recall_at_1"] = hard_gallery[
-                                "macro_recall_at_1"
-                            ]
+                            best_val_metrics["val_hard_gallery_macro_mrr"] = (
+                                hard_gallery["macro_mrr"]
+                            )
+                            best_val_metrics["val_hard_gallery_macro_recall_at_1"] = (
+                                hard_gallery["macro_recall_at_1"]
+                            )
                             best_val_metrics[
                                 "val_hard_gallery_macro_retrieval_score"
                             ] = hard_gallery["selection_score"]
@@ -3697,41 +4448,63 @@ def train(args):
                             bool(neg_gw_guardrail["met"])
                         )
                         epochs_no_improve = 0
-                        best_ckpt = os.path.join(args.ckpt_path, "ALBEF", "albef_best.pth")
+                        best_ckpt = os.path.join(
+                            args.ckpt_path, "ALBEF", "albef_best.pth"
+                        )
                         os.makedirs(os.path.dirname(best_ckpt), exist_ok=True)
-                        torch.save({
-                            'epoch': epoch,
-                            'model_state_dict': model.state_dict(),
-                            'optimizer_state_dict': optimizer.state_dict(),
-                            'scaler_state_dict': scaler.state_dict(),
-                            'acc_total': val_metrics.get('classification', {}).get('acc_total', 0),
-                            'selection_metric': args.best_ckpt_metric,
-                            'selection_score': current_selection_score,
-                            'selection_eligible': bool(best_selection_eligible),
-                            'best_tracking_start_epoch': best_tracking_start_epoch,
-                            'loss': val_metrics['total'],
-                            'args': vars(args),
-                            'dataset_window_metadata': getattr(args, "_dataset_window_metadata", None),
-                            'effective_input_window_metadata': getattr(args, "_effective_input_window_metadata", None),
-                            'validation_hard_gallery': val_metrics.get("hard_gallery"),
-                            'neg_gw_strata': strata_m,
-                            'neg_gw_guardrail': neg_gw_guardrail,
-                        }, best_ckpt)
+                        torch.save(
+                            {
+                                "epoch": epoch,
+                                "model_state_dict": model.state_dict(),
+                                "optimizer_state_dict": optimizer.state_dict(),
+                                "scaler_state_dict": scaler.state_dict(),
+                                "acc_total": val_metrics.get("classification", {}).get(
+                                    "acc_total", 0
+                                ),
+                                "selection_metric": args.best_ckpt_metric,
+                                "selection_score": current_selection_score,
+                                "selection_eligible": bool(best_selection_eligible),
+                                "best_tracking_start_epoch": best_tracking_start_epoch,
+                                "loss": val_metrics["total"],
+                                "args": vars(args),
+                                "dataset_window_metadata": getattr(
+                                    args, "_dataset_window_metadata", None
+                                ),
+                                "effective_input_window_metadata": getattr(
+                                    args, "_effective_input_window_metadata", None
+                                ),
+                                "validation_hard_gallery": val_metrics.get(
+                                    "hard_gallery"
+                                ),
+                                "neg_gw_strata": strata_m,
+                                "neg_gw_guardrail": neg_gw_guardrail,
+                            },
+                            best_ckpt,
+                        )
                         print(
                             f"Saved best checkpoint ({args.best_ckpt_metric}="
                             f"{current_selection_score:.4f}, epoch={epoch+1}): {best_ckpt}"
                         )
                     else:
                         if guardrail_blocked:
-                            print("  Neg-GW guardrail blocked; early stopping patience not consumed.")
+                            print(
+                                "  Neg-GW guardrail blocked; early stopping patience not consumed."
+                            )
                         else:
                             epochs_no_improve += 1
-                            if args.early_stop_patience > 0 and epochs_no_improve >= args.early_stop_patience:
+                            if (
+                                args.early_stop_patience > 0
+                                and epochs_no_improve >= args.early_stop_patience
+                            ):
                                 print("Early stopping triggered.")
                                 stop_early = True
 
-                best_score_str = "N/A" if best_val_score is None else f"{best_val_score:.4f}"
-                best_epoch_str = "N/A" if best_epoch_idx is None else str(best_epoch_idx + 1)
+                best_score_str = (
+                    "N/A" if best_val_score is None else f"{best_val_score:.4f}"
+                )
+                best_epoch_str = (
+                    "N/A" if best_epoch_idx is None else str(best_epoch_idx + 1)
+                )
                 print(
                     f"  Best-CKPT metric[{args.best_ckpt_metric}]: current={current_selection_score:.4f}, "
                     f"best={best_score_str}@epoch{best_epoch_str}, "
@@ -3739,24 +4512,33 @@ def train(args):
                 )
 
         if not bool(getattr(args, "skip_epoch_checkpoints", False)):
-            checkpoint_path = os.path.join(args.ckpt_path, "ALBEF", f"albef_epoch_{epoch+1}.pth")
+            checkpoint_path = os.path.join(
+                args.ckpt_path, "ALBEF", f"albef_epoch_{epoch+1}.pth"
+            )
             os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'scaler_state_dict': scaler.state_dict(),
-                'loss': avg_total,
-                'args': vars(args),
-                'dataset_window_metadata': getattr(args, "_dataset_window_metadata", None),
-                'effective_input_window_metadata': getattr(args, "_effective_input_window_metadata", None),
-            }, checkpoint_path)
-        
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scaler_state_dict": scaler.state_dict(),
+                    "loss": avg_total,
+                    "args": vars(args),
+                    "dataset_window_metadata": getattr(
+                        args, "_dataset_window_metadata", None
+                    ),
+                    "effective_input_window_metadata": getattr(
+                        args, "_effective_input_window_metadata", None
+                    ),
+                },
+                checkpoint_path,
+            )
+
         # End-of-epoch memory cleanup
-        if device.type == 'cuda':
+        if device.type == "cuda":
             torch.cuda.empty_cache()
         gc.collect()
-        
+
         if stop_early:
             break
 
@@ -3776,12 +4558,20 @@ def train(args):
     # Write trial results JSON for HPO collection
     if best_val_metrics:
         best_val_metrics["final_epoch"] = epoch
-        best_val_metrics["dataset_window_metadata"] = getattr(args, "_dataset_window_metadata", None)
-        best_val_metrics["effective_input_window_metadata"] = getattr(args, "_effective_input_window_metadata", None)
+        best_val_metrics["dataset_window_metadata"] = getattr(
+            args, "_dataset_window_metadata", None
+        )
+        best_val_metrics["effective_input_window_metadata"] = getattr(
+            args, "_effective_input_window_metadata", None
+        )
         result_path = os.path.join(args.ckpt_path, "ALBEF", "trial_results.json")
         summary_dir = os.path.dirname(result_path)
         os.makedirs(summary_dir, exist_ok=True)
-        for summary_name in ("trial_results.json", "train_summary.json", "best_checkpoint_summary.json"):
+        for summary_name in (
+            "trial_results.json",
+            "train_summary.json",
+            "best_checkpoint_summary.json",
+        ):
             summary_path = os.path.join(summary_dir, summary_name)
             with open(summary_path, "w") as f:
                 json.dump(best_val_metrics, f, indent=2)
@@ -3804,36 +4594,72 @@ if __name__ == "__main__":
     parser.add_argument("--ckpt_path", type=str, default=None)
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--weight_decay", type=float, default=1e-4, help="Weight decay for AdamW optimizer")
-    parser.add_argument("--grad_clip_norm", type=float, default=1.0, help="Max norm for gradient clipping (0 to disable)")
-    parser.add_argument("--lr_scheduler", type=str, default="none", choices=["none", "cosine"])
+    parser.add_argument(
+        "--weight_decay",
+        type=float,
+        default=1e-4,
+        help="Weight decay for AdamW optimizer",
+    )
+    parser.add_argument(
+        "--grad_clip_norm",
+        type=float,
+        default=1.0,
+        help="Max norm for gradient clipping (0 to disable)",
+    )
+    parser.add_argument(
+        "--lr_scheduler", type=str, default="none", choices=["none", "cosine"]
+    )
     parser.add_argument("--warmup_epochs", type=int, default=0)
     parser.add_argument("--min_lr", type=float, default=0.0)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--pin_memory", type=int, default=1)
     parser.add_argument("--persistent_workers", type=int, default=1)
     parser.add_argument("--prefetch_factor", type=int, default=4)
-    parser.add_argument("--cache_in_memory", action='store_true')
+    parser.add_argument("--cache_in_memory", action="store_true")
     parser.add_argument("--val_split", type=float, default=0.1)
     parser.add_argument("--val_batch_size", type=int, default=None)
     parser.add_argument("--val_steps_per_epoch", type=int, default=None)
     parser.add_argument("--split_seed", type=int, default=42)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--early_stop_patience", type=int, default=10)
-    parser.add_argument("--early_stop_min_delta", type=float, default=1e-4,
-                        help="Minimum improvement required on best_ckpt_metric to reset early stopping.")
-    parser.add_argument("--neg_gw_guardrail_enable", action=argparse.BooleanOptionalAction, default=False,
-                        help="Require all four neg-GW validation strata recalls to pass before selecting checkpoints.")
-    parser.add_argument("--neg_gw_guardrail_recall", type=float, default=0.9,
-                        help="Minimum per-stratum recall required by the neg-GW checkpoint guardrail.")
-    parser.add_argument("--best_ckpt_metric", type=str, default="hard_gallery_macro_retrieval_score",
-                        choices=[
-                            "auprc", "auroc", "f1_optimal", "acc_total", "cls_composite_auprc_auroc",
-                            "g2o_recall_at_1", "g2o_recall_at_5", "g2o_mrr",
-                            "fusion_gallery_recall_at_1", "fusion_gallery_recall_at_5", "fusion_gallery_mrr",
-                            "hard_gallery_macro_retrieval_score",
-                        ],
-                        help="In-domain validation metric used for selecting best checkpoint. Supports classification and retrieval metrics.")
+    parser.add_argument(
+        "--early_stop_min_delta",
+        type=float,
+        default=1e-4,
+        help="Minimum improvement required on best_ckpt_metric to reset early stopping.",
+    )
+    parser.add_argument(
+        "--neg_gw_guardrail_enable",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Require all four neg-GW validation strata recalls to pass before selecting checkpoints.",
+    )
+    parser.add_argument(
+        "--neg_gw_guardrail_recall",
+        type=float,
+        default=0.9,
+        help="Minimum per-stratum recall required by the neg-GW checkpoint guardrail.",
+    )
+    parser.add_argument(
+        "--best_ckpt_metric",
+        type=str,
+        default="hard_gallery_macro_retrieval_score",
+        choices=[
+            "auprc",
+            "auroc",
+            "f1_optimal",
+            "acc_total",
+            "cls_composite_auprc_auroc",
+            "g2o_recall_at_1",
+            "g2o_recall_at_5",
+            "g2o_mrr",
+            "fusion_gallery_recall_at_1",
+            "fusion_gallery_recall_at_5",
+            "fusion_gallery_mrr",
+            "hard_gallery_macro_retrieval_score",
+        ],
+        help="In-domain validation metric used for selecting best checkpoint. Supports classification and retrieval metrics.",
+    )
     parser.add_argument(
         "--best_ckpt_start_epoch",
         type=int,
@@ -3868,8 +4694,12 @@ if __name__ == "__main__":
     parser.add_argument("--validation_gallery_queries_per_source", type=int, default=64)
     parser.add_argument("--validation_gallery_trials", type=int, default=1)
     parser.add_argument("--validation_gallery_seed", type=int, default=42)
-    parser.add_argument("--validation_gallery_time_window_days", type=float, default=30.0)
-    parser.add_argument("--validation_gallery_credible_level_max", type=float, default=0.9)
+    parser.add_argument(
+        "--validation_gallery_time_window_days", type=float, default=30.0
+    )
+    parser.add_argument(
+        "--validation_gallery_credible_level_max", type=float, default=0.9
+    )
     parser.add_argument(
         "--validation_gallery_include_undersized",
         action=argparse.BooleanOptionalAction,
@@ -3887,192 +4717,542 @@ if __name__ == "__main__":
     parser.add_argument("--ref_dim", type=int, default=64)
     parser.add_argument("--enc_dim", type=int, default=128)
     parser.add_argument("--proj_dim", type=int, default=256)
-    parser.add_argument("--optical_curve_dim", type=int, default=None,
-                        help="Physical-dual optical curve feature dimension (default: enc_dim).")
-    parser.add_argument("--optical_coord_dim", type=int, default=None,
-                        help="Physical-dual optical coordinate feature dimension (default: enc_dim).")
-    parser.add_argument("--optical_curve_hidden_dim", type=int, default=None,
-                        help="Hidden size for residual optical curve refiner; <=0 disables it.")
-    parser.add_argument("--contrastive_hidden_dim", type=int, default=None,
-                        help="Hidden size for physical-dual contrastive heads (default: max(input_dim, proj_dim)).")
+    parser.add_argument(
+        "--optical_curve_dim",
+        type=int,
+        default=None,
+        help="Physical-dual optical curve feature dimension (default: enc_dim).",
+    )
+    parser.add_argument(
+        "--optical_coord_dim",
+        type=int,
+        default=None,
+        help="Physical-dual optical coordinate feature dimension (default: enc_dim).",
+    )
+    parser.add_argument(
+        "--optical_curve_hidden_dim",
+        type=int,
+        default=None,
+        help="Hidden size for residual optical curve refiner; <=0 disables it.",
+    )
+    parser.add_argument(
+        "--contrastive_hidden_dim",
+        type=int,
+        default=None,
+        help="Hidden size for physical-dual contrastive heads (default: max(input_dim, proj_dim)).",
+    )
     parser.add_argument("--fusion_attn_dim", type=int, default=None)
     parser.add_argument("--fusion_hidden_dim", type=int, default=None)
     parser.add_argument("--fusion_dropout", type=float, default=0.1)
-    parser.add_argument("--label_smoothing", type=float, default=0.0, help="Label smoothing for classification loss (0 to disable)")
+    parser.add_argument(
+        "--label_smoothing",
+        type=float,
+        default=0.0,
+        help="Label smoothing for classification loss (0 to disable)",
+    )
     parser.add_argument("--temp_init", type=float, default=0.07)
     parser.add_argument("--temp_final", type=float, default=None)
     parser.add_argument("--temp_min", type=float, default=0.01)
     parser.add_argument("--temp_max", type=float, default=100.0)
-    parser.add_argument("--temp_schedule", type=str, default="learned", choices=["learned", "fixed", "cosine"])
-    parser.add_argument("--time_compat_weight", type=float, default=0.6,
-                        help="Weight for time-compatibility penalty on ITC logits (<=0 to disable).")
-    parser.add_argument("--time_compat_tau_days", type=float, default=30.0,
-                        help="Time scale tau (days) for time-compatibility penalty.")
-    parser.add_argument("--time_compat_power", type=float, default=2.0,
-                        help="Power for |Δt/tau|^power in time-compatibility penalty.")
-    parser.add_argument("--time_compat_max_penalty", type=float, default=8.0,
-                        help="Maximum absolute logit penalty for time compatibility.")
-    parser.add_argument("--use_time_delta_cls_feature", action=argparse.BooleanOptionalAction, default=False,
-                        help="Append normalized |delta time| to the physical_dual_hgw classifier input.")
-    parser.add_argument("--time_delta_cls_scale_days", type=float, default=None,
-                        help="Scale in days for the CLS time-delta feature (default: time_compat_tau_days).")
-    parser.add_argument("--time_delta_cls_clip", type=float, default=10.0,
-                        help="Maximum normalized |delta time| value appended to the CLS fusion head.")
-    parser.add_argument("--fusion_physical_weight", type=float, default=1.0,
-                        help="Fixed multiplier for the physical-consistency fused feature.")
-    parser.add_argument("--fusion_spatial_weight", type=float, default=1.0,
-                        help="Fixed multiplier for the spatial-consistency fused feature.")
-    parser.add_argument("--mtan_snr_s0", type=float, default=3.0,
-                        help="mTAN SNR compatibility threshold s0.")
-    parser.add_argument("--mtan_snr_beta", type=float, default=1.0,
-                        help="mTAN SNR compatibility slope beta.")
-    parser.add_argument("--mtan_snr_clip_min", type=float, default=-8.0,
-                        help="mTAN SNR clipping lower bound.")
-    parser.add_argument("--mtan_snr_clip_max", type=float, default=20.0,
-                        help="mTAN SNR clipping upper bound.")
-    parser.add_argument("--mtan_snr_eps", type=float, default=1e-9,
-                        help="Numerical epsilon for mTAN SNR denominator.")
-    parser.add_argument("--mtan_lupt_psfflux_zp", type=float, default=None,
-                        help="Optional override for luptitude psfFlux zero point used by mTAN.")
-    parser.add_argument("--mtan_lupt_k", type=float, default=None,
-                        help="Optional override for luptitude softening scale k used by mTAN.")
-    parser.add_argument("--mtan_lupt_m5_mag", type=str, default=None,
-                        help="Optional override: 6 comma-separated m5 mags in order u,g,r,i,z,Y.")
-    parser.add_argument("--nonkn_cls_base_field", type=str, default="zero_time_mjd_cls_base",
-                        help="Negative H5 field used as base absolute time for extra-negative dt.")
+    parser.add_argument(
+        "--temp_schedule",
+        type=str,
+        default="learned",
+        choices=["learned", "fixed", "cosine"],
+    )
+    parser.add_argument(
+        "--time_compat_weight",
+        type=float,
+        default=0.6,
+        help="Weight for time-compatibility penalty on ITC logits (<=0 to disable).",
+    )
+    parser.add_argument(
+        "--time_compat_tau_days",
+        type=float,
+        default=30.0,
+        help="Time scale tau (days) for time-compatibility penalty.",
+    )
+    parser.add_argument(
+        "--time_compat_power",
+        type=float,
+        default=2.0,
+        help="Power for |Δt/tau|^power in time-compatibility penalty.",
+    )
+    parser.add_argument(
+        "--time_compat_max_penalty",
+        type=float,
+        default=8.0,
+        help="Maximum absolute logit penalty for time compatibility.",
+    )
+    parser.add_argument(
+        "--use_time_delta_cls_feature",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Append normalized |delta time| to the physical_dual_hgw classifier input.",
+    )
+    parser.add_argument(
+        "--time_delta_cls_scale_days",
+        type=float,
+        default=None,
+        help="Scale in days for the CLS time-delta feature (default: time_compat_tau_days).",
+    )
+    parser.add_argument(
+        "--time_delta_cls_clip",
+        type=float,
+        default=10.0,
+        help="Maximum normalized |delta time| value appended to the CLS fusion head.",
+    )
+    parser.add_argument(
+        "--fusion_physical_weight",
+        type=float,
+        default=1.0,
+        help="Fixed multiplier for the physical-consistency fused feature.",
+    )
+    parser.add_argument(
+        "--fusion_spatial_weight",
+        type=float,
+        default=1.0,
+        help="Fixed multiplier for the spatial-consistency fused feature.",
+    )
+    parser.add_argument(
+        "--mtan_snr_s0",
+        type=float,
+        default=3.0,
+        help="mTAN SNR compatibility threshold s0.",
+    )
+    parser.add_argument(
+        "--mtan_snr_beta",
+        type=float,
+        default=1.0,
+        help="mTAN SNR compatibility slope beta.",
+    )
+    parser.add_argument(
+        "--mtan_snr_clip_min",
+        type=float,
+        default=-8.0,
+        help="mTAN SNR clipping lower bound.",
+    )
+    parser.add_argument(
+        "--mtan_snr_clip_max",
+        type=float,
+        default=20.0,
+        help="mTAN SNR clipping upper bound.",
+    )
+    parser.add_argument(
+        "--mtan_snr_eps",
+        type=float,
+        default=1e-9,
+        help="Numerical epsilon for mTAN SNR denominator.",
+    )
+    parser.add_argument(
+        "--mtan_lupt_psfflux_zp",
+        type=float,
+        default=None,
+        help="Optional override for luptitude psfFlux zero point used by mTAN.",
+    )
+    parser.add_argument(
+        "--mtan_lupt_k",
+        type=float,
+        default=None,
+        help="Optional override for luptitude softening scale k used by mTAN.",
+    )
+    parser.add_argument(
+        "--mtan_lupt_m5_mag",
+        type=str,
+        default=None,
+        help="Optional override: 6 comma-separated m5 mags in order u,g,r,i,z,Y.",
+    )
+    parser.add_argument(
+        "--nonkn_cls_base_field",
+        type=str,
+        default="zero_time_mjd_cls_base",
+        help="Negative H5 field used as base absolute time for extra-negative dt.",
+    )
     parser.add_argument("--gw_dropout", type=float, default=0.1)
     parser.add_argument("--opt_dropout", type=float, default=0.1)
-    parser.add_argument("--proj_dropout", type=float, default=0.0,
-                        help="Projection head dropout to prevent ITC overfitting (default: 0.0)")
-    parser.add_argument("--feature_dropout", type=float, default=0.0,
-                        help="Dropout applied to encoder features before ITC/CLS heads")
+    parser.add_argument(
+        "--proj_dropout",
+        type=float,
+        default=0.0,
+        help="Projection head dropout to prevent ITC overfitting (default: 0.0)",
+    )
+    parser.add_argument(
+        "--feature_dropout",
+        type=float,
+        default=0.0,
+        help="Dropout applied to encoder features before ITC/CLS heads",
+    )
     parser.add_argument("--itc_weight", type=float, default=1.0)
     parser.add_argument("--cls_weight", type=float, default=1.0)
-    parser.add_argument("--cls_pos_weight", type=float, default=1.0,
-                        help="Fallback positive class weight for CLS loss (legacy)")
-    parser.add_argument("--cls_neg_weight", type=float, default=1.0,
-                        help="Fallback negative class weight for CLS loss (legacy)")
-    parser.add_argument("--cls_extra_neg_weight", type=float, default=1.0,
-                        help="Fallback extra negative class weight for CLS loss (legacy)")
-    parser.add_argument("--cls_aligned_pos_weight", type=float, default=0.5,
-                        help="Aligned positive GW->own-KN bucket weight for CLS loss")
-    parser.add_argument("--cls_neg_gw_weight", type=float, default=0.2,
-                        help="neg-GW->source-matched KN bucket weight for CLS loss")
-    parser.add_argument("--cls_mismatched_weight", type=float, default=0.15,
-                        help="GW->other-GW optical mismatched bucket weight for CLS loss")
-    parser.add_argument("--cls_external_neg_weight", type=float, default=0.15,
-                        help="GW->external non-KN optical bucket weight for CLS loss")
-    parser.add_argument("--neg_gw_pair_ratio", type=float, default=0.2,
-                        help="Training batch fraction of classification-only negative-GW/positive-optical pairs.")
-    parser.add_argument("--cls_ramp_epochs", type=int, default=0,
-                        help="Epochs to ramp CLS weight from 0 to cls_weight (0 to disable)")
-    parser.add_argument("--staged_training_enable", action=argparse.BooleanOptionalAction, default=False,
-                        help="Enable A/B/C staged training with frozen-head warm-up and differential LR.")
-    parser.add_argument("--stage_alignment_epochs", type=int, default=8,
-                        help="Epochs for the ITC-only alignment stage (staged_training_enable=true).")
-    parser.add_argument("--stage_head_epochs", type=int, default=4,
-                        help="Epochs for the frozen-encoder head/classifier warm-up stage.")
-    parser.add_argument("--stage_joint_itc_start_weight", type=float, default=0.5,
-                        help="ITC weight fraction at the start of joint fine-tuning.")
-    parser.add_argument("--stage_joint_itc_end_weight", type=float, default=0.25,
-                        help="ITC weight fraction at the end of joint fine-tuning.")
-    parser.add_argument("--encoder_lr_ratio", type=float, default=0.1,
-                        help="Encoder LR multiplier relative to head LR during joint fine-tuning.")
-    parser.add_argument("--retrieval_start_epoch", type=int, default=0,
-                        help="Epoch to start retrieval/gallery training (0 = start from epoch 0).")
-    parser.add_argument("--gallery_loss_weight", type=float, default=0.0,
-                        help="Weight for batch-level fusion mini-gallery retrieval loss (0 to disable).")
-    parser.add_argument("--gallery_loss_ramp_epochs", type=int, default=0,
-                        help="Epochs to ramp gallery loss from 0 to gallery_loss_weight after retrieval_start_epoch.")
-    parser.add_argument("--compute_cls_metrics", action=argparse.BooleanOptionalAction, default=True,
-                        help="Compute validation pair/triplet classification metrics even when CLS loss is disabled.")
-    parser.add_argument("--compute_fusion_gallery_metrics", action=argparse.BooleanOptionalAction, default=True,
-                        help="Compute validation fusion-gallery retrieval metrics even when gallery loss is disabled.")
-    parser.add_argument("--fusion_gallery_metrics_start_epoch", type=int, default=0,
-                        help="Epoch to start validation-only fusion-gallery metrics.")
-    parser.add_argument("--gallery_score_chunk_size", type=int, default=8192,
-                        help="Approximate number of flattened query-candidate pairs scored per gallery chunk.")
-    parser.add_argument("--max_gallery_queries", type=int, default=0,
-                        help="Max queries for fusion gallery scoring during training (0 = use all queries).")
-    parser.add_argument("--gallery_include_extra_negatives", action=argparse.BooleanOptionalAction, default=True,
-                        help="Include external non-KN negatives in the fusion mini-gallery loss when available.")
-    parser.add_argument("--gallery_distractor_time_mode", type=str, default="actual",
-                        choices=["actual", "synthetic_after_gw"],
-                        help="Time-delta policy for non-matching fusion mini-gallery distractors.")
-    parser.add_argument("--gallery_distractor_time_window_days", type=float, default=30.0,
-                        help="Upper bound in days for synthetic_after_gw gallery distractor dt sampling.")
-    parser.add_argument("--gallery_hard_neg_enable", action=argparse.BooleanOptionalAction, default=False,
-                        help="Enable top-k hard-negative mining inside the fusion mini-gallery retrieval loss.")
-    parser.add_argument("--gallery_hard_neg_topk", type=int, default=32,
-                        help="Number of top-scoring negative candidates to keep per query in the hard gallery NCE term.")
-    parser.add_argument("--gallery_hard_neg_weight", type=float, default=0.5,
-                        help="Weight of the hard-gallery NCE auxiliary loss term.")
-    parser.add_argument("--gallery_hard_neg_start_after_retrieval_epochs", type=int, default=2,
-                        help="Epochs after retrieval_start_epoch to begin gallery hard-negative mining.")
-    parser.add_argument("--gallery_hard_neg_ramp_epochs", type=int, default=2,
-                        help="Epochs to ramp gallery hard-negative weight from 0 to gallery_hard_neg_weight.")
-    parser.add_argument("--itc_decay_start_epoch", type=int, default=0,
-                        help="Epoch to start decaying ITC weight (ignored if itc_decay_epochs <= 0)")
-    parser.add_argument("--itc_decay_epochs", type=int, default=0,
-                        help="Epochs to decay ITC weight (0 to disable)")
-    parser.add_argument("--itc_decay_ratio", type=float, default=0.0,
-                        help="Fractional decay of ITC weight by the end of itc_decay_epochs")
-    parser.add_argument("--itc_extra_negative_enable", action=argparse.BooleanOptionalAction, default=False,
-                        help="Include external non-KN optical samples as ITC negatives (default: off).")
-    parser.add_argument("--itc_label_smoothing", type=float, default=0.0,
-                        help="Label smoothing for ITC loss (0 to disable)")
-    parser.add_argument("--itc_loss_type", type=str, default="infonce",
-                        choices=["infonce", "supcon"],
-                        help="ITC loss type: 'infonce' (original) or 'supcon' (supervised contrastive)")
-    parser.add_argument("--supcon_margin", type=float, default=0.0,
-                        help="Margin for SupCon loss to enforce separation between positives and negatives (default: 0.0)")
-    parser.add_argument("--samples_per_gw", type=int, default=4,
-                        help="Number of optical samples per GW event for SupCon (default: 4)")
-    parser.add_argument("--min_lc_per_gw", type=int, default=2,
-                        help="Minimum light curves required for a GW to be eligible for SupCon")
-    parser.add_argument("--mis_neg_dt_window_days", type=float, default=30.0,
-                        help="Synthetic time delta for in-batch mismatched negatives: Uniform(0, window_days) days. "
-                             "Models the realistic scenario where optical first detection follows GW by 0–window days.")
-    parser.add_argument("--hardneg_time_window_days", type=str, default="30,60,120",
-                        help="Comma-separated adaptive windows (days) for hard-negative mining.")
-    parser.add_argument("--hardneg_min_candidates", type=int, default=4,
-                        help="Minimum candidate count before accepting current hard-negative time window.")
-    parser.add_argument("--cls_start_epoch", type=int, default=0,
-                        help="Epoch to start CLS training. Before this epoch, only ITC loss is used (for staged training)")
-    parser.add_argument("--use_lightweight_gw", action='store_true',
-                        help="Use lightweight GW encoder (~100K params) instead of ResNet-18 (~11M params) to prevent overfitting on small GW datasets")
-    parser.add_argument("--dual_fusion", action='store_true',
-                        help="Use dual cross-attention fusion (optical→GW + GW→optical) with per-pair credible level")
-    parser.add_argument("--fusion_mode", type=str, default=None,
-                        help="Fusion mode: legacy_g2o | legacy_dual | physical_dual_hgw | concat_proj. If unset, inferred from --dual_fusion.")
-    parser.add_argument("--use_similarity_as_cls_input", action=argparse.BooleanOptionalAction, default=False,
-                        help="Append pair ITC similarity to classifier input in physical_dual_hgw mode.")
-    parser.add_argument("--use_cred_level_feature", action=argparse.BooleanOptionalAction, default=False,
-                        help="Append cred_level to classifier input in physical_dual_hgw mode.")
+    parser.add_argument(
+        "--cls_pos_weight",
+        type=float,
+        default=1.0,
+        help="Fallback positive class weight for CLS loss (legacy)",
+    )
+    parser.add_argument(
+        "--cls_neg_weight",
+        type=float,
+        default=1.0,
+        help="Fallback negative class weight for CLS loss (legacy)",
+    )
+    parser.add_argument(
+        "--cls_extra_neg_weight",
+        type=float,
+        default=1.0,
+        help="Fallback extra negative class weight for CLS loss (legacy)",
+    )
+    parser.add_argument(
+        "--cls_aligned_pos_weight",
+        type=float,
+        default=0.5,
+        help="Aligned positive GW->own-KN bucket weight for CLS loss",
+    )
+    parser.add_argument(
+        "--cls_neg_gw_weight",
+        type=float,
+        default=0.2,
+        help="neg-GW->source-matched KN bucket weight for CLS loss",
+    )
+    parser.add_argument(
+        "--cls_mismatched_weight",
+        type=float,
+        default=0.15,
+        help="GW->other-GW optical mismatched bucket weight for CLS loss",
+    )
+    parser.add_argument(
+        "--cls_external_neg_weight",
+        type=float,
+        default=0.15,
+        help="GW->external non-KN optical bucket weight for CLS loss",
+    )
+    parser.add_argument(
+        "--neg_gw_pair_ratio",
+        type=float,
+        default=0.2,
+        help="Training batch fraction of classification-only negative-GW/positive-optical pairs.",
+    )
+    parser.add_argument(
+        "--cls_ramp_epochs",
+        type=int,
+        default=0,
+        help="Epochs to ramp CLS weight from 0 to cls_weight (0 to disable)",
+    )
+    parser.add_argument(
+        "--staged_training_enable",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable A/B/C staged training with frozen-head warm-up and differential LR.",
+    )
+    parser.add_argument(
+        "--stage_itc_epochs",
+        type=int,
+        default=8,
+        help="ITC-only epochs in sequential_loss mode.",
+    )
+    parser.add_argument(
+        "--stage_cls_ramp_epochs",
+        type=int,
+        default=4,
+        help="CLS introduction/ramp epochs in sequential_loss mode.",
+    )
+    parser.add_argument(
+        "--stage_retrieval_ramp_epochs",
+        type=int,
+        default=4,
+        help="Retrieval introduction/ramp epochs in sequential_loss mode.",
+    )
+    parser.add_argument(
+        "--stage_joint_itc_start_weight",
+        type=float,
+        default=0.5,
+        help="ITC weight fraction at the start of joint fine-tuning.",
+    )
+    parser.add_argument(
+        "--stage_joint_itc_end_weight",
+        type=float,
+        default=0.25,
+        help="ITC weight fraction at the end of joint fine-tuning.",
+    )
+    parser.add_argument(
+        "--encoder_lr_ratio",
+        type=float,
+        default=0.1,
+        help="Encoder LR multiplier relative to head LR during joint fine-tuning.",
+    )
+    parser.add_argument(
+        "--retrieval_start_epoch",
+        type=int,
+        default=0,
+        help="Epoch to start retrieval/gallery training (0 = start from epoch 0).",
+    )
+    parser.add_argument(
+        "--gallery_loss_weight",
+        type=float,
+        default=0.0,
+        help="Weight for batch-level fusion mini-gallery retrieval loss (0 to disable).",
+    )
+    parser.add_argument(
+        "--gallery_loss_ramp_epochs",
+        type=int,
+        default=0,
+        help="Epochs to ramp gallery loss from 0 to gallery_loss_weight after retrieval_start_epoch.",
+    )
+    parser.add_argument(
+        "--compute_cls_metrics",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Compute validation pair/triplet classification metrics even when CLS loss is disabled.",
+    )
+    parser.add_argument(
+        "--compute_fusion_gallery_metrics",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Compute validation fusion-gallery retrieval metrics even when gallery loss is disabled.",
+    )
+    parser.add_argument(
+        "--fusion_gallery_metrics_start_epoch",
+        type=int,
+        default=0,
+        help="Epoch to start validation-only fusion-gallery metrics.",
+    )
+    parser.add_argument(
+        "--gallery_score_chunk_size",
+        type=int,
+        default=8192,
+        help="Approximate number of flattened query-candidate pairs scored per gallery chunk.",
+    )
+    parser.add_argument(
+        "--max_gallery_queries",
+        type=int,
+        default=0,
+        help="Max queries for fusion gallery scoring during training (0 = use all queries).",
+    )
+    parser.add_argument(
+        "--gallery_include_extra_negatives",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Include external non-KN negatives in the fusion mini-gallery loss when available.",
+    )
+    parser.add_argument(
+        "--gallery_distractor_time_mode",
+        type=str,
+        default="actual",
+        choices=["actual", "synthetic_after_gw"],
+        help="Time-delta policy for non-matching fusion mini-gallery distractors.",
+    )
+    parser.add_argument(
+        "--gallery_distractor_time_window_days",
+        type=float,
+        default=30.0,
+        help="Upper bound in days for synthetic_after_gw gallery distractor dt sampling.",
+    )
+    parser.add_argument(
+        "--gallery_hard_neg_enable",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable top-k hard-negative mining inside the fusion mini-gallery retrieval loss.",
+    )
+    parser.add_argument(
+        "--gallery_hard_neg_topk",
+        type=int,
+        default=32,
+        help="Number of top-scoring negative candidates to keep per query in the hard gallery NCE term.",
+    )
+    parser.add_argument(
+        "--gallery_hard_neg_weight",
+        type=float,
+        default=0.5,
+        help="Weight of the hard-gallery NCE auxiliary loss term.",
+    )
+    parser.add_argument(
+        "--gallery_hard_neg_start_after_retrieval_epochs",
+        type=int,
+        default=2,
+        help="Epochs after retrieval_start_epoch to begin gallery hard-negative mining.",
+    )
+    parser.add_argument(
+        "--gallery_hard_neg_ramp_epochs",
+        type=int,
+        default=2,
+        help="Epochs to ramp gallery hard-negative weight from 0 to gallery_hard_neg_weight.",
+    )
+    parser.add_argument(
+        "--itc_decay_start_epoch",
+        type=int,
+        default=0,
+        help="Epoch to start decaying ITC weight (ignored if itc_decay_epochs <= 0)",
+    )
+    parser.add_argument(
+        "--itc_decay_epochs",
+        type=int,
+        default=0,
+        help="Epochs to decay ITC weight (0 to disable)",
+    )
+    parser.add_argument(
+        "--itc_decay_ratio",
+        type=float,
+        default=0.0,
+        help="Fractional decay of ITC weight by the end of itc_decay_epochs",
+    )
+    parser.add_argument(
+        "--itc_extra_negative_enable",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Include external non-KN optical samples as ITC negatives (default: off).",
+    )
+    parser.add_argument(
+        "--itc_label_smoothing",
+        type=float,
+        default=0.0,
+        help="Label smoothing for ITC loss (0 to disable)",
+    )
+    parser.add_argument(
+        "--itc_loss_type",
+        type=str,
+        default="infonce",
+        choices=["infonce", "supcon"],
+        help="ITC loss type: 'infonce' (original) or 'supcon' (supervised contrastive)",
+    )
+    parser.add_argument(
+        "--supcon_margin",
+        type=float,
+        default=0.0,
+        help="Margin for SupCon loss to enforce separation between positives and negatives (default: 0.0)",
+    )
+    parser.add_argument(
+        "--samples_per_gw",
+        type=int,
+        default=4,
+        help="Number of optical samples per GW event for SupCon (default: 4)",
+    )
+    parser.add_argument(
+        "--min_lc_per_gw",
+        type=int,
+        default=2,
+        help="Minimum light curves required for a GW to be eligible for SupCon",
+    )
+    parser.add_argument(
+        "--mis_neg_dt_window_days",
+        type=float,
+        default=30.0,
+        help="Synthetic time delta for in-batch mismatched negatives: Uniform(0, window_days) days. "
+        "Models the realistic scenario where optical first detection follows GW by 0–window days.",
+    )
+    parser.add_argument(
+        "--hardneg_time_window_days",
+        type=str,
+        default="30,60,120",
+        help="Comma-separated adaptive windows (days) for hard-negative mining.",
+    )
+    parser.add_argument(
+        "--hardneg_min_candidates",
+        type=int,
+        default=4,
+        help="Minimum candidate count before accepting current hard-negative time window.",
+    )
+    parser.add_argument(
+        "--cls_start_epoch",
+        type=int,
+        default=0,
+        help="Epoch to start CLS training. Before this epoch, only ITC loss is used (for staged training)",
+    )
+    parser.add_argument(
+        "--use_lightweight_gw",
+        action="store_true",
+        help="Use lightweight GW encoder (~100K params) instead of ResNet-18 (~11M params) to prevent overfitting on small GW datasets",
+    )
+    parser.add_argument(
+        "--dual_fusion",
+        action="store_true",
+        help="Use dual cross-attention fusion (optical→GW + GW→optical) with per-pair credible level",
+    )
+    parser.add_argument(
+        "--fusion_mode",
+        type=str,
+        default=None,
+        help="Fusion mode: legacy_g2o | legacy_dual | physical_dual_hgw | concat_proj. If unset, inferred from --dual_fusion.",
+    )
+    parser.add_argument(
+        "--use_similarity_as_cls_input",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Append pair ITC similarity to classifier input in physical_dual_hgw mode.",
+    )
+    parser.add_argument(
+        "--use_cred_level_feature",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Append cred_level to classifier input in physical_dual_hgw mode.",
+    )
     # GW数据增强参数
-    parser.add_argument("--gw_aug_noise", type=float, default=0.05,
-                        help="GW skymap augmentation noise std (default: 0.05)")
-    parser.add_argument("--gw_aug_jitter", type=float, default=0.02,
-                        help="GW scalar augmentation jitter ratio (default: 0.02)")
-    parser.add_argument("--gw_aug_dropout", type=float, default=0.1,
-                        help="GW channel dropout probability (default: 0.1)")
+    parser.add_argument(
+        "--gw_aug_noise",
+        type=float,
+        default=0.05,
+        help="GW skymap augmentation noise std (default: 0.05)",
+    )
+    parser.add_argument(
+        "--gw_aug_jitter",
+        type=float,
+        default=0.02,
+        help="GW scalar augmentation jitter ratio (default: 0.02)",
+    )
+    parser.add_argument(
+        "--gw_aug_dropout",
+        type=float,
+        default=0.1,
+        help="GW channel dropout probability (default: 0.1)",
+    )
     # Optical data augmentation parameters
-    parser.add_argument("--opt_aug_noise", type=float, default=0.0,
-                        help="Optical flux noise scale relative to errors (default: 0.0)")
-    parser.add_argument("--opt_aug_time_jitter", type=float, default=0.0,
-                        help="Optical time jitter std (default: 0.0)")
-    parser.add_argument("--opt_aug_dropout", type=float, default=0.0,
-                        help="Optical observation dropout probability (default: 0.0)")
-    parser.add_argument("--opt_aug_band_dropout", type=float, default=0.0,
-                        help="Optical band dropout probability (default: 0.0)")
-    parser.add_argument("--hpo_trial_number", type=int, default=None,
-                        help="Optuna trial number (set automatically by HPO, not for manual use)")
-    parser.add_argument("--skip_epoch_checkpoints", action=argparse.BooleanOptionalAction, default=False,
-                        help="Skip per-epoch checkpoint files while still writing best checkpoint and summaries.")
-    parser.add_argument("--default_json_config", type=str, default=None,
-                        help="Default JSON config file path. Loaded before --json_config.")
-    parser.add_argument("--json_config", type=str, default=None,
-                        help="JSON config file path. Values set defaults; CLI args override them.")
+    parser.add_argument(
+        "--opt_aug_noise",
+        type=float,
+        default=0.0,
+        help="Optical flux noise scale relative to errors (default: 0.0)",
+    )
+    parser.add_argument(
+        "--opt_aug_time_jitter",
+        type=float,
+        default=0.0,
+        help="Optical time jitter std (default: 0.0)",
+    )
+    parser.add_argument(
+        "--opt_aug_dropout",
+        type=float,
+        default=0.0,
+        help="Optical observation dropout probability (default: 0.0)",
+    )
+    parser.add_argument(
+        "--opt_aug_band_dropout",
+        type=float,
+        default=0.0,
+        help="Optical band dropout probability (default: 0.0)",
+    )
+    parser.add_argument(
+        "--hpo_trial_number",
+        type=int,
+        default=None,
+        help="Optuna trial number (set automatically by HPO, not for manual use)",
+    )
+    parser.add_argument(
+        "--skip_epoch_checkpoints",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Skip per-epoch checkpoint files while still writing best checkpoint and summaries.",
+    )
+    parser.add_argument(
+        "--default_json_config",
+        type=str,
+        default=None,
+        help="Default JSON config file path. Loaded before --json_config.",
+    )
+    parser.add_argument(
+        "--json_config",
+        type=str,
+        default=None,
+        help="JSON config file path. Values set defaults; CLI args override them.",
+    )
 
     config_parser = argparse.ArgumentParser(add_help=False)
     config_parser.add_argument("--default_json_config", type=str, default=None)

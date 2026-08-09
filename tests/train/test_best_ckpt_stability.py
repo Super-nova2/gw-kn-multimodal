@@ -3,7 +3,6 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-
 MODEL_DIR = Path(__file__).resolve().parents[2] / "Model"
 sys.path.insert(0, str(MODEL_DIR))
 
@@ -14,7 +13,6 @@ from scripts.train.train import (  # noqa: E402
     load_merged_json_config,
     validate_best_ckpt_selection_schedule,
 )
-
 
 DEFAULT_CONFIG = MODEL_DIR / "args" / "defaults" / "MAGIKS_BNS_NSBH_default.json"
 
@@ -51,19 +49,17 @@ def make_args(**overrides):
 class BestCheckpointStabilityTests(unittest.TestCase):
     def test_ablation_configs_start_after_all_enabled_phases(self):
         cases = {
-            "full": 14,
+            "full": 16,
             "no_retrieval_loss": 12,
-            "no_cls_loss": 14,
+            "no_cls_loss": 12,
             "no_gallery_loss": 12,
-            "no_itc_loss": 14,
-            "no_cross_atten": 14,
-            "no_fusion": 14,
+            "no_itc_loss": 8,
+            "no_cross_atten": 16,
+            "no_fusion": 12,
         }
         for config_name, expected_epoch in cases.items():
             with self.subTest(config_name=config_name):
-                config_path = (
-                    MODEL_DIR / "args" / f"MAGIKS_BNS_NSBH_{config_name}.json"
-                )
+                config_path = MODEL_DIR / "args" / f"MAGIKS_BNS_NSBH_{config_name}.json"
                 merged = load_merged_json_config(
                     default_json_config=str(DEFAULT_CONFIG),
                     json_config=str(config_path),
@@ -76,9 +72,7 @@ class BestCheckpointStabilityTests(unittest.TestCase):
                 self.assertFalse(
                     is_best_ckpt_selection_eligible(args, expected_epoch - 1)
                 )
-                self.assertTrue(
-                    is_best_ckpt_selection_eligible(args, expected_epoch)
-                )
+                self.assertTrue(is_best_ckpt_selection_eligible(args, expected_epoch))
 
     def test_disabled_future_phases_do_not_delay_selection(self):
         args = make_args(

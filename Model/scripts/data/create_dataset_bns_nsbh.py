@@ -28,10 +28,10 @@ MERGE_MODE = _data_loader.MERGE_MODE
 MERGE_FLUX_DOMAIN = _data_loader.MERGE_FLUX_DOMAIN
 
 GW_PARAM_COLUMNS = [
-    "mass1_detector",
-    "mass2_detector",
-    "spin1z",
-    "spin2z",
+    "recovered_mass1_detector",
+    "recovered_mass2_detector",
+    "recovered_spin1z",
+    "recovered_spin2z",
     "inclination",
     "distmean",
     "diststd",
@@ -1478,6 +1478,8 @@ def create_dataset_with_neg_gw_bns_nsbh_fast(
         f.attrs["first_detection_snr_domain"] = FIRST_DETECTION_SNR_DOMAIN
         f.attrs["first_detection_snr_threshold"] = 5.0
         f.attrs["scalar_column_names"] = SCALAR_COLUMN_NAMES
+        f.attrs["scalar_mass_spin_source"] = "catalog_recovered"
+        f.attrs["scalar_mass_spin_catalog_columns"] = ",".join(GW_PARAM_COLUMNS[:4])
         f.attrs["time_unit"] = "mjd_days"
         f.attrs["runtime_offset_applied"] = 0
         f.attrs["min_nobs_stage"] = "post_merge"

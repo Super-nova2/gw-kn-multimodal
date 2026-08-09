@@ -457,50 +457,52 @@ def build_prepared_catalog(
     redshift_values = parse_redshifts(redshifts)
     counts = parse_n_per_redshift(n_per_redshift, redshift_values)
 
-    rng = np.random.default_rng(int(seed))
     rows = []
-    sim_event_id = 0
     for redshift_bin, (redshift, n_each) in enumerate(zip(redshift_values, counts)):
         skymap_file = skymap_dir / f"gw170817a_z{redshift:.4f}.fits"
         write_rescaled_skymap(sky_map, skymap_file, redshift)
-        selected = rng.choice(len(pixels["ra"]), size=n_each, replace=True, p=weights)
+        # One GW parent per redshift. Optical positions are sampled later;
+        # n_each is the candidate light-curve budget, not a GW event count.
+        rng = np.random.default_rng(
+            np.random.SeedSequence([int(seed), int(redshift_bin)])
+        )
+        idx = int(rng.choice(len(pixels["ra"]), p=weights))
         distance = luminosity_distance_mpc(float(redshift))
-        for local_index, idx in enumerate(selected.tolist()):
-            sim_id = sim_event_id
-            sequence = np.random.SeedSequence([int(seed), int(sim_id)])
-            snana_seq, coord_seq = sequence.spawn(2)
-            snana_seed = int(snana_seq.generate_state(1, dtype=np.uint32)[0]) % 2_000_000_000 + 1
-            coordinate_seed = int(coord_seq.generate_state(1, dtype=np.uint32)[0]) % 2_000_000_000 + 1
-            rows.append(
-                {
-                    "simulation_id": int(sim_id),
-                    "sim_event_id": int(sim_id),
-                    "redshift_bin": int(redshift_bin),
-                    "redshift": float(redshift),
-                    "luminosity_distance": float(distance),
-                    "target_distance_mpc": float(distance),
-                    "ra_deg": float(pixels["ra"][idx]),
-                    "dec_deg": float(pixels["dec"][idx]),
-                    "ra": float(pixels["ra"][idx]),
-                    "dec": float(pixels["dec"][idx]),
-                    "skymap_credible_level": float(pixels["credible_level"][idx]),
-                    "skymap_pixel_index": int(pixels["pixel_index"][idx]),
-                    "skymap_path": str(skymap_file),
-                    "network_snr": float(network_snr),
-                    "trigger_mjd": float(trigger_mjd),
-                    "viewing_costheta": float(abs(posterior["viewing_costheta"])),
-                    "phi_deg": float(phi_deg),
-                    "mej_dynamic": float(mej_dynamic),
-                    "mej_wind": float(mej_wind),
-                    "mej_total": float(mej_dynamic + mej_wind),
-                    "mass1_detector_ref": float(posterior["mass1_detector_ref"]),
-                    "mass2_detector_ref": float(posterior["mass2_detector_ref"]),
-                    "snana_seed": int(snana_seed),
-                    "coordinate_seed": int(coordinate_seed),
-                    "seed": int(seed),
-                }
-            )
-            sim_event_id += 1
+        sim_id = int(redshift_bin)
+        sequence = np.random.SeedSequence([int(seed), sim_id])
+        snana_seq, coord_seq = sequence.spawn(2)
+        snana_seed = int(snana_seq.generate_state(1, dtype=np.uint32)[0]) % 2_000_000_000 + 1
+        coordinate_seed = int(coord_seq.generate_state(1, dtype=np.uint32)[0]) % 2_000_000_000 + 1
+        rows.append(
+            {
+                "simulation_id": sim_id,
+                "sim_event_id": sim_id,
+                "redshift_bin": int(redshift_bin),
+                "redshift": float(redshift),
+                "optical_candidate_count": int(n_each),
+                "luminosity_distance": float(distance),
+                "target_distance_mpc": float(distance),
+                "ra_deg": float(pixels["ra"][idx]),
+                "dec_deg": float(pixels["dec"][idx]),
+                "ra": float(pixels["ra"][idx]),
+                "dec": float(pixels["dec"][idx]),
+                "skymap_credible_level": float(pixels["credible_level"][idx]),
+                "skymap_pixel_index": int(pixels["pixel_index"][idx]),
+                "skymap_path": str(skymap_file),
+                "network_snr": float(network_snr),
+                "trigger_mjd": float(trigger_mjd),
+                "viewing_costheta": float(abs(posterior["viewing_costheta"])),
+                "phi_deg": float(phi_deg),
+                "mej_dynamic": float(mej_dynamic),
+                "mej_wind": float(mej_wind),
+                "mej_total": float(mej_dynamic + mej_wind),
+                "mass1_detector_ref": float(posterior["mass1_detector_ref"]),
+                "mass2_detector_ref": float(posterior["mass2_detector_ref"]),
+                "snana_seed": int(snana_seed),
+                "coordinate_seed": int(coordinate_seed),
+                "seed": int(seed),
+            }
+        )
     return rows
 
 
@@ -531,31 +533,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     redshifts = parse_redshifts(args.redshifts)
     n_per_redshift = parse_n_per_redshift(args.n_per_redshift, redshifts)
-    manifest = build_manifest_from_skymap(
-        args.skymap,
-        credible_level_max=float(args.credible_level_max),
-        redshifts=redshifts,
-        n_per_redshift=n_per_redshift,
-        seed=int(args.seed),
-    )
     manifest_path = out_dir / "gw170817a_lsst_manifest.csv"
-    manifest.to_csv(manifest_path, index=False)
-    write_manifest_metadata(
-        out_dir / "gw170817a_lsst_manifest.meta.json",
-        {
-            "skymap": str(Path(args.skymap).expanduser().resolve()),
-            "opsim_db": str(Path(args.opsim_db).expanduser().resolve()),
-            "genversion": str(args.genversion),
-            "credible_level_max": float(args.credible_level_max),
-            "redshifts": redshifts,
-            "n_per_redshift": n_per_redshift,
-            "n_per_redshift_by_redshift": {
-                f"{float(redshift):.4f}": int(count) for redshift, count in zip(redshifts, n_per_redshift)
-            },
-            "n_manifest_rows": int(len(manifest)),
-            "seed": int(args.seed),
-        },
-    )
     if args.prepared_catalog:
         rows = build_prepared_catalog(
             skymap_path=args.skymap,
@@ -576,13 +554,57 @@ def main(argv: Sequence[str] | None = None) -> int:
         ids_path = out_dir / "simulation_ids.txt"
         frame = pd.DataFrame(rows)
         frame.to_csv(catalog_path, index=False)
-        manifest_path.write_text(frame.to_csv(index=False), encoding="utf-8")
-        ids_path.write_text("\n".join(str(int(v)) for v in frame["simulation_id"]) + "\n", encoding="utf-8")
+        frame.to_csv(manifest_path, index=False)
+        ids_path.write_text(
+            "\n".join(str(int(v)) for v in frame["simulation_id"]) + "\n",
+            encoding="utf-8",
+        )
+        write_manifest_metadata(
+            out_dir / "gw170817a_lsst_manifest.meta.json",
+            {
+                "skymap": str(Path(args.skymap).expanduser().resolve()),
+                "redshifts": redshifts,
+                "n_gw_parents": int(len(frame)),
+                "n_optical_candidates": int(sum(n_per_redshift)),
+                "optical_candidate_count_by_redshift": {
+                    f"{float(redshift):.4f}": int(count)
+                    for redshift, count in zip(redshifts, n_per_redshift)
+                },
+                "seed": int(args.seed),
+            },
+        )
         print(f"Prepared catalog written: {catalog_path}")
         print(f"Prepared skymaps written under: {args.skymap_dir}")
-        print(f"Total events: {len(frame)}")
+        print(
+            f"GW parents: {len(frame)}; "
+            f"optical candidate budget: {sum(n_per_redshift)}"
+        )
         return 0
 
+    manifest = build_manifest_from_skymap(
+        args.skymap,
+        credible_level_max=float(args.credible_level_max),
+        redshifts=redshifts,
+        n_per_redshift=n_per_redshift,
+        seed=int(args.seed),
+    )
+    manifest.to_csv(manifest_path, index=False)
+    write_manifest_metadata(
+        out_dir / "gw170817a_lsst_manifest.meta.json",
+        {
+            "skymap": str(Path(args.skymap).expanduser().resolve()),
+            "opsim_db": str(Path(args.opsim_db).expanduser().resolve()),
+            "genversion": str(args.genversion),
+            "credible_level_max": float(args.credible_level_max),
+            "redshifts": redshifts,
+            "n_per_redshift": n_per_redshift,
+            "n_per_redshift_by_redshift": {
+                f"{float(redshift):.4f}": int(count) for redshift, count in zip(redshifts, n_per_redshift)
+            },
+            "n_manifest_rows": int(len(manifest)),
+            "seed": int(args.seed),
+        },
+    )
     if args.dry_run:
         print(f"Manifest written: {manifest_path}")
         return 0

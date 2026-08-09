@@ -190,10 +190,10 @@ DEFAULT_TUTORIAL_NEG_GROUP = "Tutorial/optical_data"
 #   transform "cos"        → scalar == cos(catalog_value)
 #   transform "scale_1000" → scalar == catalog_value / 1000
 _SCALAR_VALIDATION_COLS: List[Tuple[str, int, str]] = [
-    ("mass1_detector", 0, "direct"),
-    ("mass2_detector", 1, "direct"),
-    ("spin1z",         2, "direct"),
-    ("spin2z",         3, "direct"),
+    ("recovered_mass1_detector", 0, "direct"),
+    ("recovered_mass2_detector", 1, "direct"),
+    ("recovered_spin1z",         2, "direct"),
+    ("recovered_spin2z",         3, "direct"),
     ("inclination",    4, "cos"),
     ("distmean",       5, "scale_1000"),
     ("diststd",        6, "scale_1000"),

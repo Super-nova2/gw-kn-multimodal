@@ -20,7 +20,6 @@ import optuna
 from optuna.pruners import MedianPruner
 from optuna.samplers import TPESampler
 
-
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_DIR = os.path.dirname(os.path.dirname(SCRIPT_DIR))
 REPO_ROOT = os.path.dirname(MODEL_DIR)
@@ -130,8 +129,9 @@ MAGIKS_ARG_KEYS = {
     "cls_external_neg_weight",
     "cls_ramp_epochs",
     "staged_training_enable",
-    "stage_alignment_epochs",
-    "stage_head_epochs",
+    "stage_itc_epochs",
+    "stage_cls_ramp_epochs",
+    "stage_retrieval_ramp_epochs",
     "stage_joint_itc_start_weight",
     "stage_joint_itc_end_weight",
     "encoder_lr_ratio",
@@ -290,7 +290,11 @@ OBJECTIVE_PRESETS = {
     # Pure classification objective.
     "cls_auroc_auprc": {"val_auroc": 0.5, "val_auprc": 0.5},
     # Classification-priority objective with retrieval as a soft guard.
-    "cls_priority_auprc_auroc_r5": {"val_auprc": 0.45, "val_auroc": 0.35, "val_recall_at_5": 0.20},
+    "cls_priority_auprc_auroc_r5": {
+        "val_auprc": 0.45,
+        "val_auroc": 0.35,
+        "val_recall_at_5": 0.20,
+    },
     # Fusion-gallery retrieval priority for current three-stage training.
     "fusion_gallery_priority": {
         "val_fusion_gallery_mrr": 0.70,
@@ -339,6 +343,7 @@ METRIC_SHORT_NAMES = {
     "val_neg_gw_guardrail_met": "NegGWGuardrail",
 }
 
+
 def _resolve_path(path: str) -> str:
     path = str(path)
     path = path.replace("<REPO_ROOT>", REPO_ROOT).replace("<BASE_DIR>", WORKSPACE_ROOT)
@@ -384,9 +389,7 @@ def _validate_balanced_model_capacity_config(cfg: Dict[str, Any]) -> None:
     if not capacity_is_tunable and not capacity_is_fixed:
         return
 
-    conflicts = sorted(
-        BALANCED_MODEL_CAPACITY_KEYS & (tunable_params | fixed_params)
-    )
+    conflicts = sorted(BALANCED_MODEL_CAPACITY_KEYS & (tunable_params | fixed_params))
     if conflicts:
         raise ValueError(
             "balanced_model_capacity controls model dimensions as one preset and cannot "
@@ -406,8 +409,7 @@ def _validate_balanced_model_capacity_config(cfg: Dict[str, Any]) -> None:
     invalid = [
         value
         for value in capacity_values
-        if not isinstance(value, str)
-        or value not in BALANCED_MODEL_CAPACITY_PRESETS
+        if not isinstance(value, str) or value not in BALANCED_MODEL_CAPACITY_PRESETS
     ]
     if invalid:
         raise ValueError(
@@ -428,7 +430,9 @@ def _apply_balanced_model_capacity(config: Dict[str, Any], preset_name: Any) -> 
     config.update(BALANCED_MODEL_CAPACITY_PRESETS[preset_name])
 
 
-def _validate_metric_weights(weights: Dict[str, Any], field_name: str) -> Dict[str, float]:
+def _validate_metric_weights(
+    weights: Dict[str, Any], field_name: str
+) -> Dict[str, float]:
     if not isinstance(weights, dict) or not weights:
         raise ValueError(f"{field_name} must be a non-empty object")
 
@@ -463,7 +467,9 @@ def _resolve_objective_weights(cfg: Dict[str, Any]) -> Dict[str, float]:
     custom = cfg.get("objective_weights")
     if metric_name == "weighted_sum":
         if custom is None:
-            raise ValueError("objective_metric='weighted_sum' requires objective_weights")
+            raise ValueError(
+                "objective_metric='weighted_sum' requires objective_weights"
+            )
         return _validate_metric_weights(custom, "objective_weights")
 
     preset = OBJECTIVE_PRESETS[metric_name]
@@ -496,7 +502,9 @@ def _resolve_objective_min_metrics(cfg: Dict[str, Any]) -> Dict[str, float]:
         resolved[key] = value
     for key, value in resolved.items():
         if value > 1.0:
-            raise ValueError(f"objective_min_metrics['{key}'] should be <= 1.0, got {value}")
+            raise ValueError(
+                f"objective_min_metrics['{key}'] should be <= 1.0, got {value}"
+            )
     return resolved
 
 
@@ -521,7 +529,13 @@ def _validate_existing_file(path_value: Any, field_name: str) -> str:
 def load_hpo_config(config_path: str) -> Dict[str, Any]:
     cfg = _load_json(config_path)
 
-    required = ["study_name", "n_trials", "output_dir", "epochs_per_trial", "search_space"]
+    required = [
+        "study_name",
+        "n_trials",
+        "output_dir",
+        "epochs_per_trial",
+        "search_space",
+    ]
     missing = [k for k in required if k not in cfg]
     if missing:
         raise ValueError(f"Missing required config keys: {missing}")
@@ -540,9 +554,13 @@ def load_hpo_config(config_path: str) -> Dict[str, Any]:
     )
 
     if not os.path.exists(cfg["base_train_config"]):
-        raise FileNotFoundError(f"base_train_config not found: {cfg['base_train_config']}")
+        raise FileNotFoundError(
+            f"base_train_config not found: {cfg['base_train_config']}"
+        )
     if cfg["default_train_config"] and not os.path.exists(cfg["default_train_config"]):
-        raise FileNotFoundError(f"default_train_config not found: {cfg['default_train_config']}")
+        raise FileNotFoundError(
+            f"default_train_config not found: {cfg['default_train_config']}"
+        )
 
     cfg.setdefault("n_startup_trials", 10)
     cfg.setdefault("storage", None)
@@ -564,9 +582,13 @@ def load_hpo_config(config_path: str) -> Dict[str, Any]:
     if "data_path" in cfg:
         cfg["data_path"] = _validate_existing_file(cfg["data_path"], "data_path")
     if "neg_data_path" in cfg and cfg["neg_data_path"] not in (None, ""):
-        cfg["neg_data_path"] = _validate_existing_file(cfg["neg_data_path"], "neg_data_path")
+        cfg["neg_data_path"] = _validate_existing_file(
+            cfg["neg_data_path"], "neg_data_path"
+        )
     if "test_data_path" in cfg and cfg["test_data_path"] not in (None, ""):
-        cfg["test_data_path"] = _validate_existing_file(cfg["test_data_path"], "test_data_path")
+        cfg["test_data_path"] = _validate_existing_file(
+            cfg["test_data_path"], "test_data_path"
+        )
 
     if not isinstance(cfg["tunable_params"], list) or not cfg["tunable_params"]:
         raise ValueError("tunable_params must be a non-empty list")
@@ -592,7 +614,9 @@ def load_hpo_config(config_path: str) -> Dict[str, Any]:
 
     overlap = set(cfg["tunable_params"]) & set(cfg["fixed_overrides"].keys())
     if overlap:
-        raise ValueError(f"Parameters cannot be both tuned and fixed: {sorted(overlap)}")
+        raise ValueError(
+            f"Parameters cannot be both tuned and fixed: {sorted(overlap)}"
+        )
 
     for p in cfg["tunable_params"]:
         if p not in cfg["search_space"]:
@@ -671,24 +695,43 @@ def apply_batch_size_step_derivation(config: Dict[str, Any]) -> None:
         )
     config["val_batch_size"] = batch_size
     config["steps_per_epoch"] = max(1, int(round(20500.0 / events_per_batch)))
-    config["val_steps_per_epoch"] = max(
-        1, int(round(config["steps_per_epoch"] * 0.16))
-    )
+    config["val_steps_per_epoch"] = max(1, int(round(config["steps_per_epoch"] * 0.16)))
 
 
-def _apply_three_stage_constraints(config: Dict[str, Any]) -> None:
-    if bool(config.get("staged_training_enable", False)):
-        alignment_epochs = int(config.get("stage_alignment_epochs", 8))
-        head_epochs = int(config.get("stage_head_epochs", 4))
-        if alignment_epochs < 0 or head_epochs < 0:
-            raise ValueError("stage_alignment_epochs and stage_head_epochs must be >= 0")
-        epochs = int(config.get("epochs", 1))
-        if alignment_epochs + head_epochs >= epochs:
-            raise ValueError(
-                "staged training stages do not fit within this trial: "
-                f"epochs={epochs}, stage_alignment_epochs={alignment_epochs}, "
-                f"stage_head_epochs={head_epochs}"
-            )
+def _sequential_phase_boundaries(config: Dict[str, Any]) -> Tuple[int, int]:
+    cursor = 0
+    if float(config.get("itc_weight", 0.0) or 0.0) > 0.0:
+        cursor += int(config.get("stage_itc_epochs", 8))
+    if float(config.get("cls_weight", 0.0) or 0.0) > 0.0:
+        cursor += int(config.get("stage_cls_ramp_epochs", 4))
+    retrieval_start = cursor
+    if float(config.get("gallery_loss_weight", 0.0) or 0.0) > 0.0:
+        cursor += int(config.get("stage_retrieval_ramp_epochs", 4))
+    return retrieval_start, cursor
+
+
+def _apply_curriculum_constraints(config: Dict[str, Any]) -> None:
+    durations = {
+        key: int(config.get(key, default))
+        for key, default in (
+            ("stage_itc_epochs", 8),
+            ("stage_cls_ramp_epochs", 4),
+            ("stage_retrieval_ramp_epochs", 4),
+        )
+    }
+    if any(value < 0 for value in durations.values()):
+        raise ValueError("Sequential curriculum stage durations must be >= 0.")
+    if not any(
+        float(config.get(key, 0.0) or 0.0) > 0.0
+        for key in ("itc_weight", "cls_weight", "gallery_loss_weight")
+    ):
+        raise ValueError("Sequential curriculum has no enabled loss.")
+    retrieval_start, joint_start = _sequential_phase_boundaries(config)
+    epochs = int(config.get("epochs", 1))
+    if joint_start >= epochs:
+        raise ValueError(
+            f"Sequential curriculum leaves no joint epoch: epochs={epochs}, joint_start={joint_start}."
+        )
 
     guardrail_recall = float(config.get("neg_gw_guardrail_recall", 0.9))
     if not 0.0 < guardrail_recall <= 1.0:
@@ -699,40 +742,39 @@ def _apply_three_stage_constraints(config: Dict[str, Any]) -> None:
     if lr > 0.0 and min_lr >= lr:
         raise ValueError(f"min_lr ({min_lr}) must be strictly less than lr ({lr})")
 
-    cls_start = int(config.get("cls_start_epoch", 0))
-    cls_ramp = int(config.get("cls_ramp_epochs", 0))
-    if "retrieval_start_after_cls_epochs" in config:
-        retrieval_offset = int(config.pop("retrieval_start_after_cls_epochs"))
-        config["retrieval_start_epoch"] = cls_start + cls_ramp + retrieval_offset
-
-    epochs = int(config.get("epochs", 1))
-    retrieval_start = int(config.get("retrieval_start_epoch", 0))
-    gallery_ramp = int(config.get("gallery_loss_ramp_epochs", 0))
+    gallery_ramp = durations["stage_retrieval_ramp_epochs"]
     gallery_full = _curriculum_full_epoch(retrieval_start, gallery_ramp)
-    if float(config.get("gallery_loss_weight", 0.0) or 0.0) > 0.0 and gallery_full >= epochs:
+    if (
+        float(config.get("gallery_loss_weight", 0.0) or 0.0) > 0.0
+        and gallery_full >= epochs
+    ):
         raise ValueError(
             "gallery loss does not reach full activation within this trial: "
-            f"epochs={epochs}, retrieval_start_epoch={retrieval_start}, "
-            f"gallery_loss_ramp_epochs={gallery_ramp}, full_epoch={gallery_full}"
+            f"epochs={epochs}, retrieval_start={retrieval_start}, "
+            f"stage_retrieval_ramp_epochs={gallery_ramp}, full_epoch={gallery_full}"
         )
 
     hard_enabled = bool(config.get("gallery_hard_neg_enable", False))
     hard_weight = float(config.get("gallery_hard_neg_weight", 0.0) or 0.0)
     if hard_enabled and hard_weight > 0.0:
-        hard_offset = int(config.get("gallery_hard_neg_start_after_retrieval_epochs", 0))
+        hard_offset = int(
+            config.get("gallery_hard_neg_start_after_retrieval_epochs", 0)
+        )
         hard_ramp = int(config.get("gallery_hard_neg_ramp_epochs", 0))
         hard_start = retrieval_start + hard_offset
         hard_full = _curriculum_full_epoch(hard_start, hard_ramp)
         if hard_full >= epochs:
             raise ValueError(
                 "gallery hard-negative loss does not reach full activation within this trial: "
-                f"epochs={epochs}, retrieval_start_epoch={retrieval_start}, "
+                f"epochs={epochs}, retrieval_start={retrieval_start}, "
                 f"gallery_hard_neg_start_after_retrieval_epochs={hard_offset}, "
                 f"gallery_hard_neg_ramp_epochs={hard_ramp}, full_epoch={hard_full}"
             )
 
 
-def build_trial_config(trial: optuna.Trial, hpo_cfg: Dict[str, Any], base_cfg: Dict[str, Any]) -> Dict[str, Any]:
+def build_trial_config(
+    trial: optuna.Trial, hpo_cfg: Dict[str, Any], base_cfg: Dict[str, Any]
+) -> Dict[str, Any]:
     config = dict(base_cfg)
     default_aug_preset = {k: base_cfg.get(k, 0.0) for k in AUGMENT_PRESET_KEYS}
 
@@ -754,7 +796,9 @@ def build_trial_config(trial: optuna.Trial, hpo_cfg: Dict[str, Any], base_cfg: D
         if key in hpo_cfg:
             config[key] = hpo_cfg[key]
 
-    config["num_workers"] = int(hpo_cfg.get("num_workers", config.get("num_workers", 4)))
+    config["num_workers"] = int(
+        hpo_cfg.get("num_workers", config.get("num_workers", 4))
+    )
     config["epochs"] = int(hpo_cfg["epochs_per_trial"])
 
     # Required HPO runtime behavior.
@@ -806,9 +850,11 @@ def build_trial_config(trial: optuna.Trial, hpo_cfg: Dict[str, Any], base_cfg: D
     if int(config.get("proj_dim", 0)) < int(config.get("enc_dim", 0)):
         config["proj_dim"] = int(config["enc_dim"])
 
-    _apply_three_stage_constraints(config)
+    _apply_curriculum_constraints(config)
 
-    trial_ckpt = os.path.join(hpo_cfg["output_dir"], "results", f"trial_{trial.number}", "checkpoints")
+    trial_ckpt = os.path.join(
+        hpo_cfg["output_dir"], "results", f"trial_{trial.number}", "checkpoints"
+    )
     os.makedirs(trial_ckpt, exist_ok=True)
     config["ckpt_path"] = trial_ckpt
     config["resume"] = None
@@ -817,7 +863,9 @@ def build_trial_config(trial: optuna.Trial, hpo_cfg: Dict[str, Any], base_cfg: D
     return _filter_train_config(config)
 
 
-def run_trial_subprocess(config: Dict[str, Any], trial_number: int, output_dir: str) -> Dict[str, Any]:
+def run_trial_subprocess(
+    config: Dict[str, Any], trial_number: int, output_dir: str
+) -> Dict[str, Any]:
     """Run a single training trial as a subprocess and return parsed trial_results.json."""
 
     config_dir = os.path.join(output_dir, "configs")
@@ -838,13 +886,13 @@ def run_trial_subprocess(config: Dict[str, Any], trial_number: int, output_dir: 
     )
     print(
         "  "
-        f"cls_start_epoch={config.get('cls_start_epoch', 'N/A')}, "
-        f"cls_ramp_epochs={config.get('cls_ramp_epochs', 'N/A')}, "
-        f"retrieval_start_epoch={config.get('retrieval_start_epoch', 'N/A')}"
+        f"stage_itc_epochs={config.get('stage_itc_epochs', 'N/A')}, "
+        f"stage_cls_ramp_epochs={config.get('stage_cls_ramp_epochs', 'N/A')}, "
+        f"stage_retrieval_ramp_epochs={config.get('stage_retrieval_ramp_epochs', 'N/A')}"
     )
     print(
         "  "
-        f"gallery_loss_ramp_epochs={config.get('gallery_loss_ramp_epochs', 'N/A')}, "
+        f"encoder_lr_ratio={config.get('encoder_lr_ratio', 'N/A')}, "
         f"gallery_hard_neg_topk={config.get('gallery_hard_neg_topk', 'N/A')}, "
         f"gallery_hard_neg_weight={config.get('gallery_hard_neg_weight', 'N/A')}"
     )
@@ -907,7 +955,9 @@ def _read_metric(results: Dict[str, Any], key: str) -> float:
         return float("nan")
 
 
-def compute_objective_score(results: Dict[str, Any], weights: Dict[str, float]) -> float:
+def compute_objective_score(
+    results: Dict[str, Any], weights: Dict[str, float]
+) -> float:
     weighted_sum = 0.0
     weight_total = 0.0
     for key, weight in weights.items():
@@ -921,7 +971,9 @@ def compute_objective_score(results: Dict[str, Any], weights: Dict[str, float]) 
     return weighted_sum / weight_total
 
 
-def check_objective_min_metrics(results: Dict[str, Any], min_metrics: Dict[str, float]) -> Tuple[bool, str]:
+def check_objective_min_metrics(
+    results: Dict[str, Any], min_metrics: Dict[str, float]
+) -> Tuple[bool, str]:
     for key, min_value in min_metrics.items():
         value = _read_metric(results, key)
         if math.isnan(value):
@@ -943,12 +995,16 @@ def format_metric_summary(results: Dict[str, Any], metric_keys) -> str:
     return ", ".join(parts)
 
 
-def objective(trial: optuna.Trial, hpo_cfg: Dict[str, Any], base_cfg: Dict[str, Any]) -> float:
+def objective(
+    trial: optuna.Trial, hpo_cfg: Dict[str, Any], base_cfg: Dict[str, Any]
+) -> float:
     config = build_trial_config(trial, hpo_cfg, base_cfg)
     results = run_trial_subprocess(config, trial.number, hpo_cfg["output_dir"])
 
     score = compute_objective_score(results, hpo_cfg["objective_weights"])
-    passed_min_metrics, min_fail_reason = check_objective_min_metrics(results, hpo_cfg["objective_min_metrics"])
+    passed_min_metrics, min_fail_reason = check_objective_min_metrics(
+        results, hpo_cfg["objective_min_metrics"]
+    )
     if math.isnan(score) or not passed_min_metrics:
         score = worst_value(hpo_cfg["objective_direction"])
 
@@ -978,14 +1034,18 @@ def objective(trial: optuna.Trial, hpo_cfg: Dict[str, Any], base_cfg: Dict[str, 
         f"({format_metric_summary(results, hpo_cfg['objective_weights'].keys())})"
     )
     if not passed_min_metrics:
-        print(f"  [T{trial.number}] objective min-metric check failed: {min_fail_reason}")
+        print(
+            f"  [T{trial.number}] objective min-metric check failed: {min_fail_reason}"
+        )
     return score
 
 
 def dry_run(hpo_cfg: Dict[str, Any], base_cfg: Dict[str, Any]) -> None:
     print("Dry run: sampling one trial config without launching training.")
     sampler = TPESampler(seed=42, n_startup_trials=1)
-    study = optuna.create_study(direction=hpo_cfg["objective_direction"], sampler=sampler)
+    study = optuna.create_study(
+        direction=hpo_cfg["objective_direction"], sampler=sampler
+    )
     trial = study.ask()
     config = build_trial_config(trial, hpo_cfg, base_cfg)
 
@@ -993,11 +1053,13 @@ def dry_run(hpo_cfg: Dict[str, Any], base_cfg: Dict[str, Any]) -> None:
     for k, v in sorted(trial.params.items()):
         print(f"  {k}: {v}")
 
-    retrieval_start = int(config.get("retrieval_start_epoch", 0))
+    retrieval_start, _ = _sequential_phase_boundaries(config)
     gallery_full = _curriculum_full_epoch(
-        retrieval_start, int(config.get("gallery_loss_ramp_epochs", 0))
+        retrieval_start, int(config.get("stage_retrieval_ramp_epochs", 4))
     )
-    hard_start = retrieval_start + int(config.get("gallery_hard_neg_start_after_retrieval_epochs", 0))
+    hard_start = retrieval_start + int(
+        config.get("gallery_hard_neg_start_after_retrieval_epochs", 0)
+    )
     hard_full = _curriculum_full_epoch(
         hard_start, int(config.get("gallery_hard_neg_ramp_epochs", 0))
     )
@@ -1009,15 +1071,11 @@ def dry_run(hpo_cfg: Dict[str, Any], base_cfg: Dict[str, Any]) -> None:
     )
     if capacity_name is not None:
         dims = ", ".join(
-            f"{key}={config.get(key)}"
-            for key in sorted(BALANCED_MODEL_CAPACITY_KEYS)
+            f"{key}={config.get(key)}" for key in sorted(BALANCED_MODEL_CAPACITY_KEYS)
         )
         print(f"  balanced_model_capacity: {capacity_name} ({dims})")
     print(f"  n_ref == ref_dim: {config.get('n_ref')} == {config.get('ref_dim')}")
-    print(
-        "  retrieval_start_epoch = cls_start_epoch + cls_ramp_epochs + "
-        f"retrieval_start_after_cls_epochs: {config.get('retrieval_start_epoch')}"
-    )
+    print(f"  sequential retrieval phase start (0-based): {retrieval_start}")
     print(f"  gallery full activation epoch (0-based): {gallery_full}")
     print(f"  gallery hard-negative full activation epoch (0-based): {hard_full}")
     print(f"  epochs = {config.get('epochs')}")
@@ -1027,9 +1085,17 @@ def dry_run(hpo_cfg: Dict[str, Any], base_cfg: Dict[str, Any]) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Config-driven Optuna HPO for MAGIKS training")
-    parser.add_argument("--config", type=str, required=True, help="Path to HPO config JSON")
-    parser.add_argument("--dry_run", action="store_true", help="Validate config and print one sampled trial")
+    parser = argparse.ArgumentParser(
+        description="Config-driven Optuna HPO for MAGIKS training"
+    )
+    parser.add_argument(
+        "--config", type=str, required=True, help="Path to HPO config JSON"
+    )
+    parser.add_argument(
+        "--dry_run",
+        action="store_true",
+        help="Validate config and print one sampled trial",
+    )
     args = parser.parse_args()
 
     hpo_cfg = load_hpo_config(args.config)
@@ -1039,7 +1105,9 @@ def main() -> None:
     print(f"Storage: {hpo_cfg['storage']}")
     print(f"Output: {hpo_cfg['output_dir']}")
     print(f"Trials: {hpo_cfg['n_trials']} ({hpo_cfg['epochs_per_trial']} epochs each)")
-    print(f"Objective: {hpo_cfg['objective_metric']} ({hpo_cfg['objective_direction']})")
+    print(
+        f"Objective: {hpo_cfg['objective_metric']} ({hpo_cfg['objective_direction']})"
+    )
     print(f"Objective formula: {_objective_formula_str(hpo_cfg['objective_weights'])}")
     if hpo_cfg["objective_min_metrics"]:
         print(f"Objective minimum metrics: {hpo_cfg['objective_min_metrics']}")
@@ -1053,7 +1121,9 @@ def main() -> None:
         return
 
     sampler = TPESampler(n_startup_trials=hpo_cfg["n_startup_trials"], seed=42)
-    pruner = MedianPruner(n_startup_trials=hpo_cfg["n_startup_trials"], n_warmup_steps=0)
+    pruner = MedianPruner(
+        n_startup_trials=hpo_cfg["n_startup_trials"], n_warmup_steps=0
+    )
 
     study = optuna.create_study(
         study_name=hpo_cfg["study_name"],
@@ -1080,8 +1150,12 @@ def main() -> None:
     print("HPO COMPLETE")
     print("=" * 60)
     total_trials = len(study.trials)
-    completed_trials = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
-    failed_trials = [t for t in study.trials if t.state != optuna.trial.TrialState.COMPLETE]
+    completed_trials = [
+        t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE
+    ]
+    failed_trials = [
+        t for t in study.trials if t.state != optuna.trial.TrialState.COMPLETE
+    ]
     print(f"Total trials: {total_trials}")
     print(f"Completed: {len(completed_trials)}")
     print(f"Pruned/Failed: {len(failed_trials)}")
@@ -1098,7 +1172,9 @@ def main() -> None:
         print(f"    {key}: {value}")
 
     best_config_path = os.path.join(hpo_cfg["output_dir"], "best_config.json")
-    config_path = os.path.join(hpo_cfg["output_dir"], "configs", f"trial_{best.number}.json")
+    config_path = os.path.join(
+        hpo_cfg["output_dir"], "configs", f"trial_{best.number}.json"
+    )
     if os.path.exists(config_path):
         with open(config_path) as f:
             best_config = json.load(f)

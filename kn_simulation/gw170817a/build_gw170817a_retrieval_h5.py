@@ -118,7 +118,10 @@ def _load_manifest(path: str | Path) -> pd.DataFrame:
 
 def generated_counts_from_manifest(manifest_path: str | Path) -> Dict[float, int]:
     df = _load_manifest(manifest_path)
-    counts = df["redshift"].value_counts().sort_index()
+    if "optical_candidate_count" in df.columns:
+        counts = df.groupby("redshift")["optical_candidate_count"].sum().sort_index()
+    else:
+        counts = df["redshift"].value_counts().sort_index()
     return {float(redshift): int(count) for redshift, count in counts.items()}
 
 
@@ -368,6 +371,32 @@ def load_true_libid(coordinate_dir: str | Path, simulation_id: int) -> int:
     return int(row["libid"])
 
 
+def load_coordinate_lookup(
+    coordinate_dir: str | Path, simulation_id: int
+) -> dict[int, dict[str, object]]:
+    """Return unique, in-footprint coordinate metadata keyed by SNANA LIBID."""
+    path = Path(coordinate_dir) / f"{int(simulation_id)}.csv"
+    if not path.is_file():
+        raise FileNotFoundError(f"Coordinate manifest not found: {path}")
+    frame = pd.read_csv(path)
+    required = {"simulation_id", "libid", "ra", "dec"}
+    missing = sorted(required - set(frame.columns))
+    if missing:
+        raise ValueError(f"Coordinate manifest {path} missing columns: {missing}")
+    frame = frame.loc[
+        (frame["simulation_id"].astype(int) == int(simulation_id))
+        & np.isfinite(pd.to_numeric(frame["libid"], errors="coerce"))
+    ].copy()
+    frame["libid"] = frame["libid"].astype(int)
+    if frame["libid"].duplicated().any():
+        duplicates = sorted(frame.loc[frame["libid"].duplicated(), "libid"].unique())
+        raise ValueError(f"Coordinate manifest {path} has duplicate LIBIDs: {duplicates[:10]}")
+    return {
+        int(row.libid): row._asdict()
+        for row in frame.itertuples(index=False)
+    }
+
+
 def format_snana_fits_to_records(
     *,
     sim_dir: str | Path,
@@ -401,19 +430,19 @@ def format_snana_fits_to_records(
         manifest_row = manifest_lookup.get(sim_event_id)
         if manifest_row is None:
             continue
-        true_libid = load_true_libid(coordinate_dir, sim_event_id)
+        coordinate_lookup = load_coordinate_lookup(coordinate_dir, sim_event_id)
         with fits.open(head_path) as hdul_head, fits.open(phot_path) as hdul_phot:
             head = hdul_head[1].data
             phot = hdul_phot[1].data
             phot_columns = set(phot.columns.names)
-            true_rows = [row for row in head if int(row["SIM_LIBID"]) == true_libid]
-            if len(true_rows) > 1:
-                raise ValueError(
-                    f"HEAD file {head_path} contains {len(true_rows)} rows for true LIBID "
-                    f"{true_libid}; expected at most one"
-                )
-            for row in true_rows:
-
+            seen_libids: set[int] = set()
+            for row in head:
+                libid = int(row["SIM_LIBID"])
+                # Old SNANA versions may wrap over usable SIMLIB entries when
+                # some requested coordinates have no observations.
+                if libid in seen_libids or libid not in coordinate_lookup:
+                    continue
+                seen_libids.add(libid)
                 start = int(row["PTROBS_MIN"]) - 1
                 end = int(row["PTROBS_MAX"])
                 event_time_mjd = _head_value(row, ("SIM_MJD_EXPLODE", "SIM_PEAKMJD", "PEAKMJD"))
@@ -458,7 +487,13 @@ def format_snana_fits_to_records(
                         errors=errors,
                         masks=masks,
                         times=times,
-                        coordinates=np.asarray([float(row["RA"]), float(row["DEC"])], dtype=np.float32),
+                        coordinates=np.asarray(
+                            [
+                                float(coordinate_lookup[libid]["ra"]),
+                                float(coordinate_lookup[libid]["dec"]),
+                            ],
+                            dtype=np.float32,
+                        ),
                         event_time_mjd=float(event_time_mjd),
                         first_detection_mjd=float(first_detection_mjd),
                         redshift=redshift,
@@ -474,6 +509,46 @@ def format_snana_fits_to_records(
                     )
                 )
     return records
+
+
+def select_balanced_records(
+    records: Sequence[FormattedEventRecord],
+    *,
+    target_per_redshift: int,
+    seed: int = 170817,
+    expected_redshifts_by_bin: Mapping[int, float] | None = None,
+) -> list[FormattedEventRecord]:
+    """Select exactly target_per_redshift usable optical curves per GW parent."""
+    target = int(target_per_redshift)
+    if target < 1:
+        raise ValueError("target_per_redshift must be >= 1")
+    grouped: dict[int, list[FormattedEventRecord]] = {}
+    for record in records:
+        grouped.setdefault(int(record.redshift_bin), []).append(record)
+    if expected_redshifts_by_bin is None:
+        expected = {
+            int(record.redshift_bin): float(record.redshift) for record in records
+        }
+    else:
+        expected = {
+            int(redshift_bin): float(redshift)
+            for redshift_bin, redshift in expected_redshifts_by_bin.items()
+        }
+    selected: list[FormattedEventRecord] = []
+    for redshift_bin in sorted(expected):
+        candidates = grouped.get(redshift_bin, [])
+        if len(candidates) < target:
+            redshift = expected[redshift_bin]
+            raise ValueError(
+                f"redshift bin {redshift_bin} (z={redshift:.4f}) has only "
+                f"{len(candidates)} usable unique light curves; need {target}"
+            )
+        rng = np.random.default_rng(
+            np.random.SeedSequence([int(seed), int(redshift_bin)])
+        )
+        indices = np.sort(rng.choice(len(candidates), size=target, replace=False))
+        selected.extend(candidates[int(index)] for index in indices)
+    return selected
 
 
 def _array_or_empty(records: Sequence[FormattedEventRecord], attr: str, shape: tuple[int, ...], dtype) -> np.ndarray:
@@ -496,9 +571,21 @@ def write_retrieval_h5(
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
     scalar_reference = scalar_reference or load_posterior_scalar_reference()
-    n = int(len(records))
-    gw_chunk = max(1, min(256, n or 1))
-    opt_chunk = max(1, min(1024, n or 1))
+    n_optical = int(len(records))
+    gw_by_bin: dict[int, FormattedEventRecord] = {}
+    for record in records:
+        gw_by_bin.setdefault(int(record.redshift_bin), record)
+    gw_records = [gw_by_bin[key] for key in sorted(gw_by_bin)]
+    n_gw = int(len(gw_records))
+    parent_index_by_bin = {
+        int(record.redshift_bin): index for index, record in enumerate(gw_records)
+    }
+    parent_gw_idx = np.asarray(
+        [parent_index_by_bin[int(record.redshift_bin)] for record in records],
+        dtype=np.int32,
+    )
+    gw_chunk = max(1, min(256, n_gw or 1))
+    opt_chunk = max(1, min(1024, n_optical or 1))
     dt_str = h5py.string_dtype(encoding="utf-8")
     if isinstance(lupt_m5_mag, str):
         m5 = _data_loader.parse_lupt_m5_mag(str(lupt_m5_mag))
@@ -513,22 +600,22 @@ def write_retrieval_h5(
 
     with h5py.File(output, "w") as f:
         gw = f.create_group("events/gw_data")
-        gw.create_dataset("scalars", data=_array_or_empty(records, "scalar", (7,), np.float32), chunks=(gw_chunk, 7), maxshape=(None, 7))
-        gw.create_dataset("skymaps", data=_array_or_empty(records, "skymap", (7, 19200), np.float32), chunks=(1, 7, 19200), maxshape=(None, 7, 19200))
-        gw.create_dataset("ids", data=np.asarray([f"gw170817a_{r.sim_event_id}" for r in records], dtype=object), dtype=dt_str, chunks=(gw_chunk,), maxshape=(None,))
-        gw.create_dataset("event_uid", data=np.asarray([r.event_uid for r in records], dtype=object), dtype=dt_str, chunks=(gw_chunk,), maxshape=(None,))
-        gw.create_dataset("simulation_id", data=np.asarray([r.simulation_id for r in records], dtype=np.int64), chunks=(gw_chunk,), maxshape=(None,))
-        gw.create_dataset("sample_class", data=np.asarray([r.sample_class for r in records], dtype=object), dtype=dt_str, chunks=(gw_chunk,), maxshape=(None,))
-        gw.create_dataset("mej_dynamic", data=np.asarray([r.mej_dynamic for r in records], dtype=np.float32), chunks=(gw_chunk,), maxshape=(None,))
-        gw.create_dataset("mej_wind", data=np.asarray([r.mej_wind for r in records], dtype=np.float32), chunks=(gw_chunk,), maxshape=(None,))
-        gw.create_dataset("has_kn", data=np.ones((n,), dtype=np.int32), chunks=(gw_chunk,), maxshape=(None,))
-        gw.create_dataset("neg_type", data=np.zeros((n,), dtype=np.int32), chunks=(gw_chunk,), maxshape=(None,))
-        gw.create_dataset("mej_tot", data=np.full((n,), 0.04, dtype=np.float32), chunks=(gw_chunk,), maxshape=(None,))
-        gw.create_dataset("event_time_mjd", data=np.asarray([r.event_time_mjd for r in records], dtype=np.float64), chunks=(gw_chunk,), maxshape=(None,))
-        gw.create_dataset("source_type", data=np.asarray(["gw170817a"] * n, dtype=object), dtype=dt_str, chunks=(gw_chunk,), maxshape=(None,))
-        gw.create_dataset("redshift", data=np.asarray([r.redshift for r in records], dtype=np.float64), chunks=(gw_chunk,), maxshape=(None,))
-        gw.create_dataset("redshift_bin", data=np.asarray([r.redshift_bin for r in records], dtype=np.int16), chunks=(gw_chunk,), maxshape=(None,))
-        gw.create_dataset("credible_level", data=np.asarray([r.credible_level for r in records], dtype=np.float32), chunks=(gw_chunk,), maxshape=(None,))
+        gw.create_dataset("scalars", data=_array_or_empty(gw_records, "scalar", (7,), np.float32), chunks=(gw_chunk, 7), maxshape=(None, 7))
+        gw.create_dataset("skymaps", data=_array_or_empty(gw_records, "skymap", (7, 19200), np.float32), chunks=(1, 7, 19200), maxshape=(None, 7, 19200))
+        gw.create_dataset("ids", data=np.asarray([f"gw170817a_{r.sim_event_id}" for r in gw_records], dtype=object), dtype=dt_str, chunks=(gw_chunk,), maxshape=(None,))
+        gw.create_dataset("event_uid", data=np.asarray([r.event_uid for r in gw_records], dtype=object), dtype=dt_str, chunks=(gw_chunk,), maxshape=(None,))
+        gw.create_dataset("simulation_id", data=np.asarray([r.simulation_id for r in gw_records], dtype=np.int64), chunks=(gw_chunk,), maxshape=(None,))
+        gw.create_dataset("sample_class", data=np.asarray([r.sample_class for r in gw_records], dtype=object), dtype=dt_str, chunks=(gw_chunk,), maxshape=(None,))
+        gw.create_dataset("mej_dynamic", data=np.asarray([r.mej_dynamic for r in gw_records], dtype=np.float32), chunks=(gw_chunk,), maxshape=(None,))
+        gw.create_dataset("mej_wind", data=np.asarray([r.mej_wind for r in gw_records], dtype=np.float32), chunks=(gw_chunk,), maxshape=(None,))
+        gw.create_dataset("has_kn", data=np.ones((n_gw,), dtype=np.int32), chunks=(gw_chunk,), maxshape=(None,))
+        gw.create_dataset("neg_type", data=np.zeros((n_gw,), dtype=np.int32), chunks=(gw_chunk,), maxshape=(None,))
+        gw.create_dataset("mej_tot", data=np.full((n_gw,), 0.04, dtype=np.float32), chunks=(gw_chunk,), maxshape=(None,))
+        gw.create_dataset("event_time_mjd", data=np.asarray([r.event_time_mjd for r in gw_records], dtype=np.float64), chunks=(gw_chunk,), maxshape=(None,))
+        gw.create_dataset("source_type", data=np.asarray(["gw170817a"] * n_gw, dtype=object), dtype=dt_str, chunks=(gw_chunk,), maxshape=(None,))
+        gw.create_dataset("redshift", data=np.asarray([r.redshift for r in gw_records], dtype=np.float64), chunks=(gw_chunk,), maxshape=(None,))
+        gw.create_dataset("redshift_bin", data=np.asarray([r.redshift_bin for r in gw_records], dtype=np.int16), chunks=(gw_chunk,), maxshape=(None,))
+        gw.create_dataset("credible_level", data=np.asarray([r.credible_level for r in gw_records], dtype=np.float32), chunks=(gw_chunk,), maxshape=(None,))
 
         opt = f.create_group("events/optical_data")
         opt.create_dataset("values", data=_array_or_empty(records, "values", (MAX_LC_LENGTH, NUM_BANDS), np.float32), chunks=(opt_chunk, MAX_LC_LENGTH, NUM_BANDS), maxshape=(None, MAX_LC_LENGTH, NUM_BANDS))
@@ -538,13 +625,13 @@ def write_retrieval_h5(
         opt.create_dataset("zero_time_mjd_base", data=np.asarray([r.first_detection_mjd for r in records], dtype=np.float64), chunks=(opt_chunk,), maxshape=(None,))
         opt.create_dataset("first_detection_mjd", data=np.asarray([r.first_detection_mjd for r in records], dtype=np.float64), chunks=(opt_chunk,), maxshape=(None,))
         opt.create_dataset("coordinates", data=_array_or_empty(records, "coordinates", (2,), np.float32), chunks=(opt_chunk, 2), maxshape=(None, 2))
-        opt.create_dataset("parent_gw_idx", data=np.arange(n, dtype=np.int32), chunks=(opt_chunk,), maxshape=(None,))
+        opt.create_dataset("parent_gw_idx", data=parent_gw_idx, chunks=(opt_chunk,), maxshape=(None,))
 
-        f.attrs["dataset_mode"] = "gw170817a_lsst_redshift_balanced_firstdet_v2"
-        f.attrs["n_total_gw"] = n
-        f.attrs["n_pos_gw"] = n
+        f.attrs["dataset_mode"] = "gw170817a_lsst_redshift_balanced_one_to_many_v3"
+        f.attrs["n_total_gw"] = n_gw
+        f.attrs["n_pos_gw"] = n_gw
         f.attrs["n_neg_gw"] = 0
-        f.attrs["n_total_optical"] = n
+        f.attrs["n_total_optical"] = n_optical
         f.attrs["photometry_representation"] = "luptitude"
         f.attrs["flux_input_column"] = "FLUXCAL"
         f.attrs["fluxerr_input_column"] = "FLUXCALERR"
@@ -599,6 +686,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--skymap", default=DEFAULT_SKYMAP)
     parser.add_argument("--output-h5", default=DEFAULT_OUTPUT_H5)
     parser.add_argument("--min-nobs", type=int, default=5)
+    parser.add_argument("--target-per-redshift", type=int, default=200)
+    parser.add_argument("--selection-seed", type=int, default=170817)
     parser.add_argument("--fluxcal-zp", type=float, default=27.5)
     parser.add_argument("--psfflux-zp", type=float, default=31.4)
     parser.add_argument("--lupt-k", type=float, default=1.0)
@@ -608,7 +697,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     scalar_reference = load_posterior_scalar_reference(args.posterior_h5, args.posterior_dataset)
-    records = format_snana_fits_to_records(
+    candidate_records = format_snana_fits_to_records(
         sim_dir=args.sim_dir,
         genversion=args.genversion,
         manifest_path=args.manifest,
@@ -621,6 +710,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         min_nobs=int(args.min_nobs),
         scalar_reference=scalar_reference,
     )
+    manifest = _load_manifest(args.manifest)
+    expected_redshifts_by_bin = {
+        int(row.redshift_bin): float(row.redshift)
+        for row in manifest[["redshift_bin", "redshift"]]
+        .drop_duplicates()
+        .itertuples(index=False)
+    }
+    records = select_balanced_records(
+        candidate_records,
+        target_per_redshift=int(args.target_per_redshift),
+        seed=int(args.selection_seed),
+        expected_redshifts_by_bin=expected_redshifts_by_bin,
+    )
     write_retrieval_h5(
         args.output_h5,
         records,
@@ -631,7 +733,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         lupt_m5_mag=str(args.lupt_m5_mag),
         scalar_reference=scalar_reference,
     )
-    print(f"Wrote {len(records)} formatted GW170817A records to {args.output_h5}")
+    print(
+        f"Selected {len(records)} of {len(candidate_records)} usable unique "
+        f"light curves and wrote {len(expected_redshifts_by_bin)} GW parents "
+        f"to {args.output_h5}"
+    )
     return 0
 
 

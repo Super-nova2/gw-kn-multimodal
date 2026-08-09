@@ -216,3 +216,30 @@ def build_test_coordinate_samples(
     is_true_position = np.zeros(samples_per_event, dtype=bool)
     is_true_position[0] = True
     return ra, dec, distance, probability, is_true_position
+
+
+def build_fixed_distance_coordinate_samples(
+    mocmap,
+    *,
+    distance_mpc: float,
+    samples_per_event: int,
+    level: float = 0.9,
+    nside: int = 256,
+    seed: int | None = None,
+):
+    """Sample alternative sky positions for one GW parent at fixed distance."""
+    if samples_per_event < 1:
+        raise ValueError("samples_per_event must be >= 1")
+    if not np.isfinite(distance_mpc) or distance_mpc <= 0:
+        raise ValueError("distance_mpc must be finite and positive")
+
+    ra, dec, _sampled_distance, probability = sample_posterior_3d(
+        mocmap,
+        samples_per_event,
+        level=level,
+        nside=nside,
+        seed=seed,
+    )
+    distance = np.full(samples_per_event, float(distance_mpc), dtype=float)
+    is_true_position = np.zeros(samples_per_event, dtype=bool)
+    return ra, dec, distance, probability, is_true_position

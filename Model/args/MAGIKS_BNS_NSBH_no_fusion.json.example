@@ -21,10 +21,9 @@
   "grad_clip_norm": 1.0,
   "warmup_epochs": 5,
   "min_lr": 2e-05,
-  "gallery_loss_weight": 0.0,
+  "gallery_loss_weight": 1.0,
   "gallery_distractor_time_mode": "synthetic_after_gw",
   "gallery_distractor_time_window_days": 30.0,
-  "retrieval_start_epoch": 999,
   "itc_weight": 1.0,
   "cls_weight": 0.0,
   "gallery_hard_neg_enable": false,
@@ -34,7 +33,7 @@
   "time_delta_cls_scale_days": 30.0,
   "time_delta_cls_clip": 10.0,
   "time_compat_weight": 0.6,
-  "gallery_loss_ramp_epochs": 5,
   "gallery_hard_neg_start_after_retrieval_epochs": 10,
-  "gallery_hard_neg_ramp_epochs": 0
+  "gallery_hard_neg_ramp_epochs": 0,
+  "neg_gw_guardrail_enable": false
 }
