@@ -398,7 +398,7 @@ class CurrentScheduleConfigTests(unittest.TestCase):
     RUN_CONFIGS = (
         "MAGIKS_BNS_NSBH_full.json",
         "MAGIKS_BNS_NSBH_hard_mining.json",
-        "MAGIKS_BNS_NSBH_with_retrieval_loss.json",
+        "MAGIKS_BNS_NSBH_no_retrieval_loss.json",
         "MAGIKS_BNS_NSBH_no_itc_loss.json",
         "MAGIKS_BNS_NSBH_no_cls_loss.json",
         "MAGIKS_BNS_NSBH_no_cross_atten.json",
@@ -432,24 +432,27 @@ class CurrentScheduleConfigTests(unittest.TestCase):
         self.assertEqual(cfg["stage_joint_itc_end_weight"], 0.25)
         self.assertEqual(cfg["encoder_lr_ratio"], 0.1)
         self.assertTrue(cfg["neg_gw_guardrail_enable"])
-        self.assertEqual(cfg["neg_gw_guardrail_recall"], 0.9)
+        self.assertEqual(cfg["neg_gw_guardrail_recall"], 0.85)
         self.assertEqual(cfg["cls_aligned_pos_weight"], 0.5)
         self.assertEqual(cfg["cls_neg_gw_weight"], 0.2)
         self.assertEqual(cfg["cls_mismatched_weight"], 0.15)
         self.assertEqual(cfg["cls_external_neg_weight"], 0.15)
+        self.assertEqual(cfg["gallery_loss_weight"], 1.0)
+        self.assertEqual(cfg["retrieval_start_epoch"], 10)
+        self.assertEqual(cfg["gallery_loss_ramp_epochs"], 5)
 
     def test_hard_mining_variant_keeps_gallery_hard_mining_disabled(self):
         cfg = self._merged_config("MAGIKS_BNS_NSBH_hard_mining.json")
 
-        self.assertEqual(cfg["retrieval_start_epoch"], 0)
-        self.assertEqual(cfg["gallery_loss_weight"], 0.0)
+        self.assertEqual(cfg["retrieval_start_epoch"], 10)
+        self.assertEqual(cfg["gallery_loss_weight"], 1.0)
         self.assertFalse(cfg["gallery_hard_neg_enable"])
 
     def test_hard_disabled_ablations_keep_gallery_hard_mining_off(self):
         expected = {
-            "MAGIKS_BNS_NSBH_hard_mining.json": (0, 0.0),
+            "MAGIKS_BNS_NSBH_hard_mining.json": (10, 1.0),
             "MAGIKS_BNS_NSBH_no_gallery_loss.json": (0, 0.0),
-            "MAGIKS_BNS_NSBH_no_fusion.json": (0, 0.0),
+            "MAGIKS_BNS_NSBH_no_fusion.json": (10, 1.0),
         }
 
         for run_config, (retrieval_start, gallery_weight) in expected.items():

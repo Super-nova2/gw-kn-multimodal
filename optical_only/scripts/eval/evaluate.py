@@ -373,10 +373,15 @@ def load_model(checkpoint_path, device, config_dict):
         raise ValueError("Checkpoint does not contain valid state_dict.")
     cleaned_state_dict = {k.replace("_orig_mod.", ""): v for k, v in state_dict.items()}
     cleaned_state_dict = migrate_time_embed_state_dict(cleaned_state_dict)
-    has_universal_aux = (
-        bool(ckpt_args.get("universal_train_enable", False))
-        or any(k.startswith("projection_head.") for k in cleaned_state_dict.keys())
-        or any(k.startswith("adv_head_n_det.") for k in cleaned_state_dict.keys())
+    has_universal_aux = any(
+        k.startswith(prefix)
+        for k in cleaned_state_dict.keys()
+        for prefix in (
+            "projection_head.",
+            "adv_head_n_det.",
+            "adv_head_n_bands.",
+            "adv_head_t_span.",
+        )
     )
 
     model = OpticalKNClassifier(

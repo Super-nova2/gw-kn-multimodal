@@ -488,7 +488,7 @@ def build_prepared_catalog(
                     "skymap_path": str(skymap_file),
                     "network_snr": float(network_snr),
                     "trigger_mjd": float(trigger_mjd),
-                    "viewing_costheta": float(posterior["viewing_costheta"]),
+                    "viewing_costheta": float(abs(posterior["viewing_costheta"])),
                     "phi_deg": float(phi_deg),
                     "mej_dynamic": float(mej_dynamic),
                     "mej_wind": float(mej_wind),

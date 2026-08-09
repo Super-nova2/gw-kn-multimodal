@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -42,6 +43,7 @@ MAX_LC_LENGTH = int(_data_loader.MAX_LC_LENGTH)
 NUM_BANDS = int(_data_loader.NUM_BANDS)
 DEFAULT_OUTPUT_H5 = "/fred/oz016/bgao_kn/data/ALBEF_dataset/gw170817a_lsst_redshift_test.h5"
 DEFAULT_MANIFEST = str(GW170817A_DIR / "lsst_redshift_experiment" / "gw170817a_lsst_manifest.csv")
+DEFAULT_COORDINATE_DIR = str(GW170817A_DIR / "lsst_redshift_experiment" / "COORDINATES")
 DEFAULT_SNANA_SIM_DIR = "/fred/oz016/bgao_kn/SNANA/SNDATA_ROOT/SIM/gw170817a"
 DEFAULT_SKYMAP = str(GW170817A_DIR / "bayestar_no_virgo.fits")
 DEFAULT_POSTERIOR_H5 = str(GW170817A_DIR / "GW170817_GWTC-1.hdf5")
@@ -332,10 +334,45 @@ def iter_snana_fits(sim_dir: str | Path, genversion: str = DEFAULT_GENVERSION):
             yield head, phot
 
 
+def simulation_id_from_head_path(head_path: str | Path) -> int:
+    """Return the manifest simulation id encoded in a per-event HEAD filename."""
+    match = re.search(r"_(\d+)_HEAD\.FITS(?:\.gz)?$", Path(head_path).name)
+    if match is None:
+        raise ValueError(f"Cannot determine simulation_id from HEAD path: {head_path}")
+    return int(match.group(1))
+
+
+def load_true_libid(coordinate_dir: str | Path, simulation_id: int) -> int:
+    """Load the single SNANA LIBID corresponding to the injected true position."""
+    path = Path(coordinate_dir) / f"{int(simulation_id)}.csv"
+    if not path.is_file():
+        raise FileNotFoundError(f"Coordinate manifest not found: {path}")
+    frame = pd.read_csv(path)
+    required = {"simulation_id", "libid", "is_true_position"}
+    missing = sorted(required - set(frame.columns))
+    if missing:
+        raise ValueError(f"Coordinate manifest {path} missing columns: {missing}")
+    true_mask = frame["is_true_position"].astype(str).str.lower().isin(("true", "1"))
+    true_rows = frame.loc[true_mask]
+    if len(true_rows) != 1:
+        raise ValueError(
+            f"Coordinate manifest {path} must contain exactly one true position; "
+            f"found {len(true_rows)}"
+        )
+    row = true_rows.iloc[0]
+    if int(row["simulation_id"]) != int(simulation_id):
+        raise ValueError(
+            f"Coordinate manifest {path} has simulation_id={int(row['simulation_id'])}, "
+            f"expected {int(simulation_id)}"
+        )
+    return int(row["libid"])
+
+
 def format_snana_fits_to_records(
     *,
     sim_dir: str | Path,
     manifest_path: str | Path,
+    coordinate_dir: str | Path = DEFAULT_COORDINATE_DIR,
     skymap_path: str | Path,
     genversion: str = DEFAULT_GENVERSION,
     fluxcal_zp: float = 27.5,
@@ -358,18 +395,24 @@ def format_snana_fits_to_records(
     )
 
     records: list[FormattedEventRecord] = []
+    scaled_gw_cache: dict[float, tuple[np.ndarray, np.ndarray]] = {}
     for head_path, phot_path in iter_snana_fits(sim_dir, genversion=genversion):
+        sim_event_id = simulation_id_from_head_path(head_path)
+        manifest_row = manifest_lookup.get(sim_event_id)
+        if manifest_row is None:
+            continue
+        true_libid = load_true_libid(coordinate_dir, sim_event_id)
         with fits.open(head_path) as hdul_head, fits.open(phot_path) as hdul_phot:
             head = hdul_head[1].data
             phot = hdul_phot[1].data
             phot_columns = set(phot.columns.names)
-            for row in head:
-                sim_event_id = int(_head_value(row, ("SIM_LIBID", "LIBID"), default=-1))
-                if sim_event_id < 0:
-                    sim_event_id = int(float(str(row["SNID"]).strip()))
-                manifest_row = manifest_lookup.get(sim_event_id)
-                if manifest_row is None:
-                    continue
+            true_rows = [row for row in head if int(row["SIM_LIBID"]) == true_libid]
+            if len(true_rows) > 1:
+                raise ValueError(
+                    f"HEAD file {head_path} contains {len(true_rows)} rows for true LIBID "
+                    f"{true_libid}; expected at most one"
+                )
+            for row in true_rows:
 
                 start = int(row["PTROBS_MIN"]) - 1
                 end = int(row["PTROBS_MAX"])
@@ -394,13 +437,19 @@ def format_snana_fits_to_records(
                 if formatted is None:
                     continue
                 redshift = float(manifest_row["redshift"])
-                scalar, skymap = _scaled_gw_inputs(
-                    base_skymap=base_skymap,
-                    reference_distance_mpc=reference_distance,
-                    reference_distance_std_mpc=reference_std,
-                    redshift=redshift,
-                    scalar_prefix=scalar_prefix,
-                )
+                cache_key = round(redshift, 8)
+                if cache_key not in scaled_gw_cache:
+                    scalar, skymap = _scaled_gw_inputs(
+                        base_skymap=base_skymap,
+                        reference_distance_mpc=reference_distance,
+                        reference_distance_std_mpc=reference_std,
+                        redshift=redshift,
+                        scalar_prefix=scalar_prefix,
+                    )
+                    scalar.setflags(write=False)
+                    skymap.setflags(write=False)
+                    scaled_gw_cache[cache_key] = (scalar, skymap)
+                scalar, skymap = scaled_gw_cache[cache_key]
                 values, errors, masks, times, first_detection_mjd = formatted
                 records.append(
                     FormattedEventRecord(
@@ -546,6 +595,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--sim-dir", default=DEFAULT_SNANA_SIM_DIR)
     parser.add_argument("--genversion", default=DEFAULT_GENVERSION)
     parser.add_argument("--manifest", default=DEFAULT_MANIFEST)
+    parser.add_argument("--coordinate-dir", default=DEFAULT_COORDINATE_DIR)
     parser.add_argument("--skymap", default=DEFAULT_SKYMAP)
     parser.add_argument("--output-h5", default=DEFAULT_OUTPUT_H5)
     parser.add_argument("--min-nobs", type=int, default=5)
@@ -562,6 +612,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         sim_dir=args.sim_dir,
         genversion=args.genversion,
         manifest_path=args.manifest,
+        coordinate_dir=args.coordinate_dir,
         skymap_path=args.skymap,
         fluxcal_zp=float(args.fluxcal_zp),
         psfflux_zp=float(args.psfflux_zp),

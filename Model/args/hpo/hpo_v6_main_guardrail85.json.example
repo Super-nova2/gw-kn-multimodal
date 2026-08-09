@@ -22,7 +22,7 @@
   "cache_in_memory": true,
   "tunable_params": [
     "lr",
-    "batch_size",
+    "gallery_loss_weight",
     "itc_weight",
     "cls_weight",
     "fusion_physical_weight",
@@ -47,9 +47,8 @@
     "neg_gw_pair_ratio": 0.2,
     "samples_per_gw": 4,
     "min_lc_per_gw": 2,
-    "gallery_loss_weight": 0.0,
-    "retrieval_start_epoch": 0,
-    "gallery_loss_ramp_epochs": 0,
+    "retrieval_start_epoch": 10,
+    "gallery_loss_ramp_epochs": 5,
     "gallery_hard_neg_enable": false,
     "time_compat_weight": 0.6,
     "time_compat_tau_days": 30.0,
@@ -78,14 +77,6 @@
       "low": 0.0002,
       "high": 0.001,
       "log": true
-    },
-    "batch_size": {
-      "type": "categorical",
-      "choices": [
-        512,
-        1024,
-        2048
-      ]
     },
     "itc_weight": {
       "type": "categorical",
@@ -131,6 +122,16 @@
       "low": 1e-05,
       "high": 0.0001,
       "log": true
+    },
+    "gallery_loss_weight": {
+      "type": "categorical",
+      "choices": [
+        0.5,
+        0.75,
+        1.0,
+        1.5,
+        2.0
+      ]
     }
   },
   "constraints": {

@@ -39,6 +39,7 @@ TOO_CONFIG="${TOO_CONFIG:-${REPO_ROOT}/kn_simulation/config/rubin_too_2024.yaml}
 SNDATA_ROOT="${SNDATA_ROOT:-${BASE_DIR}/SNANA/SNDATA_ROOT}"
 SNANA_BIN_DIR="${SNANA_BIN_DIR:-${BASE_DIR}/SNANA/SNANA/bin}"
 SNDATA_SIM_DIR="${SNDATA_SIM_DIR:-${SNDATA_ROOT}/SIM/gw170817a}"
+COORDINATE_DIR="${COORDINATE_DIR:-${OUTPUT_DIR}/COORDINATES}"
 SIM_NAME="${SIM_NAME:-LSST_KN_GW170817A}"
 GENVERSION="${GENVERSION:-LSST_KN_GW170817A_REDSHIFT_GRID}"
 REDSHIFTS="${REDSHIFTS:-0.01,0.02,0.03,0.05,0.08,0.12,0.16}"
@@ -47,7 +48,7 @@ SEED="${SEED:-170817}"
 MIN_NOBS="${MIN_NOBS:-5}"
 SAMPLES_PER_EVENT="${SAMPLES_PER_EVENT:-64}"
 SAMPLING_NSIDE="${SAMPLING_NSIDE:-256}"
-BATCH_SIZE="${BATCH_SIZE:-100}"
+BATCH_SIZE="${BATCH_SIZE:-500}"
 NETWORK_SNR="${NETWORK_SNR:-32.4}"
 TRIGGER_MJD="${TRIGGER_MJD:-62500.0}"
 OUTPUT_H5="${OUTPUT_H5:-${BASE_DIR}/data/ALBEF_dataset/gw170817a_lsst_redshift_test.h5}"
@@ -88,6 +89,9 @@ fi
 
 export SNDATA_ROOT
 export PATH="${SNANA_BIN_DIR}:${PATH}"
+NPROC="${NPROC:-${SLURM_CPUS_PER_TASK:-4}}"
+export NPROC SNANA_PREPARE CATALOG SKYMAP_DIR SIM_NAME OPSIM_DB TEMPLATE_INPUT TOO_CONFIG
+export SAMPLES_PER_EVENT SAMPLING_NSIDE OUTPUT_DIR SNDATA_SIM_DIR
 
 case "${STAGE}" in
   all|catalog|snana|sim|h5) ;;
@@ -117,37 +121,25 @@ IDS_FILE="${OUTPUT_DIR}/simulation_ids.txt"
 
 if [[ "${STAGE}" == "all" || "${STAGE}" == "snana" ]]; then
   echo "== Stage: snana prepare =="
-  rm -rf "${OUTPUT_DIR}/SIM_INPUT" "${OUTPUT_DIR}/SIMLIB"
+  rm -rf "${OUTPUT_DIR}/SIM_INPUT" "${OUTPUT_DIR}/SIMLIB" "${COORDINATE_DIR}"
   rm -f "${OUTPUT_DIR}"/sim_ids_chunk_*
   mkdir -p "${OUTPUT_DIR}/SIM_INPUT" "${OUTPUT_DIR}/SIMLIB"
+  mkdir -p "${COORDINATE_DIR}"
   split -l "${BATCH_SIZE}" -d -a 4 "${IDS_FILE}" "${OUTPUT_DIR}/sim_ids_chunk_"
-  for chunk in "${OUTPUT_DIR}"/sim_ids_chunk_*; do
-    echo "Preparing chunk: ${chunk}"
-    python -u "${SNANA_PREPARE}" \
-      --GW_type bns \
-      --sim-id-file "${chunk}" \
-      --GW_catalog "${CATALOG}" \
-      --skymap_path "${SKYMAP_DIR}" \
-      --sim_name "${SIM_NAME}" \
-      --Opsim "${OPSIM_DB}" \
-      --template_input "${TEMPLATE_INPUT}" \
-      --too_config "${TOO_CONFIG}" \
-      --coordinate_mode posterior_test \
-      --samples_per_event "${SAMPLES_PER_EVENT}" \
-      --sampling_nside "${SAMPLING_NSIDE}" \
-      --cosmology Planck15 \
-      --outdir "${OUTPUT_DIR}" \
-      --sndata-sim-dir "${SNDATA_SIM_DIR}"
-  done
+  find "${OUTPUT_DIR}" -maxdepth 1 -name 'sim_ids_chunk_*' -print0 | sort -z | \
+    xargs -0 -P "${NPROC}" -I{} bash -c '
+      echo "Preparing chunk: $1"
+      python -u "$SNANA_PREPARE"         --GW_type bns         --sim-id-file "$1"         --GW_catalog "$CATALOG"         --skymap_path "$SKYMAP_DIR"         --sim_name "$SIM_NAME"         --Opsim "$OPSIM_DB"         --template_input "$TEMPLATE_INPUT"         --too_config "$TOO_CONFIG"         --coordinate_mode posterior_test         --samples_per_event "$SAMPLES_PER_EVENT"         --sampling_nside "$SAMPLING_NSIDE"         --cosmology Planck15         --outdir "$OUTPUT_DIR"         --sndata-sim-dir "$SNDATA_SIM_DIR"
+    ' _ {}
 fi
 
 if [[ "${STAGE}" == "all" || "${STAGE}" == "sim" ]]; then
   echo "== Stage: snana simulation =="
-  for input in "${OUTPUT_DIR}"/SIM_INPUT/SIMGEN_*; do
-    [[ -f "${input}" ]] || continue
-    echo "Running SNANA: ${input}"
-    snlc_sim.exe "${input}"
-  done
+  find "${OUTPUT_DIR}/SIM_INPUT" -maxdepth 1 -name 'SIMGEN_*' -print0 | sort -z | \
+    xargs -0 -P "${NPROC}" -I{} bash -c '
+      echo "Running SNANA: $1"
+      snlc_sim.exe "$1"
+    ' _ {}
 fi
 
 if [[ "${STAGE}" == "all" || "${STAGE}" == "h5" ]]; then
@@ -156,6 +148,7 @@ if [[ "${STAGE}" == "all" || "${STAGE}" == "h5" ]]; then
     --sim-dir "${SNDATA_SIM_DIR}" \
     --genversion "${GENVERSION}" \
     --manifest "${OUTPUT_DIR}/gw170817a_lsst_manifest.csv" \
+    --coordinate-dir "${COORDINATE_DIR}" \
     --skymap "${SKYMAP}" \
     --posterior-h5 "${POSTERIOR_H5}" \
     --posterior-dataset "${POSTERIOR_DATASET}" \

@@ -99,7 +99,7 @@ def gen_input(injections, text, sim_id, gw_type="bns", sndata_sim_dir=None):
 
     replacements = {
         r"^(MJD_EXPLODE:\s*)\S+.*$": rf"\1 {float(row['trigger_mjd'])}",
-        r"^(GENPEAK_COSTHETA:\s*)\S+.*$": (rf"\1 {float(row['viewing_costheta'])}"),
+        r"^(GENPEAK_COSTHETA:\s*)\S+.*$": (rf"\1 {abs(float(row['viewing_costheta']))}"),
         r"^(GENPEAK_MEJDYN:\s*)\S+.*$": rf"\1 {mej_dyn}",
         r"^(GENPEAK_MEJWIND:\s*)\S+.*$": rf"\1 {mej_wind}",
     }
@@ -288,8 +288,10 @@ def main(argv=None):
     outdir = Path(args.outdir)
     input_dir = outdir / "SIM_INPUT"
     simlib_dir = outdir / "SIMLIB"
+    coordinate_dir = outdir / "COORDINATES"
     input_dir.mkdir(parents=True, exist_ok=True)
     simlib_dir.mkdir(parents=True, exist_ok=True)
+    coordinate_dir.mkdir(parents=True, exist_ok=True)
     if args.sndata_sim_dir is not None:
         Path(args.sndata_sim_dir).mkdir(parents=True, exist_ok=True)
         # SNANA requires $SNDATA_ROOT/SIM/PATH_SNDATA_SIM.LIST to exist when
@@ -335,7 +337,9 @@ def main(argv=None):
         row = _event_row(catalog, sim_id)
         simlib_file = simlib_dir / (f"{opsim_stem}_{args.sim_name}_{sim_id}.SIMLIB")
         input_file = input_dir / f"SIMGEN_{args.sim_name}_{sim_id}.INPUT"
+        coordinate_file = coordinate_dir / f"{sim_id}.csv"
         _remove_event_products(simlib_file, input_file)
+        coordinate_file.unlink(missing_ok=True)
         coordinate_frame = None
 
         plan = {
@@ -574,6 +578,7 @@ def main(argv=None):
                 sndata_sim_dir=args.sndata_sim_dir,
             )
             input_file.write_text(text, encoding="utf-8")
+            coordinate_frame.to_csv(coordinate_file, index=False)
 
             plan.update(
                 status="generated",
@@ -588,6 +593,7 @@ def main(argv=None):
             }
         except Exception as error:  # noqa: BLE001 - isolate failures by event
             _remove_event_products(simlib_file, input_file)
+            coordinate_file.unlink(missing_ok=True)
             plan.update(
                 status="failed",
                 error_type=type(error).__name__,

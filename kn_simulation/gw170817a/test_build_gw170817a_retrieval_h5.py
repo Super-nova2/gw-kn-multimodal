@@ -138,6 +138,43 @@ def _write_test_posterior(path: Path) -> None:
 
 
 class Gw170817ARetrievalH5Test(unittest.TestCase):
+    def test_simulation_id_from_head_path_uses_event_filename_not_libid(self):
+        self.assertEqual(
+            builder.simulation_id_from_head_path(
+                "/tmp/LSST_KN_GW170817A_123/LSST_KN_GW170817A_123_HEAD.FITS"
+            ),
+            123,
+        )
+        self.assertEqual(
+            builder.simulation_id_from_head_path("LSST_KN_GW170817A_456_HEAD.FITS.gz"),
+            456,
+        )
+
+    def test_load_true_libid_selects_single_injected_coordinate(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "123.csv"
+            path.write_text(
+                "simulation_id,libid,is_true_position\n"
+                "123,8,False\n"
+                "123,42,True\n",
+                encoding="utf-8",
+            )
+
+            self.assertEqual(builder.load_true_libid(tmpdir, 123), 42)
+
+    def test_load_true_libid_rejects_ambiguous_true_positions(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "123.csv"
+            path.write_text(
+                "simulation_id,libid,is_true_position\n"
+                "123,8,True\n"
+                "123,42,True\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "exactly one true position"):
+                builder.load_true_libid(tmpdir, 123)
+
     def test_load_posterior_scalar_reference_uses_finite_signed_medians(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             posterior_path = Path(tmpdir) / "posterior.h5"
@@ -223,6 +260,11 @@ class Gw170817ARetrievalH5Test(unittest.TestCase):
                 credible_level=0.42,
                 scalar=scalar,
                 skymap=np.zeros((7, 19200), dtype=np.float32),
+                event_uid="gw170817a_7",
+                simulation_id=7,
+                sample_class="positive",
+                mej_dynamic=0.016,
+                mej_wind=0.024,
             )
             output_path = tmp_path / "retrieval.h5"
 
