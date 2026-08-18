@@ -4,7 +4,6 @@ import unittest
 
 import numpy as np
 
-
 MODEL_DIR = Path(__file__).resolve().parents[2] / "Model"
 if str(MODEL_DIR) not in sys.path:
     sys.path.insert(0, str(MODEL_DIR))
@@ -16,15 +15,44 @@ from retrieval_gallery import (
     build_prefixed_gallery_specs,
     compute_source_macro_and_gap,
 )
-from validation_gallery import compute_hard_gallery_selection_summary
+from validation_gallery import (
+    compute_hard_gallery_selection_summary,
+    partition_validation_gw_ids,
+)
 
 
 class BalancedValidationTests(unittest.TestCase):
+    def test_tune_and_confirmation_query_pools_are_disjoint_and_deterministic(self):
+        by_source = {"bns": list(range(20)), "nsbh": list(range(100, 120))}
+        first = partition_validation_gw_ids(by_source, fraction=0.75, seed=314159)
+        second = partition_validation_gw_ids(by_source, fraction=0.75, seed=314159)
+        self.assertEqual(first, second)
+        for source in by_source:
+            self.assertTrue(
+                set(first["tune"][source]).isdisjoint(first["confirmation"][source])
+            )
+            self.assertEqual(len(first["tune"][source]), 15)
+            self.assertEqual(len(first["confirmation"][source]), 5)
+
+    def test_selection_score_accepts_explicit_gallery_size_weights(self):
+        source_macro = {
+            "gallery_100_mrr": 1.0,
+            "gallery_5000_mrr": 0.0,
+            "gallery_100_recall_at_1": 1.0,
+            "gallery_5000_recall_at_1": 0.0,
+        }
+        summary = compute_hard_gallery_selection_summary(
+            source_macro,
+            [100, 5000],
+            mrr_weight=0.8,
+            recall_at_1_weight=0.2,
+            gallery_size_weights={100: 0.1, 5000: 0.9},
+        )
+        self.assertTrue(np.isclose(summary["selection_score"], 0.1))
+
     def test_stratified_split_preserves_sources_and_has_no_overlap(self):
         gw_map = {gw_id: [gw_id] for gw_id in range(30)}
-        source_map = {
-            gw_id: ("bns" if gw_id < 20 else "nsbh") for gw_id in gw_map
-        }
+        source_map = {gw_id: ("bns" if gw_id < 20 else "nsbh") for gw_id in gw_map}
 
         train_map, val_map = split_gw_map(
             gw_map,

@@ -26,7 +26,6 @@ from scripts.eval.eval_retrieval_comparison import (
 )
 from scripts.eval.evaluate import load_negative_optical_samples
 
-
 SUPPORTED_VALIDATION_GALLERY_MODE = "synthetic_time_sky_hard"
 
 
@@ -47,14 +46,31 @@ def compute_hard_gallery_selection_summary(
     *,
     mrr_weight: float,
     recall_at_1_weight: float,
+    gallery_size_weights: Mapping[Any, float] | None = None,
 ) -> Dict[str, float]:
     sizes = [int(size) for size in gallery_sizes]
+    raw_weights = gallery_size_weights or {size: 1.0 for size in sizes}
+    size_weights = np.asarray(
+        [
+            float(raw_weights.get(size, raw_weights.get(str(size), 0.0)))
+            for size in sizes
+        ],
+        dtype=np.float64,
+    )
+    if np.any(size_weights < 0.0) or float(size_weights.sum()) <= 0.0:
+        raise ValueError(
+            "validation gallery size weights must be non-negative and sum to > 0."
+        )
+    size_weights /= size_weights.sum()
     macro_mrr = float(
-        np.mean([float(source_macro[f"gallery_{size}_mrr"]) for size in sizes])
+        np.dot(
+            size_weights, [float(source_macro[f"gallery_{size}_mrr"]) for size in sizes]
+        )
     )
     macro_r1 = float(
-        np.mean(
-            [float(source_macro[f"gallery_{size}_recall_at_1"]) for size in sizes]
+        np.dot(
+            size_weights,
+            [float(source_macro[f"gallery_{size}_recall_at_1"]) for size in sizes],
         )
     )
     mrr_weight = float(mrr_weight)
@@ -70,6 +86,23 @@ def compute_hard_gallery_selection_summary(
         "macro_recall_at_1": macro_r1,
         "selection_score": float(score),
     }
+
+
+def partition_validation_gw_ids(
+    by_source: Mapping[str, Sequence[int]], *, fraction: float, seed: int
+) -> Dict[str, Dict[str, list[int]]]:
+    """Create deterministic, source-stratified and disjoint tune/confirmation pools."""
+    if not 0.0 < float(fraction) < 1.0:
+        raise ValueError("validation_gallery_tune_fraction must be in (0, 1).")
+    rng = np.random.default_rng(int(seed))
+    partitions = {"tune": {}, "confirmation": {}}
+    for source, values in by_source.items():
+        shuffled = np.asarray(sorted({int(value) for value in values}), dtype=np.int64)
+        rng.shuffle(shuffled)
+        cut = int(np.floor(shuffled.size * float(fraction)))
+        partitions["tune"][source] = shuffled[:cut].tolist()
+        partitions["confirmation"][source] = shuffled[cut:].tolist()
+    return partitions
 
 
 def _jsonable_gallery_manifest(
@@ -127,10 +160,14 @@ class ValidationGalleryContext:
     n_trials: int
     mrr_weight: float
     recall_at_1_weight: float
+    gallery_size_weights: Mapping[Any, float] | None = None
 
     @classmethod
     def build(cls, args, val_gw_map: Mapping[int, Sequence[int]]):
-        if str(args.validation_gallery_mode).strip().lower() != SUPPORTED_VALIDATION_GALLERY_MODE:
+        if (
+            str(args.validation_gallery_mode).strip().lower()
+            != SUPPORTED_VALIDATION_GALLERY_MODE
+        ):
             raise ValueError(
                 f"validation_gallery_mode must be '{SUPPORTED_VALIDATION_GALLERY_MODE}'."
             )
@@ -152,6 +189,19 @@ class ValidationGalleryContext:
             source = source_type_map[int(gw_id)]
             if source in by_source and len(optical_indices) >= min_lc:
                 by_source[source].append(int(gw_id))
+
+        partition = str(getattr(args, "validation_gallery_partition", "all")).lower()
+        if partition not in {"all", "tune", "confirmation"}:
+            raise ValueError(
+                "validation_gallery_partition must be all, tune, or confirmation."
+            )
+        if partition != "all":
+            pools = partition_validation_gw_ids(
+                by_source,
+                fraction=float(getattr(args, "validation_gallery_tune_fraction", 0.75)),
+                seed=int(getattr(args, "validation_gallery_partition_seed", 42)),
+            )
+            by_source = pools[partition]
 
         rng = np.random.default_rng(int(args.validation_gallery_seed))
         selected_gw = []
@@ -184,7 +234,9 @@ class ValidationGalleryContext:
             runtime_input_window_end=float(args.ref_end),
         )
         if negative_bank_raw is None:
-            raise ValueError("Failed to load negative optical samples for validation gallery.")
+            raise ValueError(
+                "Failed to load negative optical samples for validation gallery."
+            )
 
         candidate_sequences, _gw_skymaps, _gw_times = (
             build_synthetic_time_sky_candidate_sequences(
@@ -195,9 +247,7 @@ class ValidationGalleryContext:
                 n_trials=n_trials,
                 seed=int(args.validation_gallery_seed),
                 time_window_days=float(args.validation_gallery_time_window_days),
-                credible_level_max=float(
-                    args.validation_gallery_credible_level_max
-                ),
+                credible_level_max=float(args.validation_gallery_credible_level_max),
             )
         )
         galleries, unique_gw = build_prefixed_gallery_specs(
@@ -209,7 +259,9 @@ class ValidationGalleryContext:
             include_undersized=bool(args.validation_gallery_include_undersized),
         )
         if not galleries:
-            raise ValueError("Validation hard-gallery construction produced no instances.")
+            raise ValueError(
+                "Validation hard-gallery construction produced no instances."
+            )
 
         selected_positive_indices = np.unique(
             np.asarray(
@@ -224,9 +276,7 @@ class ValidationGalleryContext:
             runtime_input_window_end=float(args.ref_end),
         )
         galleries = remap_gallery_positive_indices(galleries, positive_remap)
-        gw_source_map = {
-            int(gw_id): source_type_map[int(gw_id)] for gw_id in unique_gw
-        }
+        gw_source_map = {int(gw_id): source_type_map[int(gw_id)] for gw_id in unique_gw}
 
         manifest = _jsonable_gallery_manifest(
             galleries=galleries,
@@ -243,7 +293,7 @@ class ValidationGalleryContext:
         manifest_dir = os.path.join(args.ckpt_path, "ALBEF")
         os.makedirs(manifest_dir, exist_ok=True)
         manifest_path = os.path.join(
-            manifest_dir, "validation_gallery_manifest.json"
+            manifest_dir, f"validation_gallery_manifest_{partition}.json"
         )
         with open(manifest_path, "w") as f:
             json.dump(manifest, f, indent=2)
@@ -264,9 +314,8 @@ class ValidationGalleryContext:
             gallery_sizes=gallery_sizes,
             n_trials=n_trials,
             mrr_weight=float(args.validation_gallery_mrr_weight),
-            recall_at_1_weight=float(
-                args.validation_gallery_recall_at_1_weight
-            ),
+            recall_at_1_weight=float(args.validation_gallery_recall_at_1_weight),
+            gallery_size_weights=getattr(args, "validation_gallery_size_weights", None),
         )
 
     def evaluate(self, model, args, device, amp_dtype, gw_event_time_mjd_table):
@@ -331,6 +380,7 @@ class ValidationGalleryContext:
                 self.gallery_sizes,
                 mrr_weight=self.mrr_weight,
                 recall_at_1_weight=self.recall_at_1_weight,
+                gallery_size_weights=self.gallery_size_weights,
             )
             return {
                 "overall": overall,

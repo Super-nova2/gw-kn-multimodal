@@ -35,3 +35,21 @@ def test_production_profiles(name, source, split, mode, samples):
         DEFAULT_BASE_DIR / "data" / "skymap" / "negative" / f"{source}_skymap_{split}"
     )
     assert isinstance(profile.template_input, Path)
+
+
+@pytest.mark.parametrize(
+    "name,split", [("bns_train_am", "train"), ("bns_test_am", "test")]
+)
+def test_production_am_profiles_are_positive_only_variants(name, split):
+    profile = load_profile(name)
+    assert profile.name == name
+    assert profile.seed == 1234
+    assert profile.negative_skymap_dir is None
+    assert profile.skymap_dir == (
+        DEFAULT_BASE_DIR
+        / "GWSamplegen"
+        / "outputs"
+        / "production_am_bayestar"
+        / f"bns_{split}_seed_1234"
+        / "skymaps"
+    )

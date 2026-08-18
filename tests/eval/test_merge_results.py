@@ -105,10 +105,21 @@ class MergeRetrievalComparisonTests(unittest.TestCase):
         )
         base["config"]["models"] = [{"name": "base", "type": "test"}]
         supplement = copy.deepcopy(base)
-        supplement["models"] = {"new": {"type": "test"}}
-        supplement["curve_rows"] = [{"method": "new"}]
-        supplement["table"] = {"rows": [{"method": "new"}]}
-        supplement["config"]["models"] = [{"name": "new", "type": "test"}]
+        supplement["models"] = {
+            "new": {"type": "test"},
+            "new-2": {"type": "test"},
+        }
+        supplement["curve_rows"] = [
+            {"method": "new"},
+            {"method": "new-2"},
+        ]
+        supplement["table"] = {
+            "rows": [{"method": "new"}, {"method": "new-2"}]
+        }
+        supplement["config"]["models"] = [
+            {"name": "new", "type": "test"},
+            {"name": "new-2", "type": "test"},
+        ]
         supplement["gallery_identity"] = {"sha256": "shared-gallery"}
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -135,6 +146,11 @@ class MergeRetrievalComparisonTests(unittest.TestCase):
         self.assertEqual(
             merged["supplement_provenance"]["gallery_identity_sha256"],
             "shared-gallery",
+        )
+        self.assertEqual(list(merged["models"]), ["base", "new", "new-2"])
+        self.assertEqual(
+            merged["supplement_provenance"]["added_methods"],
+            ["new", "new-2"],
         )
 
     def test_merge_comparison_help_runs_outside_repo(self):

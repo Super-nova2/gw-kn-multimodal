@@ -136,6 +136,8 @@ TEST_DATA_PATH=$(jq -r '.test_data_path // empty' "$config_file")
 NEG_DATA_PATH=$(jq -r '.neg_data_path // empty' "$config_file")
 NEG_GROUP=$(jq -r '.neg_group // empty' "$config_file")
 OUTPUT_DIR=$(jq -r '.output_dir // empty' "$config_file")
+POST_MERGE_BASE_RESULT=$(jq -r '.post_merge_base_result // empty' "$config_file")
+POST_MERGE_OUTPUT_DIR=$(jq -r '.post_merge_output_dir // empty' "$config_file")
 STRICT_OUTPUT_SAFETY=$(jq -r '.strict_output_safety // false' "$config_file")
 DEVICE=$(jq -r '.device // "cuda"' "$config_file")
 AMP_DTYPE=$(jq -r '.amp_dtype // empty' "$config_file")
@@ -166,6 +168,16 @@ if [[ -n "$NEG_DATA_PATH" && "$NEG_DATA_PATH" != "null" && ! -f "$NEG_DATA_PATH"
 fi
 if [[ -z "$OUTPUT_DIR" || "$OUTPUT_DIR" == "null" ]]; then
     OUTPUT_DIR="${DEFAULT_OUTPUT_DIR}"
+fi
+if [[ -n "$POST_MERGE_BASE_RESULT" || -n "$POST_MERGE_OUTPUT_DIR" ]]; then
+    if [[ -z "$POST_MERGE_BASE_RESULT" || -z "$POST_MERGE_OUTPUT_DIR" ]]; then
+        echo "post_merge_base_result and post_merge_output_dir must be set together." >&2
+        exit 1
+    fi
+    if [[ ! -f "$POST_MERGE_BASE_RESULT" ]]; then
+        echo "Post-merge base result not found: $POST_MERGE_BASE_RESULT" >&2
+        exit 1
+    fi
 fi
 if [[ "$STRICT_OUTPUT_SAFETY" != "true" ]]; then
     mkdir -p "${OUTPUT_DIR}"
@@ -210,6 +222,10 @@ if [[ -n "${MAX_GW_EVENTS}" && "${MAX_GW_EVENTS}" != "null" ]]; then
 fi
 echo "Compute classification metrics: ${COMPUTE_CLASSIFICATION_METRICS}"
 echo "Run mode: retrieval comparison"
+if [[ -n "$POST_MERGE_BASE_RESULT" ]]; then
+    echo "Post-merge base: ${POST_MERGE_BASE_RESULT}"
+    echo "Post-merge output: ${POST_MERGE_OUTPUT_DIR}"
+fi
 echo "Expected outputs:"
 echo "  ${OUTPUT_DIR}/ablation_comparison.json"
 echo "  ${OUTPUT_DIR}/retrieval_curves.png"
@@ -312,6 +328,19 @@ exit_code=$?
 if [[ ${exit_code} -ne 0 ]]; then
     echo "Retrieval comparison failed with exit code ${exit_code}" >&2
     exit ${exit_code}
+fi
+
+if [[ -n "$POST_MERGE_BASE_RESULT" ]]; then
+    supplement_result="${OUTPUT_DIR}/ablation_comparison.json"
+    if [[ ! -f "$supplement_result" ]]; then
+        echo "Supplement result not found after evaluation: $supplement_result" >&2
+        exit 1
+    fi
+    echo "Merging supplement into existing comparison results"
+    python -u "${SCRIPT_DIR}/merge_retrieval_comparison.py" \
+        --base "$POST_MERGE_BASE_RESULT" \
+        --supplement "$supplement_result" \
+        --output-dir "$POST_MERGE_OUTPUT_DIR"
 fi
 
 echo "----------------------------------------"

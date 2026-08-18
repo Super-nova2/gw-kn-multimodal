@@ -14,8 +14,9 @@ import os
 import subprocess
 import sys
 import time
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, List, Tuple
 
+import numpy as np
 import optuna
 from optuna.pruners import MedianPruner
 from optuna.samplers import TPESampler
@@ -43,6 +44,7 @@ MAGIKS_BOOL_KEYS = {
     "gallery_include_extra_negatives",
     "gallery_hard_neg_enable",
     "skip_epoch_checkpoints",
+    "save_last_checkpoint",
 }
 
 MAGIKS_ARG_KEYS = {
@@ -63,6 +65,8 @@ MAGIKS_ARG_KEYS = {
     "lr_scheduler",
     "warmup_epochs",
     "min_lr",
+    "lr_schedule_total_epochs",
+    "training_schedule_total_epochs",
     "num_workers",
     "pin_memory",
     "persistent_workers",
@@ -75,6 +79,7 @@ MAGIKS_ARG_KEYS = {
     "seed",
     "early_stop_patience",
     "early_stop_min_delta",
+    "best_ckpt_min_delta",
     "best_ckpt_metric",
     "n_ref",
     "ref_start",
@@ -155,6 +160,14 @@ MAGIKS_ARG_KEYS = {
     "validation_gallery_include_undersized",
     "validation_gallery_mrr_weight",
     "validation_gallery_recall_at_1_weight",
+    "validation_gallery_eval_interval",
+    "validation_gallery_partition",
+    "validation_gallery_tune_fraction",
+    "validation_gallery_partition_seed",
+    "validation_gallery_size_weights",
+    "validation_confirmation_gallery_enable",
+    "validation_confirmation_gallery_queries_per_source",
+    "validation_confirmation_gallery_trials",
     "gallery_score_chunk_size",
     "max_gallery_queries",
     "gallery_include_extra_negatives",
@@ -204,6 +217,7 @@ MAGIKS_ARG_KEYS = {
     "opt_aug_band_dropout",
     "hpo_trial_number",
     "skip_epoch_checkpoints",
+    "save_last_checkpoint",
 }
 
 STALE_KEYS = {
@@ -418,6 +432,72 @@ def _validate_balanced_model_capacity_config(cfg: Dict[str, Any]) -> None:
         )
 
 
+def _validate_stage_joint_itc_schedule_config(cfg: Dict[str, Any]) -> None:
+    ratio = cfg.get("stage_joint_itc_end_ratio")
+    if ratio is None:
+        return
+    try:
+        ratio = float(ratio)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("stage_joint_itc_end_ratio must be numeric") from exc
+    if not 0.0 < ratio <= 1.0:
+        raise ValueError("stage_joint_itc_end_ratio must be in (0, 1].")
+
+    if "stage_joint_itc_end_weight" in cfg["tunable_params"]:
+        raise ValueError(
+            "stage_joint_itc_end_weight cannot be tuned when "
+            "stage_joint_itc_end_ratio is set"
+        )
+    if "stage_joint_itc_end_weight" in cfg["fixed_overrides"]:
+        raise ValueError(
+            "stage_joint_itc_end_weight cannot be fixed when "
+            "stage_joint_itc_end_ratio is set"
+        )
+    cfg["stage_joint_itc_end_ratio"] = ratio
+
+
+def _validate_successive_halving_config(cfg: Dict[str, Any]) -> None:
+    rungs = cfg.get("promotion_rungs")
+    if not rungs:
+        return
+    if len(cfg["tunable_params"]) != 8:
+        raise ValueError("successive-halving v7 must tune exactly 8 parameters.")
+    epochs = [int(item["epochs"]) for item in rungs]
+    keeps = [int(item["keep"]) for item in rungs]
+    if epochs != sorted(set(epochs)) or epochs[-1] != 100:
+        raise ValueError(
+            "promotion_rungs epochs must increase uniquely and end at 100."
+        )
+    if keeps[0] != int(cfg["n_trials"]) or any(
+        later > earlier for earlier, later in zip(keeps, keeps[1:])
+    ):
+        raise ValueError(
+            "promotion_rungs keep counts must start at n_trials and not increase."
+        )
+    baseline = cfg.get("baseline_trial", {})
+    if set(baseline) != set(cfg["tunable_params"]):
+        raise ValueError(
+            "baseline_trial must specify every and only tunable parameter."
+        )
+    weights = cfg.get("gallery_size_weights", {})
+    if {int(size) for size in weights} != {100, 500, 1000, 2000, 5000}:
+        raise ValueError(
+            "gallery_size_weights must cover 100, 500, 1000, 2000, and 5000."
+        )
+    if not math.isclose(sum(float(value) for value in weights.values()), 1.0):
+        raise ValueError("gallery_size_weights must sum to 1.")
+    confirmation = cfg.get("confirmation", {})
+    if list(confirmation.get("seeds", [])) != [42, 123, 456]:
+        raise ValueError("confirmation seeds must be [42, 123, 456].")
+
+
+def _apply_stage_joint_itc_schedule(config: Dict[str, Any], end_ratio: Any) -> None:
+    if end_ratio is None:
+        return
+    start_weight = float(config.get("stage_joint_itc_start_weight", 0.5))
+    config["stage_joint_itc_end_weight"] = start_weight * float(end_ratio)
+
+
 def _apply_balanced_model_capacity(config: Dict[str, Any], preset_name: Any) -> None:
     if (
         not isinstance(preset_name, str)
@@ -571,6 +651,7 @@ def load_hpo_config(config_path: str) -> Dict[str, Any]:
     cfg.setdefault("tunable_params", list(DEFAULT_TUNABLE_PARAMS))
     cfg.setdefault("fixed_overrides", {})
     cfg.setdefault("retrain_overrides", {})
+    cfg.setdefault("stage_joint_itc_end_ratio", None)
     cfg.setdefault("num_workers", 4)
 
     if cfg["objective_direction"] not in {"maximize", "minimize"}:
@@ -624,6 +705,8 @@ def load_hpo_config(config_path: str) -> Dict[str, Any]:
         _validate_search_space_spec(p, cfg["search_space"][p])
 
     _validate_balanced_model_capacity_config(cfg)
+    _validate_stage_joint_itc_schedule_config(cfg)
+    _validate_successive_halving_config(cfg)
 
     os.makedirs(cfg["output_dir"], exist_ok=True)
     if cfg["storage"] is None:
@@ -835,6 +918,7 @@ def build_trial_config(
         _apply_balanced_model_capacity(config, balanced_model_capacity)
 
     config.update(fixed_overrides)
+    _apply_stage_joint_itc_schedule(config, hpo_cfg.get("stage_joint_itc_end_ratio"))
 
     if "batch_size" in sampled or "batch_size" in fixed_overrides:
         apply_batch_size_step_derivation(config)
@@ -864,13 +948,14 @@ def build_trial_config(
 
 
 def run_trial_subprocess(
-    config: Dict[str, Any], trial_number: int, output_dir: str
+    config: Dict[str, Any], trial_number: int, output_dir: str, label: str = None
 ) -> Dict[str, Any]:
     """Run a single training trial as a subprocess and return parsed trial_results.json."""
 
     config_dir = os.path.join(output_dir, "configs")
     os.makedirs(config_dir, exist_ok=True)
-    config_path = os.path.join(config_dir, f"trial_{trial_number}.json")
+    suffix = f"_{label}" if label else ""
+    config_path = os.path.join(config_dir, f"trial_{trial_number}{suffix}.json")
 
     with open(config_path, "w") as f:
         json.dump(config, f, indent=2)
@@ -898,7 +983,9 @@ def run_trial_subprocess(
     )
     print(f"{'=' * 60}")
 
-    log_path = os.path.join(output_dir, "results", f"trial_{trial_number}", "train.log")
+    log_path = os.path.join(
+        output_dir, "results", f"trial_{trial_number}", f"train{suffix}.log"
+    )
     os.makedirs(os.path.dirname(log_path), exist_ok=True)
 
     t0 = time.time()
@@ -969,6 +1056,184 @@ def compute_objective_score(
     if weight_total <= 0:
         return float("nan")
     return weighted_sum / weight_total
+
+
+def compute_retrieval_weighted_score(
+    results: Dict[str, Any], gallery_size_weights: Dict[Any, float]
+) -> float:
+    """Score source-macro retrieval with explicit gallery-size importance."""
+    hard = results.get("val_hard_gallery", {})
+    source_macro = hard.get("source_macro", {}) if isinstance(hard, dict) else {}
+    weighted_sum = 0.0
+    weight_total = 0.0
+    for raw_size, raw_weight in gallery_size_weights.items():
+        size = int(raw_size)
+        weight = float(raw_weight)
+        mrr = _read_metric(source_macro, f"gallery_{size}_mrr")
+        r1 = _read_metric(source_macro, f"gallery_{size}_recall_at_1")
+        if weight < 0.0 or math.isnan(mrr) or math.isnan(r1):
+            return float("nan")
+        weighted_sum += weight * (0.8 * mrr + 0.2 * r1)
+        weight_total += weight
+    return weighted_sum / weight_total if weight_total > 0.0 else float("nan")
+
+
+def compute_relative_constraint_values(
+    results: Dict[str, Any],
+    baseline_results: Dict[str, Any],
+    *,
+    min_neg_recall: float,
+    max_auprc_drop: float,
+) -> List[float]:
+    """Return Optuna-style violations (feasible iff every value is <= 0)."""
+    neg_recall = _read_metric(results, "val_neg_gw_min_recall")
+    auprc = _read_metric(results, "val_auprc")
+    baseline_auprc = _read_metric(baseline_results, "val_auprc")
+    values = [
+        float(min_neg_recall) - neg_recall,
+        baseline_auprc - float(max_auprc_drop) - auprc,
+    ]
+    return [value if math.isfinite(value) else float("inf") for value in values]
+
+
+def constraints_are_feasible(values) -> bool:
+    return bool(values) and all(
+        math.isfinite(float(v)) and float(v) <= 0.0 for v in values
+    )
+
+
+def select_promotions(records, keep_count: int, baseline_trial_number: int):
+    """Promote feasible trials by score while always retaining the Full baseline."""
+    records = list(records)
+    baseline = next(r for r in records if r["trial_number"] == baseline_trial_number)
+    ranked = sorted(
+        (r for r in records if r is not baseline),
+        key=lambda r: (constraints_are_feasible(r["constraints"]), r["score"]),
+        reverse=True,
+    )
+    return [baseline] + ranked[: max(0, int(keep_count) - 1)]
+
+
+def summarize_confirmation_runs(runs, size_weights, baseline_trial_number=0):
+    """Apply the predeclared robust replacement gates to confirmation results."""
+    grouped = {}
+    for run in runs:
+        grouped.setdefault(int(run["trial_number"]), []).append(run)
+    baseline = grouped[int(baseline_trial_number)]
+
+    def metrics(items):
+        scores = [
+            compute_retrieval_weighted_score(x["results"], size_weights) for x in items
+        ]
+        auprcs = [_read_metric(x["results"], "val_auprc") for x in items]
+        neg = [_read_metric(x["results"], "val_neg_gw_min_recall") for x in items]
+        pooled_correct = 0.0
+        pooled_count = 0.0
+        large = {}
+        source_scores = []
+        for size in (2000, 5000):
+            large[size] = float(
+                np.mean(
+                    [
+                        _read_metric(
+                            x["results"]
+                            .get("val_hard_gallery", {})
+                            .get("source_macro", {}),
+                            f"gallery_{size}_mrr",
+                        )
+                        for x in items
+                    ]
+                )
+            )
+        for item in items:
+            by_source = item["results"].get("val_hard_gallery", {}).get("by_source", {})
+            for source_metrics in by_source.values():
+                weighted_value = 0.0
+                weight_total = 0.0
+                for raw_size in size_weights:
+                    size = int(raw_size)
+                    weight = float(size_weights[raw_size])
+                    weighted_value += weight * (
+                        0.8 * _read_metric(source_metrics, f"gallery_{size}_mrr")
+                        + 0.2
+                        * _read_metric(source_metrics, f"gallery_{size}_recall_at_1")
+                    )
+                    weight_total += weight
+                if weight_total > 0.0:
+                    source_scores.append(weighted_value / weight_total)
+            for stratum in item["results"].get("neg_gw_strata", {}).values():
+                count = float(stratum.get("count", 0.0))
+                pooled_correct += count * float(stratum.get("recall", 0.0))
+                pooled_count += count
+        return {
+            "mean_score": float(np.mean(scores)),
+            "worst_seed_score": float(np.min(scores)),
+            "worst_source_score": (
+                float(np.min(source_scores)) if source_scores else float("nan")
+            ),
+            "mean_auprc": float(np.mean(auprcs)),
+            "pooled_neg_gw_recall": (
+                pooled_correct / pooled_count
+                if pooled_count > 0.0
+                else float(np.mean(neg))
+            ),
+            "min_seed_neg_gw_recall": float(np.min(neg)),
+            "large_gallery_mrr": large,
+            "scores_by_seed": {
+                str(x["seed"]): score for x, score in zip(items, scores)
+            },
+        }
+
+    baseline_metrics = metrics(baseline)
+    summaries = {}
+    for trial_number, items in grouped.items():
+        current = metrics(items)
+        wins = sum(
+            current["scores_by_seed"].get(seed, float("-inf"))
+            > baseline_metrics["scores_by_seed"].get(seed, float("inf"))
+            for seed in current["scores_by_seed"]
+        )
+        gates = {
+            "mean_score_gain_ge_0.005": current["mean_score"]
+            >= baseline_metrics["mean_score"] + 0.005,
+            "wins_at_least_2_of_3_seeds": wins >= 2,
+            "large_gallery_no_drop": all(
+                current["large_gallery_mrr"][s]
+                >= baseline_metrics["large_gallery_mrr"][s]
+                for s in (2000, 5000)
+            ),
+            "auprc_drop_le_0.005": current["mean_auprc"]
+            >= baseline_metrics["mean_auprc"] - 0.005,
+            "pooled_neg_recall_ge_0.85": current["pooled_neg_gw_recall"] >= 0.85,
+            "each_seed_neg_recall_ge_0.83": current["min_seed_neg_gw_recall"] >= 0.83,
+        }
+        current.update(
+            seed_wins=wins, gates=gates, passes_all_gates=all(gates.values())
+        )
+        summaries[str(trial_number)] = current
+    eligible = [
+        (int(number), values)
+        for number, values in summaries.items()
+        if int(number) != int(baseline_trial_number) and values["passes_all_gates"]
+    ]
+    winner = (
+        max(
+            eligible,
+            key=lambda x: (
+                x[1]["mean_score"],
+                x[1]["worst_seed_score"],
+                x[1]["worst_source_score"],
+            ),
+        )[0]
+        if eligible
+        else baseline_trial_number
+    )
+    return {
+        "baseline_trial_number": baseline_trial_number,
+        "recommended_trial_number": winner,
+        "retain_full_baseline": winner == baseline_trial_number,
+        "trials": summaries,
+    }
 
 
 def check_objective_min_metrics(
@@ -1084,6 +1349,331 @@ def dry_run(hpo_cfg: Dict[str, Any], base_cfg: Dict[str, Any]) -> None:
     print(json.dumps(config, indent=2))
 
 
+def _write_json(path: str, value: Any, max_attempts: int = 5) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    max_attempts = max(1, int(max_attempts))
+    for attempt in range(1, max_attempts + 1):
+        temporary_path = f"{path}.tmp.{os.getpid()}.{attempt}"
+        try:
+            with open(temporary_path, "w") as handle:
+                json.dump(value, handle, indent=2)
+            os.replace(temporary_path, path)
+            return
+        except OSError as exc:
+            if attempt >= max_attempts:
+                raise
+            delay = min(2 ** (attempt - 1), 30)
+            print(
+                f"[WARN] JSON write attempt {attempt}/{max_attempts} failed "
+                f"for {path}: {exc}; retrying in {delay}s."
+            )
+            time.sleep(delay)
+        finally:
+            if os.path.exists(temporary_path):
+                os.remove(temporary_path)
+
+
+def _read_json(path: str) -> Any:
+    with open(path) as handle:
+        return json.load(handle)
+
+
+def _labeled_result_path(output_dir: str, trial_number: int, label: str) -> str:
+    return os.path.join(
+        output_dir,
+        "results",
+        f"trial_{int(trial_number)}",
+        f"results_{label}.json",
+    )
+
+
+def _restore_first_rung_records(study, hpo_cfg, first_epoch, size_weights):
+    """Reconstruct v7 state after all first-rung Optuna trials completed."""
+    trials = sorted(study.trials, key=lambda item: item.number)
+    expected = int(hpo_cfg["n_trials"])
+    complete_state = optuna.trial.TrialState.COMPLETE
+    if len(trials) != expected or any(t.state != complete_state for t in trials):
+        raise RuntimeError(
+            "Cannot resume successive halving unless the first rung contains "
+            f"exactly {expected} COMPLETE Optuna trials; found {len(trials)}."
+        )
+    if [t.number for t in trials] != list(range(expected)):
+        raise RuntimeError(
+            "Cannot resume: first-rung trial numbers are not contiguous."
+        )
+
+    baseline_path = _labeled_result_path(
+        hpo_cfg["output_dir"], 0, f"epoch_{first_epoch}"
+    )
+    if not os.path.exists(baseline_path):
+        raise RuntimeError(f"Cannot resume: missing baseline result {baseline_path}")
+    baseline_results = _read_json(baseline_path)
+    records = []
+    for trial in trials:
+        config_path = os.path.join(
+            hpo_cfg["output_dir"],
+            "configs",
+            f"trial_{trial.number}_epoch_{first_epoch}.json",
+        )
+        result_path = _labeled_result_path(
+            hpo_cfg["output_dir"], trial.number, f"epoch_{first_epoch}"
+        )
+        if not os.path.exists(config_path) or not os.path.exists(result_path):
+            raise RuntimeError(
+                "Cannot resume: missing first-rung config/result for "
+                f"trial {trial.number}."
+            )
+        config = _read_json(config_path)
+        for runtime_key in (
+            "data_path",
+            "neg_data_path",
+            "neg_group",
+            "test_data_path",
+            "num_workers",
+        ):
+            if hpo_cfg.get(runtime_key) is not None:
+                config[runtime_key] = hpo_cfg[runtime_key]
+        results = _read_json(result_path)
+        score = compute_retrieval_weighted_score(results, size_weights)
+        if trial.value is None or not math.isclose(
+            score, float(trial.value), rel_tol=0.0, abs_tol=1e-12
+        ):
+            raise RuntimeError(
+                f"Cannot resume: trial {trial.number} score does not match Optuna."
+            )
+        constraints = compute_relative_constraint_values(
+            results,
+            baseline_results,
+            min_neg_recall=float(hpo_cfg["constraints"]["min_neg_gw_recall"]),
+            max_auprc_drop=float(hpo_cfg["constraints"]["max_auprc_drop"]),
+        )
+        records.append(
+            {
+                "trial_number": trial.number,
+                "params": dict(trial.params),
+                "config": config,
+                "rungs": {str(first_epoch): results},
+                "score": score,
+                "constraints": constraints,
+            }
+        )
+    print(f"Restored {len(records)} completed epoch-{first_epoch} trials.")
+    return records
+
+
+def _run_labeled_training(config, record, hpo_cfg, label):
+    number = int(record["trial_number"])
+    result_copy = _labeled_result_path(hpo_cfg["output_dir"], number, label)
+    if os.path.exists(result_copy):
+        print(f"Trial {number}: reusing completed {label} result: {result_copy}")
+        return _read_json(result_copy)
+    last_checkpoint = os.path.join(config["ckpt_path"], "ALBEF", "albef_last.pth")
+    if config.get("resume") is None and os.path.exists(last_checkpoint):
+        config = dict(config)
+        config["resume"] = last_checkpoint
+        print(
+            f"Trial {number}: auto-resuming incomplete {label} from {last_checkpoint}"
+        )
+    results = run_trial_subprocess(config, number, hpo_cfg["output_dir"], label=label)
+    _write_json(result_copy, results)
+    return results
+
+
+def run_successive_halving(hpo_cfg: Dict[str, Any], base_cfg: Dict[str, Any]) -> None:
+    """Run v7's fixed-horizon 30->60->100 retrieval-first search."""
+    rung_specs = hpo_cfg["promotion_rungs"]
+    size_weights = hpo_cfg["gallery_size_weights"]
+    baseline_params = hpo_cfg["baseline_trial"]
+
+    def constraints_func(frozen_trial):
+        return frozen_trial.user_attrs.get("constraint_values", [0.0, 0.0])
+
+    sampler = TPESampler(
+        n_startup_trials=int(hpo_cfg["n_startup_trials"]),
+        seed=int(hpo_cfg.get("sampler_seed", 42)),
+        multivariate=True,
+        group=True,
+        constraints_func=constraints_func,
+    )
+    study = optuna.create_study(
+        study_name=hpo_cfg["study_name"],
+        storage=hpo_cfg["storage"],
+        sampler=sampler,
+        direction="maximize",
+        load_if_exists=True,
+    )
+    resume_existing = bool(study.trials)
+    if not resume_existing:
+        study.enqueue_trial(baseline_params)
+    first_epoch = int(rung_specs[0]["epochs"])
+    records = (
+        _restore_first_rung_records(study, hpo_cfg, first_epoch, size_weights)
+        if resume_existing
+        else []
+    )
+    baseline_results = None
+    first_rung_runs = 0 if resume_existing else int(hpo_cfg["n_trials"])
+    for _ in range(first_rung_runs):
+        trial = study.ask()
+        config = build_trial_config(trial, hpo_cfg, base_cfg)
+        config.update(
+            {
+                "epochs": first_epoch,
+                "lr_schedule_total_epochs": int(rung_specs[-1]["epochs"]),
+                "training_schedule_total_epochs": int(rung_specs[-1]["epochs"]),
+                "best_ckpt_min_delta": 0.0,
+                "early_stop_patience": 0,
+                "validation_gallery_eval_interval": int(
+                    hpo_cfg.get("validation_gallery_eval_interval", 5)
+                ),
+                "validation_gallery_partition": "tune",
+                "validation_gallery_size_weights": size_weights,
+                "save_last_checkpoint": True,
+                "skip_epoch_checkpoints": True,
+            }
+        )
+        record = {
+            "trial_number": trial.number,
+            "params": dict(trial.params),
+            "config": config,
+            "rungs": {},
+        }
+        results = _run_labeled_training(config, record, hpo_cfg, f"epoch_{first_epoch}")
+        if trial.number == 0:
+            baseline_results = results
+        if baseline_results is None:
+            raise RuntimeError("The enqueued Full baseline must execute as trial 0.")
+        score = compute_retrieval_weighted_score(results, size_weights)
+        constraints = compute_relative_constraint_values(
+            results,
+            baseline_results,
+            min_neg_recall=float(hpo_cfg["constraints"]["min_neg_gw_recall"]),
+            max_auprc_drop=float(hpo_cfg["constraints"]["max_auprc_drop"]),
+        )
+        record.update(score=score, constraints=constraints)
+        record["rungs"][str(first_epoch)] = results
+        trial.set_user_attr("constraint_values", constraints)
+        trial.set_user_attr("rung_epoch", first_epoch)
+        study.tell(trial, score)
+        records.append(record)
+
+    baseline_number = 0
+    current = records
+    for rung in rung_specs[1:]:
+        epoch_limit = int(rung["epochs"])
+        current = select_promotions(current, int(rung["keep"]), baseline_number)
+        baseline_record = next(
+            r for r in current if r["trial_number"] == baseline_number
+        )
+        ordered = [baseline_record] + [r for r in current if r is not baseline_record]
+        baseline_results = None
+        for record in ordered:
+            config = dict(record["config"])
+            config["epochs"] = epoch_limit
+            config["resume"] = os.path.join(
+                config["ckpt_path"], "ALBEF", "albef_last.pth"
+            )
+            if epoch_limit == int(rung_specs[-1]["epochs"]):
+                config.update(
+                    {
+                        "validation_confirmation_gallery_enable": True,
+                        "validation_confirmation_gallery_queries_per_source": int(
+                            hpo_cfg["confirmation"]["queries_per_source"]
+                        ),
+                        "validation_confirmation_gallery_trials": int(
+                            hpo_cfg["confirmation"]["gallery_trials"]
+                        ),
+                    }
+                )
+            results = _run_labeled_training(
+                config, record, hpo_cfg, f"epoch_{epoch_limit}"
+            )
+            if record["trial_number"] == baseline_number:
+                baseline_results = results
+            score = compute_retrieval_weighted_score(results, size_weights)
+            constraints = compute_relative_constraint_values(
+                results,
+                baseline_results,
+                min_neg_recall=float(hpo_cfg["constraints"]["min_neg_gw_recall"]),
+                max_auprc_drop=float(hpo_cfg["constraints"]["max_auprc_drop"]),
+            )
+            record.update(config=config, score=score, constraints=constraints)
+            record["rungs"][str(epoch_limit)] = results
+        _write_json(
+            os.path.join(hpo_cfg["output_dir"], f"promotions_epoch_{epoch_limit}.json"),
+            current,
+        )
+
+    feasible = [r for r in current if constraints_are_feasible(r["constraints"])]
+    baseline_record = next(r for r in current if r["trial_number"] == baseline_number)
+    finalist_pool = feasible or current
+    if baseline_record not in finalist_pool:
+        finalist_pool = [baseline_record] + finalist_pool
+    finalists = select_promotions(
+        finalist_pool, int(hpo_cfg["confirmation"]["top_k"]), baseline_number
+    )
+    confirmation_runs = []
+    for record in finalists:
+        seed_42_results = dict(record["rungs"][str(rung_specs[-1]["epochs"])])
+        seed_42_results["val_hard_gallery"] = seed_42_results.pop(
+            "val_confirmation_hard_gallery"
+        )
+        confirmation_runs.append(
+            {
+                "trial_number": record["trial_number"],
+                "seed": 42,
+                "results": seed_42_results,
+            }
+        )
+        for seed in hpo_cfg["confirmation"]["seeds"]:
+            if int(seed) == 42:
+                continue
+            config = dict(record["config"])
+            config.update(
+                {
+                    "epochs": int(rung_specs[-1]["epochs"]),
+                    "resume": None,
+                    "seed": int(seed),
+                    "validation_gallery_partition": "confirmation",
+                    "validation_gallery_queries_per_source": int(
+                        hpo_cfg["confirmation"]["queries_per_source"]
+                    ),
+                    "validation_gallery_trials": int(
+                        hpo_cfg["confirmation"]["gallery_trials"]
+                    ),
+                    "validation_gallery_eval_interval": int(rung_specs[-1]["epochs"]),
+                    "validation_confirmation_gallery_enable": False,
+                    "ckpt_path": os.path.join(
+                        hpo_cfg["output_dir"],
+                        "confirmation",
+                        f"trial_{record['trial_number']}",
+                        f"seed_{seed}",
+                    ),
+                }
+            )
+            run_record = {"trial_number": record["trial_number"]}
+            results = _run_labeled_training(
+                config, run_record, hpo_cfg, f"confirmation_seed_{seed}"
+            )
+            confirmation_runs.append(
+                {
+                    "trial_number": record["trial_number"],
+                    "seed": seed,
+                    "results": results,
+                }
+            )
+    _write_json(
+        os.path.join(hpo_cfg["output_dir"], "confirmation_results.json"),
+        confirmation_runs,
+    )
+    decision = summarize_confirmation_runs(
+        confirmation_runs, size_weights, baseline_number
+    )
+    _write_json(
+        os.path.join(hpo_cfg["output_dir"], "confirmation_decision.json"), decision
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Config-driven Optuna HPO for MAGIKS training"
@@ -1118,6 +1708,10 @@ def main() -> None:
 
     if args.dry_run:
         dry_run(hpo_cfg, base_cfg)
+        return
+
+    if hpo_cfg.get("promotion_rungs"):
+        run_successive_halving(hpo_cfg, base_cfg)
         return
 
     sampler = TPESampler(n_startup_trials=hpo_cfg["n_startup_trials"], seed=42)

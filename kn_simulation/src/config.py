@@ -231,7 +231,7 @@ def load_profile(profile: str | Path) -> Profile:
             f"Profile name {result.name!r} must match filename {path.stem!r}"
         )
     expected_name = f"{source}_{split}"
-    if result.name != expected_name:
+    if result.name != expected_name and not result.name.startswith(f"{expected_name}_"):
         raise ValueError(
             f"Profile name {result.name!r} must be {expected_name!r} for its source/split"
         )

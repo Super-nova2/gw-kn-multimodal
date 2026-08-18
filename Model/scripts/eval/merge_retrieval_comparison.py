@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Merge a single-model retrieval run into an existing comparison result."""
+"""Merge one or more newly evaluated models into an existing comparison result."""
 
 from __future__ import annotations
 
@@ -60,16 +60,19 @@ def merge_results(base_path: Path, supplement_path: Path, output_dir: Path) -> P
     base = _load(base_path)
     supplement = _load(supplement_path)
     _assert_same_galleries(base, supplement)
-    if len(supplement.get("models", {})) != 1:
-        raise ValueError("Supplement must contain exactly one model.")
-
-    method, model_result = next(iter(supplement["models"].items()))
-    if method in base.get("models", {}):
-        raise ValueError(f"Method already exists in base result: {method}")
+    supplement_models = supplement.get("models", {})
+    if not supplement_models:
+        raise ValueError("Supplement must contain at least one model.")
+    duplicate_methods = sorted(set(base.get("models", {})) & set(supplement_models))
+    if duplicate_methods:
+        raise ValueError(
+            "Method already exists in base result: " + ", ".join(duplicate_methods)
+        )
+    added_methods = list(supplement_models)
 
     merged = dict(base)
     merged["models"] = dict(base["models"])
-    merged["models"][method] = model_result
+    merged["models"].update(supplement_models)
     merged["curve_rows"] = list(base.get("curve_rows", [])) + list(supplement.get("curve_rows", []))
     merged["redshift_rows"] = list(base.get("redshift_rows", [])) + list(supplement.get("redshift_rows", []))
     merged["redshift_macro_rows"] = aggregate_redshift_macro_metrics(merged["redshift_rows"])
@@ -83,10 +86,17 @@ def merge_results(base_path: Path, supplement_path: Path, output_dir: Path) -> P
     )
     merged["supplement_provenance"] = {
         "base_result": str(base_path),
-        "single_model_result": str(supplement_path),
-        "added_method": method,
+        "supplement_result": str(supplement_path),
+        "added_methods": added_methods,
         "gallery_identity_sha256": (supplement.get("gallery_identity") or {}).get("sha256"),
     }
+    if len(added_methods) == 1:
+        merged["supplement_provenance"].update(
+            {
+                "single_model_result": str(supplement_path),
+                "added_method": added_methods[0],
+            }
+        )
 
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / "ablation_comparison.json"

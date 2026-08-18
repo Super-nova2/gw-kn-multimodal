@@ -5,11 +5,13 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=200G
+#SBATCH --mem=150G
 #SBATCH --gres=gpu:1
 #SBATCH --time=168:00:00
 #SBATCH --partition=milan-gpu
 #SBATCH --tmp=180G
+#SBATCH --requeue
+#SBATCH --open-mode=append
 
 set -euo pipefail
 
@@ -146,7 +148,7 @@ which python
 N_TRIALS=$(jq -r '.n_trials' "$args_file")
 STUDY_NAME=$(jq -r '.study_name' "$args_file")
 EPOCHS_PER_TRIAL=$(jq -r '.epochs_per_trial' "$args_file")
-OUTPUT_DIR=$(jq -r '.output_dir' "$args_file")
+OUTPUT_DIR=$(resolve_data_path "$(jq -r '.output_dir' "$args_file")")
 OBJECTIVE_METRIC=$(jq -r '.objective_metric // "combined_auroc_g2o_r5"' "$args_file")
 BEST_CKPT_METRIC=$(jq -r '.best_ckpt_metric // "auprc"' "$args_file")
 OOD_MONITORING=$(jq -r '.enable_ood_monitoring // false' "$args_file")
@@ -247,9 +249,19 @@ fi
 echo ""
 
 # ─── Stage data to local disk ─────────────────────────────────────────
-JOBFS_DIR="${SLURM_TMPDIR:-${TMPDIR:-${JOBFS:-}}}"
-if [ -n "$JOBFS_DIR" ]; then
-    echo "Staging datasets to local disk: $JOBFS_DIR"
+JOBFS_ROOT="${SLURM_TMPDIR:-${JOBFS:-${TMPDIR:-}}}"
+JOBFS_DIR=""
+cleanup_jobfs() {
+    if [[ -n "${JOBFS_DIR}" && "${JOBFS_DIR}" == */"magiks_hpo_${SLURM_JOB_ID}" ]]; then
+        rm -rf -- "${JOBFS_DIR}"
+    fi
+}
+trap cleanup_jobfs EXIT
+
+if [[ -n "${JOBFS_ROOT}" ]]; then
+    JOBFS_DIR="${JOBFS_ROOT%/}/magiks_hpo_${SLURM_JOB_ID}"
+    mkdir -p "$JOBFS_DIR"
+    echo "Staging datasets to job-specific local disk: $JOBFS_DIR"
     cp -f "$DATA_PATH" "$JOBFS_DIR"/
     DATA_PATH="$JOBFS_DIR/$(basename "$DATA_PATH")"
     if [[ -n "$NEG_DATA_PATH" && "$NEG_DATA_PATH" != "null" ]]; then
@@ -316,12 +328,29 @@ cmd=(
 
 # ─── Run HPO ───────────────────────────────────────────────────────────
 echo "Command: ${cmd[*]}"
+set +e
 "${cmd[@]}"
 exit_code=$?
+set -e
 
 echo "------------------------------------------------"
 echo "End time: $(date)"
 echo "Exit code: $exit_code"
+
+if [[ $exit_code -ne 0 ]]; then
+    restart_count=${SLURM_RESTART_COUNT:-0}
+    max_restarts=${HPO_MAX_RESTARTS:-3}
+    if (( restart_count < max_restarts )); then
+        echo "HPO failed; requeueing job $SLURM_JOB_ID " \
+             "(restart $((restart_count + 1))/$max_restarts)."
+        cleanup_jobfs
+        JOBFS_DIR=""
+        trap - EXIT
+        scontrol requeue "$SLURM_JOB_ID"
+        exit 0
+    fi
+    echo "HPO failed after $restart_count automatic restarts; not requeueing."
+fi
 
 # ─── Run analysis if HPO succeeded ────────────────────────────────────
 if [ $exit_code -eq 0 ]; then

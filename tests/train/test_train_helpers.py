@@ -1,8 +1,11 @@
 import argparse
 import os
 import sys
+import tempfile
 import unittest
+from unittest import mock
 
+import numpy as np
 import torch
 
 MODEL_DIR = os.path.abspath(
@@ -55,6 +58,138 @@ def _curriculum_args(**overrides):
 
 
 class SequentialCurriculumTests(unittest.TestCase):
+    def test_atomic_checkpoint_save_preserves_previous_file_on_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "checkpoint.pth")
+            with open(path, "wb") as handle:
+                handle.write(b"previous")
+
+            with mock.patch.object(torch, "save", side_effect=RuntimeError("boom")):
+                with self.assertRaisesRegex(RuntimeError, "boom"):
+                    train.save_training_checkpoint_atomic(
+                        {"epoch": 1}, path, max_attempts=1
+                    )
+
+            with open(path, "rb") as handle:
+                self.assertEqual(handle.read(), b"previous")
+            self.assertEqual(os.listdir(directory), ["checkpoint.pth"])
+
+    def test_atomic_checkpoint_save_retries_transient_failure(self):
+        original_save = torch.save
+        attempts = 0
+
+        def flaky_save(value, path):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("temporary filesystem failure")
+            original_save(value, path)
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "checkpoint.pth")
+            with (
+                mock.patch.object(torch, "save", side_effect=flaky_save),
+                mock.patch.object(train.time, "sleep") as sleep,
+            ):
+                train.save_training_checkpoint_atomic(
+                    {"epoch": 50}, path, max_attempts=2
+                )
+            loaded = torch.load(path, map_location="cpu", weights_only=True)
+
+        self.assertEqual(attempts, 2)
+        sleep.assert_called_once_with(1)
+        self.assertEqual(loaded["epoch"], 50)
+
+    def test_last_checkpoint_failure_is_nonfatal(self):
+        with mock.patch.object(
+            train,
+            "save_training_checkpoint_atomic",
+            side_effect=RuntimeError("filesystem unavailable"),
+        ):
+            saved = train.save_last_checkpoint_resilient({}, "checkpoint.pth")
+
+        self.assertFalse(saved)
+
+    def test_restore_rng_state_passes_cpu_tensors_to_torch_generators(self):
+        state = train.capture_rng_state()
+        state["cuda"] = [state["torch"].clone()]
+
+        with (
+            mock.patch.object(torch, "set_rng_state") as set_cpu_state,
+            mock.patch.object(torch.cuda, "is_available", return_value=True),
+            mock.patch.object(torch.cuda, "set_rng_state_all") as set_cuda_states,
+        ):
+            train.restore_rng_state(state)
+
+        self.assertEqual(set_cpu_state.call_args.args[0].device.type, "cpu")
+        restored_cuda_states = set_cuda_states.call_args.args[0]
+        self.assertTrue(restored_cuda_states)
+        self.assertTrue(all(item.device.type == "cpu" for item in restored_cuda_states))
+
+    def test_training_checkpoint_loads_numpy_rng_state_with_restricted_loader(self):
+        checkpoint = {"rng_state": {"numpy": np.random.get_state()}, "epoch": 29}
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "checkpoint.pth")
+            torch.save(checkpoint, path)
+
+            loaded = train.load_training_checkpoint(path, map_location="cpu")
+
+        self.assertEqual(loaded["epoch"], 29)
+        self.assertEqual(loaded["rng_state"]["numpy"][0], "MT19937")
+
+    def test_rung_uses_full_training_schedule_horizon(self):
+        rung = _curriculum_args(epochs=30, training_schedule_total_epochs=100)
+        full = _curriculum_args(epochs=100, training_schedule_total_epochs=100)
+        for epoch in (0, 8, 16, 29):
+            self.assertEqual(
+                train.resolve_sequential_curriculum(rung, epoch),
+                train.resolve_sequential_curriculum(full, epoch),
+            )
+
+    def test_cosine_lr_prefix_is_identical_across_rungs(self):
+        common = dict(
+            lr=5e-4,
+            min_lr=2e-5,
+            warmup_epochs=5,
+            training_schedule_total_epochs=100,
+        )
+        rung = argparse.Namespace(epochs=30, **common)
+        full = argparse.Namespace(epochs=100, **common)
+        for step in (0, 499, 500, 1500, 2999):
+            self.assertAlmostEqual(
+                train._common_lr_scale(rung, step, 100),
+                train._common_lr_scale(full, step, 100),
+            )
+
+    def test_validation_interval_always_includes_rung_end(self):
+        self.assertFalse(train.should_run_validation(28, 30, 5))
+        self.assertTrue(train.should_run_validation(29, 30, 5))
+
+    def test_scheduler_resume_matches_uninterrupted_run(self):
+        args = argparse.Namespace(
+            epochs=30,
+            training_schedule_total_epochs=100,
+            lr_scheduler="cosine",
+            lr=5e-4,
+            min_lr=2e-5,
+            warmup_epochs=5,
+            staged_training_enable=False,
+        )
+        parameter = torch.nn.Parameter(torch.tensor(1.0))
+        optimizer = torch.optim.AdamW([parameter], lr=args.lr)
+        scheduler = train.build_lr_scheduler(optimizer, args, 10, 0)
+        for _ in range(300):
+            optimizer.step()
+            scheduler.step()
+        expected_lr = optimizer.param_groups[0]["lr"]
+        state = optimizer.state_dict()
+
+        resumed_parameter = torch.nn.Parameter(torch.tensor(1.0))
+        resumed_optimizer = torch.optim.AdamW([resumed_parameter], lr=args.lr)
+        resumed_optimizer.load_state_dict(state)
+        train.build_lr_scheduler(resumed_optimizer, args, 10, 300)
+        self.assertAlmostEqual(resumed_optimizer.param_groups[0]["lr"], expected_lr)
+
     def test_full_boundary_weights(self):
         args = _curriculum_args()
         expected = {

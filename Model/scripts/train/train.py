@@ -26,11 +26,13 @@ import numpy as np
 import os
 import datetime
 import argparse
+import copy
 import math
 import gc
 import json
 import time
 import warnings
+import random
 from typing import Any, Dict, List, Optional, Tuple
 
 warnings.filterwarnings("ignore", "Wswiglal-redir-stdio")
@@ -862,6 +864,14 @@ def is_staged_training_enabled(args):
     return bool(getattr(args, "staged_training_enable", False))
 
 
+def get_training_schedule_total_epochs(args):
+    """Return the fixed schedule horizon used across resumable HPO rungs."""
+    configured = getattr(args, "training_schedule_total_epochs", None)
+    if configured is None:
+        configured = getattr(args, "lr_schedule_total_epochs", None)
+    return int(configured if configured is not None else getattr(args, "epochs", 1))
+
+
 def build_sequential_curriculum(args):
     """Build enabled loss phases in order, using 0-based half-open ranges."""
     if not is_staged_training_enabled(args):
@@ -885,12 +895,23 @@ def build_sequential_curriculum(args):
             )
             start += durations[name]
     phases.append(
-        {"name": "joint", "start": start, "end": int(getattr(args, "epochs", 1))}
+        {
+            "name": "joint",
+            "start": start,
+            "end": get_training_schedule_total_epochs(args),
+        }
     )
     return phases
 
 
 def get_curriculum_phase_start(args, phase_name):
+    if not is_staged_training_enabled(args):
+        legacy_starts = {
+            "cls_intro": int(getattr(args, "cls_start_epoch", 0)),
+            "retrieval_intro": int(getattr(args, "retrieval_start_epoch", 0)),
+            "itc": 0,
+        }
+        return legacy_starts.get(phase_name, int(getattr(args, "epochs", 1)))
     for phase in build_sequential_curriculum(args):
         if phase["name"] == phase_name:
             return phase["start"]
@@ -1004,7 +1025,9 @@ def resolve_training_stage(args, epoch):
 
 
 def _common_lr_scale(args, step, steps_per_epoch):
-    total_steps = max(1, int(args.epochs) * int(steps_per_epoch))
+    total_steps = max(
+        1, get_training_schedule_total_epochs(args) * int(steps_per_epoch)
+    )
     warmup_steps = max(0, int(args.warmup_epochs) * int(steps_per_epoch))
     min_lr = args.min_lr if args.min_lr is not None else 0.0
     min_lr_ratio = min(float(min_lr) / float(args.lr), 1.0)
@@ -1026,7 +1049,7 @@ def build_lr_scheduler(optimizer, args, steps_per_epoch, start_step):
             if not is_staged_training_enabled(args):
                 return common
             epoch = min(
-                int(getattr(args, "epochs", 1)) - 1,
+                get_training_schedule_total_epochs(args) - 1,
                 max(0, int(step) // max(1, int(steps_per_epoch))),
             )
             stage = resolve_training_stage(args, epoch)
@@ -1056,6 +1079,102 @@ def build_lr_scheduler(optimizer, args, steps_per_epoch, start_step):
     return torch.optim.lr_scheduler.LambdaLR(
         optimizer, lambdas, last_epoch=start_step - 1
     )
+
+
+def capture_rng_state():
+    state = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state["cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def restore_rng_state(state):
+    if not state:
+        return
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch_state = state["torch"]
+    if isinstance(torch_state, torch.Tensor):
+        torch_state = torch_state.detach().cpu()
+    torch.set_rng_state(torch_state)
+    if torch.cuda.is_available() and "cuda" in state:
+        cuda_states = [
+            item.detach().cpu() if isinstance(item, torch.Tensor) else item
+            for item in state["cuda"]
+        ]
+        torch.cuda.set_rng_state_all(cuda_states)
+
+
+def load_training_checkpoint(path, map_location):
+    """Load a pipeline checkpoint with a minimal NumPy RNG-state allowlist."""
+    numpy_uint32_dtype = type(np.dtype(np.uint32))
+    safe_globals = [
+        np.core.multiarray._reconstruct,
+        np.ndarray,
+        np.dtype,
+        numpy_uint32_dtype,
+    ]
+    with torch.serialization.safe_globals(safe_globals):
+        return torch.load(path, map_location=map_location, weights_only=True)
+
+
+def save_training_checkpoint_atomic(value, path, max_attempts=5):
+    """Atomically replace a checkpoint, retrying transient filesystem errors."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    max_attempts = max(1, int(max_attempts))
+    for attempt in range(1, max_attempts + 1):
+        temporary_path = f"{path}.tmp.{os.getpid()}.{attempt}"
+        try:
+            torch.save(value, temporary_path)
+            os.replace(temporary_path, path)
+            return
+        except (OSError, RuntimeError) as exc:
+            if attempt >= max_attempts:
+                raise
+            delay = min(2 ** (attempt - 1), 30)
+            print(
+                f"[WARN] Checkpoint write attempt {attempt}/{max_attempts} failed "
+                f"for {path}: {exc}; retrying in {delay}s."
+            )
+            time.sleep(delay)
+        finally:
+            if os.path.exists(temporary_path):
+                os.remove(temporary_path)
+
+
+def save_last_checkpoint_resilient(value, path):
+    """Preserve the prior last checkpoint if all transient-write retries fail."""
+    try:
+        save_training_checkpoint_atomic(value, path)
+        return True
+    except (OSError, RuntimeError) as exc:
+        print(
+            f"[WARN] Could not update last checkpoint after retries: {exc}. "
+            "The previous checkpoint is preserved; training will continue."
+        )
+        return False
+
+
+def write_json_atomic(path, value):
+    """Atomically replace a JSON summary in the destination directory."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    temporary_path = f"{path}.tmp.{os.getpid()}"
+    try:
+        with open(temporary_path, "w") as handle:
+            json.dump(value, handle, indent=2)
+        os.replace(temporary_path, path)
+    finally:
+        if os.path.exists(temporary_path):
+            os.remove(temporary_path)
+
+
+def should_run_validation(epoch, epochs, interval):
+    interval = max(1, int(interval))
+    return (int(epoch) + 1) % interval == 0 or int(epoch) + 1 == int(epochs)
 
 
 def compute_cls_weight(args, epoch):
@@ -2939,6 +3058,14 @@ def train(args):
         raise ValueError("gallery_loss_ramp_epochs must be >= 0.")
     if args.warmup_epochs < 0:
         raise ValueError("warmup_epochs must be >= 0.")
+    if args.best_ckpt_min_delta is None:
+        args.best_ckpt_min_delta = float(args.early_stop_min_delta)
+    if args.best_ckpt_min_delta < 0:
+        raise ValueError("best_ckpt_min_delta must be >= 0.")
+    if args.validation_gallery_eval_interval < 1:
+        raise ValueError("validation_gallery_eval_interval must be >= 1.")
+    if get_training_schedule_total_epochs(args) < int(args.epochs):
+        raise ValueError("training schedule horizon must be >= epochs.")
     if args.cls_start_epoch < 0:
         raise ValueError("cls_start_epoch must be >= 0.")
     if args.cls_ramp_epochs < 0:
@@ -3268,10 +3395,11 @@ def train(args):
     optimizer = torch.optim.AdamW(build_optimizer_param_groups(model, args))
     start_epoch = 0
     global_step = 0
+    resume_training_state = {}
     if args.resume is not None:
         if not os.path.exists(args.resume):
             raise FileNotFoundError(f"Resume checkpoint not found: {args.resume}")
-        ckpt = torch.load(args.resume, map_location=device)
+        ckpt = load_training_checkpoint(args.resume, map_location=device)
         migrate_time_embed_state_dict(ckpt["model_state_dict"])
         try:
             model.load_state_dict(ckpt["model_state_dict"], strict=True)
@@ -3287,7 +3415,11 @@ def train(args):
         if "scaler_state_dict" in ckpt:
             scaler.load_state_dict(ckpt["scaler_state_dict"])
         start_epoch = ckpt.get("epoch", -1) + 1
-        global_step = start_epoch * steps_per_epoch
+        resume_training_state = ckpt.get("training_state", {})
+        global_step = int(
+            resume_training_state.get("global_step", start_epoch * steps_per_epoch)
+        )
+        restore_rng_state(ckpt.get("rng_state"))
         print(f"Resumed from {args.resume} at epoch {start_epoch}.")
     model.train()
     has_negatives = args.neg_data_path is not None
@@ -3326,16 +3458,20 @@ def train(args):
 
     pbar_update_every = 500
     tb_log_interval = 50
-    best_val_score = None
-    best_epoch_idx = None
-    best_val_metrics = {}
-    epochs_no_improve = 0
-    best_tracking_started = False
-    best_tracking_start_epoch = None
-    last_selection_score = None
+    best_val_score = resume_training_state.get("best_val_score")
+    best_epoch_idx = resume_training_state.get("best_epoch_idx")
+    best_val_metrics = dict(resume_training_state.get("best_val_metrics", {}))
+    epochs_no_improve = int(resume_training_state.get("epochs_no_improve", 0))
+    best_tracking_started = bool(
+        resume_training_state.get("best_tracking_started", False)
+    )
+    best_tracking_start_epoch = resume_training_state.get("best_tracking_start_epoch")
+    last_selection_score = resume_training_state.get("last_selection_score")
     lr_scheduler = build_lr_scheduler(optimizer, args, steps_per_epoch, global_step)
+    last_completed_epoch = start_epoch - 1
 
     for epoch in range(start_epoch, args.epochs):
+        last_completed_epoch = epoch
         epoch_total = 0.0
         training_stage = resolve_training_stage(args, epoch)
         configure_model_for_stage(model, args, training_stage)
@@ -4196,7 +4332,9 @@ def train(args):
         writer.flush()
 
         stop_early = False
-        if val_loader is not None:
+        if val_loader is not None and should_run_validation(
+            epoch, args.epochs, args.validation_gallery_eval_interval
+        ):
             val_metrics = evaluate(
                 model,
                 val_loader,
@@ -4382,7 +4520,7 @@ def train(args):
                         improved = is_checkpoint_score_improved(
                             current_selection_score,
                             prev_best,
-                            args.early_stop_min_delta,
+                            args.best_ckpt_min_delta,
                         )
                     if improved:
                         best_val_score = current_selection_score
@@ -4452,7 +4590,7 @@ def train(args):
                             args.ckpt_path, "ALBEF", "albef_best.pth"
                         )
                         os.makedirs(os.path.dirname(best_ckpt), exist_ok=True)
-                        torch.save(
+                        save_training_checkpoint_atomic(
                             {
                                 "epoch": epoch,
                                 "model_state_dict": model.state_dict(),
@@ -4478,6 +4616,7 @@ def train(args):
                                 ),
                                 "neg_gw_strata": strata_m,
                                 "neg_gw_guardrail": neg_gw_guardrail,
+                                "rng_state": capture_rng_state(),
                             },
                             best_ckpt,
                         )
@@ -4516,7 +4655,7 @@ def train(args):
                 args.ckpt_path, "ALBEF", f"albef_epoch_{epoch+1}.pth"
             )
             os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
-            torch.save(
+            save_training_checkpoint_atomic(
                 {
                     "epoch": epoch,
                     "model_state_dict": model.state_dict(),
@@ -4534,6 +4673,34 @@ def train(args):
                 checkpoint_path,
             )
 
+        if bool(getattr(args, "save_last_checkpoint", False)):
+            last_checkpoint_path = os.path.join(
+                args.ckpt_path, "ALBEF", "albef_last.pth"
+            )
+            os.makedirs(os.path.dirname(last_checkpoint_path), exist_ok=True)
+            save_last_checkpoint_resilient(
+                {
+                    "epoch": epoch,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scaler_state_dict": scaler.state_dict(),
+                    "loss": avg_total,
+                    "args": vars(args),
+                    "rng_state": capture_rng_state(),
+                    "training_state": {
+                        "global_step": global_step,
+                        "best_val_score": best_val_score,
+                        "best_epoch_idx": best_epoch_idx,
+                        "best_val_metrics": best_val_metrics,
+                        "epochs_no_improve": epochs_no_improve,
+                        "best_tracking_started": best_tracking_started,
+                        "best_tracking_start_epoch": best_tracking_start_epoch,
+                        "last_selection_score": last_selection_score,
+                    },
+                },
+                last_checkpoint_path,
+            )
+
         # End-of-epoch memory cleanup
         if device.type == "cuda":
             torch.cuda.empty_cache()
@@ -4541,6 +4708,30 @@ def train(args):
 
         if stop_early:
             break
+
+    if bool(args.validation_confirmation_gallery_enable) and best_val_metrics:
+        validation_gallery_context = None
+        gc.collect()
+        confirmation_args = copy.copy(args)
+        confirmation_args.validation_gallery_partition = "confirmation"
+        confirmation_args.validation_gallery_queries_per_source = int(
+            args.validation_confirmation_gallery_queries_per_source
+        )
+        confirmation_args.validation_gallery_trials = int(
+            args.validation_confirmation_gallery_trials
+        )
+        validation_confirmation_gallery_context = ValidationGalleryContext.build(
+            confirmation_args, val_gw_map
+        )
+        best_ckpt_path = os.path.join(args.ckpt_path, "ALBEF", "albef_best.pth")
+        checkpoint = load_training_checkpoint(best_ckpt_path, map_location=device)
+        migrate_time_embed_state_dict(checkpoint["model_state_dict"])
+        model.load_state_dict(checkpoint["model_state_dict"], strict=True)
+        best_val_metrics["val_confirmation_hard_gallery"] = (
+            validation_confirmation_gallery_context.evaluate(
+                model, args, device, amp_dtype, gw_event_time_mjd_table
+            )
+        )
 
     _close_loader_dataset_handles(
         train_loader,
@@ -4557,7 +4748,7 @@ def train(args):
 
     # Write trial results JSON for HPO collection
     if best_val_metrics:
-        best_val_metrics["final_epoch"] = epoch
+        best_val_metrics["final_epoch"] = last_completed_epoch
         best_val_metrics["dataset_window_metadata"] = getattr(
             args, "_dataset_window_metadata", None
         )
@@ -4573,8 +4764,7 @@ def train(args):
             "best_checkpoint_summary.json",
         ):
             summary_path = os.path.join(summary_dir, summary_name)
-            with open(summary_path, "w") as f:
-                json.dump(best_val_metrics, f, indent=2)
+            write_json_atomic(summary_path, best_val_metrics)
         print(f"Trial results saved to: {result_path}")
 
 
@@ -4611,6 +4801,8 @@ if __name__ == "__main__":
     )
     parser.add_argument("--warmup_epochs", type=int, default=0)
     parser.add_argument("--min_lr", type=float, default=0.0)
+    parser.add_argument("--lr_schedule_total_epochs", type=int, default=None)
+    parser.add_argument("--training_schedule_total_epochs", type=int, default=None)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--pin_memory", type=int, default=1)
     parser.add_argument("--persistent_workers", type=int, default=1)
@@ -4627,6 +4819,18 @@ if __name__ == "__main__":
         type=float,
         default=1e-4,
         help="Minimum improvement required on best_ckpt_metric to reset early stopping.",
+    )
+    parser.add_argument(
+        "--best_ckpt_min_delta",
+        type=float,
+        default=None,
+        help="Minimum checkpoint-score improvement; defaults to early_stop_min_delta.",
+    )
+    parser.add_argument(
+        "--validation_gallery_eval_interval",
+        type=int,
+        default=1,
+        help="Run validation every N epochs and always on the final epoch.",
     )
     parser.add_argument(
         "--neg_gw_guardrail_enable",
@@ -4694,6 +4898,30 @@ if __name__ == "__main__":
     parser.add_argument("--validation_gallery_queries_per_source", type=int, default=64)
     parser.add_argument("--validation_gallery_trials", type=int, default=1)
     parser.add_argument("--validation_gallery_seed", type=int, default=42)
+    parser.add_argument(
+        "--validation_gallery_partition",
+        choices=["all", "tune", "confirmation"],
+        default="all",
+    )
+    parser.add_argument("--validation_gallery_tune_fraction", type=float, default=0.75)
+    parser.add_argument("--validation_gallery_partition_seed", type=int, default=42)
+    parser.add_argument(
+        "--validation_gallery_size_weights",
+        type=json.loads,
+        default=None,
+        help="JSON mapping from gallery size to objective weight.",
+    )
+    parser.add_argument(
+        "--validation_confirmation_gallery_enable",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument(
+        "--validation_confirmation_gallery_queries_per_source",
+        type=int,
+        default=128,
+    )
+    parser.add_argument("--validation_confirmation_gallery_trials", type=int, default=5)
     parser.add_argument(
         "--validation_gallery_time_window_days", type=float, default=30.0
     )
@@ -5240,6 +5468,12 @@ if __name__ == "__main__":
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Skip per-epoch checkpoint files while still writing best checkpoint and summaries.",
+    )
+    parser.add_argument(
+        "--save_last_checkpoint",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Overwrite albef_last.pth each epoch with resumable training state.",
     )
     parser.add_argument(
         "--default_json_config",
