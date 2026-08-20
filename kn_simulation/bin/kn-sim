@@ -3,4 +3,5 @@
 set -euo pipefail
 
 PIPELINE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export PYTHONDONTWRITEBYTECODE=1
 exec python "${PIPELINE_ROOT}/src/cli.py" "$@"

@@ -13,4 +13,5 @@ if [[ ! -f "${PIPELINE_ROOT}/src/worker.py" ]]; then
     exit 2
 fi
 export PYTHONPATH="${PIPELINE_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}"
+export PYTHONDONTWRITEBYTECODE=1
 exec python "${PIPELINE_ROOT}/src/worker.py"

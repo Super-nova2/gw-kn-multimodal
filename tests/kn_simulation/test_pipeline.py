@@ -21,7 +21,12 @@ from scheduler import (
     submit_profile,
     validate_prepared_run,
 )
-from worker import _cleanup_snana_unneeded_outputs, finalize_submission, run_array_task
+from worker import (
+    _cleanup_snana_unneeded_outputs,
+    _generate_documents,
+    finalize_submission,
+    run_array_task,
+)
 
 
 def make_opsim(path: Path) -> None:
@@ -491,6 +496,24 @@ def generated_products(simulation_ids: list[int]) -> dict[int, dict]:
         }
         for simulation_id in simulation_ids
     }
+
+
+def test_worker_keeps_coordinates_in_memory_without_per_event_csv(
+    tmp_path, monkeypatch
+):
+    profile, _ = prepare_profile(tmp_path)
+    captured = {}
+
+    def fake_snana_main(arguments):
+        captured["arguments"] = arguments
+        return generated_products([7])
+
+    monkeypatch.setattr("worker.snana.main", fake_snana_main)
+
+    products = _generate_documents(profile, [7])
+
+    assert products[7]["coordinates"].shape == (8, 13)
+    assert "--no-coordinate-files" in captured["arguments"]
 
 
 def test_array_tasks_write_hdf5_shards_then_finalizer_sorts_and_compacts(

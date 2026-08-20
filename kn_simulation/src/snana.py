@@ -100,7 +100,9 @@ def gen_input(injections, text, sim_id, gw_type="bns", sndata_sim_dir=None):
 
     replacements = {
         r"^(MJD_EXPLODE:\s*)\S+.*$": rf"\1 {float(row['trigger_mjd'])}",
-        r"^(GENPEAK_COSTHETA:\s*)\S+.*$": (rf"\1 {abs(float(row['viewing_costheta']))}"),
+        r"^(GENPEAK_COSTHETA:\s*)\S+.*$": (
+            rf"\1 {abs(float(row['viewing_costheta']))}"
+        ),
         r"^(GENPEAK_MEJDYN:\s*)\S+.*$": rf"\1 {mej_dyn}",
         r"^(GENPEAK_MEJWIND:\s*)\S+.*$": rf"\1 {mej_wind}",
     }
@@ -290,6 +292,16 @@ def build_parser():
     parser.add_argument("--sampling_nside", type=int, default=256)
     parser.add_argument("--cosmology", default="Planck15")
     parser.add_argument(
+        "--no-coordinate-files",
+        dest="write_coordinate_files",
+        action="store_false",
+        help=(
+            "Return coordinate samples in memory without writing one CSV per event. "
+            "Production workers use this because samples are stored in HDF5 shards."
+        ),
+    )
+    parser.set_defaults(write_coordinate_files=True)
+    parser.add_argument(
         "--too_config",
         default=str(PIPELINE_DIR / "config" / "rubin_too_2024.yaml"),
         help="Rubin GW ToO strategy YAML configuration",
@@ -307,7 +319,8 @@ def main(argv=None):
     coordinate_dir = outdir / "COORDINATES"
     input_dir.mkdir(parents=True, exist_ok=True)
     simlib_dir.mkdir(parents=True, exist_ok=True)
-    coordinate_dir.mkdir(parents=True, exist_ok=True)
+    if args.write_coordinate_files:
+        coordinate_dir.mkdir(parents=True, exist_ok=True)
     if args.sndata_sim_dir is not None:
         Path(args.sndata_sim_dir).mkdir(parents=True, exist_ok=True)
         # SNANA requires $SNDATA_ROOT/SIM/PATH_SNDATA_SIM.LIST to exist when
@@ -316,7 +329,9 @@ def main(argv=None):
         if sndata_root:
             path_sndata_sim_list = Path(sndata_root) / "SIM" / "PATH_SNDATA_SIM.LIST"
         else:
-            path_sndata_sim_list = Path(args.sndata_sim_dir).parent / "PATH_SNDATA_SIM.LIST"
+            path_sndata_sim_list = (
+                Path(args.sndata_sim_dir).parent / "PATH_SNDATA_SIM.LIST"
+            )
         path_sndata_sim_list.parent.mkdir(parents=True, exist_ok=True)
         path_sndata_sim_list.touch(exist_ok=True)
     opsim_stem = Path(args.Opsim).stem
@@ -353,9 +368,12 @@ def main(argv=None):
         row = _event_row(catalog, sim_id)
         simlib_file = simlib_dir / (f"{opsim_stem}_{args.sim_name}_{sim_id}.SIMLIB")
         input_file = input_dir / f"SIMGEN_{args.sim_name}_{sim_id}.INPUT"
-        coordinate_file = coordinate_dir / f"{sim_id}.csv"
+        coordinate_file = (
+            coordinate_dir / f"{sim_id}.csv" if args.write_coordinate_files else None
+        )
         _remove_event_products(simlib_file, input_file)
-        coordinate_file.unlink(missing_ok=True)
+        if coordinate_file is not None:
+            coordinate_file.unlink(missing_ok=True)
         coordinate_frame = None
 
         plan = {
@@ -606,7 +624,8 @@ def main(argv=None):
                     flags=re.MULTILINE,
                 )
             input_file.write_text(text, encoding="utf-8")
-            coordinate_frame.to_csv(coordinate_file, index=False)
+            if coordinate_file is not None:
+                coordinate_frame.to_csv(coordinate_file, index=False)
 
             plan.update(
                 status="generated",
@@ -621,7 +640,8 @@ def main(argv=None):
             }
         except Exception as error:  # noqa: BLE001 - isolate failures by event
             _remove_event_products(simlib_file, input_file)
-            coordinate_file.unlink(missing_ok=True)
+            if coordinate_file is not None:
+                coordinate_file.unlink(missing_ok=True)
             plan.update(
                 status="failed",
                 error_type=type(error).__name__,

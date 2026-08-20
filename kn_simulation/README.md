@@ -29,10 +29,11 @@ Do not execute files under `src/` directly. Do not place legacy
 
 ## Prerequisites
 
-The matching GWSamplegen dual bundle must be complete. Production profiles read
-positive maps from
-`GWSamplegen/outputs/production_rubin_dual/<source>_<split>_seed_42/pos/skymaps`
-and type-1 maps from the sibling `neg/skymaps` directory. `BASE_DIR` defaults to
+The matching GWSamplegen dual bundle must be complete. Production profiles read positive and type-1 maps from
+`data/skymap/positive/<source>_skymap_<split>` and
+`data/skymap/negative/<source>_skymap_<split>`. Canonical catalogs and bundle
+provenance live under
+`GWSamplegen/outputs/production_am_bayestar/dual/<source>_<split>_seed_1234/`. `BASE_DIR` defaults to
 `/fred/oz016/bgao_kn`. Profiles also require the Rubin OpSim database, SNANA
 installation, SNDATA_ROOT models, and `sbatch`.
 
@@ -42,18 +43,18 @@ Prepare a run without submitting compute work:
 
 ```bash
 kn_simulation/bin/kn-sim prepare bns_train \
-    --pos-catalog /path/to/bns_train_seed_42/pos_catalog.csv \
-    --neg-catalog /path/to/bns_train_seed_42/neg_catalog.csv
+    --pos-catalog /path/to/bns_train_seed_1234/pos_catalog.csv \
+    --neg-catalog /path/to/bns_train_seed_1234/neg_catalog.csv
 ```
 
 This validates the complete catalog and every expected skymap before writing:
 
 ```text
-kn_simulation/runs_dual/bns_train/catalog.csv
-kn_simulation/runs_dual/bns_train/catalog.input.json
-kn_simulation/runs_dual/bns_train/kn_catalog.csv
-kn_simulation/runs_dual/bns_train/neg_catalog.csv
-kn_simulation/runs_dual/bns_train/dual_catalog.manifest.json
+kn_simulation/runs/bns_train/catalog.csv
+kn_simulation/runs/bns_train/catalog.input.json
+kn_simulation/runs/bns_train/kn_catalog.csv
+kn_simulation/runs/bns_train/neg_catalog.csv
+kn_simulation/runs/bns_train/dual_catalog.manifest.json
 ```
 
 Existing prepared files are protected. Use `--overwrite-prepared` only when an
@@ -70,8 +71,8 @@ Prepare and submit in one command:
 
 ```bash
 kn_simulation/bin/kn-sim run bns_train \
-    --pos-catalog /path/to/bns_train_seed_42/pos_catalog.csv \
-    --neg-catalog /path/to/bns_train_seed_42/neg_catalog.csv
+    --pos-catalog /path/to/bns_train_seed_1234/pos_catalog.csv \
+    --neg-catalog /path/to/bns_train_seed_1234/neg_catalog.csv
 ```
 
 Inspect consolidated event state:
@@ -163,7 +164,7 @@ instead of clipping. Runs prepared with an earlier schema must be regenerated wi
 
 Train profiles use 1000 `posterior_3d` coordinate samples. Test profiles use 64
 `posterior_test` samples, including one truth position. All profiles use
-Planck15, sampling nside 256, seed 42, and the shared Rubin ToO configuration.
+Planck15, sampling nside 256, seed 1234, and the shared Rubin ToO configuration.
 
 ## Slurm products
 
@@ -212,10 +213,13 @@ status/skipped_sim_ids.txt
 status/summary.json
 ```
 
-Temporary SIMLIB and SNANA input files are removed after each event. Observation
-plans and coordinate samples remain available in the aggregate HDF5; status
-sidecars, submission metadata, and SNANA FITS outputs remain separate for audit
-and resume.
+Temporary SIMLIB and SNANA input files are removed after each event. Production
+workers keep coordinate samples in memory and write them directly into one HDF5
+artifact per array task, so they do not create per-event `work/COORDINATES/*.csv`
+files. Observation plans and coordinate samples remain available in the aggregate
+HDF5; status sidecars, submission metadata, and SNANA FITS outputs remain separate
+for audit and resume. Direct standalone use of `src/snana.py` retains the legacy
+coordinate CSV output unless `--no-coordinate-files` is supplied.
 
 Legacy compatibility is automatic: a successful event from an older run that
 has only `coordinate_samples/<id>.csv` and `observation_plans/<id>.json` is

@@ -128,6 +128,7 @@ def _generate_documents(profile: Profile, simulation_ids: list[int]) -> dict[int
         str(profile.sampling_nside),
         "--cosmology",
         profile.cosmology,
+        "--no-coordinate-files",
         "--too_config",
         str(profile.too_config),
     ]
