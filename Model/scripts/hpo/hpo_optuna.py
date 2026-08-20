@@ -1162,6 +1162,8 @@ def summarize_confirmation_runs(runs, size_weights, baseline_trial_number=0):
                 if weight_total > 0.0:
                     source_scores.append(weighted_value / weight_total)
             for stratum in item["results"].get("neg_gw_strata", {}).values():
+                if not isinstance(stratum, dict):
+                    continue
                 count = float(stratum.get("count", 0.0))
                 pooled_correct += count * float(stratum.get("recall", 0.0))
                 pooled_count += count
