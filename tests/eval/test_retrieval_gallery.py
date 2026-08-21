@@ -77,7 +77,7 @@ class RetrievalGalleryTests(unittest.TestCase):
             "w/o Contrastive Loss",
             "w/o Cross-Attn",
             "w/o Fusion",
-            "w/o Gallery Loss",
+            "w/o Retrieval Loss",
             "Full",
         ]
         extended_methods = [*existing_methods, "w/o Classification Loss"]

@@ -8,6 +8,7 @@ from pathlib import Path
 
 from catalog import prepare_dual_run_catalog, prepare_run_catalog
 from config import load_profile
+from migration import migrate_optical, prune_snana, validate_optical_coverage
 from scheduler import compact_profile, status_report, submit_profile
 
 
@@ -49,6 +50,20 @@ def build_parser() -> argparse.ArgumentParser:
 
     compact = commands.add_parser("compact", help="Merge terminal artifacts into HDF5")
     compact.add_argument("profile")
+    migrate = commands.add_parser(
+        "migrate-optical", help="Archive existing SNANA outputs into v2 HDF5 shards"
+    )
+    migrate.add_argument("profile")
+    migrate.add_argument("--batch-size", type=int, default=200)
+    validate_optical = commands.add_parser(
+        "validate-optical", help="Validate v2 optical coverage and checksums"
+    )
+    validate_optical.add_argument("profile")
+    prune = commands.add_parser(
+        "prune-snana", help="Dry-run or remove verified legacy SNANA directories"
+    )
+    prune.add_argument("profile")
+    prune.add_argument("--execute", action="store_true")
     return parser
 
 
@@ -122,6 +137,14 @@ def main(argv: list[str] | None = None) -> int:
         result = status_report(load_profile(args.profile))
     elif args.command == "compact":
         result = compact_profile(load_profile(args.profile))
+    elif args.command == "migrate-optical":
+        result = migrate_optical(
+            load_profile(args.profile), batch_size=int(args.batch_size)
+        )
+    elif args.command == "validate-optical":
+        result = validate_optical_coverage(load_profile(args.profile))
+    elif args.command == "prune-snana":
+        result = prune_snana(load_profile(args.profile), execute=bool(args.execute))
     else:  # pragma: no cover - argparse enforces the command choices
         raise AssertionError(args.command)
     print(json.dumps(result, indent=2, sort_keys=True))

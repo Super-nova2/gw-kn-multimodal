@@ -34,10 +34,10 @@
       "config": "<REPO_ROOT>/Model/args/MAGIKS_BNS_NSBH_no_itc_loss.json"
     },
     {
-      "name": "w/o Gallery Loss",
+      "name": "w/o Retrieval Loss",
       "type": "multimodal",
-      "checkpoint": "<BASE_DIR>/data/model/checkpoints_bns_nsbh/bns_nsbh_ablation_no_gallery_loss",
-      "config": "<REPO_ROOT>/Model/args/MAGIKS_BNS_NSBH_no_gallery_loss.json"
+      "checkpoint": "<BASE_DIR>/data/model/checkpoints_bns_nsbh/bns_nsbh_ablation_no_retrieval_loss",
+      "config": "<REPO_ROOT>/Model/args/MAGIKS_BNS_NSBH_no_retrieval_loss.json"
     },
     {
       "name": "w/o Classification Loss",

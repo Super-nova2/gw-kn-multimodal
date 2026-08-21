@@ -22,6 +22,7 @@ class SlurmConfig:
     time_limit: str = "04:00:00"
     cpus_per_task: int = 1
     memory: str = "10G"
+    tmp_size: str = "5G"
     finalizer_time_limit: str = "01:00:00"
     finalizer_memory: str = "4G"
 
@@ -180,6 +181,7 @@ def load_profile(profile: str | Path) -> Profile:
         time_limit=str(slurm_raw.get("time_limit", "04:00:00")),
         cpus_per_task=int(slurm_raw.get("cpus_per_task", 1)),
         memory=str(slurm_raw.get("memory", "10G")),
+        tmp_size=str(slurm_raw.get("tmp_size", "5G")),
         finalizer_time_limit=str(slurm_raw.get("finalizer_time_limit", "01:00:00")),
         finalizer_memory=str(slurm_raw.get("finalizer_memory", "4G")),
     )

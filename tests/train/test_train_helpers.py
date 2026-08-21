@@ -638,7 +638,6 @@ class CurrentScheduleConfigTests(unittest.TestCase):
         "MAGIKS_BNS_NSBH_no_itc_loss.json",
         "MAGIKS_BNS_NSBH_no_cls_loss.json",
         "MAGIKS_BNS_NSBH_no_cross_atten.json",
-        "MAGIKS_BNS_NSBH_no_gallery_loss.json",
         "MAGIKS_BNS_NSBH_no_fusion.json",
     )
 
@@ -685,7 +684,7 @@ class CurrentScheduleConfigTests(unittest.TestCase):
     def test_hard_disabled_ablations_keep_gallery_hard_mining_off(self):
         expected = {
             "MAGIKS_BNS_NSBH_hard_mining.json": 1.0,
-            "MAGIKS_BNS_NSBH_no_gallery_loss.json": 0.0,
+            "MAGIKS_BNS_NSBH_no_retrieval_loss.json": 0.0,
             "MAGIKS_BNS_NSBH_no_fusion.json": 1.0,
         }
 

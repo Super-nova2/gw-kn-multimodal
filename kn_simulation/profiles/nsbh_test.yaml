@@ -28,5 +28,6 @@ slurm:
   time_limit: "04:00:00"
   cpus_per_task: 1
   memory: 10G
+  tmp_size: 5G
   finalizer_time_limit: "01:00:00"
   finalizer_memory: 4G

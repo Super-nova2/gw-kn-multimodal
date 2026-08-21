@@ -1,8 +1,10 @@
 import sys
 from pathlib import Path
 
+import h5py
 import numpy as np
 import pandas as pd
+import pytest
 
 MODEL_DIR = Path(__file__).resolve().parents[2] / "Model"
 if str(MODEL_DIR) not in sys.path:
@@ -99,3 +101,45 @@ def test_prepare_source_uses_split_catalogs_and_collision_safe_identity(
         prepared.gw_params[prepared.event_to_row[2], :4],
         [1.6, 1.2, 0.1, -0.1],
     )
+
+
+def test_scan_source_pos_neg_uses_verified_aggregate_status(tmp_path):
+    skymap_dir = tmp_path / "skymaps"
+    skymap_dir.mkdir()
+    for event_id in (2, 3):
+        (skymap_dir / f"{event_id}.fits").touch()
+    artifact = tmp_path / "simulation_intermediates.h5"
+    with h5py.File(artifact, "w") as handle:
+        handle.attrs["schema_version"] = "kn-simulation-intermediates-v2"
+        handle.attrs["artifact_kind"] = "aggregate"
+        events = handle.create_group("events")
+        events.create_dataset("simulation_id", data=[2, 3])
+        events.create_dataset("optical_realization_count", data=[1, 0])
+        events.create_dataset(
+            "status", data=["success", "success"], dtype=h5py.string_dtype()
+        )
+
+    positive, negative, missing = builder._scan_source_pos_neg(
+        np.asarray([2, 3]),
+        str(skymap_dir),
+        None,
+        "TEST",
+        "scan",
+        sim_artifact=str(artifact),
+    )
+
+    assert positive.tolist() == [2]
+    assert negative.tolist() == [3]
+    assert missing == 0
+
+    with h5py.File(artifact, "r+") as handle:
+        handle["events/status"][0] = "failed"
+    with pytest.raises(ValueError, match="listed as successful"):
+        builder._scan_source_pos_neg(
+            np.asarray([2]),
+            str(skymap_dir),
+            None,
+            "TEST",
+            "scan",
+            sim_artifact=str(artifact),
+        )

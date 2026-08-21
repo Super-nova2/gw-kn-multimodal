@@ -3,6 +3,7 @@ import os
 import shutil
 import sqlite3
 import subprocess
+import sys
 from pathlib import Path
 
 import cli as kn_cli
@@ -11,9 +12,16 @@ import numpy as np
 import pandas as pd
 import pytest
 from artifacts import SCHEMA_VERSION, write_task_shard
+from astropy.io import fits
 from astropy.time import Time
 from catalog import prepare_catalog, prepare_dual_run_catalog, prepare_run_catalog
 from config import PIPELINE_ROOT, Profile, SlurmConfig
+from migration import migrate_optical, prune_snana, validate_optical_coverage
+from optical import (
+    OpticalPayload,
+    normalize_optical_payload,
+    read_snana_optical,
+)
 from scheduler import (
     compact_profile,
     latest_event_statuses,
@@ -24,6 +32,10 @@ from scheduler import (
 from worker import (
     _cleanup_snana_unneeded_outputs,
     _generate_documents,
+    _pin_sndata_resource_paths,
+    _prepare_sndata_overlay,
+    _runtime_paths,
+    _snana_failure_result,
     finalize_submission,
     run_array_task,
 )
@@ -140,6 +152,66 @@ def prepare_profile(tmp_path: Path) -> tuple[Profile, Path]:
     return profile, profile_path
 
 
+def test_runtime_sndata_overlay_uses_private_empty_path_list(tmp_path):
+    profile, _ = make_profile(tmp_path)
+    models = profile.sndata_root / "models"
+    models.mkdir()
+    survey = profile.sndata_root / "SURVEY.DEF"
+    survey.write_text("test\n", encoding="utf-8")
+    shared_sim = profile.sndata_root / "SIM"
+    shared_sim.mkdir()
+    shared_list = shared_sim / "PATH_SNDATA_SIM.LIST"
+    shared_list.write_text("/shared/legacy/path\n", encoding="utf-8")
+    runtime = _runtime_paths(profile, tmp_path / "jobfs")
+
+    _prepare_sndata_overlay(profile, runtime)
+
+    assert (runtime.sndata_root / "models").is_symlink()
+    assert (runtime.sndata_root / "models").resolve() == models.resolve()
+    assert (runtime.sndata_root / "SURVEY.DEF").resolve() == survey.resolve()
+    assert (runtime.sndata_root / "SIM/PATH_SNDATA_SIM.LIST").read_text() == ""
+    assert shared_list.read_text() == "/shared/legacy/path\n"
+    assert runtime.sndata_sim_dir.is_dir()
+
+
+def test_snana_input_pins_shared_resources_but_keeps_jobfs_output(tmp_path):
+    shared = tmp_path / "shared" / "SNDATA_ROOT"
+    input_file = tmp_path / "event.INPUT"
+    input_file.write_text(
+        "GENMODEL: $SNDATA_ROOT/models/model\n"
+        "KCOR_FILE: ${SNDATA_ROOT}/kcor/test.fits\n"
+        "PATH_SNDATA_SIM: /jobfs/task/SNDATA_ROOT/SIM/profile\n",
+        encoding="utf-8",
+    )
+
+    _pin_sndata_resource_paths(input_file, shared)
+
+    text = input_file.read_text(encoding="utf-8")
+    assert f"GENMODEL: {shared.resolve()}/models/model" in text
+    assert f"KCOR_FILE: {shared.resolve()}/kcor/test.fits" in text
+    assert "PATH_SNDATA_SIM: /jobfs/task/SNDATA_ROOT/SIM/profile" in text
+
+
+@pytest.mark.parametrize(
+    "detail",
+    [
+        "FATAL: Every generated event fails NEPOCH>=2 .",
+        "Could not find SIMLIB HEADER passing GENRANGE_XXX cuts.",
+    ],
+)
+def test_expected_snana_no_coverage_is_permanently_skipped(detail):
+    assert _snana_failure_result(11, detail) == (
+        "skipped",
+        "rubin_observation_requirements_not_met",
+    )
+
+
+def test_unknown_snana_failure_retains_diagnostics():
+    status, reason = _snana_failure_result(11, "unexpected fatal detail")
+    assert status == "failed"
+    assert reason == "snlc_sim_exit_11: unexpected fatal detail"
+
+
 def test_worker_removes_only_unused_per_event_snana_outputs(tmp_path):
     profile, _ = make_profile(tmp_path)
     simulation_id = 7
@@ -235,6 +307,7 @@ def test_validate_accepts_manifest_before_finalizer_resource_fields(tmp_path):
     manifest = json.loads(profile.prepared_manifest.read_text(encoding="utf-8"))
     manifest["profile"]["slurm"].pop("finalizer_time_limit")
     manifest["profile"]["slurm"].pop("finalizer_memory")
+    manifest["profile"]["slurm"].pop("tmp_size")
     profile.prepared_manifest.write_text(
         json.dumps(manifest),
         encoding="utf-8",
@@ -400,6 +473,7 @@ def test_submit_dry_run_builds_array_without_writing_submission(tmp_path):
     assert result["event_count"] == 2
     assert result["task_count"] == 2
     assert "--array=0-1%3" in result["array_command"]
+    assert "--tmp=5G" in result["array_command"]
     export_argument = next(
         argument
         for argument in result["array_command"]
@@ -430,9 +504,52 @@ def test_copied_slurm_launcher_uses_exported_pipeline_root(tmp_path):
     environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
     environment["CAPTURE_PATH"] = str(capture)
     environment["KN_PIPELINE_ROOT"] = str(pipeline_root)
+    environment["KN_COMMAND"] = "finalize"
 
     subprocess.run([copied_launcher], check=True, env=environment)
     assert capture.read_text(encoding="utf-8").strip() == str(worker)
+
+
+def test_slurm_launcher_requires_and_cleans_jobfs(tmp_path):
+    pipeline_root = tmp_path / "pipeline"
+    worker = pipeline_root / "src" / "worker.py"
+    worker.parent.mkdir(parents=True)
+    worker.write_text("# test worker\n", encoding="utf-8")
+    launcher = tmp_path / "worker.sh"
+    shutil.copy2(PIPELINE_ROOT / "slurm" / "worker.sh", launcher)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    capture = tmp_path / "scratch.txt"
+    fake_python = fake_bin / "python"
+    fake_python.write_text(
+        '#!/bin/sh\nprintf "%s\\n" "$KN_SCRATCH_DIR" > "$CAPTURE_PATH"\n'
+        'touch "$KN_SCRATCH_DIR/worker-created"\n',
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+    environment = os.environ.copy()
+    environment.update(
+        PATH=f"{fake_bin}:{environment['PATH']}",
+        CAPTURE_PATH=str(capture),
+        KN_PIPELINE_ROOT=str(pipeline_root),
+        KN_COMMAND="work",
+    )
+    environment.pop("SLURM_TMPDIR", None)
+    environment.pop("JOBFS", None)
+
+    missing = subprocess.run(
+        launcher, env=environment, capture_output=True, text=True, check=False
+    )
+    assert missing.returncode == 2
+    assert "SLURM_TMPDIR or JOBFS" in missing.stderr
+
+    jobfs = tmp_path / "jobfs"
+    jobfs.mkdir()
+    environment["JOBFS"] = str(jobfs)
+    subprocess.run([launcher], check=True, env=environment)
+    scratch = Path(capture.read_text(encoding="utf-8").strip())
+    assert scratch.parent == jobfs
+    assert not scratch.exists()
 
 
 def test_finalize_and_resume_use_event_sidecars(tmp_path):
@@ -484,6 +601,63 @@ def coordinate_frame(simulation_id: int, count: int = 8) -> pd.DataFrame:
     )
 
 
+def optical_payload(simulation_id: int) -> OpticalPayload:
+    payload = OpticalPayload(
+        simulation_id=simulation_id,
+        mjd_explode=62000.0,
+        realizations={
+            "ra_deg": np.asarray([1.0]),
+            "dec_deg": np.asarray([-0.5]),
+            "nobs": np.asarray([6]),
+            "mjd_detect_first": np.asarray([62001.0]),
+            "observation_start": np.asarray([0]),
+            "observation_count": np.asarray([6]),
+        },
+        observations={
+            "mjd": np.linspace(62000.0, 62005.0, 6),
+            "fluxcal": np.linspace(10.0, 60.0, 6),
+            "fluxcalerr": np.ones(6),
+            "band_code": np.asarray([ord(value) for value in "ugrizY"]),
+            "photflag": np.asarray([0, 4096, 0, 0, 0, 0]),
+        },
+        checksum="",
+    )
+    return normalize_optical_payload(payload, simulation_id)
+
+
+def write_snana_event(profile: Profile, simulation_id: int) -> Path:
+    version = f"{profile.sim_name}_{simulation_id}"
+    event_dir = profile.sndata_sim_dir / version
+    event_dir.mkdir(parents=True)
+    fits.BinTableHDU.from_columns(
+        [
+            fits.Column(name="RA", format="D", array=[1.0]),
+            fits.Column(name="DEC", format="D", array=[-0.5]),
+            fits.Column(name="NOBS", format="K", array=[6]),
+            fits.Column(name="PTROBS_MIN", format="K", array=[1]),
+            fits.Column(name="PTROBS_MAX", format="K", array=[6]),
+            fits.Column(name="MJD_DETECT_FIRST", format="D", array=[62001.0]),
+        ]
+    ).writeto(event_dir / f"{version}_HEAD.FITS")
+    fits.BinTableHDU.from_columns(
+        [
+            fits.Column(name="MJD", format="D", array=np.arange(62000.0, 62007.0)),
+            fits.Column(name="FLUXCAL", format="E", array=np.arange(10.0, 80.0, 10.0)),
+            fits.Column(name="FLUXCALERR", format="E", array=np.ones(7)),
+            fits.Column(
+                name="BAND",
+                format="A20",
+                array=np.asarray([*[f"LSST-{value}" for value in "ugrizY"], "-"]),
+            ),
+            fits.Column(name="PHOTFLAG", format="J", array=[0, 4096, 0, 0, 0, 0, 0]),
+        ]
+    ).writeto(event_dir / f"{version}_PHOT.FITS")
+    (event_dir / f"{version}.README").write_text(
+        "DOCUMENTATION:\nMJD_EXPLODE: 62000.0\n", encoding="utf-8"
+    )
+    return event_dir
+
+
 def generated_products(simulation_ids: list[int]) -> dict[int, dict]:
     return {
         simulation_id: {
@@ -493,6 +667,7 @@ def generated_products(simulation_ids: list[int]) -> dict[int, dict]:
                 "nested": {"nights": [0, 1], "enabled": True},
             },
             "coordinates": coordinate_frame(simulation_id),
+            "optical": optical_payload(simulation_id),
         }
         for simulation_id in simulation_ids
     }
@@ -525,11 +700,11 @@ def test_array_tasks_write_hdf5_shards_then_finalizer_sorts_and_compacts(
     ids_file.write_text("7\n3\n", encoding="utf-8")
     monkeypatch.setattr(
         "worker._generate_documents",
-        lambda profile, simulation_ids: generated_products(simulation_ids),
+        lambda profile, simulation_ids, runtime: generated_products(simulation_ids),
     )
     monkeypatch.setattr(
         "worker._run_one",
-        lambda profile, simulation_id, plan: {
+        lambda profile, simulation_id, plan, runtime: {
             "simulation_id": simulation_id,
             "status": "success",
             "reason": None,
@@ -557,6 +732,9 @@ def test_array_tasks_write_hdf5_shards_then_finalizer_sorts_and_compacts(
         assert handle["events/simulation_id"][:].tolist() == [7]
         assert len(handle["coordinates/ra"]) == 8
         assert handle["coordinates/ra"].compression == "gzip"
+        assert handle["events/optical_realization_count"][:].tolist() == [1]
+        assert handle["events/optical_observation_count"][:].tolist() == [6]
+        assert handle["optical/observations/mjd"].compression == "gzip"
         assert np.isnan(handle["coordinates/redshift"][0])
         plan = json.loads(handle["events/observation_plan_json"][0])
         assert plan["nested"]["nights"] == [0, 1]
@@ -574,6 +752,8 @@ def test_array_tasks_write_hdf5_shards_then_finalizer_sorts_and_compacts(
         assert handle["events/simulation_id"][:].tolist() == [3, 7]
         assert handle["events/coordinate_start"][:].tolist() == [0, 8]
         assert handle["events/coordinate_count"][:].tolist() == [8, 8]
+        assert handle["events/optical_realization_start"][:].tolist() == [0, 1]
+        assert handle["events/optical_observation_start"][:].tolist() == [0, 6]
         assert handle["coordinates/simulation_id"][:].tolist() == [3] * 8 + [7] * 8
     artifact_status = status_report(profile)["intermediate_artifacts"]
     assert artifact_status["exists"]
@@ -633,7 +813,9 @@ def test_finalizer_imports_legacy_event_and_cleans_sources(tmp_path):
         json.dumps(
             {
                 "created_utc": "2026-08-04T00:00:00+00:00",
-                "events": [{"simulation_id": 7, "status": "success", "reason": None}],
+                "events": [
+                    {"simulation_id": 7, "status": "skipped", "reason": "coverage"}
+                ],
             }
         ),
         encoding="utf-8",
@@ -655,6 +837,7 @@ def test_finalizer_imports_legacy_event_and_cleans_sources(tmp_path):
                     "status": "generated",
                 },
                 "coordinates": coordinate_frame(3),
+                "optical": optical_payload(3),
             }
         ],
     )
@@ -718,6 +901,7 @@ def test_corrupt_shard_keeps_all_source_artifacts(tmp_path):
                     "status": "generated",
                 },
                 "coordinates": coordinate_frame(simulation_id),
+                "optical": optical_payload(simulation_id),
             }
             for simulation_id in (3, 7)
         ],
@@ -807,3 +991,108 @@ def test_manual_compact_refuses_incomplete_run(tmp_path):
         compact_profile(profile)
 
     assert not profile.aggregate_artifact_file.exists()
+
+
+def test_migrate_validate_and_prune_legacy_snana(tmp_path):
+    profile, _ = prepare_profile(tmp_path)
+    profile.coordinate_manifest_dir.mkdir(parents=True)
+    profile.observation_plan_dir.mkdir(parents=True)
+    for simulation_id in (3, 7):
+        coordinate_frame(simulation_id).to_csv(
+            profile.coordinate_manifest_dir / f"{simulation_id}.csv", index=False
+        )
+        (profile.observation_plan_dir / f"{simulation_id}.json").write_text(
+            json.dumps({"simulation_id": simulation_id, "status": "generated"}),
+            encoding="utf-8",
+        )
+    status_dir = profile.status_dir / "shards"
+    status_dir.mkdir(parents=True)
+    (status_dir / "legacy_0.json").write_text(
+        json.dumps(
+            {
+                "created_utc": "2026-08-01T00:00:00+00:00",
+                "events": [
+                    {"simulation_id": 3, "status": "success", "reason": None},
+                    {"simulation_id": 7, "status": "failed", "reason": "test"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    event_dir = write_snana_event(profile, 3)
+    payload = read_snana_optical(profile.sndata_sim_dir, profile.sim_name, 3)
+    assert payload.realization_count == 1
+    assert payload.observation_count == 7
+    assert payload.observations["band_code"].tolist() == [
+        *[ord(x) for x in "ugrizY"],
+        ord("-"),
+    ]
+
+    assert not validate_optical_coverage(profile)["verified"]
+    with pytest.raises(FileNotFoundError, match="manifest"):
+        prune_snana(profile)
+
+    migrated = migrate_optical(profile, batch_size=2)
+
+    assert migrated["migrated_events"] == 2
+    assert migrated["created_shards"] == 1
+    assert migrated["verified"]
+    assert profile.aggregate_artifact_file.is_file()
+    assert validate_optical_coverage(profile)["verified"]
+    with h5py.File(profile.aggregate_artifact_file, "r") as handle:
+        assert handle["events/simulation_id"][:].tolist() == [3, 7]
+        assert handle["events/optical_realization_count"][:].tolist() == [1, 0]
+        assert handle["events/optical_observation_count"][:].tolist() == [7, 0]
+
+    dry_run = prune_snana(profile)
+    assert not dry_run["execute"]
+    assert dry_run["event_directories"] == 1
+    assert event_dir.is_dir()
+    executed = prune_snana(profile, execute=True)
+    assert executed["event_directories"] == 1
+    assert not event_dir.exists()
+
+
+def test_model_reader_hdf5_matches_legacy_fits(tmp_path):
+    profile, _ = prepare_profile(tmp_path)
+    write_snana_event(profile, 3)
+    payload = read_snana_optical(profile.sndata_sim_dir, profile.sim_name, 3)
+    artifact = tmp_path / "raw_optical.h5"
+    write_task_shard(
+        artifact,
+        profile=profile,
+        submission_id="reader",
+        task_index=0,
+        events=[
+            {
+                "simulation_id": 3,
+                "status": "success",
+                "reason": None,
+                "observation_plan": {"simulation_id": 3},
+                "coordinates": coordinate_frame(3),
+                "optical": payload,
+            }
+        ],
+    )
+    model_dir = Path(__file__).resolve().parents[2] / "Model"
+    sys.path.insert(0, str(model_dir))
+    from data_loader import parse_snana_fits, parse_snana_h5
+
+    kwargs = {
+        "fluxcal_to_psfflux_factor": 1.0,
+        "psfflux_zp": 31.4,
+        "lupt_b_njy": np.ones(6),
+        "normalize_to_first_detection": True,
+    }
+    legacy = parse_snana_fits(
+        3,
+        profile.sndata_sim_dir,
+        profile.sim_name,
+        **kwargs,
+    )
+    compact = parse_snana_h5(3, artifact, **kwargs)
+
+    assert len(legacy) == len(compact) == 1
+    assert len(legacy[0]) == len(compact[0]) == 6
+    for legacy_value, compact_value in zip(legacy[0], compact[0]):
+        np.testing.assert_allclose(legacy_value, compact_value, rtol=0, atol=1e-7)

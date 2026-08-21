@@ -68,12 +68,14 @@ set_profile_defaults() {
             NSBH_MAX_NEG_TYPE2_GW="${NSBH_MAX_NEG_TYPE2_GW:-5000}"
             BNS_FULL_CATALOG_PATH="${BNS_FULL_CATALOG_PATH:-${BASE_DIR}/GWSamplegen/outputs/production_am_bayestar/dual/bns_train_seed_1234/pos_catalog.csv}"
             BNS_SKYMAP_DIR="${BNS_SKYMAP_DIR:-${BASE_DIR}/data/skymap/positive/bns_skymap_train}"
+            BNS_SIM_ARTIFACT="${BNS_SIM_ARTIFACT-${REPO_ROOT}/kn_simulation/runs/bns_train/simulation_intermediates.h5}"
             BNS_SIM_ROOT="${BNS_SIM_ROOT:-${BASE_DIR}/SNANA/SNDATA_ROOT/SIM/LSST_KN_BNS_TRAIN}"
             BNS_SIM_NAME="${BNS_SIM_NAME:-LSST_KN_BNS_TRAIN}"
             BNS_SUCCESS_IDS_PATH="${BNS_SUCCESS_IDS_PATH:-${REPO_ROOT}/kn_simulation/runs/bns_train/success_sim_ids.txt}"
 
             NSBH_FULL_CATALOG_PATH="${NSBH_FULL_CATALOG_PATH:-${BASE_DIR}/GWSamplegen/outputs/production_am_bayestar/dual/nsbh_train_seed_1234/pos_catalog.csv}"
             NSBH_SKYMAP_DIR="${NSBH_SKYMAP_DIR:-${BASE_DIR}/data/skymap/positive/nsbh_skymap_train}"
+            NSBH_SIM_ARTIFACT="${NSBH_SIM_ARTIFACT-${REPO_ROOT}/kn_simulation/runs/nsbh_train/simulation_intermediates.h5}"
             NSBH_SIM_ROOT="${NSBH_SIM_ROOT:-${BASE_DIR}/SNANA/SNDATA_ROOT/SIM/LSST_KN_NSBH_TRAIN}"
             NSBH_SIM_NAME="${NSBH_SIM_NAME:-LSST_KN_NSBH_TRAIN}"
             NSBH_SUCCESS_IDS_PATH="${NSBH_SUCCESS_IDS_PATH:-${REPO_ROOT}/kn_simulation/runs/nsbh_train/success_sim_ids.txt}"
@@ -90,12 +92,14 @@ set_profile_defaults() {
             NSBH_MAX_NEG_TYPE2_GW="${NSBH_MAX_NEG_TYPE2_GW:-500}"
             BNS_FULL_CATALOG_PATH="${BNS_FULL_CATALOG_PATH:-${BASE_DIR}/GWSamplegen/outputs/production_am_bayestar/dual/bns_test_seed_1234/pos_catalog.csv}"
             BNS_SKYMAP_DIR="${BNS_SKYMAP_DIR:-${BASE_DIR}/data/skymap/positive/bns_skymap_test}"
+            BNS_SIM_ARTIFACT="${BNS_SIM_ARTIFACT-${REPO_ROOT}/kn_simulation/runs/bns_test/simulation_intermediates.h5}"
             BNS_SIM_ROOT="${BNS_SIM_ROOT:-${BASE_DIR}/SNANA/SNDATA_ROOT/SIM/LSST_KN_BNS_TEST}"
             BNS_SIM_NAME="${BNS_SIM_NAME:-LSST_KN_BNS_TEST}"
             BNS_SUCCESS_IDS_PATH="${BNS_SUCCESS_IDS_PATH:-${REPO_ROOT}/kn_simulation/runs/bns_test/success_sim_ids.txt}"
 
             NSBH_FULL_CATALOG_PATH="${NSBH_FULL_CATALOG_PATH:-${BASE_DIR}/GWSamplegen/outputs/production_am_bayestar/dual/nsbh_test_seed_1234/pos_catalog.csv}"
             NSBH_SKYMAP_DIR="${NSBH_SKYMAP_DIR:-${BASE_DIR}/data/skymap/positive/nsbh_skymap_test}"
+            NSBH_SIM_ARTIFACT="${NSBH_SIM_ARTIFACT-${REPO_ROOT}/kn_simulation/runs/nsbh_test/simulation_intermediates.h5}"
             NSBH_SIM_ROOT="${NSBH_SIM_ROOT:-${BASE_DIR}/SNANA/SNDATA_ROOT/SIM/LSST_KN_NSBH_TEST}"
             NSBH_SIM_NAME="${NSBH_SIM_NAME:-LSST_KN_NSBH_TEST}"
             NSBH_SUCCESS_IDS_PATH="${NSBH_SUCCESS_IDS_PATH:-${REPO_ROOT}/kn_simulation/runs/nsbh_test/success_sim_ids.txt}"
@@ -289,9 +293,9 @@ if [[ -z "${SLURM_JOB_ID:-}" ]]; then
     export BNS_MAX_NEG_TYPE1_GW BNS_MAX_NEG_TYPE2_GW
     export NSBH_MAX_NEG_TYPE1_GW NSBH_MAX_NEG_TYPE2_GW
     export FLUXCAL_ZP PSFFLUX_ZP LUPT_K LUPT_M5_MAG
-    export BNS_FULL_CATALOG_PATH BNS_SKYMAP_DIR BNS_SIM_ROOT BNS_SIM_NAME BNS_SUCCESS_IDS_PATH
+    export BNS_FULL_CATALOG_PATH BNS_SKYMAP_DIR BNS_SIM_ARTIFACT BNS_SIM_ROOT BNS_SIM_NAME BNS_SUCCESS_IDS_PATH
     export BNS_NEGATIVE_CATALOG_PATH BNS_NEGATIVE_SKYMAP_DIR
-    export NSBH_FULL_CATALOG_PATH NSBH_SKYMAP_DIR NSBH_SIM_ROOT NSBH_SIM_NAME NSBH_SUCCESS_IDS_PATH
+    export NSBH_FULL_CATALOG_PATH NSBH_SKYMAP_DIR NSBH_SIM_ARTIFACT NSBH_SIM_ROOT NSBH_SIM_NAME NSBH_SUCCESS_IDS_PATH
     export NSBH_NEGATIVE_CATALOG_PATH NSBH_NEGATIVE_SKYMAP_DIR
     export OUTPUT_H5_PATH
     sbatch_opts+=(--export=ALL)
@@ -312,8 +316,16 @@ require_dir "$BNS_SKYMAP_DIR"
 require_dir "$NSBH_SKYMAP_DIR"
 require_dir "$BNS_NEGATIVE_SKYMAP_DIR"
 require_dir "$NSBH_NEGATIVE_SKYMAP_DIR"
-require_dir "$BNS_SIM_ROOT"
-require_dir "$NSBH_SIM_ROOT"
+if [[ -n "${BNS_SIM_ARTIFACT:-}" ]]; then
+    require_file "$BNS_SIM_ARTIFACT"
+else
+    require_dir "$BNS_SIM_ROOT"
+fi
+if [[ -n "${NSBH_SIM_ARTIFACT:-}" ]]; then
+    require_file "$NSBH_SIM_ARTIFACT"
+else
+    require_dir "$NSBH_SIM_ROOT"
+fi
 
 if [[ -z "${BNS_SUCCESS_IDS_PATH:-}" || -z "${NSBH_SUCCESS_IDS_PATH:-}" ]]; then
     echo "BNS_SUCCESS_IDS_PATH and NSBH_SUCCESS_IDS_PATH are required to distinguish type-2 negatives from missing observation coverage."
@@ -353,19 +365,21 @@ cmd=(
     --bns_skymap_dir "$BNS_SKYMAP_DIR"
     --bns_negative_catalog_path "$BNS_NEGATIVE_CATALOG_PATH"
     --bns_negative_skymap_dir "$BNS_NEGATIVE_SKYMAP_DIR"
-    --bns_sim_root "$BNS_SIM_ROOT"
     --bns_sim_name "$BNS_SIM_NAME"
     --bns_max_lc_per_gw "$BNS_MAX_LC_PER_GW"
     --nsbh_full_catalog_path "$NSBH_FULL_CATALOG_PATH"
     --nsbh_skymap_dir "$NSBH_SKYMAP_DIR"
     --nsbh_negative_catalog_path "$NSBH_NEGATIVE_CATALOG_PATH"
     --nsbh_negative_skymap_dir "$NSBH_NEGATIVE_SKYMAP_DIR"
-    --nsbh_sim_root "$NSBH_SIM_ROOT"
     --nsbh_sim_name "$NSBH_SIM_NAME"
     --nsbh_max_lc_per_gw "$NSBH_MAX_LC_PER_GW"
 )
 
+append_optional_arg --bns_sim_artifact "${BNS_SIM_ARTIFACT:-}"
+append_optional_arg --bns_sim_root "${BNS_SIM_ROOT:-}"
 append_optional_arg --bns_success_ids_path "${BNS_SUCCESS_IDS_PATH:-}"
+append_optional_arg --nsbh_sim_artifact "${NSBH_SIM_ARTIFACT:-}"
+append_optional_arg --nsbh_sim_root "${NSBH_SIM_ROOT:-}"
 append_optional_arg --nsbh_success_ids_path "${NSBH_SUCCESS_IDS_PATH:-}"
 append_optional_arg --bns_max_neg_gw "${BNS_MAX_NEG_GW:-}"
 append_optional_arg --nsbh_max_neg_gw "${NSBH_MAX_NEG_GW:-}"

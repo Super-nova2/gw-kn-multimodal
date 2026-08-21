@@ -9,8 +9,8 @@ The supported data flow is:
 GWSamplegen pos_catalog.csv + neg_catalog.csv + separate skymap roots
     -> validated positive-only kn_catalog.csv + retained neg_catalog.csv
     -> Rubin baseline/ToO observation plans
-    -> per-event SNANA simulations
-    -> one intermediate HDF5 shard per Slurm array task
+    -> per-event SNANA simulations in node-local JOBFS
+    -> normalized raw SNANA optical rows in one HDF5 shard per Slurm array task
     -> simulation_intermediates.h5 and consolidated status summary
 ```
 
@@ -101,9 +101,12 @@ permanently footprint-uncovered events are not repeated:
 kn_simulation/bin/kn-sim submit bns_train --resume
 ```
 
-SNANA writes each event's output under
-`$SNDATA_ROOT/SIM/<sim_name>/<sim_name>_<simulation_id>/`, so every profile/task
-has its own parent directory.
+Production workers request 5 GiB of node-local temporary storage and require
+`SLURM_TMPDIR` or `JOBFS`. SIMLIB, SNANA input, HEAD/PHOT/README products, and
+the task's staging HDF5 live there. After each event is archived, its SNANA
+directory is removed; the worker's exit trap removes the unique task scratch
+directory. `SNDATA_ROOT` on Lustre is still used read-only for SNANA models and
+calibration data.
 
 Resource overrides do not require editing a profile:
 
@@ -182,8 +185,9 @@ runs/<profile>/simulation_intermediates.h5
 ```
 
 The aggregate is ordered exactly like the positive-only `kn_catalog.csv`. It contains event
-status/reason, coordinate offsets and counts, the complete observation plan as
-JSON, task provenance, and the coordinate columns. Failed events are included
+status/reason, coordinate and optical offsets/counts, the complete observation
+plan as JSON, task provenance, normalized raw SNANA HEAD/PHOT columns, and the
+coordinate columns. Failed events are included
 but do not block aggregation; the usable event list is written to
 `runs/<profile>/success_sim_ids.txt`.
 
@@ -193,9 +197,12 @@ posterior_probability, is_true_position, redshift, libid,
 in_baseline_footprint, too_tile_index, too_nobs, too_mode
 ```
 
-Coordinate datasets are chunked and gzip-compressed. Root attributes record the
-schema version, profile/source/split, prepared-catalog SHA256, creation time,
-event count, and coordinate count.
+Coordinate and raw optical datasets are chunked and gzip-compressed. The raw
+optical schema stores realization-level RA/Dec, NOBS, first-detection time and
+observation offsets plus observation-level MJD, FLUXCAL, FLUXCALERR, BAND and
+PHOTFLAG. Each event has a deterministic SHA256 payload checksum. Root
+attributes record the schema version, profile/source/split, prepared-catalog
+SHA256, creation time, and row counts.
 
 Before publishing the aggregate, the finalizer reopens the temporary file and
 validates the catalog checksum, event IDs/order, JSON plans, coordinate offsets,
@@ -213,15 +220,37 @@ status/skipped_sim_ids.txt
 status/summary.json
 ```
 
-Temporary SIMLIB and SNANA input files are removed after each event. Production
-workers keep coordinate samples in memory and write them directly into one HDF5
-artifact per array task, so they do not create per-event `work/COORDINATES/*.csv`
-files. Observation plans and coordinate samples remain available in the aggregate
-HDF5; status sidecars, submission metadata, and SNANA FITS outputs remain separate
-for audit and resume. Direct standalone use of `src/snana.py` retains the legacy
-coordinate CSV output unless `--no-coordinate-files` is supplied.
+Production workers keep coordinate samples in memory and never create
+per-event `work/COORDINATES/*.csv` files. Observation plans, coordinate samples,
+and successful optical outputs remain in the aggregate HDF5; status sidecars
+and submission metadata remain separate for audit and resume. Direct standalone
+use of `src/snana.py` retains legacy coordinate CSV output unless
+`--no-coordinate-files` is supplied.
 
-Legacy compatibility is automatic: a successful event from an older run that
-has only `coordinate_samples/<id>.csv` and `observation_plans/<id>.json` is
-imported into the final aggregate without rerunning SNANA. This is how an
-already-successful probe event can be combined with later task shards.
+## Legacy optical migration and safe pruning
+
+Old successful events cannot be compacted into schema v2 until their existing
+HEAD/PHOT/README products are archived. Migrate each profile before pruning:
+
+```bash
+kn_simulation/bin/kn-sim migrate-optical bns_train
+kn_simulation/bin/kn-sim validate-optical bns_train
+kn_simulation/bin/kn-sim prune-snana bns_train
+```
+
+Migration is resumable and defaults to 200 events per shard to limit new inode
+usage. It preserves the latest success/failed/skipped status, verifies every
+successful payload checksum, and compacts terminal profiles into
+`simulation_intermediates.h5`. `prune-snana` is a report-only dry run by default
+and refuses to proceed without a current migration manifest and full optical
+coverage. Review its event/file/byte counts, then explicitly remove only the
+matching per-event directories:
+
+```bash
+kn_simulation/bin/kn-sim prune-snana bns_train --execute
+```
+
+Run this sequence independently for `bns_train`, `nsbh_train`, `bns_test`, and
+`nsbh_test`. The combined BNS+NSBH dataset submit script now uses the four
+profile aggregates by default; legacy `BNS_SIM_ROOT`/`NSBH_SIM_ROOT` remains an
+explicit fallback when the artifact variables are empty.

@@ -15,8 +15,15 @@ import h5py
 import numpy as np
 import pandas as pd
 from config import Profile
+from optical import (
+    OBSERVATION_DTYPES,
+    REALIZATION_DTYPES,
+    OpticalPayload,
+    normalize_optical_payload,
+)
 
-SCHEMA_VERSION = "kn-simulation-intermediates-v1"
+SCHEMA_VERSION = "kn-simulation-intermediates-v2"
+LEGACY_SCHEMA_VERSION = "kn-simulation-intermediates-v1"
 COORDINATE_COLUMNS = (
     "simulation_id",
     "sample_index",
@@ -155,7 +162,7 @@ def _create_coordinate_datasets(group: h5py.Group, count: int) -> None:
     options: dict[str, Any] = {"shape": (count,)}
     if count:
         options.update(
-            chunks=(min(count, 65_536),),
+            chunks=(min(count, 1_024),),
             compression="gzip",
             compression_opts=4,
             shuffle=True,
@@ -191,9 +198,67 @@ def _create_event_datasets(group: h5py.Group, count: int) -> None:
     group.create_dataset("reason", shape=(count,), dtype=text_dtype)
     group.create_dataset("coordinate_start", shape=(count,), dtype=np.int64)
     group.create_dataset("coordinate_count", shape=(count,), dtype=np.int64)
+    group.create_dataset("optical_realization_start", shape=(count,), dtype=np.int64)
+    group.create_dataset("optical_realization_count", shape=(count,), dtype=np.int64)
+    group.create_dataset("optical_observation_start", shape=(count,), dtype=np.int64)
+    group.create_dataset("optical_observation_count", shape=(count,), dtype=np.int64)
+    group.create_dataset("mjd_explode", shape=(count,), dtype=np.float64)
+    group.create_dataset("optical_payload_sha256", shape=(count,), dtype=text_dtype)
     group.create_dataset("observation_plan_json", shape=(count,), dtype=text_dtype)
     group.create_dataset("submission_id", shape=(count,), dtype=text_dtype)
     group.create_dataset("task_index", shape=(count,), dtype=np.int64)
+
+
+def _dataset_options(count: int, chunk_rows: int) -> dict[str, Any]:
+    options: dict[str, Any] = {"shape": (count,)}
+    if count:
+        options.update(
+            chunks=(min(count, chunk_rows),),
+            compression="gzip",
+            compression_opts=4,
+            shuffle=True,
+        )
+    return options
+
+
+def _create_optical_datasets(
+    handle: h5py.File,
+    realization_count: int,
+    observation_count: int,
+) -> tuple[h5py.Group, h5py.Group]:
+    optical = handle.create_group("optical")
+    optical.attrs.update(storage="raw_snana_normalized", band_encoding="ascii_uint8")
+    realizations = optical.create_group("realizations")
+    observations = optical.create_group("observations")
+    for name, dtype in REALIZATION_DTYPES.items():
+        realizations.create_dataset(
+            name, dtype=dtype, **_dataset_options(realization_count, 1_024)
+        )
+    for name, dtype in OBSERVATION_DTYPES.items():
+        observations.create_dataset(
+            name, dtype=dtype, **_dataset_options(observation_count, 4_096)
+        )
+    return realizations, observations
+
+
+def _write_optical_slice(
+    realization_group: h5py.Group,
+    observation_group: h5py.Group,
+    realization_start: int,
+    observation_start: int,
+    payload: OpticalPayload,
+) -> None:
+    realization_stop = realization_start + payload.realization_count
+    observation_stop = observation_start + payload.observation_count
+    for name in REALIZATION_DTYPES:
+        values = payload.realizations[name]
+        if name == "observation_start":
+            values = values + observation_start
+        realization_group[name][realization_start:realization_stop] = values
+    for name in OBSERVATION_DTYPES:
+        observation_group[name][observation_start:observation_stop] = (
+            payload.observations[name]
+        )
 
 
 def write_task_shard(
@@ -211,7 +276,22 @@ def write_task_shard(
         normalize_coordinates(record.get("coordinates"), int(record["simulation_id"]))
         for record in records
     ]
+    optical_payloads = [
+        normalize_optical_payload(record.get("optical"), int(record["simulation_id"]))
+        for record in records
+    ]
+    for record, payload in zip(records, optical_payloads):
+        if record.get("status") == "success" and payload is None:
+            raise ValueError(
+                f"Successful simulation_id={record['simulation_id']} has no optical payload"
+            )
     coordinate_count = sum(len(frame) for frame in normalized)
+    optical_realization_count = sum(
+        payload.realization_count for payload in optical_payloads if payload is not None
+    )
+    optical_observation_count = sum(
+        payload.observation_count for payload in optical_payloads if payload is not None
+    )
     temporary = _atomic_hdf5_path(path)
     temporary.unlink(missing_ok=True)
     try:
@@ -228,25 +308,58 @@ def write_task_shard(
                 created_utc=utc_now(),
                 event_count=len(records),
                 coordinate_count=coordinate_count,
+                optical_realization_count=optical_realization_count,
+                optical_observation_count=optical_observation_count,
             )
             event_group = handle.create_group("events")
             coordinate_group = handle.create_group("coordinates")
             _create_event_datasets(event_group, len(records))
             _create_coordinate_datasets(coordinate_group, coordinate_count)
-            cursor = 0
-            for index, (record, frame) in enumerate(zip(records, normalized)):
+            realization_group, observation_group = _create_optical_datasets(
+                handle, optical_realization_count, optical_observation_count
+            )
+            coordinate_cursor = 0
+            realization_cursor = 0
+            observation_cursor = 0
+            for index, (record, frame, payload) in enumerate(
+                zip(records, normalized, optical_payloads)
+            ):
                 event_group["simulation_id"][index] = int(record["simulation_id"])
                 event_group["status"][index] = str(record.get("status", "failed"))
                 event_group["reason"][index] = str(record.get("reason") or "")
-                event_group["coordinate_start"][index] = cursor
+                event_group["coordinate_start"][index] = coordinate_cursor
                 event_group["coordinate_count"][index] = len(frame)
+                event_group["optical_realization_start"][index] = realization_cursor
+                event_group["optical_realization_count"][index] = (
+                    payload.realization_count if payload is not None else 0
+                )
+                event_group["optical_observation_start"][index] = observation_cursor
+                event_group["optical_observation_count"][index] = (
+                    payload.observation_count if payload is not None else 0
+                )
+                event_group["mjd_explode"][index] = (
+                    payload.mjd_explode if payload is not None else np.nan
+                )
+                event_group["optical_payload_sha256"][index] = (
+                    payload.checksum if payload is not None else ""
+                )
                 event_group["observation_plan_json"][index] = _json_text(
                     record.get("observation_plan") or {}
                 )
                 event_group["submission_id"][index] = str(submission_id)
                 event_group["task_index"][index] = int(task_index)
-                _write_coordinate_slice(coordinate_group, cursor, frame)
-                cursor += len(frame)
+                _write_coordinate_slice(coordinate_group, coordinate_cursor, frame)
+                coordinate_cursor += len(frame)
+                if payload is not None:
+                    _write_optical_slice(
+                        realization_group,
+                        observation_group,
+                        realization_cursor,
+                        observation_cursor,
+                        payload,
+                    )
+                    realization_cursor += payload.realization_count
+                    observation_cursor += payload.observation_count
             handle.flush()
         temporary.replace(path)
     finally:
@@ -268,6 +381,12 @@ class EventSource:
     event_index: int
     coordinate_start: int
     coordinate_count: int
+    optical_realization_start: int
+    optical_realization_count: int
+    optical_observation_start: int
+    optical_observation_count: int
+    mjd_explode: float
+    optical_payload_sha256: str
     status: str
     reason: str
     submission_id: str
@@ -278,6 +397,66 @@ class EventSource:
 def _resolve_shard_path(profile: Profile, value: str) -> Path:
     path = Path(value)
     return path if path.is_absolute() else profile.run_dir / path
+
+
+def _event_source_from_handle(
+    handle: h5py.File,
+    *,
+    simulation_id: int,
+    index: int,
+    kind: str,
+    path: Path,
+) -> EventSource:
+    schema_version = str(handle.attrs.get("schema_version", ""))
+    is_v2 = schema_version == SCHEMA_VERSION
+    return EventSource(
+        simulation_id=int(simulation_id),
+        kind=kind,
+        path=path,
+        event_index=int(index),
+        coordinate_start=int(handle["events/coordinate_start"][index]),
+        coordinate_count=int(handle["events/coordinate_count"][index]),
+        optical_realization_start=(
+            int(handle["events/optical_realization_start"][index]) if is_v2 else 0
+        ),
+        optical_realization_count=(
+            int(handle["events/optical_realization_count"][index]) if is_v2 else 0
+        ),
+        optical_observation_start=(
+            int(handle["events/optical_observation_start"][index]) if is_v2 else 0
+        ),
+        optical_observation_count=(
+            int(handle["events/optical_observation_count"][index]) if is_v2 else 0
+        ),
+        mjd_explode=(float(handle["events/mjd_explode"][index]) if is_v2 else np.nan),
+        optical_payload_sha256=(
+            _decode(handle["events/optical_payload_sha256"][index]) if is_v2 else ""
+        ),
+        status=_decode(handle["events/status"][index]),
+        reason=_decode(handle["events/reason"][index]),
+        submission_id=_decode(handle["events/submission_id"][index]),
+        task_index=int(handle["events/task_index"][index]),
+    )
+
+
+def _validate_source_header(
+    handle: h5py.File,
+    *,
+    profile: Profile,
+    path: Path,
+    artifact_kind: str,
+    catalog_hash: str,
+) -> str:
+    schema_version = str(handle.attrs.get("schema_version", ""))
+    if schema_version not in {SCHEMA_VERSION, LEGACY_SCHEMA_VERSION}:
+        raise ValueError(f"Unsupported artifact schema in {path}")
+    if handle.attrs.get("artifact_kind") != artifact_kind:
+        raise ValueError(f"Unexpected artifact kind in {path}")
+    if handle.attrs.get("profile_name") != profile.name:
+        raise ValueError(f"Artifact belongs to another profile: {path}")
+    if handle.attrs.get("prepared_catalog_sha256") != catalog_hash:
+        raise ValueError(f"Artifact catalog checksum mismatch: {path}")
+    return schema_version
 
 
 def _shard_sources(
@@ -297,14 +476,13 @@ def _shard_sources(
         if not path.is_file():
             raise FileNotFoundError(f"Artifact shard is missing: {path}")
         with h5py.File(path, "r") as handle:
-            if handle.attrs.get("schema_version") != SCHEMA_VERSION:
-                raise ValueError(f"Unsupported artifact schema in {path}")
-            if handle.attrs.get("artifact_kind") != "task_shard":
-                raise ValueError(f"Not a task artifact shard: {path}")
-            if handle.attrs.get("profile_name") != profile.name:
-                raise ValueError(f"Artifact shard belongs to another profile: {path}")
-            if handle.attrs.get("prepared_catalog_sha256") != catalog_hash:
-                raise ValueError(f"Artifact shard catalog checksum mismatch: {path}")
+            _validate_source_header(
+                handle,
+                profile=profile,
+                path=path,
+                artifact_kind="task_shard",
+                catalog_hash=catalog_hash,
+            )
             ids = handle["events/simulation_id"][:].astype(np.int64)
             if len(ids) != len(set(ids.tolist())):
                 raise ValueError(f"Duplicate event IDs in artifact shard: {path}")
@@ -315,18 +493,12 @@ def _shard_sources(
                     f"Artifact shard {path} does not contain events {sorted(missing)}"
                 )
             for simulation_id in simulation_ids:
-                index = positions[simulation_id]
-                result[simulation_id] = EventSource(
+                result[simulation_id] = _event_source_from_handle(
+                    handle,
                     simulation_id=simulation_id,
+                    index=positions[simulation_id],
                     kind="hdf5",
                     path=path,
-                    event_index=index,
-                    coordinate_start=int(handle["events/coordinate_start"][index]),
-                    coordinate_count=int(handle["events/coordinate_count"][index]),
-                    status=_decode(handle["events/status"][index]),
-                    reason=_decode(handle["events/reason"][index]),
-                    submission_id=_decode(handle["events/submission_id"][index]),
-                    task_index=int(handle["events/task_index"][index]),
                 )
     return result
 
@@ -341,31 +513,24 @@ def _aggregate_sources(
 
     result: dict[int, EventSource] = {}
     with h5py.File(path, "r") as handle:
-        if handle.attrs.get("schema_version") != SCHEMA_VERSION:
-            raise ValueError(f"Unsupported aggregate schema: {path}")
-        if handle.attrs.get("artifact_kind") != "aggregate":
-            raise ValueError(f"Not an aggregate artifact: {path}")
-        if handle.attrs.get("profile_name") != profile.name:
-            raise ValueError(f"Aggregate belongs to another profile: {path}")
-        if handle.attrs.get("prepared_catalog_sha256") != catalog_hash:
-            raise ValueError(f"Aggregate catalog checksum mismatch: {path}")
+        _validate_source_header(
+            handle,
+            profile=profile,
+            path=path,
+            artifact_kind="aggregate",
+            catalog_hash=catalog_hash,
+        )
         ids = handle["events/simulation_id"][:].astype(np.int64).tolist()
         positions = {int(value): index for index, value in enumerate(ids)}
         for simulation_id in catalog_ids:
             if simulation_id not in positions:
                 continue
-            index = positions[simulation_id]
-            result[simulation_id] = EventSource(
+            result[simulation_id] = _event_source_from_handle(
+                handle,
                 simulation_id=simulation_id,
+                index=positions[simulation_id],
                 kind="aggregate",
                 path=path,
-                event_index=index,
-                coordinate_start=int(handle["events/coordinate_start"][index]),
-                coordinate_count=int(handle["events/coordinate_count"][index]),
-                status=_decode(handle["events/status"][index]),
-                reason=_decode(handle["events/reason"][index]),
-                submission_id=_decode(handle["events/submission_id"][index]),
-                task_index=int(handle["events/task_index"][index]),
             )
     return result
 
@@ -392,6 +557,12 @@ def _legacy_source(
         event_index=0,
         coordinate_start=0,
         coordinate_count=coordinate_count,
+        optical_realization_start=0,
+        optical_realization_count=0,
+        optical_observation_start=0,
+        optical_observation_count=0,
+        mjd_explode=np.nan,
+        optical_payload_sha256="",
         status=str(status.get("status", "failed")),
         reason=str(status.get("reason") or ""),
         submission_id=str(status.get("submission_id") or "legacy"),
@@ -412,14 +583,16 @@ class EventSourceReader:
         self._handle = None
         self._path = None
 
-    def read(self, source: EventSource) -> tuple[dict[str, Any], pd.DataFrame]:
+    def read(
+        self, source: EventSource
+    ) -> tuple[dict[str, Any], pd.DataFrame, OpticalPayload | None]:
         if source.kind == "legacy":
             assert source.plan_path is not None
             plan = json.loads(source.plan_path.read_text(encoding="utf-8"))
             coordinates = normalize_coordinates(
                 pd.read_csv(source.path), source.simulation_id
             )
-            return plan, coordinates
+            return plan, coordinates, None
         if self._path != source.path:
             self.close()
             self._handle = h5py.File(source.path, "r")
@@ -438,7 +611,88 @@ class EventSourceReader:
                 data = np.asarray([_decode(value) for value in data], dtype=object)
             values[column] = data
         coordinates = normalize_coordinates(pd.DataFrame(values), source.simulation_id)
-        return plan, coordinates
+        optical = None
+        if source.optical_payload_sha256:
+            realization_start = source.optical_realization_start
+            realization_stop = realization_start + source.optical_realization_count
+            observation_start = source.optical_observation_start
+            observation_stop = observation_start + source.optical_observation_count
+            realizations = {
+                name: handle[f"optical/realizations/{name}"][
+                    realization_start:realization_stop
+                ]
+                for name in REALIZATION_DTYPES
+            }
+            realizations["observation_start"] = (
+                realizations["observation_start"].astype(np.int64) - observation_start
+            )
+            observations = {
+                name: handle[f"optical/observations/{name}"][
+                    observation_start:observation_stop
+                ]
+                for name in OBSERVATION_DTYPES
+            }
+            optical = normalize_optical_payload(
+                OpticalPayload(
+                    simulation_id=source.simulation_id,
+                    mjd_explode=source.mjd_explode,
+                    realizations=realizations,
+                    observations=observations,
+                    checksum=source.optical_payload_sha256,
+                ),
+                source.simulation_id,
+            )
+        return plan, coordinates, optical
+
+
+def _validate_offsets(
+    starts: np.ndarray, counts: np.ndarray, total: int, label: str
+) -> None:
+    if len(starts) and (
+        starts[0] != 0
+        or not np.array_equal(starts[1:], np.cumsum(counts)[:-1])
+        or int(starts[-1] + counts[-1]) != total
+    ):
+        raise ValueError(f"Aggregate {label} offsets are inconsistent")
+
+
+def _payload_from_handle(
+    handle: h5py.File,
+    event_index: int,
+    simulation_id: int,
+) -> OpticalPayload | None:
+    checksum = _decode(handle["events/optical_payload_sha256"][event_index])
+    if not checksum:
+        return None
+    realization_start = int(handle["events/optical_realization_start"][event_index])
+    realization_count = int(handle["events/optical_realization_count"][event_index])
+    observation_start = int(handle["events/optical_observation_start"][event_index])
+    observation_count = int(handle["events/optical_observation_count"][event_index])
+    realizations = {
+        name: handle[f"optical/realizations/{name}"][
+            realization_start : realization_start + realization_count
+        ]
+        for name in REALIZATION_DTYPES
+    }
+    realizations["observation_start"] = (
+        realizations["observation_start"].astype(np.int64) - observation_start
+    )
+    observations = {
+        name: handle[f"optical/observations/{name}"][
+            observation_start : observation_start + observation_count
+        ]
+        for name in OBSERVATION_DTYPES
+    }
+    return normalize_optical_payload(
+        OpticalPayload(
+            simulation_id=simulation_id,
+            mjd_explode=float(handle["events/mjd_explode"][event_index]),
+            realizations=realizations,
+            observations=observations,
+            checksum=checksum,
+        ),
+        simulation_id,
+    )
 
 
 def validate_aggregate(
@@ -448,7 +702,7 @@ def validate_aggregate(
     catalog_ids: list[int],
     catalog_hash: str,
 ) -> dict[str, Any]:
-    """Validate the canonical aggregate before source artifacts are deleted."""
+    """Validate the canonical v2 aggregate before source artifacts are deleted."""
 
     if not path.is_file():
         raise FileNotFoundError(f"Aggregate artifact does not exist: {path}")
@@ -471,31 +725,76 @@ def validate_aggregate(
             raise ValueError(
                 "Aggregate contains an unprocessed or invalid event status"
             )
+
         coordinate_total = int(handle.attrs["coordinate_count"])
         for column in COORDINATE_COLUMNS:
             if len(handle[f"coordinates/{column}"]) != coordinate_total:
                 raise ValueError(
                     f"Aggregate coordinate dataset {column} has an invalid length"
                 )
-        starts = handle["events/coordinate_start"][:].astype(np.int64)
-        counts = handle["events/coordinate_count"][:].astype(np.int64)
+        coordinate_starts = handle["events/coordinate_start"][:].astype(np.int64)
+        coordinate_counts = handle["events/coordinate_count"][:].astype(np.int64)
+        _validate_offsets(
+            coordinate_starts, coordinate_counts, coordinate_total, "coordinate"
+        )
         expected_samples = int(profile.samples_per_event)
-        for status, count in zip(statuses, counts):
+        for status, count in zip(statuses, coordinate_counts):
             if status in {"success", "skipped"} and count != expected_samples:
                 raise ValueError(
                     f"Aggregate {status} event has {count} coordinates; "
                     f"expected {expected_samples}"
                 )
             if status == "failed" and not 0 <= count <= expected_samples:
+                raise ValueError(f"Failed event has invalid coordinate count {count}")
+
+        realization_total = int(handle.attrs["optical_realization_count"])
+        observation_total = int(handle.attrs["optical_observation_count"])
+        for name in REALIZATION_DTYPES:
+            if len(handle[f"optical/realizations/{name}"]) != realization_total:
                 raise ValueError(
-                    f"Failed event has invalid coordinate count {count}"
+                    f"Optical realization dataset {name} has invalid length"
                 )
-        if len(starts) and (
-            starts[0] != 0
-            or not np.array_equal(starts[1:], np.cumsum(counts)[:-1])
-            or int(starts[-1] + counts[-1]) != coordinate_total
+        for name in OBSERVATION_DTYPES:
+            if len(handle[f"optical/observations/{name}"]) != observation_total:
+                raise ValueError(
+                    f"Optical observation dataset {name} has invalid length"
+                )
+        realization_starts = handle["events/optical_realization_start"][:].astype(
+            np.int64
+        )
+        realization_counts = handle["events/optical_realization_count"][:].astype(
+            np.int64
+        )
+        observation_starts = handle["events/optical_observation_start"][:].astype(
+            np.int64
+        )
+        observation_counts = handle["events/optical_observation_count"][:].astype(
+            np.int64
+        )
+        _validate_offsets(
+            realization_starts, realization_counts, realization_total, "realization"
+        )
+        _validate_offsets(
+            observation_starts, observation_counts, observation_total, "observation"
+        )
+        checksums = [
+            _decode(value) for value in handle["events/optical_payload_sha256"][:]
+        ]
+        for index, (simulation_id, status, checksum) in enumerate(
+            zip(catalog_ids, statuses, checksums)
         ):
-            raise ValueError("Aggregate coordinate offsets are inconsistent")
+            if status == "success" and not checksum:
+                raise ValueError(
+                    f"Successful simulation_id={simulation_id} has no optical payload"
+                )
+            if checksum:
+                payload = _payload_from_handle(handle, index, simulation_id)
+                assert payload is not None
+                if payload.checksum != checksum:
+                    raise ValueError(
+                        f"Optical checksum mismatch for simulation_id={simulation_id}"
+                    )
+
         for simulation_id, raw in zip(
             catalog_ids, handle["events/observation_plan_json"]
         ):
@@ -509,6 +808,8 @@ def validate_aggregate(
         "schema_version": SCHEMA_VERSION,
         "event_count": len(catalog_ids),
         "coordinate_count": coordinate_total,
+        "optical_realization_count": realization_total,
+        "optical_observation_count": observation_total,
         "prepared_catalog_sha256": catalog_hash,
     }
 
@@ -545,12 +846,7 @@ def compact_artifacts(
     event_statuses: dict[int, dict[str, Any]],
     cleanup: bool = True,
 ) -> dict[str, Any]:
-    """Merge artifacts into one validated canonical HDF5 file.
-
-    Successful and skipped events must have complete coordinate samples.
-    Failed events are preserved with their status/reason and whatever
-    coordinates were generated, but do not block the merge.
-    """
+    """Merge coordinate and raw optical artifacts into one validated v2 HDF5."""
 
     invalid = [
         simulation_id
@@ -565,9 +861,8 @@ def compact_artifacts(
         )
     catalog_hash = file_sha256(profile.prepared_catalog)
     existing_aggregate = profile.aggregate_artifact_file
-    has_pending_shards = (
-        profile.artifact_shard_dir.is_dir()
-        and any(profile.artifact_shard_dir.glob("*.h5"))
+    has_pending_shards = profile.artifact_shard_dir.is_dir() and any(
+        profile.artifact_shard_dir.glob("*.h5")
     )
     if existing_aggregate.is_file() and not has_pending_shards:
         aggregate = validate_aggregate(
@@ -586,20 +881,13 @@ def compact_artifacts(
     sources: dict[int, EventSource] = {}
     if existing_aggregate.is_file():
         sources.update(
-            _aggregate_sources(
-                profile,
-                catalog_ids,
-                catalog_hash,
-                existing_aggregate,
-            )
+            _aggregate_sources(profile, catalog_ids, catalog_hash, existing_aggregate)
         )
     shard_statuses = {
         simulation_id: status
         for simulation_id, status in catalog_statuses.items()
         if status.get("artifact_shard")
-        and _resolve_shard_path(
-            profile, str(status["artifact_shard"])
-        ).is_file()
+        and _resolve_shard_path(profile, str(status["artifact_shard"])).is_file()
     }
     sources.update(_shard_sources(profile, shard_statuses, catalog_hash))
     for simulation_id in catalog_ids:
@@ -621,19 +909,24 @@ def compact_artifacts(
                     f"simulation_id={simulation_id} has {source.coordinate_count} "
                     f"coordinates; expected {expected_samples}"
                 )
-        elif source.status == "failed":
-            if not 0 <= source.coordinate_count <= expected_samples:
-                raise ValueError(
-                    f"simulation_id={simulation_id} has invalid failed-event "
-                    f"coordinate count {source.coordinate_count}"
-                )
-        else:
+        elif not 0 <= source.coordinate_count <= expected_samples:
             raise ValueError(
-                f"simulation_id={simulation_id} has unexpected status "
-                f"{source.status}"
+                f"simulation_id={simulation_id} has invalid failed-event "
+                f"coordinate count {source.coordinate_count}"
+            )
+        if source.status == "success" and not source.optical_payload_sha256:
+            raise ValueError(
+                f"Successful simulation_id={simulation_id} has no archived optical payload; "
+                "run kn-sim migrate-optical before compacting"
             )
 
     coordinate_count = sum(sources[value].coordinate_count for value in catalog_ids)
+    optical_realization_count = sum(
+        sources[value].optical_realization_count for value in catalog_ids
+    )
+    optical_observation_count = sum(
+        sources[value].optical_observation_count for value in catalog_ids
+    )
     output = profile.aggregate_artifact_file
     temporary = _atomic_hdf5_path(output)
     temporary.unlink(missing_ok=True)
@@ -650,15 +943,22 @@ def compact_artifacts(
                 created_utc=utc_now(),
                 event_count=len(catalog_ids),
                 coordinate_count=coordinate_count,
+                optical_realization_count=optical_realization_count,
+                optical_observation_count=optical_observation_count,
             )
             event_group = handle.create_group("events")
             coordinate_group = handle.create_group("coordinates")
             _create_event_datasets(event_group, len(catalog_ids))
             _create_coordinate_datasets(coordinate_group, coordinate_count)
-            cursor = 0
+            realization_group, observation_group = _create_optical_datasets(
+                handle, optical_realization_count, optical_observation_count
+            )
+            coordinate_cursor = 0
+            realization_cursor = 0
+            observation_cursor = 0
             for index, simulation_id in enumerate(catalog_ids):
                 source = sources[simulation_id]
-                plan, coordinates = reader.read(source)
+                plan, coordinates, optical = reader.read(source)
                 if len(coordinates) != source.coordinate_count:
                     raise ValueError(
                         f"Coordinate count changed for simulation_id={simulation_id}"
@@ -667,16 +967,46 @@ def compact_artifacts(
                     raise ValueError(
                         f"Observation plan ID mismatch for simulation_id={simulation_id}"
                     )
+                if source.status == "success" and optical is None:
+                    raise ValueError(
+                        f"Successful simulation_id={simulation_id} lost optical payload"
+                    )
                 event_group["simulation_id"][index] = simulation_id
                 event_group["status"][index] = source.status
                 event_group["reason"][index] = source.reason
-                event_group["coordinate_start"][index] = cursor
+                event_group["coordinate_start"][index] = coordinate_cursor
                 event_group["coordinate_count"][index] = len(coordinates)
+                event_group["optical_realization_start"][index] = realization_cursor
+                event_group["optical_realization_count"][index] = (
+                    optical.realization_count if optical is not None else 0
+                )
+                event_group["optical_observation_start"][index] = observation_cursor
+                event_group["optical_observation_count"][index] = (
+                    optical.observation_count if optical is not None else 0
+                )
+                event_group["mjd_explode"][index] = (
+                    optical.mjd_explode if optical is not None else np.nan
+                )
+                event_group["optical_payload_sha256"][index] = (
+                    optical.checksum if optical is not None else ""
+                )
                 event_group["observation_plan_json"][index] = _json_text(plan)
                 event_group["submission_id"][index] = source.submission_id
                 event_group["task_index"][index] = source.task_index
-                _write_coordinate_slice(coordinate_group, cursor, coordinates)
-                cursor += len(coordinates)
+                _write_coordinate_slice(
+                    coordinate_group, coordinate_cursor, coordinates
+                )
+                coordinate_cursor += len(coordinates)
+                if optical is not None:
+                    _write_optical_slice(
+                        realization_group,
+                        observation_group,
+                        realization_cursor,
+                        observation_cursor,
+                        optical,
+                    )
+                    realization_cursor += optical.realization_count
+                    observation_cursor += optical.observation_count
             handle.flush()
         validate_aggregate(
             temporary,

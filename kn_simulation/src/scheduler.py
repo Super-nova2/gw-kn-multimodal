@@ -102,6 +102,7 @@ def validate_prepared_run(profile: Profile) -> dict[str, Any]:
             "finalizer_time_limit", profile.slurm.finalizer_time_limit
         )
         slurm_snapshot.setdefault("finalizer_memory", profile.slurm.finalizer_memory)
+        slurm_snapshot.setdefault("tmp_size", profile.slurm.tmp_size)
         manifest_profile["slurm"] = slurm_snapshot
     if manifest_profile != profile.as_manifest():
         raise ValueError(
@@ -196,6 +197,7 @@ def submit_profile(
         f"--time={profile.slurm.time_limit}",
         f"--cpus-per-task={profile.slurm.cpus_per_task}",
         f"--mem={profile.slurm.memory}",
+        f"--tmp={profile.slurm.tmp_size}",
         f"--array=0-{task_count - 1}%{max_concurrency}",
         f"--output={profile.log_dir}/%x_%A_%a.out",
         f"--chdir={REPO_ROOT}",

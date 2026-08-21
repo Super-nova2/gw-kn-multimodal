@@ -22,10 +22,10 @@
       "config": "<REPO_ROOT>/Model/args/MAGIKS_BNS_NSBH_full.json"
     },
     {
-      "name": "w/o Gallery Loss",
+      "name": "w/o Retrieval Loss",
       "type": "multimodal",
-      "checkpoint": "<BASE_DIR>/data/model/checkpoints_bns_nsbh/bns_nsbh_ablation_no_gallery_loss",
-      "config": "<REPO_ROOT>/Model/args/MAGIKS_BNS_NSBH_no_gallery_loss.json"
+      "checkpoint": "<BASE_DIR>/data/model/checkpoints_bns_nsbh/bns_nsbh_ablation_no_retrieval_loss",
+      "config": "<REPO_ROOT>/Model/args/MAGIKS_BNS_NSBH_no_retrieval_loss.json"
     }
   ],
   "test_data_path": "<BASE_DIR>/data/ALBEF_dataset/gw170817a_lsst_redshift_test.h5",

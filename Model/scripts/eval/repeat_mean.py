@@ -90,7 +90,7 @@ PAPER_RETRIEVAL_MODELS = (
     "Skymap-only",
     "Optical-only baseline",
     "Fink Random Forest",
-    "w/o Gallery Loss",
+    "w/o Retrieval Loss",
     "w/o Cross-Attn",
     "w/o Fusion",
     "w/o Contrastive Loss",
@@ -100,14 +100,14 @@ PAPER_GW170817_MODELS = (
     "Skymap-only",
     "Optical-only baseline",
     "Fink Random Forest",
-    "w/o Gallery Loss",
+    "w/o Retrieval Loss",
     "Full",
 )
 PAPER_METHOD_LABELS = {
     "Skymap-only": "Skymap-only",
     "Optical-only baseline": "Optical-only",
     "Fink Random Forest": "Fink Random Forest",
-    "w/o Gallery Loss": "w/o Retrieval Loss",
+    "w/o Retrieval Loss": "w/o Retrieval Loss",
     "w/o Cross-Attn": "w/o Cross Attention",
     "w/o Fusion": "w/o Fusion Branch",
     "w/o Contrastive Loss": "w/o Contrastive Loss",
@@ -117,7 +117,7 @@ PAPER_TABLE_LABELS = {
     "Skymap-only": "Skymap-only",
     "Optical-only baseline": "Optical-only",
     "Fink Random Forest": "Fink Random Forest",
-    "w/o Gallery Loss": "w/o Retrieval loss",
+    "w/o Retrieval Loss": "w/o Retrieval loss",
     "w/o Cross-Attn": "w/o Cross-attention",
     "w/o Fusion": "w/o Fusion",
     "w/o Contrastive Loss": "w/o Contrastive loss",
@@ -130,7 +130,7 @@ PAPER_PLOT_ORDER = (
     "w/o Contrastive Loss",
     "w/o Cross-Attn",
     "w/o Fusion",
-    "w/o Gallery Loss",
+    "w/o Retrieval Loss",
     "Full",
 )
 PAPER_METHOD_STYLES = {
@@ -140,7 +140,7 @@ PAPER_METHOD_STYLES = {
     "w/o Contrastive Loss": ("#9467BD", "o", "-"),
     "w/o Cross-Attn": ("#8C564B", "o", "-"),
     "w/o Fusion": ("#E377C2", "o", "-"),
-    "w/o Gallery Loss": ("#7F7F7F", "o", "-"),
+    "w/o Retrieval Loss": ("#7F7F7F", "o", "-"),
     "Full": ("#D62728", "o", "-"),
 }
 PAPER_PAIR_STYLES = {

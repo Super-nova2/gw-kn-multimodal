@@ -4,16 +4,20 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import traceback
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import h5py
 import snana
-from artifacts import compact_artifacts, write_task_shard
+from artifacts import SCHEMA_VERSION, compact_artifacts, write_task_shard
 from config import Profile, load_profile
+from optical import optical_event_dir, read_snana_optical
 from scheduler import latest_event_statuses, read_catalog_ids
 
 
@@ -58,30 +62,121 @@ def _read_submission_ids(path: Path) -> list[int]:
     return values
 
 
-def _event_paths(profile: Profile, simulation_id: int) -> tuple[Path, Path]:
+@dataclass(frozen=True)
+class RuntimePaths:
+    root: Path
+    work_dir: Path
+    sndata_root: Path
+    sndata_sim_dir: Path
+
+
+def _runtime_paths(profile: Profile, scratch_dir: Path | None = None) -> RuntimePaths:
+    if scratch_dir is None:
+        configured = os.environ.get("KN_SCRATCH_DIR")
+        scratch_dir = Path(configured) if configured else profile.run_dir / "scratch"
+    root = Path(scratch_dir).resolve()
+    sndata_root = root / "SNDATA_ROOT"
+    return RuntimePaths(
+        root=root,
+        work_dir=root / "work",
+        sndata_root=sndata_root,
+        sndata_sim_dir=sndata_root / "SIM" / profile.sim_name,
+    )
+
+
+def _prepare_sndata_overlay(profile: Profile, runtime: RuntimePaths) -> None:
+    runtime.sndata_root.mkdir(parents=True, exist_ok=True)
+    for source in profile.sndata_root.iterdir():
+        if source.name == "SIM":
+            continue
+        target = runtime.sndata_root / source.name
+        if target.is_symlink():
+            if target.resolve() != source.resolve():
+                raise ValueError(f"Unexpected SNDATA_ROOT overlay link: {target}")
+            continue
+        if target.exists():
+            raise ValueError(f"Unexpected SNDATA_ROOT overlay entry: {target}")
+        target.symlink_to(source.resolve(), target_is_directory=source.is_dir())
+    sim_root = runtime.sndata_root / "SIM"
+    sim_root.mkdir(parents=True, exist_ok=True)
+    (sim_root / "PATH_SNDATA_SIM.LIST").touch(exist_ok=True)
+    runtime.sndata_sim_dir.mkdir(parents=True, exist_ok=True)
+
+
+def _event_paths(
+    profile: Profile,
+    simulation_id: int,
+    work_dir: Path | None = None,
+) -> tuple[Path, Path]:
+    work_dir = profile.work_dir if work_dir is None else Path(work_dir)
     opsim_stem = profile.opsim_db.stem
     simlib = (
-        profile.work_dir
+        work_dir
         / "SIMLIB"
         / (f"{opsim_stem}_{profile.sim_name}_{simulation_id}.SIMLIB")
     )
     input_file = (
-        profile.work_dir
-        / "SIM_INPUT"
-        / (f"SIMGEN_{profile.sim_name}_{simulation_id}.INPUT")
+        work_dir / "SIM_INPUT" / (f"SIMGEN_{profile.sim_name}_{simulation_id}.INPUT")
     )
     return simlib, input_file
 
 
-def _cleanup_transients(simlib: Path, input_file: Path) -> None:
+def _cleanup_transients(
+    simlib: Path, input_file: Path, snana_log: Path | None = None
+) -> None:
     simlib.unlink(missing_ok=True)
     input_file.unlink(missing_ok=True)
+    if snana_log is not None:
+        snana_log.unlink(missing_ok=True)
 
 
-def _cleanup_snana_unneeded_outputs(profile: Profile, simulation_id: int) -> None:
+def _pin_sndata_resource_paths(input_file: Path, sndata_root: Path) -> None:
+    text = input_file.read_text(encoding="utf-8")
+    root = str(sndata_root.resolve()).rstrip("/")
+    pinned = text.replace("${SNDATA_ROOT}/", f"{root}/").replace(
+        "$SNDATA_ROOT/", f"{root}/"
+    )
+    if pinned != text:
+        input_file.write_text(pinned, encoding="utf-8")
+
+
+EXPECTED_SNANA_NO_COVERAGE = (
+    "Every generated event fails NEPOCH>=2",
+    "Could not find SIMLIB HEADER passing GENRANGE_XXX cuts",
+)
+
+
+def _snana_failure_result(returncode: int, detail: str) -> tuple[str, str]:
+    if any(pattern in detail for pattern in EXPECTED_SNANA_NO_COVERAGE):
+        return "skipped", "rubin_observation_requirements_not_met"
+    reason = (
+        f"snlc_sim_exit_{returncode}: {detail}"
+        if detail
+        else f"snlc_sim_exit_{returncode}"
+    )
+    return "failed", reason
+
+
+def _log_tail(path: Path, limit: int = 4_000) -> str:
+    if not path.is_file():
+        return ""
+    with path.open("rb") as stream:
+        stream.seek(0, os.SEEK_END)
+        size = stream.tell()
+        stream.seek(max(0, size - max(limit * 4, 16_384)))
+        value = stream.read().decode("utf-8", errors="replace")
+    return value.strip()[-limit:]
+
+
+def _cleanup_snana_unneeded_outputs(
+    profile: Profile,
+    simulation_id: int,
+    sndata_sim_dir: Path | None = None,
+) -> None:
     """Remove per-event SNANA products that are not used downstream."""
     version = f"{profile.sim_name}_{simulation_id}"
-    event_dir = profile.sndata_sim_dir / version
+    parent = profile.sndata_sim_dir if sndata_sim_dir is None else Path(sndata_sim_dir)
+    event_dir = parent / version
     for suffix in (".DUMP", ".LIST"):
         path = event_dir / f"{version}{suffix}"
         try:
@@ -93,12 +188,28 @@ def _cleanup_snana_unneeded_outputs(profile: Profile, simulation_id: int) -> Non
             )
 
 
-def _snana_head(profile: Profile, simulation_id: int) -> Path:
-    version = f"{profile.sim_name}_{simulation_id}"
-    return profile.sndata_sim_dir / version / f"{version}_HEAD.FITS"
+def _cleanup_event_output(
+    profile: Profile,
+    simulation_id: int,
+    sndata_sim_dir: Path,
+) -> None:
+    path = optical_event_dir(sndata_sim_dir, profile.sim_name, simulation_id)
+    expected_parent = Path(sndata_sim_dir).resolve()
+    resolved = path.resolve()
+    if resolved.parent != expected_parent or not resolved.name.startswith(
+        f"{profile.sim_name}_"
+    ):
+        raise ValueError(f"Refusing to remove unexpected SNANA output path: {path}")
+    if path.is_dir():
+        shutil.rmtree(path)
 
 
-def _generate_documents(profile: Profile, simulation_ids: list[int]) -> dict[int, Any]:
+def _generate_documents(
+    profile: Profile,
+    simulation_ids: list[int],
+    runtime: RuntimePaths | None = None,
+) -> dict[int, Any]:
+    runtime = _runtime_paths(profile) if runtime is None else runtime
     arguments = [
         "--sim_name",
         profile.sim_name,
@@ -115,11 +226,11 @@ def _generate_documents(profile: Profile, simulation_ids: list[int]) -> dict[int
         "--level",
         str(profile.credible_level),
         "--outdir",
-        str(profile.work_dir),
+        str(runtime.work_dir),
         "--template_input",
         str(profile.template_input),
         "--sndata-sim-dir",
-        str(profile.sndata_sim_dir),
+        str(runtime.sndata_sim_dir),
         "--coordinate_mode",
         profile.coordinate_mode,
         "--samples_per_event",
@@ -132,15 +243,28 @@ def _generate_documents(profile: Profile, simulation_ids: list[int]) -> dict[int
         "--too_config",
         str(profile.too_config),
     ]
-    return snana.main(arguments)
+    previous_sndata_root = os.environ.get("SNDATA_ROOT")
+    os.environ["SNDATA_ROOT"] = str(runtime.sndata_root)
+    try:
+        return snana.main(arguments)
+    finally:
+        if previous_sndata_root is None:
+            os.environ.pop("SNDATA_ROOT", None)
+        else:
+            os.environ["SNDATA_ROOT"] = previous_sndata_root
 
 
 def _run_one(
     profile: Profile,
     simulation_id: int,
     plan: dict[str, Any],
+    runtime: RuntimePaths | None = None,
 ) -> dict[str, Any]:
-    simlib, input_file = _event_paths(profile, simulation_id)
+    runtime = _runtime_paths(profile) if runtime is None else runtime
+    simlib, input_file = _event_paths(profile, simulation_id, runtime.work_dir)
+    snana_log = (
+        runtime.work_dir / "SNANA_LOG" / f"{profile.sim_name}_{simulation_id}.log"
+    )
     result: dict[str, Any] = {
         "simulation_id": int(simulation_id),
         "status": "failed",
@@ -154,40 +278,71 @@ def _run_one(
             return result
         if not simlib.is_file() or not input_file.is_file():
             raise FileNotFoundError("generated SIMLIB or SNANA input is missing")
+        _pin_sndata_resource_paths(input_file, profile.sndata_root)
         if snana.get_nlibid(simlib) == 0:
             result.update(status="skipped", reason="rubin_footprint_not_covered")
             return result
 
         environment = os.environ.copy()
-        environment["SNDATA_ROOT"] = str(profile.sndata_root)
+        environment["SNDATA_ROOT"] = str(runtime.sndata_root)
         environment["PATH"] = f"{profile.snana_bin_dir}:{environment.get('PATH', '')}"
-        completed = subprocess.run(
-            [str(profile.snana_bin_dir / "snlc_sim.exe"), str(input_file)],
-            env=environment,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            text=True,
-            check=False,
-        )
-        if completed.returncode != 0:
-            result["reason"] = (
-                completed.stderr.strip()[-2000:]
-                or f"snlc_sim_exit_{completed.returncode}"
+        snana_log.parent.mkdir(parents=True, exist_ok=True)
+        with snana_log.open("w", encoding="utf-8") as log_stream:
+            completed = subprocess.run(
+                [str(profile.snana_bin_dir / "snlc_sim.exe"), str(input_file)],
+                env=environment,
+                cwd=runtime.root,
+                stdout=log_stream,
+                stderr=subprocess.STDOUT,
+                text=True,
+                check=False,
             )
+        if completed.returncode != 0:
+            status, reason = _snana_failure_result(
+                completed.returncode, _log_tail(snana_log)
+            )
+            result.update(status=status, reason=reason)
             return result
-        head = _snana_head(profile, simulation_id)
-        if not head.is_file() or head.stat().st_size == 0:
-            result["reason"] = f"SNANA completed but output is missing: {head}"
-            return result
-        result.update(status="success", reason=None, snana_head=str(head))
+        optical = read_snana_optical(
+            runtime.sndata_sim_dir, profile.sim_name, simulation_id
+        )
+        result.update(
+            status="success",
+            reason=None,
+            optical_embedded=True,
+            optical_realization_count=optical.realization_count,
+            optical_observation_count=optical.observation_count,
+            optical_payload_sha256=optical.checksum,
+            _optical_payload=optical,
+        )
         return result
     except Exception as error:  # noqa: BLE001 - isolate failures by event
         result.update(reason=str(error), error_type=type(error).__name__)
         traceback.print_exc()
         return result
     finally:
-        _cleanup_snana_unneeded_outputs(profile, simulation_id)
-        _cleanup_transients(simlib, input_file)
+        _cleanup_snana_unneeded_outputs(profile, simulation_id, runtime.sndata_sim_dir)
+        _cleanup_event_output(profile, simulation_id, runtime.sndata_sim_dir)
+        _cleanup_transients(simlib, input_file, snana_log)
+
+
+def _publish_artifact(
+    local_path: Path, output_path: Path, expected_ids: list[int]
+) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output_path.with_name(f".{output_path.name}.tmp.{os.getpid()}")
+    temporary.unlink(missing_ok=True)
+    try:
+        shutil.copyfile(local_path, temporary)
+        with h5py.File(temporary, "r") as handle:
+            if handle.attrs.get("schema_version") != SCHEMA_VERSION:
+                raise ValueError("Published task shard has an invalid schema")
+            ids = handle["events/simulation_id"][:].astype(int).tolist()
+            if ids != [int(value) for value in expected_ids]:
+                raise ValueError("Published task shard event IDs are inconsistent")
+        temporary.replace(output_path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def run_array_task(
@@ -196,8 +351,9 @@ def run_array_task(
     submission_id: str,
     task_index: int,
     batch_size: int,
+    scratch_dir: Path | None = None,
 ) -> dict[str, Any]:
-    """Generate documents and run SNANA for one disjoint array slice."""
+    """Generate, simulate, archive and clean one disjoint array slice."""
 
     all_ids = _read_submission_ids(ids_file)
     start = int(task_index) * int(batch_size)
@@ -205,13 +361,11 @@ def run_array_task(
     if not selected:
         raise ValueError(f"Array task {task_index} selects no events")
     started = _utc_now()
-    profile.work_dir.mkdir(parents=True, exist_ok=True)
+    runtime = _runtime_paths(profile, scratch_dir)
+    runtime.work_dir.mkdir(parents=True, exist_ok=True)
+    _prepare_sndata_overlay(profile, runtime)
     profile.artifact_shard_dir.mkdir(parents=True, exist_ok=True)
-    profile.sndata_sim_dir.mkdir(parents=True, exist_ok=True)
-    path_sndata_sim_list = profile.sndata_root / "SIM" / "PATH_SNDATA_SIM.LIST"
-    path_sndata_sim_list.parent.mkdir(parents=True, exist_ok=True)
-    path_sndata_sim_list.touch(exist_ok=True)
-    generated = _generate_documents(profile, selected)
+    generated = _generate_documents(profile, selected, runtime)
     events = []
     artifact_events = []
     for simulation_id in selected:
@@ -226,23 +380,30 @@ def run_array_task(
                 "coordinates": None,
             }
         plan = product["plan"]
-        result = _run_one(profile, simulation_id, plan)
+        result = _run_one(profile, simulation_id, plan, runtime)
+        optical = result.pop("_optical_payload", None)
+        if optical is None:
+            optical = product.get("optical")
         events.append(result)
         artifact_events.append(
             {
                 **result,
                 "observation_plan": plan,
                 "coordinates": product.get("coordinates"),
+                "optical": optical,
             }
         )
     artifact_path = profile.artifact_shard_dir / f"{submission_id}_{int(task_index)}.h5"
+    local_artifact = runtime.root / f"{submission_id}_{int(task_index)}.h5"
     write_task_shard(
-        artifact_path,
+        local_artifact,
         profile=profile,
         submission_id=submission_id,
         task_index=task_index,
         events=artifact_events,
     )
+    _publish_artifact(local_artifact, artifact_path, selected)
+    local_artifact.unlink(missing_ok=True)
     artifact_reference = str(artifact_path.relative_to(profile.run_dir))
     for event in events:
         event.update(

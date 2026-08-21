@@ -52,7 +52,6 @@ class BestCheckpointStabilityTests(unittest.TestCase):
             "full": 16,
             "no_retrieval_loss": 12,
             "no_cls_loss": 12,
-            "no_gallery_loss": 12,
             "no_itc_loss": 8,
             "no_cross_atten": 16,
             "no_fusion": 12,

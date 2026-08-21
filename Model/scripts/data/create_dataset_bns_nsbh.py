@@ -20,6 +20,7 @@ _data_loader = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_data_loader)  # type: ignore
 
 parse_snana_fits = _data_loader.parse_snana_fits
+parse_snana_h5 = _data_loader.parse_snana_h5
 sample_moc_skymap = _data_loader.sample_moc_skymap
 MAX_LC_LENGTH = _data_loader.MAX_LC_LENGTH
 NUM_BANDS = _data_loader.NUM_BANDS
@@ -159,8 +160,9 @@ class SourceConfig:
     tag: str
     full_catalog_path: str
     skymap_dir: str
-    sim_root: str
+    sim_root: Optional[str]
     sim_name: str
+    sim_artifact: Optional[str] = None
     success_ids_path: Optional[str] = None
     negative_catalog_path: Optional[str] = None
     negative_skymap_dir: Optional[str] = None
@@ -202,8 +204,9 @@ class EventProcessTask:
     tag: str
     event_id: int
     simulation_id: int
-    sim_root: str
+    sim_root: Optional[str]
     sim_name: str
+    sim_artifact: Optional[str]
     skymap_dir: str
     include_lightcurves: bool
     fluxcal_to_psfflux_factor: float
@@ -235,8 +238,9 @@ def _build_event_process_task(
         tag=str(src.cfg.tag),
         event_id=int(event_id),
         simulation_id=int(src.simulation_id_by_event[event_id]),
-        sim_root=str(src.cfg.sim_root),
+        sim_root=str(src.cfg.sim_root) if src.cfg.sim_root else None,
         sim_name=str(src.cfg.sim_name),
+        sim_artifact=str(src.cfg.sim_artifact) if src.cfg.sim_artifact else None,
         skymap_dir=str(src.skymap_dir_by_event[event_id]),
         include_lightcurves=bool(include_lightcurves),
         fluxcal_to_psfflux_factor=float(fluxcal_to_psfflux_factor),
@@ -263,15 +267,28 @@ def _process_event_task(task: EventProcessTask) -> EventProcessResult:
         List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]]
     ] = None
     if task.include_lightcurves:
-        lcs = parse_snana_fits(
+        parser_kwargs = dict(
             event_id=int(task.simulation_id),
-            sim_dir=task.sim_root,
-            sim_name=task.sim_name,
             fluxcal_to_psfflux_factor=float(task.fluxcal_to_psfflux_factor),
             psfflux_zp=float(task.psfflux_zp),
             lupt_b_njy=np.asarray(task.lupt_b_njy, dtype=np.float64),
             normalize_to_first_detection=True,
         )
+        if task.sim_artifact:
+            lcs = parse_snana_h5(
+                artifact_path=task.sim_artifact,
+                **parser_kwargs,
+            )
+        elif task.sim_root:
+            lcs = parse_snana_fits(
+                sim_dir=task.sim_root,
+                sim_name=task.sim_name,
+                **parser_kwargs,
+            )
+        else:
+            raise ValueError(
+                f"{task.tag}: no optical HDF5 artifact or legacy SNANA root configured"
+            )
         if len(lcs) == 0:
             return EventProcessResult(
                 tag=task.tag,
@@ -443,13 +460,37 @@ def _normalize_max_count(value: Optional[int]) -> Optional[int]:
 def _scan_source_pos_neg(
     event_ids: np.ndarray,
     skymap_dir: str,
-    sim_root: str,
+    sim_root: Optional[str],
     sim_name: str,
     scan_desc: str,
+    sim_artifact: Optional[str] = None,
 ) -> Tuple[np.ndarray, np.ndarray, int]:
     pos_ids: List[int] = []
     neg_ids: List[int] = []
     missing_skymap = 0
+    artifact_realization_counts: Dict[int, int] = {}
+    if sim_artifact:
+        with h5py.File(sim_artifact, "r") as handle:
+            if handle.attrs.get("schema_version") != "kn-simulation-intermediates-v2":
+                raise ValueError(f"Unsupported raw optical artifact: {sim_artifact}")
+            if handle.attrs.get("artifact_kind") != "aggregate":
+                raise ValueError(f"Raw optical input is not an aggregate: {sim_artifact}")
+            artifact_ids = np.asarray(
+                handle["events/simulation_id"][:], dtype=np.int64
+            )
+            realization_counts = np.asarray(
+                handle["events/optical_realization_count"][:], dtype=np.int64
+            )
+            artifact_statuses = [
+                value.decode() if isinstance(value, bytes) else str(value)
+                for value in handle["events/status"][:]
+            ]
+        if len(artifact_ids) != len(set(artifact_ids.tolist())):
+            raise ValueError(f"Raw optical aggregate has duplicate IDs: {sim_artifact}")
+        artifact_realization_counts = dict(
+            zip(artifact_ids.tolist(), realization_counts.tolist())
+        )
+        artifact_status_by_id = dict(zip(artifact_ids.tolist(), artifact_statuses))
 
     for event_id in tqdm(
         event_ids,
@@ -464,19 +505,32 @@ def _scan_source_pos_neg(
             missing_skymap += 1
             continue
 
-        head_path = os.path.join(
-            sim_root,
-            f"{sim_name}_{event_id}",
-            f"{sim_name}_{event_id}_HEAD.FITS",
-        )
-
-        has_optical = False
-        if os.path.exists(head_path) and os.path.getsize(head_path) > 0:
-            try:
-                nrows = fits.getheader(head_path, 1).get("NAXIS2", 0)
-                has_optical = bool(nrows and int(nrows) > 0)
-            except Exception:
-                has_optical = False
+        if sim_artifact:
+            if event_id not in artifact_realization_counts:
+                raise ValueError(
+                    f"Successful event {event_id} is missing from {sim_artifact}"
+                )
+            if artifact_status_by_id[event_id] != "success":
+                raise ValueError(
+                    f"Event {event_id} is listed as successful but its raw optical "
+                    f"artifact status is {artifact_status_by_id[event_id]!r}"
+                )
+            has_optical = artifact_realization_counts[event_id] > 0
+        else:
+            if not sim_root:
+                raise ValueError("Legacy optical scan requires sim_root")
+            head_path = os.path.join(
+                sim_root,
+                f"{sim_name}_{event_id}",
+                f"{sim_name}_{event_id}_HEAD.FITS",
+            )
+            has_optical = False
+            if os.path.exists(head_path) and os.path.getsize(head_path) > 0:
+                try:
+                    nrows = fits.getheader(head_path, 1).get("NAXIS2", 0)
+                    has_optical = bool(nrows and int(nrows) > 0)
+                except Exception:
+                    has_optical = False
 
         if has_optical:
             pos_ids.append(event_id)
@@ -629,9 +683,8 @@ def _sample_required_event_ids(
 ) -> np.ndarray:
     normalized = _normalize_max_count(max_count)
     if normalized is not None and len(event_ids) < normalized:
-        raise ValueError(
-            f"{label}: found {len(event_ids)} candidates but {normalized} are required"
-        )
+        print(f"WARNING: {label}: capping {normalized} requested candidates to {len(event_ids)} available")
+        normalized = len(event_ids)
     return _sample_event_ids(event_ids, normalized, rng)
 
 
@@ -753,6 +806,7 @@ def _prepare_source(
         sim_root=cfg.sim_root,
         sim_name=cfg.sim_name,
         scan_desc=f"Scanning {cfg.tag.upper()} successful positive-ejecta events",
+        sim_artifact=cfg.sim_artifact,
     )
     valid_negative_original, missing_skymap_type1 = _scan_ids_with_skymap_only(
         event_ids=negative_original,
@@ -1574,8 +1628,9 @@ def _build_arg_parser():
     p.add_argument("--bns_skymap_dir", required=True)
     p.add_argument("--bns_negative_catalog_path", required=True)
     p.add_argument("--bns_negative_skymap_dir", required=True)
-    p.add_argument("--bns_sim_root", required=True)
+    p.add_argument("--bns_sim_root", default=None)
     p.add_argument("--bns_sim_name", required=True)
+    p.add_argument("--bns_sim_artifact", default=None)
     p.add_argument("--bns_success_ids_path", default=None)
     p.add_argument("--bns_max_lc_per_gw", type=int, default=1000)
     p.add_argument("--bns_max_neg_gw", type=int, default=None)
@@ -1588,8 +1643,9 @@ def _build_arg_parser():
     p.add_argument("--nsbh_skymap_dir", required=True)
     p.add_argument("--nsbh_negative_catalog_path", required=True)
     p.add_argument("--nsbh_negative_skymap_dir", required=True)
-    p.add_argument("--nsbh_sim_root", required=True)
+    p.add_argument("--nsbh_sim_root", default=None)
     p.add_argument("--nsbh_sim_name", required=True)
+    p.add_argument("--nsbh_sim_artifact", default=None)
     p.add_argument("--nsbh_success_ids_path", default=None)
     p.add_argument("--nsbh_max_lc_per_gw", type=int, default=1000)
     p.add_argument("--nsbh_max_neg_gw", type=int, default=None)
@@ -1602,6 +1658,14 @@ def _build_arg_parser():
 
 if __name__ == "__main__":
     args = _build_arg_parser().parse_args()
+    for source in ("bns", "nsbh"):
+        artifact = getattr(args, f"{source}_sim_artifact")
+        root = getattr(args, f"{source}_sim_root")
+        if not artifact and not root:
+            raise ValueError(
+                f"{source.upper()} requires --{source}_sim_artifact or "
+                f"--{source}_sim_root"
+            )
     lupt_m5_mag = parse_lupt_m5_mag(args.lupt_m5_mag)
     fluxcal_to_psfflux_factor, lupt_f5sigma_njy, lupt_b_njy = build_luptitude_params(
         fluxcal_zp=float(args.fluxcal_zp),
@@ -1616,6 +1680,7 @@ if __name__ == "__main__":
         skymap_dir=args.bns_skymap_dir,
         sim_root=args.bns_sim_root,
         sim_name=args.bns_sim_name,
+        sim_artifact=args.bns_sim_artifact,
         success_ids_path=args.bns_success_ids_path,
         negative_catalog_path=args.bns_negative_catalog_path,
         negative_skymap_dir=args.bns_negative_skymap_dir,
@@ -1631,6 +1696,7 @@ if __name__ == "__main__":
         skymap_dir=args.nsbh_skymap_dir,
         sim_root=args.nsbh_sim_root,
         sim_name=args.nsbh_sim_name,
+        sim_artifact=args.nsbh_sim_artifact,
         success_ids_path=args.nsbh_success_ids_path,
         negative_catalog_path=args.nsbh_negative_catalog_path,
         negative_skymap_dir=args.nsbh_negative_skymap_dir,

@@ -5,6 +5,7 @@ from astropy.io import fits
 from tqdm import tqdm
 import hashlib
 import os
+import re
 import sys
 import healpy as hp
 from ligo.skymap.io.fits import read_sky_map
@@ -3750,6 +3751,186 @@ def resolve_first_detection_mjd(
     return _valid_head_detection_mjd(head_mjd_detect_first)
 
 # Functions for parsing SNANA FITS files, and sampling MOC skymaps
+_RAW_SNANA_H5_CACHE = {}
+_MJD_EXPLODE_RE = re.compile(r"^\s*MJD_EXPLODE:\s*([-+0-9.eE]+)", re.MULTILINE)
+
+
+def _snana_column_names(table):
+    if isinstance(table, Mapping):
+        return set(table.keys())
+    return set(table.columns.names)
+
+
+def _read_mjd_explode(path):
+    match = _MJD_EXPLODE_RE.search(Path(path).read_text(encoding="utf-8"))
+    if match is None:
+        raise ValueError(f"README does not contain MJD_EXPLODE: {path}")
+    return float(match.group(1))
+
+
+def _extract_snana_lightcurves(
+    event_id,
+    data_head,
+    data_phot,
+    mjd_explode,
+    fluxcal_to_psfflux_factor=None,
+    psfflux_zp=31.4,
+    lupt_b_njy=None,
+    normalize_to_first_detection=False,
+    snr_threshold=5.0,
+):
+    # HEAD columns
+    ptrobs_min = data_head['PTROBS_MIN']
+    ptrobs_max = data_head['PTROBS_MAX']
+
+    # PHOT columns
+    mjd_all = data_phot['MJD']
+    flux_all = data_phot['FLUXCAL']
+    fluxerr_all = data_phot['FLUXCALERR'] # Optional usage
+    flt_all = data_phot['BAND'] # Filters
+    phot_columns = _snana_column_names(data_phot)
+    photflag_all = data_phot['PHOTFLAG'] if 'PHOTFLAG' in phot_columns else None
+    head_columns = _snana_column_names(data_head)
+
+    extracted_lcs = []
+    use_luptitude = (
+        fluxcal_to_psfflux_factor is not None
+        and lupt_b_njy is not None
+    )
+
+    # Iterate over each realization in HEAD
+    for i in range(len(data_head['NOBS'])):
+        # SNANA uses 1-based indexing for pointers, Python uses 0-based
+        # Start index: value - 1
+        # End index: value (exclusive in python slicing)
+        start_idx = ptrobs_min[i] - 1
+        end_idx = ptrobs_max[i]
+        nobs = data_head['NOBS'][i]
+        if (not use_luptitude) and nobs < 5:
+            # print(f"Warning: Light curve for event {event_id} realization {i} has less than 5 observations. Skipping.")
+            continue  # Skip light curves with less than 5 observations
+
+        # get coordinates
+        ra = data_head['RA'][i]
+        dec = data_head['DEC'][i]
+        coordinates = np.array([ra, dec], dtype=np.float32)
+
+        # Slicing the PHOT data
+        lc_mjd = mjd_all[start_idx : end_idx]
+        lc_flux = flux_all[start_idx : end_idx]
+        lc_fluxerr = fluxerr_all[start_idx : end_idx]
+        lc_flt = flt_all[start_idx : end_idx]
+        lc_photflag = photflag_all[start_idx : end_idx] if photflag_all is not None else None
+        raw_lc_mjd = np.asarray(lc_mjd, dtype=np.float64)
+        raw_lc_flux = np.asarray(lc_flux, dtype=np.float64)
+        raw_lc_fluxerr = np.asarray(lc_fluxerr, dtype=np.float64)
+        head_mjd_detect_first = data_head['MJD_DETECT_FIRST'][i] if 'MJD_DETECT_FIRST' in head_columns else None
+        first_detection_mjd = None
+
+        if use_luptitude:
+            merged_mjd, merged_psfflux, merged_psffluxerr, merged_flt = merge_photometry_psfflux(
+                mjd=np.asarray(lc_mjd, dtype=np.float64),
+                fluxcal=np.asarray(lc_flux, dtype=np.float64),
+                fluxcalerr=np.asarray(lc_fluxerr, dtype=np.float64),
+                flt=np.asarray(lc_flt),
+                fluxcal_to_psfflux_factor=float(fluxcal_to_psfflux_factor),
+            )
+            if len(merged_mjd) < 5:
+                continue
+            if normalize_to_first_detection:
+                first_detection_mjd = resolve_first_detection_mjd(
+                    snr_mjd=merged_mjd,
+                    snr_flux=merged_psfflux,
+                    snr_fluxerr=merged_psffluxerr,
+                    photflag_mjd=raw_lc_mjd,
+                    photflag=lc_photflag,
+                    head_mjd_detect_first=head_mjd_detect_first,
+                    snr_threshold=float(snr_threshold),
+                )
+                if first_detection_mjd is None:
+                    continue
+            lc_mjd, lc_flux, lc_fluxerr, lc_flt = _transform_psfflux_to_luptitude(
+                mjd=merged_mjd,
+                psfflux=merged_psfflux,
+                psffluxerr=merged_psffluxerr,
+                flt=np.asarray(merged_flt),
+                psfflux_zp=float(psfflux_zp),
+                lupt_b_njy=lupt_b_njy,
+            )
+            if len(lc_mjd) == 0:
+                continue
+        else:
+            # Legacy behavior for callers not passing luptitude parameters.
+            std = np.std(lc_flux)
+            mean = np.mean(lc_flux)
+            lc_flux = (lc_flux - mean) / (std + 1e-8)
+            lc_fluxerr = lc_fluxerr / (std + 1e-8)
+
+        # --- Format Conversion (to Tensor-ready numpy) ---
+        val_mat = np.zeros((MAX_LC_LENGTH, NUM_BANDS), dtype=np.float32)    # Values matrix (flux)
+        err_mat = np.zeros((MAX_LC_LENGTH, NUM_BANDS), dtype=np.float32)    # Errors matrix (flux errors)
+        mask_mat = np.zeros((MAX_LC_LENGTH, NUM_BANDS), dtype=np.float32)
+        time_vec = np.zeros((MAX_LC_LENGTH,), dtype=np.float32)
+
+        if normalize_to_first_detection:
+            if first_detection_mjd is None:
+                first_detection_mjd = resolve_first_detection_mjd(
+                    snr_mjd=raw_lc_mjd,
+                    snr_flux=raw_lc_flux,
+                    snr_fluxerr=raw_lc_fluxerr,
+                    photflag_mjd=raw_lc_mjd,
+                    photflag=lc_photflag,
+                    head_mjd_detect_first=head_mjd_detect_first,
+                    snr_threshold=float(snr_threshold),
+                )
+            if first_detection_mjd is None:
+                continue
+            rel_times = (np.asarray(lc_mjd, dtype=np.float64) - float(first_detection_mjd)) / 100.0
+        else:
+            # 1. Time Normalization (Relative to BNS merger time)
+            if len(lc_mjd) > 0:
+                rel_times = (lc_mjd - mjd_explode) / 100  # Scale down to manageable range[-0.3, 0.6]
+            else:
+                continue # Skip empty light curves
+            first_detection_mjd = None
+
+        # 2. Fill Matrices
+        # Truncate if longer than MAX_LC_LENGTH
+        seq_len = min(len(lc_mjd), MAX_LC_LENGTH)
+        if seq_len <= 0:
+            continue
+        if len(lc_mjd) > MAX_LC_LENGTH:
+            print(f"Warning: Light curve for event {event_id} exceeds MAX_LC_LENGTH. Truncating.")
+            # Keep the MAX_LC_LENGTH points with smallest absolute rel_times
+            sorted_indices = np.argsort(np.abs(rel_times))[:MAX_LC_LENGTH]
+            sorted_indices = np.sort(sorted_indices)  # Sort back to chronological order
+            lc_mjd = lc_mjd[sorted_indices]
+            lc_flux = lc_flux[sorted_indices]
+            lc_fluxerr = lc_fluxerr[sorted_indices]
+            lc_flt = lc_flt[sorted_indices]
+            rel_times = rel_times[sorted_indices]
+
+        for t in range(seq_len):
+            b_idx = _band_index_from_raw(lc_flt[t])
+            if b_idx is None:
+                continue
+
+            val_mat[t, b_idx] = lc_flux[t]
+            err_mat[t, b_idx] = lc_fluxerr[t]
+            mask_mat[t, b_idx] = 1.0
+            time_vec[t] = rel_times[t]
+
+        if not np.any(mask_mat):
+            continue
+
+        if normalize_to_first_detection:
+            extracted_lcs.append((val_mat, err_mat, mask_mat, time_vec, coordinates, first_detection_mjd))
+        else:
+            extracted_lcs.append((val_mat, err_mat, mask_mat, time_vec, coordinates))
+
+    return extracted_lcs
+
+
 def parse_snana_fits(
     event_id,
     sim_dir,
@@ -3760,192 +3941,126 @@ def parse_snana_fits(
     normalize_to_first_detection=False,
     snr_threshold=5.0,
 ):
-    """
-    Parses {event_id}_HEAD.fits and {event_id}_PHOT.fits.
-    Extracts multiple light curve realizations for a single GW event.
-    
-    Args:
-        event_id: String ID of the event.
-        sim_dir: Directory containing FITS files.
-        
-    Returns:
-        List of tuples: [(values, masks, times), ...]
-        Returns empty list if files are missing.
-    """
-    if type(event_id) == str:
+    """Parse one legacy SNANA HEAD/PHOT/README event directory."""
+    if isinstance(event_id, str):
         event_id = int(float(event_id))
-    head_path = os.path.join(sim_dir, f"{sim_name}_{event_id}",f"{sim_name}_{event_id}_HEAD.FITS")
-    phot_path = os.path.join(sim_dir, f"{sim_name}_{event_id}",f"{sim_name}_{event_id}_PHOT.FITS")
-
-    if not os.path.exists(head_path) or not os.path.exists(phot_path):
+    event_dir = Path(sim_dir) / f"{sim_name}_{event_id}"
+    head_path = event_dir / f"{sim_name}_{event_id}_HEAD.FITS"
+    phot_path = event_dir / f"{sim_name}_{event_id}_PHOT.FITS"
+    readme_path = event_dir / f"{sim_name}_{event_id}.README"
+    if not head_path.exists() or not phot_path.exists():
         print(f"Warning: FITS files not found for {event_id}")
         return []
-
     try:
-        # open readme file and get MJD explode value
-        with open(os.path.join(sim_dir, f"{sim_name}_{event_id}",f"{sim_name}_{event_id}.README")) as f:
-            readme_lines = f.readlines()
-            mjd_explode = readme_lines[27].split(":")[1].split()[0]
-            mjd_explode = float(mjd_explode)
-        # Open FITS files
-        with fits.open(head_path) as hdul_head, fits.open(phot_path) as hdul_phot:
-            # Usually data is in extension 1
-            data_head = hdul_head[1].data
-            data_phot = hdul_phot[1].data
-            
-            # Use columns directly (Astropy FITS columns are case-insensitive usually)
-            # HEAD columns
-            ptrobs_min = data_head['PTROBS_MIN']
-            ptrobs_max = data_head['PTROBS_MAX']
-            
-            # PHOT columns
-            mjd_all = data_phot['MJD']
-            flux_all = data_phot['FLUXCAL']
-            fluxerr_all = data_phot['FLUXCALERR'] # Optional usage
-            flt_all = data_phot['BAND'] # Filters
-            photflag_all = data_phot['PHOTFLAG'] if 'PHOTFLAG' in data_phot.columns.names else None
-            head_columns = set(data_head.columns.names)
+        mjd_explode = _read_mjd_explode(readme_path)
+        with fits.open(head_path) as hdul_head:
+            data_head = hdul_head[1].data.copy()
+        with fits.open(phot_path) as hdul_phot:
+            data_phot = hdul_phot[1].data.copy()
+        return _extract_snana_lightcurves(
+            event_id,
+            data_head,
+            data_phot,
+            mjd_explode,
+            fluxcal_to_psfflux_factor=fluxcal_to_psfflux_factor,
+            psfflux_zp=psfflux_zp,
+            lupt_b_njy=lupt_b_njy,
+            normalize_to_first_detection=normalize_to_first_detection,
+            snr_threshold=snr_threshold,
+        )
+    except Exception as error:
+        print(f"Error processing FITS for {event_id}: {error}")
+        return []
 
-            extracted_lcs = []
-            use_luptitude = (
-                fluxcal_to_psfflux_factor is not None
-                and lupt_b_njy is not None
-            )
-            
-            # Iterate over each realization in HEAD
-            for i in range(len(data_head)):
-                # SNANA uses 1-based indexing for pointers, Python uses 0-based
-                # Start index: value - 1
-                # End index: value (exclusive in python slicing)
-                start_idx = ptrobs_min[i] - 1
-                end_idx = ptrobs_max[i]
-                nobs = data_head['NOBS'][i]
-                if (not use_luptitude) and nobs < 5:
-                    # print(f"Warning: Light curve for event {event_id} realization {i} has less than 5 observations. Skipping.")
-                    continue  # Skip light curves with less than 5 observations
 
-                # get coordinates
-                ra = data_head['RA'][i]
-                dec = data_head['DEC'][i]
-                coordinates = np.array([ra, dec], dtype=np.float32)
-                
-                # Slicing the PHOT data
-                lc_mjd = mjd_all[start_idx : end_idx]
-                lc_flux = flux_all[start_idx : end_idx]
-                lc_fluxerr = fluxerr_all[start_idx : end_idx]
-                lc_flt = flt_all[start_idx : end_idx]
-                lc_photflag = photflag_all[start_idx : end_idx] if photflag_all is not None else None
-                raw_lc_mjd = np.asarray(lc_mjd, dtype=np.float64)
-                raw_lc_flux = np.asarray(lc_flux, dtype=np.float64)
-                raw_lc_fluxerr = np.asarray(lc_fluxerr, dtype=np.float64)
-                head_mjd_detect_first = data_head['MJD_DETECT_FIRST'][i] if 'MJD_DETECT_FIRST' in head_columns else None
-                first_detection_mjd = None
+def _raw_snana_h5(path):
+    resolved = str(Path(path).expanduser().resolve())
+    key = (os.getpid(), resolved)
+    cached = _RAW_SNANA_H5_CACHE.get(key)
+    if cached is not None:
+        return cached
+    handle = h5py.File(resolved, "r")
+    if handle.attrs.get("schema_version") != "kn-simulation-intermediates-v2":
+        handle.close()
+        raise ValueError(f"Unsupported raw optical artifact schema: {resolved}")
+    ids = np.asarray(handle["events/simulation_id"][:], dtype=np.int64)
+    if len(ids) and np.any(ids[1:] <= ids[:-1]):
+        handle.close()
+        raise ValueError("Raw optical aggregate simulation IDs are not strictly sorted")
+    cached = (handle, ids)
+    _RAW_SNANA_H5_CACHE[key] = cached
+    return cached
 
-                if use_luptitude:
-                    merged_mjd, merged_psfflux, merged_psffluxerr, merged_flt = merge_photometry_psfflux(
-                        mjd=np.asarray(lc_mjd, dtype=np.float64),
-                        fluxcal=np.asarray(lc_flux, dtype=np.float64),
-                        fluxcalerr=np.asarray(lc_fluxerr, dtype=np.float64),
-                        flt=np.asarray(lc_flt),
-                        fluxcal_to_psfflux_factor=float(fluxcal_to_psfflux_factor),
-                    )
-                    if len(merged_mjd) < 5:
-                        continue
-                    if normalize_to_first_detection:
-                        first_detection_mjd = resolve_first_detection_mjd(
-                            snr_mjd=merged_mjd,
-                            snr_flux=merged_psfflux,
-                            snr_fluxerr=merged_psffluxerr,
-                            photflag_mjd=raw_lc_mjd,
-                            photflag=lc_photflag,
-                            head_mjd_detect_first=head_mjd_detect_first,
-                            snr_threshold=float(snr_threshold),
-                        )
-                        if first_detection_mjd is None:
-                            continue
-                    lc_mjd, lc_flux, lc_fluxerr, lc_flt = _transform_psfflux_to_luptitude(
-                        mjd=merged_mjd,
-                        psfflux=merged_psfflux,
-                        psffluxerr=merged_psffluxerr,
-                        flt=np.asarray(merged_flt),
-                        psfflux_zp=float(psfflux_zp),
-                        lupt_b_njy=lupt_b_njy,
-                    )
-                    if len(lc_mjd) == 0:
-                        continue
-                else:
-                    # Legacy behavior for callers not passing luptitude parameters.
-                    std = np.std(lc_flux)
-                    mean = np.mean(lc_flux)
-                    lc_flux = (lc_flux - mean) / (std + 1e-8)
-                    lc_fluxerr = lc_fluxerr / (std + 1e-8)
-                
-                # --- Format Conversion (to Tensor-ready numpy) ---
-                val_mat = np.zeros((MAX_LC_LENGTH, NUM_BANDS), dtype=np.float32)    # Values matrix (flux)
-                err_mat = np.zeros((MAX_LC_LENGTH, NUM_BANDS), dtype=np.float32)    # Errors matrix (flux errors)
-                mask_mat = np.zeros((MAX_LC_LENGTH, NUM_BANDS), dtype=np.float32)
-                time_vec = np.zeros((MAX_LC_LENGTH,), dtype=np.float32)
 
-                if normalize_to_first_detection:
-                    if first_detection_mjd is None:
-                        first_detection_mjd = resolve_first_detection_mjd(
-                            snr_mjd=raw_lc_mjd,
-                            snr_flux=raw_lc_flux,
-                            snr_fluxerr=raw_lc_fluxerr,
-                            photflag_mjd=raw_lc_mjd,
-                            photflag=lc_photflag,
-                            head_mjd_detect_first=head_mjd_detect_first,
-                            snr_threshold=float(snr_threshold),
-                        )
-                    if first_detection_mjd is None:
-                        continue
-                    rel_times = (np.asarray(lc_mjd, dtype=np.float64) - float(first_detection_mjd)) / 100.0
-                else:
-                    # 1. Time Normalization (Relative to BNS merger time)
-                    if len(lc_mjd) > 0:
-                        rel_times = (lc_mjd - mjd_explode) / 100  # Scale down to manageable range[-0.3, 0.6]
-                    else:
-                        continue # Skip empty light curves
-                    first_detection_mjd = None
-
-                # 2. Fill Matrices
-                # Truncate if longer than MAX_LC_LENGTH
-                seq_len = min(len(lc_mjd), MAX_LC_LENGTH)
-                if seq_len <= 0:
-                    continue
-                if len(lc_mjd) > MAX_LC_LENGTH:
-                    print(f"Warning: Light curve for event {event_id} exceeds MAX_LC_LENGTH. Truncating.")
-                    # Keep the MAX_LC_LENGTH points with smallest absolute rel_times
-                    sorted_indices = np.argsort(np.abs(rel_times))[:MAX_LC_LENGTH]
-                    sorted_indices = np.sort(sorted_indices)  # Sort back to chronological order
-                    lc_mjd = lc_mjd[sorted_indices]
-                    lc_flux = lc_flux[sorted_indices]
-                    lc_fluxerr = lc_fluxerr[sorted_indices]
-                    lc_flt = lc_flt[sorted_indices]
-                    rel_times = rel_times[sorted_indices]
-                
-                for t in range(seq_len):
-                    b_idx = _band_index_from_raw(lc_flt[t])
-                    if b_idx is None:
-                        continue
-
-                    val_mat[t, b_idx] = lc_flux[t]
-                    err_mat[t, b_idx] = lc_fluxerr[t]
-                    mask_mat[t, b_idx] = 1.0
-                    time_vec[t] = rel_times[t]
-
-                if not np.any(mask_mat):
-                    continue
-
-                if normalize_to_first_detection:
-                    extracted_lcs.append((val_mat, err_mat, mask_mat, time_vec, coordinates, first_detection_mjd))
-                else:
-                    extracted_lcs.append((val_mat, err_mat, mask_mat, time_vec, coordinates))
-
-            return extracted_lcs
-
-    except Exception as e:
-        print(f"Error processing FITS for {event_id}: {e}")
+def parse_snana_h5(
+    event_id,
+    artifact_path,
+    fluxcal_to_psfflux_factor=None,
+    psfflux_zp=31.4,
+    lupt_b_njy=None,
+    normalize_to_first_detection=False,
+    snr_threshold=5.0,
+):
+    """Parse one event from a v2 normalized raw optical HDF5 aggregate."""
+    if isinstance(event_id, str):
+        event_id = int(float(event_id))
+    event_id = int(event_id)
+    try:
+        handle, ids = _raw_snana_h5(artifact_path)
+        index = int(np.searchsorted(ids, event_id))
+        if index >= len(ids) or int(ids[index]) != event_id:
+            print(f"Warning: optical HDF5 event not found for {event_id}")
+            return []
+        checksum = handle["events/optical_payload_sha256"][index]
+        if isinstance(checksum, bytes):
+            checksum = checksum.decode("utf-8")
+        if not checksum:
+            print(f"Warning: optical HDF5 payload missing for {event_id}")
+            return []
+        rstart = int(handle["events/optical_realization_start"][index])
+        rcount = int(handle["events/optical_realization_count"][index])
+        ostart = int(handle["events/optical_observation_start"][index])
+        ocount = int(handle["events/optical_observation_count"][index])
+        local_starts = np.asarray(
+            handle["optical/realizations/observation_start"][rstart:rstart + rcount],
+            dtype=np.int64,
+        ) - ostart
+        local_counts = np.asarray(
+            handle["optical/realizations/observation_count"][rstart:rstart + rcount],
+            dtype=np.int64,
+        )
+        data_head = {
+            "RA": handle["optical/realizations/ra_deg"][rstart:rstart + rcount],
+            "DEC": handle["optical/realizations/dec_deg"][rstart:rstart + rcount],
+            "NOBS": handle["optical/realizations/nobs"][rstart:rstart + rcount],
+            "PTROBS_MIN": local_starts + 1,
+            "PTROBS_MAX": local_starts + local_counts,
+            "MJD_DETECT_FIRST": handle["optical/realizations/mjd_detect_first"][rstart:rstart + rcount],
+        }
+        band_codes = np.asarray(
+            handle["optical/observations/band_code"][ostart:ostart + ocount],
+            dtype=np.uint8,
+        )
+        data_phot = {
+            "MJD": handle["optical/observations/mjd"][ostart:ostart + ocount],
+            "FLUXCAL": handle["optical/observations/fluxcal"][ostart:ostart + ocount],
+            "FLUXCALERR": handle["optical/observations/fluxcalerr"][ostart:ostart + ocount],
+            "BAND": np.asarray([chr(int(value)) for value in band_codes]),
+            "PHOTFLAG": handle["optical/observations/photflag"][ostart:ostart + ocount],
+        }
+        return _extract_snana_lightcurves(
+            event_id,
+            data_head,
+            data_phot,
+            float(handle["events/mjd_explode"][index]),
+            fluxcal_to_psfflux_factor=fluxcal_to_psfflux_factor,
+            psfflux_zp=psfflux_zp,
+            lupt_b_njy=lupt_b_njy,
+            normalize_to_first_detection=normalize_to_first_detection,
+            snr_threshold=snr_threshold,
+        )
+    except Exception as error:
+        print(f"Error processing optical HDF5 for {event_id}: {error}")
         return []
 
 def sample_moc_skymap(map_file):
