@@ -26,7 +26,7 @@
   "itc_weight": 1.0,
   "cls_weight": 0.0,
   "fusion_mode": "physical_dual_hgw",
-  "max_gallery_queries": 128,
+  "max_gallery_queries": 64,
   "use_time_delta_cls_feature": true,
   "time_delta_cls_scale_days": 30.0,
   "time_delta_cls_clip": 10.0,

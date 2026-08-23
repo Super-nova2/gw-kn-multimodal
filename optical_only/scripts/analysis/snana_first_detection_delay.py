@@ -1,472 +1,343 @@
 #!/usr/bin/env python3
+"""Build the optical first-detection delay distribution from an ALBEF HDF5 file."""
+
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import json
 import os
-import re
-from concurrent.futures import ProcessPoolExecutor
+import tempfile
+from collections.abc import Iterable
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Tuple
 
 import matplotlib
+
 matplotlib.use("Agg")
+import h5py
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from astropy.io import fits
-from tqdm.auto import tqdm
 
-_BASE = Path(os.environ.get('BASE_DIR', '/fred/oz016/bgao_kn'))
+_BASE = Path(os.environ.get("BASE_DIR", "/fred/oz016/bgao_kn"))
 OPTICAL_ONLY_DIR = Path(__file__).resolve().parents[2]
-REPO_ROOT = OPTICAL_ONLY_DIR.parent
-MODEL_DIR = REPO_ROOT / 'Model'
-DEFAULT_OUTPUT_BASE_DIR = OPTICAL_ONLY_DIR / 'outputs' / 'snana_first_detection_delay_bns_nsbh'
-DEFAULT_CANONICAL_OFFSET_NPZ = _BASE / 'data' / 'Optical_Only_dataset' / 'delta_days_distribution.npz'
-DEFAULT_BNS_SIM_ROOT = _BASE / 'SNANA' / 'SNDATA_ROOT' / 'SIM' / 'LSST_KN_BNS_AUG'
-DEFAULT_BNS_PREFIX = 'LSST_KN_BNS_AUG'
-DEFAULT_NSBH_SIM_ROOT = _BASE / 'SNANA' / 'SNDATA_ROOT' / 'SIM' / 'LSST_KN_NSBH_TRAIN'
-DEFAULT_NSBH_PREFIX = 'LSST_KN_NSBH_TRAIN'
-DEFAULT_SNR_THRESHOLD = 5.0
-DEFAULT_FLUXCAL_ZP = 27.5
-DEFAULT_PSFFLUX_ZP = 31.4
+DEFAULT_OUTPUT_BASE_DIR = (
+    OPTICAL_ONLY_DIR / "outputs" / "h5_first_detection_delay_bns_nsbh"
+)
+DEFAULT_INPUT_H5 = _BASE / "data" / "ALBEF_dataset" / "combined_dataset_train.h5"
+DEFAULT_CANONICAL_OFFSET_NPZ = (
+    _BASE / "data" / "Optical_Only_dataset" / "delta_days_distribution.npz"
+)
+DEFAULT_CHUNK_SIZE = 500_000
 
-MERGE_HELPER_PATH = MODEL_DIR / 'lightcurve_merge.py'
-_merge_spec = importlib.util.spec_from_file_location('lightcurve_merge', MERGE_HELPER_PATH)
-if _merge_spec is None or _merge_spec.loader is None:
-    raise ImportError(f'Unable to load merge helper from {MERGE_HELPER_PATH}')
-_lightcurve_merge = importlib.util.module_from_spec(_merge_spec)
-_merge_spec.loader.exec_module(_lightcurve_merge)
-MERGE_WINDOW_HOURS = float(_lightcurve_merge.MERGE_WINDOW_HOURS)
-merge_photometry_psfflux = _lightcurve_merge.merge_photometry_psfflux
-
-MJD_EXPLODE_PATTERN = re.compile(r"MJD_EXPLODE:\s*([+-]?\d+(?:\.\d+)?(?:[Ee][+-]?\d+)?)")
+GW_GROUP = "events/gw_data"
+OPTICAL_GROUP = "events/optical_data"
+REQUIRED_GW_DATASETS = ("event_time_mjd", "source_type")
+REQUIRED_OPTICAL_DATASETS = ("parent_gw_idx",)
+FIRST_DETECTION_CANDIDATES = ("first_detection_mjd", "zero_time_mjd_base")
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        description='Build merged SNR-based first-detection delay distribution and overwrite canonical optical-only offset NPZ.'
+    parser = argparse.ArgumentParser(
+        description=(
+            "Extract first-detection delays directly from an ALBEF HDF5 dataset "
+            "and overwrite the canonical optical-only offset NPZ."
+        )
     )
-    p.add_argument('--output-base-dir', type=Path, default=DEFAULT_OUTPUT_BASE_DIR)
-    p.add_argument('--canonical-offset-npz', type=Path, default=DEFAULT_CANONICAL_OFFSET_NPZ)
-    p.add_argument('--bns-sim-root', type=Path, default=DEFAULT_BNS_SIM_ROOT)
-    p.add_argument('--bns-prefix', type=str, default=DEFAULT_BNS_PREFIX)
-    p.add_argument('--nsbh-sim-root', type=Path, default=DEFAULT_NSBH_SIM_ROOT)
-    p.add_argument('--nsbh-prefix', type=str, default=DEFAULT_NSBH_PREFIX)
-    p.add_argument('--snr-threshold', type=float, default=DEFAULT_SNR_THRESHOLD)
-    p.add_argument('--fluxcal-zp', type=float, default=DEFAULT_FLUXCAL_ZP)
-    p.add_argument('--psfflux-zp', type=float, default=DEFAULT_PSFFLUX_ZP)
-    p.add_argument('--num-workers', type=int, default=min(8, max(1, (os.cpu_count() or 1) // 2)))
-    p.add_argument('--max-events-per-source', type=int, default=None)
-    p.add_argument('--chunksize', type=int, default=16)
-    p.add_argument('--save-detailed-deltas-csv', action='store_true')
-    p.add_argument('--disable-parallel', action='store_true')
-    return p.parse_args()
+    parser.add_argument("--input-h5", type=Path, default=DEFAULT_INPUT_H5)
+    parser.add_argument("--output-base-dir", type=Path, default=DEFAULT_OUTPUT_BASE_DIR)
+    parser.add_argument(
+        "--canonical-offset-npz", type=Path, default=DEFAULT_CANONICAL_OFFSET_NPZ
+    )
+    parser.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE)
+    parser.add_argument("--save-detailed-deltas-csv", action="store_true")
+    return parser.parse_args()
 
 
-def parse_mjd_explode_from_readme(readme_path: Path) -> float:
-    text = readme_path.read_text(encoding='utf-8', errors='ignore')
-    match = MJD_EXPLODE_PATTERN.search(text)
-    if match is None:
-        raise ValueError(f'MJD_EXPLODE not found in README: {readme_path}')
-    return float(match.group(1))
+def _decode_strings(values: np.ndarray) -> np.ndarray:
+    values = np.asarray(values)
+    if values.dtype.kind == "S":
+        return np.char.decode(values, "utf-8")
+    return values.astype(str)
 
 
-def build_detection_mask(flux: np.ndarray, fluxerr: np.ndarray, snr_threshold: float) -> np.ndarray:
-    if flux.size == 0:
-        return np.zeros((0,), dtype=bool)
-    valid = np.isfinite(flux) & np.isfinite(fluxerr) & (fluxerr > 0)
-    if not np.any(valid):
-        return np.zeros(flux.shape, dtype=bool)
-    snr = np.full(flux.shape, -np.inf, dtype=np.float64)
-    snr[valid] = flux[valid] / fluxerr[valid]
-    return np.asarray(snr > float(snr_threshold), dtype=bool)
+def _require_datasets(group: h5py.Group, names: Iterable[str], group_path: str) -> None:
+    missing = [name for name in names if name not in group]
+    if missing:
+        raise KeyError(f"Missing datasets under {group_path}: {missing}")
 
 
-def list_event_dirs(base_dir: Path, prefix: str) -> List[Path]:
-    return sorted([p for p in base_dir.glob(f'{prefix}_*') if p.is_dir()])
+def _first_detection_dataset(optical_group: h5py.Group) -> str:
+    for name in FIRST_DETECTION_CANDIDATES:
+        if name in optical_group:
+            return name
+    raise KeyError(f"None of {FIRST_DETECTION_CANDIDATES} exists under {OPTICAL_GROUP}")
 
 
-def process_event_dir(
-    event_dir: Path,
-    source: str,
-    snr_threshold: float,
-    fluxcal_to_psfflux_factor: float,
-) -> Dict:
-    prefix = event_dir.name
-    readme_path = event_dir / f'{prefix}.README'
-    head_path = event_dir / f'{prefix}_HEAD.FITS'
-    phot_path = event_dir / f'{prefix}_PHOT.FITS'
+def extract_delay_distributions(
+    input_h5: Path, chunk_size: int = DEFAULT_CHUNK_SIZE
+) -> tuple[np.ndarray, np.ndarray, dict[str, object]]:
+    """Extract delays as first-detection MJD minus the parent GW-event MJD.
 
-    event_id = -1
-    try:
-        event_id = int(prefix.rsplit('_', 1)[-1])
-    except Exception:
-        pass
+    Optical rows are read in chunks so that the large light-curve HDF5 need not
+    be loaded into memory. One delay is returned per optical realization.
+    """
+    input_h5 = Path(input_h5)
+    if chunk_size <= 0:
+        raise ValueError(f"chunk_size must be positive, got {chunk_size}")
+    if not input_h5.is_file():
+        raise FileNotFoundError(f"Input HDF5 does not exist: {input_h5}")
 
-    result = {
-        'source': source,
-        'event_dir': prefix,
-        'event_id': event_id,
-        'n_realizations': 0,
-        'n_detected': 0,
-        'n_no_detect': 0,
-        'delta_days': np.empty((0,), dtype=np.float32),
-        'error': None,
-    }
+    bns_chunks = []
+    nsbh_chunks = []
 
-    if not (readme_path.exists() and head_path.exists() and phot_path.exists()):
-        result['error'] = 'missing_required_files'
-        return result
-
-    try:
-        mjd_explode = parse_mjd_explode_from_readme(readme_path)
-        with fits.open(head_path, memmap=False) as hdul_head, fits.open(phot_path, memmap=False) as hdul_phot:
-            head = hdul_head[1].data
-            phot = hdul_phot[1].data
-            ptrobs_min = np.asarray(head['PTROBS_MIN'], dtype=np.int64)
-            ptrobs_max = np.asarray(head['PTROBS_MAX'], dtype=np.int64)
-            mjd_all = np.asarray(phot['MJD'], dtype=np.float64)
-            flux_all = np.asarray(phot['FLUXCAL'], dtype=np.float64)
-            fluxerr_all = np.asarray(phot['FLUXCALERR'], dtype=np.float64)
-            flt_all = np.asarray(phot['BAND'])
-
-        n_realizations = int(len(ptrobs_min))
-        if n_realizations == 0:
-            result['n_realizations'] = 0
-            result['n_no_detect'] = 0
-            return result
-
-        deltas = np.empty((n_realizations,), dtype=np.float32)
-        detected_mask = np.zeros((n_realizations,), dtype=bool)
-
-        for i, (start_1based, end_1based) in enumerate(zip(ptrobs_min, ptrobs_max)):
-            start = int(start_1based) - 1
-            end = int(end_1based)
-            if start < 0 or end <= start or end > mjd_all.size:
-                continue
-
-            local_mjd = mjd_all[start:end]
-            local_flux = flux_all[start:end]
-            local_fluxerr = fluxerr_all[start:end]
-            local_flt = flt_all[start:end]
-
-            merged_mjd, merged_psfflux, merged_psffluxerr, _ = merge_photometry_psfflux(
-                mjd=local_mjd,
-                fluxcal=local_flux,
-                fluxcalerr=local_fluxerr,
-                flt=local_flt,
-                fluxcal_to_psfflux_factor=float(fluxcal_to_psfflux_factor),
+    with h5py.File(input_h5, "r") as handle:
+        if GW_GROUP not in handle or OPTICAL_GROUP not in handle:
+            raise KeyError(
+                f"Input must contain both {GW_GROUP!r} and {OPTICAL_GROUP!r}: "
+                f"{input_h5}"
             )
-            if merged_mjd.size == 0:
-                continue
 
-            local_detect = build_detection_mask(merged_psfflux, merged_psffluxerr, snr_threshold=snr_threshold)
-            if np.any(local_detect):
-                first_local_idx = int(np.argmax(local_detect))
-                first_detect_mjd = float(merged_mjd[first_local_idx])
-                deltas[i] = np.float32(first_detect_mjd - mjd_explode)
-                detected_mask[i] = True
+        gw_group = handle[GW_GROUP]
+        optical_group = handle[OPTICAL_GROUP]
+        _require_datasets(gw_group, REQUIRED_GW_DATASETS, GW_GROUP)
+        _require_datasets(optical_group, REQUIRED_OPTICAL_DATASETS, OPTICAL_GROUP)
+        detection_name = _first_detection_dataset(optical_group)
 
-        detected_deltas = deltas[detected_mask]
-        result['n_realizations'] = n_realizations
-        result['n_detected'] = int(detected_deltas.size)
-        result['n_no_detect'] = n_realizations - result['n_detected']
-        result['delta_days'] = detected_deltas
-        return result
-    except Exception as exc:
-        result['error'] = f'{type(exc).__name__}: {exc}'
-        return result
+        event_time_mjd = np.asarray(gw_group["event_time_mjd"][:], dtype=np.float64)
+        source_type = np.char.lower(_decode_strings(gw_group["source_type"][:]))
+        parent_dataset = optical_group["parent_gw_idx"]
+        detection_dataset = optical_group[detection_name]
 
+        if event_time_mjd.shape != source_type.shape:
+            raise ValueError(
+                "GW event_time_mjd and source_type lengths differ: "
+                f"{event_time_mjd.shape} vs {source_type.shape}"
+            )
+        if parent_dataset.shape != detection_dataset.shape:
+            raise ValueError(
+                "Optical parent_gw_idx and first-detection lengths differ: "
+                f"{parent_dataset.shape} vs {detection_dataset.shape}"
+            )
 
-def process_event_dir_worker(args: Tuple[str, str, float, float]) -> Dict:
-    event_dir_str, source, snr_threshold, fluxcal_to_psfflux_factor = args
-    return process_event_dir(
-        Path(event_dir_str),
-        source=source,
-        snr_threshold=float(snr_threshold),
-        fluxcal_to_psfflux_factor=float(fluxcal_to_psfflux_factor),
-    )
+        n_gw = int(event_time_mjd.size)
+        n_optical = int(parent_dataset.shape[0])
+        for start in range(0, n_optical, chunk_size):
+            stop = min(start + chunk_size, n_optical)
+            parent_idx = np.asarray(parent_dataset[start:stop], dtype=np.int64)
+            first_detection_mjd = np.asarray(
+                detection_dataset[start:stop], dtype=np.float64
+            )
 
-
-def scan_source(
-    source: str,
-    base_dir: Path,
-    prefix: str,
-    snr_threshold: float,
-    fluxcal_to_psfflux_factor: float,
-    max_events: int | None,
-    use_parallel: bool,
-    n_workers: int,
-    chunksize: int,
-) -> Tuple[np.ndarray, pd.DataFrame, pd.DataFrame]:
-    event_dirs = list_event_dirs(base_dir, prefix)
-    if max_events is not None:
-        event_dirs = event_dirs[: int(max_events)]
-    print(f'[{source}] total event dirs selected: {len(event_dirs)}')
-
-    delta_chunks: List[np.ndarray] = []
-    event_rows: List[Dict] = []
-    error_rows: List[Dict] = []
-
-    def append_result(res: Dict) -> None:
-        event_rows.append({
-            'source': res['source'],
-            'event_dir': res['event_dir'],
-            'event_id': res['event_id'],
-            'n_realizations': res['n_realizations'],
-            'n_detected': res['n_detected'],
-            'n_no_detect': res['n_no_detect'],
-        })
-        if res['delta_days'].size > 0:
-            delta_chunks.append(res['delta_days'])
-        if res['error'] is not None:
-            error_rows.append({
-                'source': res['source'],
-                'event_dir': res['event_dir'],
-                'event_id': res['event_id'],
-                'error': res['error'],
-            })
-
-    ran_in_parallel = False
-    if use_parallel and n_workers > 1 and len(event_dirs) > 0:
-        args_iter = [
-            (str(p), source, float(snr_threshold), float(fluxcal_to_psfflux_factor))
-            for p in event_dirs
-        ]
-        try:
-            with ProcessPoolExecutor(max_workers=n_workers) as ex:
-                for res in tqdm(
-                    ex.map(process_event_dir_worker, args_iter, chunksize=max(1, int(chunksize))),
-                    total=len(args_iter),
-                    desc=f'{source} scan (parallel)',
-                ):
-                    append_result(res)
-            ran_in_parallel = True
-        except Exception as exc:
-            print(f'[{source}] parallel mode failed ({type(exc).__name__}: {exc}); fallback to sequential mode.')
-            delta_chunks.clear()
-            event_rows.clear()
-            error_rows.clear()
-
-    if not ran_in_parallel:
-        for event_dir in tqdm(event_dirs, desc=f'{source} scan (sequential)'):
-            append_result(
-                process_event_dir(
-                    event_dir,
-                    source=source,
-                    snr_threshold=snr_threshold,
-                    fluxcal_to_psfflux_factor=fluxcal_to_psfflux_factor,
+            invalid_parent = (parent_idx < 0) | (parent_idx >= n_gw)
+            if np.any(invalid_parent):
+                bad = parent_idx[invalid_parent][0]
+                raise IndexError(
+                    f"parent_gw_idx {int(bad)} outside valid range [0, {n_gw})"
                 )
-            )
 
-    delta_days = np.concatenate(delta_chunks).astype(np.float32) if delta_chunks else np.empty((0,), dtype=np.float32)
-    event_df = pd.DataFrame(event_rows)
-    error_df = pd.DataFrame(error_rows)
-    return delta_days, event_df, error_df
+            parent_event_time = event_time_mjd[parent_idx]
+            finite = np.isfinite(first_detection_mjd) & np.isfinite(parent_event_time)
+            if not np.all(finite):
+                raise ValueError(
+                    f"Found {int((~finite).sum())} non-finite detection/event times "
+                    f"in optical rows [{start}, {stop})"
+                )
+
+            delays = (first_detection_mjd - parent_event_time).astype(np.float32)
+            parent_source = source_type[parent_idx]
+            known_source = np.isin(parent_source, ("bns", "nsbh"))
+            if not np.all(known_source):
+                unknown = np.unique(parent_source[~known_source]).tolist()
+                raise ValueError(f"Unsupported parent source_type values: {unknown}")
+
+            bns_chunks.append(delays[parent_source == "bns"])
+            nsbh_chunks.append(delays[parent_source == "nsbh"])
+
+        metadata: dict[str, object] = {
+            "source_h5": str(input_h5.resolve()),
+            "source_h5_mtime_utc": datetime.fromtimestamp(
+                input_h5.stat().st_mtime, tz=timezone.utc
+            ).isoformat(),
+            "first_detection_dataset": f"{OPTICAL_GROUP}/{detection_name}",
+            "delay_definition": "first_detection_mjd - parent_event_time_mjd",
+            "n_gw": n_gw,
+            "n_optical": n_optical,
+            "snr_detection_threshold": float(
+                handle.attrs.get("first_detection_snr_threshold", 5.0)
+            ),
+            "merge_window_hours": float(
+                handle.attrs.get("lightcurve_merge_window_hours", 2.0)
+            ),
+            "fluxcal_to_psfflux_factor": float(
+                handle.attrs.get("fluxcal_to_psfflux_factor", np.nan)
+            ),
+        }
+
+    bns = (
+        np.concatenate(bns_chunks).astype(np.float32, copy=False)
+        if bns_chunks
+        else np.empty(0, dtype=np.float32)
+    )
+    nsbh = (
+        np.concatenate(nsbh_chunks).astype(np.float32, copy=False)
+        if nsbh_chunks
+        else np.empty(0, dtype=np.float32)
+    )
+    if bns.size + nsbh.size != metadata["n_optical"]:
+        raise RuntimeError(
+            "Extracted population counts do not match the optical row count: "
+            f"{bns.size} + {nsbh.size} != {metadata['n_optical']}"
+        )
+    return bns, nsbh, metadata
 
 
-def summarize_distribution(delta_days: np.ndarray, n_total_realizations: int, n_detected: int, source: str) -> Dict:
-    row = {
-        'source': source,
-        'n_total_realizations': int(n_total_realizations),
-        'n_detected': int(n_detected),
-        'n_no_detect': int(max(0, n_total_realizations - n_detected)),
-        'detect_rate': float(n_detected / n_total_realizations) if n_total_realizations > 0 else 0.0,
-    }
+def summarize_distribution(delta_days: np.ndarray, source: str) -> dict[str, object]:
+    row: dict[str, object] = {"source": source, "count": int(delta_days.size)}
     if delta_days.size == 0:
-        for key in ['mean_days', 'std_days', 'q01_days', 'q05_days', 'q25_days', 'q50_days', 'q75_days', 'q95_days', 'q99_days', 'min_days', 'max_days']:
+        for key in (
+            "mean_days",
+            "std_days",
+            "q01_days",
+            "q05_days",
+            "q25_days",
+            "q50_days",
+            "q75_days",
+            "q95_days",
+            "q99_days",
+            "min_days",
+            "max_days",
+        ):
             row[key] = np.nan
         return row
 
-    q = np.quantile(delta_days, [0.01, 0.05, 0.25, 0.5, 0.75, 0.95, 0.99])
-    row.update({
-        'mean_days': float(np.mean(delta_days)),
-        'std_days': float(np.std(delta_days)),
-        'q01_days': float(q[0]),
-        'q05_days': float(q[1]),
-        'q25_days': float(q[2]),
-        'q50_days': float(q[3]),
-        'q75_days': float(q[4]),
-        'q95_days': float(q[5]),
-        'q99_days': float(q[6]),
-        'min_days': float(np.min(delta_days)),
-        'max_days': float(np.max(delta_days)),
-    })
+    quantiles = np.quantile(delta_days, [0.01, 0.05, 0.25, 0.5, 0.75, 0.95, 0.99])
+    row.update(
+        {
+            "mean_days": float(np.mean(delta_days)),
+            "std_days": float(np.std(delta_days)),
+            "q01_days": float(quantiles[0]),
+            "q05_days": float(quantiles[1]),
+            "q25_days": float(quantiles[2]),
+            "q50_days": float(quantiles[3]),
+            "q75_days": float(quantiles[4]),
+            "q95_days": float(quantiles[5]),
+            "q99_days": float(quantiles[6]),
+            "min_days": float(np.min(delta_days)),
+            "max_days": float(np.max(delta_days)),
+        }
+    )
     return row
+
+
+def _atomic_savez(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=path.parent, prefix=f".{path.stem}.", suffix=".npz", delete=False
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+        np.savez_compressed(temporary_path, **payload)
+        temporary_path.replace(path)
+    finally:
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink()
 
 
 def save_outputs(
     output_base_dir: Path,
     canonical_offset_npz: Path,
-    bns_deltas: np.ndarray,
-    nsbh_deltas: np.ndarray,
-    combined_deltas: np.ndarray,
-    event_summary_df: pd.DataFrame,
-    error_df: pd.DataFrame,
-    summary_df: pd.DataFrame,
-    snr_threshold: float,
-    fluxcal_to_psfflux_factor: float,
+    bns: np.ndarray,
+    nsbh: np.ndarray,
+    metadata: dict[str, object],
     save_detailed_deltas_csv: bool,
-) -> Dict[str, Path]:
-    output_base_dir.mkdir(parents=True, exist_ok=True)
-    run_tag = pd.Timestamp.utcnow().strftime('%Y%m%dT%H%M%SZ')
+) -> dict[str, Path]:
+    combined = np.concatenate((bns, nsbh)).astype(np.float32, copy=False)
+    run_tag = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     run_dir = output_base_dir / run_tag
-    run_dir.mkdir(parents=True, exist_ok=True)
+    run_dir.mkdir(parents=True, exist_ok=False)
 
-    summary_csv = run_dir / 'summary_stats.csv'
-    event_csv = run_dir / 'event_level_counts.csv'
-    error_csv = run_dir / 'event_errors.csv'
-    npz_path = run_dir / 'delta_days_distribution.npz'
-    hist_csv = run_dir / 'histogram_counts.csv'
-    plot_path = run_dir / 'first_detection_delay_histogram.png'
-
-    summary_df.to_csv(summary_csv, index=False)
-    event_summary_df.to_csv(event_csv, index=False)
-    error_df.to_csv(error_csv, index=False)
-
-    payload = {
-        'delta_days_bns': bns_deltas,
-        'delta_days_nsbh': nsbh_deltas,
-        'delta_days_combined': combined_deltas,
-        'snr_detection_threshold': np.float32(snr_threshold),
-        'merge_window_hours': np.float32(MERGE_WINDOW_HOURS),
-        'fluxcal_to_psfflux_factor': np.float32(fluxcal_to_psfflux_factor),
+    payload: dict[str, object] = {
+        "delta_days_bns": bns,
+        "delta_days_nsbh": nsbh,
+        "delta_days_combined": combined,
+        "snr_detection_threshold": np.float32(metadata["snr_detection_threshold"]),
+        "merge_window_hours": np.float32(metadata["merge_window_hours"]),
+        "fluxcal_to_psfflux_factor": np.float32(metadata["fluxcal_to_psfflux_factor"]),
+        "source_h5": np.asarray(metadata["source_h5"]),
+        "source_h5_mtime_utc": np.asarray(metadata["source_h5_mtime_utc"]),
+        "first_detection_dataset": np.asarray(metadata["first_detection_dataset"]),
+        "delay_definition": np.asarray(metadata["delay_definition"]),
     }
-    np.savez_compressed(npz_path, **payload)
-    canonical_offset_npz.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(canonical_offset_npz, **payload)
+    run_npz = run_dir / "delta_days_distribution.npz"
+    _atomic_savez(run_npz, payload)
+    _atomic_savez(canonical_offset_npz, payload)
+
+    combined_summary = pd.DataFrame(
+        [
+            summarize_distribution(bns, "BNS"),
+            summarize_distribution(nsbh, "NSBH"),
+            summarize_distribution(combined, "Combined"),
+        ]
+    )
+    summary_csv = run_dir / "summary_stats.csv"
+    combined_summary.to_csv(summary_csv, index=False)
 
     if save_detailed_deltas_csv:
-        rows = []
-        if bns_deltas.size > 0:
-            rows.append(pd.DataFrame({'source': 'BNS', 'delta_days': bns_deltas}))
-        if nsbh_deltas.size > 0:
-            rows.append(pd.DataFrame({'source': 'NSBH', 'delta_days': nsbh_deltas}))
-        if rows:
-            pd.concat(rows, ignore_index=True).to_csv(run_dir / 'detected_delta_days_detailed.csv', index=False)
+        pd.concat(
+            [
+                pd.DataFrame({"source": "BNS", "delta_days": bns}),
+                pd.DataFrame({"source": "NSBH", "delta_days": nsbh}),
+            ],
+            ignore_index=True,
+        ).to_csv(run_dir / "detected_delta_days_detailed.csv", index=False)
 
-    if combined_deltas.size > 0:
-        q_lo = float(np.quantile(combined_deltas, 0.001))
-        q_hi = float(np.quantile(combined_deltas, 0.999))
-        lo = np.floor(min(q_lo, 0.0))
-        hi = np.ceil(max(q_hi, 10.0))
-        if hi <= lo:
-            hi = lo + 1.0
-        bins = np.linspace(lo, hi, 300)
-        hist_bns, edges = np.histogram(bns_deltas, bins=bins) if bns_deltas.size > 0 else (np.zeros(len(bins) - 1, dtype=int), bins)
-        hist_nsbh, _ = np.histogram(nsbh_deltas, bins=bins) if nsbh_deltas.size > 0 else (np.zeros(len(bins) - 1, dtype=int), bins)
-        hist_combined, _ = np.histogram(combined_deltas, bins=bins)
-        pd.DataFrame({
-            'bin_left': edges[:-1],
-            'bin_right': edges[1:],
-            'count_bns': hist_bns,
-            'count_nsbh': hist_nsbh,
-            'count_combined': hist_combined,
-        }).to_csv(hist_csv, index=False)
+    plot_path = run_dir / "first_detection_delay_histogram.png"
+    if combined.size:
+        lower, upper = np.quantile(combined, [0.001, 0.999])
+        bins = np.linspace(float(lower), float(upper), 150)
+        fig, ax = plt.subplots(figsize=(10, 5))
+        ax.hist(combined, bins=bins, density=True, histtype="step", label="Combined")
+        ax.hist(bns, bins=bins, density=True, histtype="step", label="BNS")
+        ax.hist(nsbh, bins=bins, density=True, histtype="step", label="NSBH")
+        ax.axvline(0.0, color="black", linestyle="--", linewidth=1)
+        ax.set_xlabel("First optical detection minus GW trigger (days)")
+        ax.set_ylabel("Probability density")
+        ax.legend(frameon=False)
+        fig.tight_layout()
+        fig.savefig(plot_path, dpi=180)
+        plt.close(fig)
 
-        plt.figure(figsize=(10, 5))
-        plt.step(edges[:-1], hist_combined, where='post', label='Combined', linewidth=2)
-        if bns_deltas.size > 0:
-            plt.step(edges[:-1], hist_bns, where='post', label='BNS', alpha=0.9)
-        if nsbh_deltas.size > 0:
-            plt.step(edges[:-1], hist_nsbh, where='post', label='NSBH', alpha=0.9)
-        plt.axvline(0.0, color='k', linestyle='--', linewidth=1, alpha=0.7)
-        plt.xlabel('Merged-SNR first detection delay (days) = first_detect_mjd - MJD_EXPLODE')
-        plt.ylabel('Count')
-        plt.title('SNANA first-detection delay distribution (merged same-band 2h + psfFlux SNR > 5)')
-        plt.legend()
-        plt.tight_layout()
-        plt.savefig(plot_path, dpi=180)
-        plt.close()
-
-    (output_base_dir / 'latest_run.txt').write_text(str(run_dir), encoding='utf-8')
+    latest_run_path = output_base_dir / "latest_run.txt"
+    latest_run_path.write_text(str(run_dir), encoding="utf-8")
     return {
-        'run_dir': run_dir,
-        'summary_csv': summary_csv,
-        'event_csv': event_csv,
-        'error_csv': error_csv,
-        'npz_path': npz_path,
-        'canonical_npz_path': canonical_offset_npz,
-        'hist_csv': hist_csv,
-        'plot_path': plot_path,
+        "run_dir": run_dir,
+        "run_npz": run_npz,
+        "canonical_npz": canonical_offset_npz,
+        "summary_csv": summary_csv,
+        "plot": plot_path,
     }
 
 
 def main() -> None:
     args = parse_args()
-    fluxcal_to_psfflux_factor = 10.0 ** (0.4 * (float(args.psfflux_zp) - float(args.fluxcal_zp)))
-    sim_sources = [
-        {'source': 'BNS', 'base_dir': args.bns_sim_root, 'prefix': args.bns_prefix},
-        {'source': 'NSBH', 'base_dir': args.nsbh_sim_root, 'prefix': args.nsbh_prefix},
-    ]
-    use_parallel = (not args.disable_parallel) and int(args.num_workers) > 1
-
-    print('SNR_THRESHOLD =', float(args.snr_threshold))
-    print('MERGE_WINDOW_HOURS =', MERGE_WINDOW_HOURS)
-    print('FLUXCAL_TO_PSFFLUX_FACTOR =', fluxcal_to_psfflux_factor)
-    print('USE_PARALLEL =', use_parallel, 'N_WORKERS =', int(args.num_workers))
-    print('CANONICAL_OFFSET_NPZ =', args.canonical_offset_npz)
-
-    all_deltas: Dict[str, np.ndarray] = {}
-    all_event_df: List[pd.DataFrame] = []
-    all_error_df: List[pd.DataFrame] = []
-
-    for cfg in sim_sources:
-        source = cfg['source']
-        delta_days, event_df, error_df = scan_source(
-            source=source,
-            base_dir=cfg['base_dir'],
-            prefix=cfg['prefix'],
-            snr_threshold=float(args.snr_threshold),
-            fluxcal_to_psfflux_factor=float(fluxcal_to_psfflux_factor),
-            max_events=args.max_events_per_source,
-            use_parallel=use_parallel,
-            n_workers=int(args.num_workers),
-            chunksize=int(args.chunksize),
-        )
-        all_deltas[source] = delta_days
-        all_event_df.append(event_df)
-        if not error_df.empty:
-            all_error_df.append(error_df)
-
-    bns_deltas = all_deltas.get('BNS', np.empty((0,), dtype=np.float32))
-    nsbh_deltas = all_deltas.get('NSBH', np.empty((0,), dtype=np.float32))
-    combined_deltas = np.concatenate([arr for arr in [bns_deltas, nsbh_deltas] if arr.size > 0]).astype(np.float32) if (bns_deltas.size + nsbh_deltas.size) > 0 else np.empty((0,), dtype=np.float32)
-
-    event_summary_df = pd.concat(all_event_df, ignore_index=True) if all_event_df else pd.DataFrame()
-    error_df = pd.concat(all_error_df, ignore_index=True) if all_error_df else pd.DataFrame(columns=['source', 'event_dir', 'event_id', 'error'])
-
-    total_bns = int(event_summary_df.loc[event_summary_df['source'] == 'BNS', 'n_realizations'].sum()) if not event_summary_df.empty else 0
-    total_nsbh = int(event_summary_df.loc[event_summary_df['source'] == 'NSBH', 'n_realizations'].sum()) if not event_summary_df.empty else 0
-    summary_rows = [
-        summarize_distribution(bns_deltas, total_bns, int(bns_deltas.size), 'BNS'),
-        summarize_distribution(nsbh_deltas, total_nsbh, int(nsbh_deltas.size), 'NSBH'),
-        summarize_distribution(combined_deltas, total_bns + total_nsbh, int(combined_deltas.size), 'Combined'),
-    ]
-    summary_df = pd.DataFrame(summary_rows)
-
+    bns, nsbh, metadata = extract_delay_distributions(
+        args.input_h5, chunk_size=args.chunk_size
+    )
     paths = save_outputs(
         output_base_dir=args.output_base_dir,
         canonical_offset_npz=args.canonical_offset_npz,
-        bns_deltas=bns_deltas,
-        nsbh_deltas=nsbh_deltas,
-        combined_deltas=combined_deltas,
-        event_summary_df=event_summary_df,
-        error_df=error_df,
-        summary_df=summary_df,
-        snr_threshold=float(args.snr_threshold),
-        fluxcal_to_psfflux_factor=float(fluxcal_to_psfflux_factor),
-        save_detailed_deltas_csv=bool(args.save_detailed_deltas_csv),
+        bns=bns,
+        nsbh=nsbh,
+        metadata=metadata,
+        save_detailed_deltas_csv=args.save_detailed_deltas_csv,
     )
-
-    print('BNS detected realizations:', bns_deltas.size)
-    print('NSBH detected realizations:', nsbh_deltas.size)
-    print('Combined detected realizations:', combined_deltas.size)
-    print('Events with processing errors:', len(error_df))
-    print(json.dumps({k: str(v) for k, v in paths.items()}, indent=2))
+    print("BNS optical realizations:", bns.size)
+    print("NSBH optical realizations:", nsbh.size)
+    print("Combined optical realizations:", bns.size + nsbh.size)
+    print(json.dumps({key: str(value) for key, value in paths.items()}, indent=2))
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

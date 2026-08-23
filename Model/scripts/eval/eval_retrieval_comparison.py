@@ -33,6 +33,8 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 import torch
+from joblib import Parallel, delayed
+from threadpoolctl import threadpool_limits
 from tqdm import tqdm
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -45,10 +47,14 @@ if FINK_RF_SRC_DIR.exists() and str(FINK_RF_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(FINK_RF_SRC_DIR))
 
 try:
-    from fink_rf_repro.features import extract_feature_matrix_from_batch as fink_extract_feature_matrix_from_batch
+    from fink_rf_repro.features import (
+        extract_feature_matrix_from_batch as fink_extract_feature_matrix_from_batch,
+        resolve_feature_n_jobs as fink_resolve_feature_n_jobs,
+    )
     from fink_rf_repro.model_io import load_artifact as load_fink_rf_artifact
 except Exception:  # pragma: no cover - optional standalone baseline dependency
     fink_extract_feature_matrix_from_batch = None
+    fink_resolve_feature_n_jobs = None
     load_fink_rf_artifact = None
 
 from data_loader import (  # noqa: E402
@@ -2802,6 +2808,14 @@ def _fink_rf_batch_from_bank(bank: Mapping[str, Any], indices: np.ndarray) -> Di
     }
 
 
+def _extract_fink_feature_task(chunk, batch, attrs, basis, kwargs, blas_threads):
+    with threadpool_limits(limits=int(blas_threads)):
+        X, valid, counts = fink_extract_feature_matrix_from_batch(
+            batch, attrs, basis=basis, **kwargs
+        )
+    return np.asarray(chunk, dtype=np.int64), X, valid, counts
+
+
 def score_fink_rf_candidate_bank(
     artifact: Mapping[str, Any],
     candidate_bank: Mapping[str, Any],
@@ -2817,47 +2831,50 @@ def score_fink_rf_candidate_bank(
     basis = artifact["basis"]
     pipeline = artifact["pipeline"]
     bs = int(chunk_size or cfg.get("batch_size", 2048))
-    fit_window = tuple(cfg.get("fit_window_days", (-50.0, 50.0)))
-    min_band_points = int(cfg.get("min_band_points", 2))
-    min_fmax_psfflux = None if cfg.get("min_fmax_psfflux") is None else float(cfg.get("min_fmax_psfflux"))
-    fmax_threshold_source = str(cfg.get("fmax_threshold_source", "lsst_m5"))
-    fmax_threshold_scale = float(cfg.get("fmax_threshold_scale", 1.0))
-    default_time_scale = float(cfg.get("default_time_scale_divisor_days", 100.0))
-    min_valid_bands = int(cfg.get("min_valid_bands", 1))
-    coefficient_bound = float(cfg.get("coefficient_bound", 2.0))
-
+    kwargs = {
+        "fit_window_days": tuple(cfg.get("fit_window_days", (-50.0, 50.0))),
+        "min_band_points": int(cfg.get("min_band_points", 2)),
+        "min_fmax_psfflux": None if cfg.get("min_fmax_psfflux") is None else float(cfg.get("min_fmax_psfflux")),
+        "fmax_threshold_source": str(cfg.get("fmax_threshold_source", "lsst_m5")),
+        "fmax_threshold_scale": float(cfg.get("fmax_threshold_scale", 1.0)),
+        "default_time_scale_divisor_days": float(cfg.get("default_time_scale_divisor_days", 100.0)),
+        "min_valid_bands": int(cfg.get("min_valid_bands", 1)),
+        "coefficient_bound": float(cfg.get("coefficient_bound", 2.0)),
+        "min_total_detections": int(cfg.get("min_total_detections", 0)),
+        "detection_snr_threshold": float(cfg.get("detection_snr_threshold", 5.0)),
+    }
+    n_jobs = fink_resolve_feature_n_jobs(int(cfg.get("feature_n_jobs", 1)))
+    blas_threads = int(cfg.get("feature_blas_threads", 1))
+    chunks = [indices[start:start + bs] for start in range(0, indices.size, bs)]
+    results = Parallel(n_jobs=n_jobs, backend="loky", pre_dispatch=max(1, 2 * n_jobs))(
+        delayed(_extract_fink_feature_task)(
+            chunk, _fink_rf_batch_from_bank(candidate_bank, chunk), attrs, basis, kwargs, blas_threads
+        )
+        for chunk in chunks
+    )
     score_map: Dict[int, float] = {}
     valid_map: Dict[int, bool] = {}
     n_valid = 0
+    n_detection_eligible = 0
     band_counts: Dict[str, int] = {str(band): 0 for band in getattr(basis, "bands", [])}
-    for start in tqdm(range(0, indices.size, bs), desc="  Scoring Fink RF candidates", leave=False):
-        chunk = indices[start:start + bs]
-        batch = _fink_rf_batch_from_bank(candidate_bank, chunk)
-        X, valid, counts = fink_extract_feature_matrix_from_batch(
-            batch,
-            attrs,
-            basis=basis,
-            fit_window_days=fit_window,
-            min_band_points=min_band_points,
-            min_fmax_psfflux=min_fmax_psfflux,
-            fmax_threshold_source=fmax_threshold_source,
-            fmax_threshold_scale=fmax_threshold_scale,
-            default_time_scale_divisor_days=default_time_scale,
-            min_valid_bands=min_valid_bands,
-            coefficient_bound=coefficient_bound,
-        )
-        probs = pipeline.predict_proba(X)[:, 1].astype(np.float64, copy=False)
-        probs = np.where(valid, probs, -np.inf)
+    for chunk, X, valid, counts in tqdm(results, desc="  Scoring Fink RF candidates", leave=False):
+        valid = np.asarray(valid, dtype=bool)
+        probs = np.full(X.shape[0], -np.inf, dtype=np.float64)
+        if np.any(valid):
+            probs[valid] = pipeline.predict_proba(X[valid])[:, 1].astype(np.float64, copy=False)
         for row_idx, prob, ok in zip(chunk.tolist(), probs.tolist(), valid.tolist()):
             score_map[int(row_idx)] = float(prob)
             valid_map[int(row_idx)] = bool(ok)
-        n_valid += int(np.asarray(valid, dtype=bool).sum())
+        n_valid += int(valid.sum())
+        n_detection_eligible += int(counts.get("n_detection_eligible", X.shape[0]))
         for band, count in counts["band_valid_counts"].items():
             band_counts[str(band)] = int(band_counts.get(str(band), 0) + int(count))
     diagnostics = {
-        "n_rows": int(indices.size),
-        "n_valid": int(n_valid),
+        "n_rows": int(indices.size), "n_valid": int(n_valid),
         "valid_fraction": float(n_valid / max(1, int(indices.size))),
+        "n_detection_eligible": int(n_detection_eligible),
+        "detection_eligible_fraction": float(n_detection_eligible / max(1, int(indices.size))),
+        "feature_n_jobs": int(n_jobs),
         "band_valid_counts": band_counts,
         "band_valid_fraction": {band: float(count / max(1, int(indices.size))) for band, count in band_counts.items()},
     }

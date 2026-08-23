@@ -46,6 +46,8 @@ docs/superpowers/
 
 # Local scratch files
 tmp/
+analysis/
+!optical_only/scripts/analysis
 
 # dataset
 dataset/test/

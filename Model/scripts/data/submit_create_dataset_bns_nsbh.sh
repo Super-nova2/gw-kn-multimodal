@@ -85,10 +85,10 @@ set_profile_defaults() {
         astro_test)
             DATASET_MODE="${DATASET_MODE:-test}"
             BNS_MAX_NEG_GW="${BNS_MAX_NEG_GW:-2000}"
-            BNS_MAX_NEG_TYPE1_GW="${BNS_MAX_NEG_TYPE1_GW:-1000}"
+            BNS_MAX_NEG_TYPE1_GW="${BNS_MAX_NEG_TYPE1_GW:-500}"
             BNS_MAX_NEG_TYPE2_GW="${BNS_MAX_NEG_TYPE2_GW:-1000}"
             NSBH_MAX_NEG_GW="${NSBH_MAX_NEG_GW:-1500}"
-            NSBH_MAX_NEG_TYPE1_GW="${NSBH_MAX_NEG_TYPE1_GW:-1000}"
+            NSBH_MAX_NEG_TYPE1_GW="${NSBH_MAX_NEG_TYPE1_GW:-500}"
             NSBH_MAX_NEG_TYPE2_GW="${NSBH_MAX_NEG_TYPE2_GW:-500}"
             BNS_FULL_CATALOG_PATH="${BNS_FULL_CATALOG_PATH:-${BASE_DIR}/GWSamplegen/outputs/production_am_bayestar/dual/bns_test_seed_1234/pos_catalog.csv}"
             BNS_SKYMAP_DIR="${BNS_SKYMAP_DIR:-${BASE_DIR}/data/skymap/positive/bns_skymap_test}"

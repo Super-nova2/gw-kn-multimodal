@@ -1,10 +1,10 @@
 #!/bin/bash
 
-#SBATCH --job-name=FD_DELAY_SNR
+#SBATCH --job-name=FD_DELAY_H5
 #SBATCH --output=logs/optical_only/%x_%j.out
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=8
+#SBATCH --cpus-per-task=1
 #SBATCH --mem=8G
 #SBATCH --time=04:00:00
 #SBATCH --partition=milan
@@ -41,5 +41,5 @@ cd "${BASE_DIR:-.}"
 which "${PYTHON_BIN}"
 "${PYTHON_BIN}" --version
 
-echo "Running: ${PYTHON_BIN} -u ${PYTHON_SCRIPT} --num-workers ${SLURM_CPUS_PER_TASK:-8} $*"
-"${PYTHON_BIN}" -u "${PYTHON_SCRIPT}" --num-workers "${SLURM_CPUS_PER_TASK:-8}" "$@"
+echo "Running: ${PYTHON_BIN} -u ${PYTHON_SCRIPT} $*"
+"${PYTHON_BIN}" -u "${PYTHON_SCRIPT}" "$@"

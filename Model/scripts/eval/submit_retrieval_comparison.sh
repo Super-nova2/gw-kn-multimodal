@@ -85,6 +85,9 @@ if [[ -z "${SLURM_JOB_ID:-}" ]]; then
     if [[ -n "${TIME_LIMIT:-}" ]]; then
         sbatch_opts+=(--time="${TIME_LIMIT}")
     fi
+    if [[ -n "${DEPENDENCY:-}" ]]; then
+        sbatch_opts+=(--dependency="${DEPENDENCY}")
+    fi
     if [[ -n "${PARTITION:-}" ]]; then
         sbatch_opts+=(--partition="${PARTITION}")
     fi
