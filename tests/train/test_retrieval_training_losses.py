@@ -12,12 +12,15 @@ if str(MODEL_DIR) not in sys.path:
 
 from scripts.train.train import (  # noqa: E402
     build_gallery_time_delta_matrix,
+    compute_parent_relative_time_delta_days,
     compute_fusion_gallery_hard_nce_loss,
     compute_fusion_gallery_metrics,
     compute_fusion_gallery_nce_loss,
     compute_gallery_hard_neg_weight,
     compute_residual_rerank_loss,
     is_gallery_hard_neg_enabled,
+    sample_mixed_external_time_deltas,
+    sample_mismatched_negatives,
     select_gallery_topk,
 )
 from model import MAGIKSModel  # noqa: E402
@@ -79,14 +82,20 @@ def _reference_cross_modal_supcon_loss(feat_g, feat_o, gw_indices):
     denominator_mask = ~mask_self & ~(labels_eq & same_modality)
 
     neg_large = torch.finfo(sim_matrix.dtype).min
-    logits_max = sim_matrix.masked_fill(~denominator_mask, neg_large).max(dim=1, keepdim=True).values
+    logits_max = (
+        sim_matrix.masked_fill(~denominator_mask, neg_large)
+        .max(dim=1, keepdim=True)
+        .values
+    )
     logits = sim_matrix - logits_max.detach()
     exp_logits = torch.exp(logits).masked_fill(~denominator_mask, 0.0)
     log_prob = logits - torch.log(exp_logits.sum(dim=1, keepdim=True) + 1e-8)
 
     mask_pos = mask_pos.float()
     has_pos = mask_pos.sum(dim=1) > 0
-    mean_log_prob_pos = (mask_pos * log_prob).sum(dim=1) / mask_pos.sum(dim=1).clamp_min(1)
+    mean_log_prob_pos = (mask_pos * log_prob).sum(dim=1) / mask_pos.sum(
+        dim=1
+    ).clamp_min(1)
     return -mean_log_prob_pos[has_pos].mean()
 
 
@@ -112,9 +121,13 @@ class RetrievalTrainingLossTests(unittest.TestCase):
         loss, sim_in, _ = model.compute_supcon_loss(feat_g, feat_o, gw_indices)
         expected = _reference_cross_modal_supcon_loss(feat_g, feat_o, gw_indices)
 
-        self.assertTrue(torch.allclose(loss, expected, atol=1e-6), f"{loss=} {expected=}")
+        self.assertTrue(
+            torch.allclose(loss, expected, atol=1e-6), f"{loss=} {expected=}"
+        )
 
-    def test_gallery_time_delta_synthesis_preserves_positives_and_windows_distractors(self):
+    def test_gallery_time_delta_synthesis_preserves_positives_and_windows_distractors(
+        self,
+    ):
         torch.manual_seed(11)
         query_event_time = torch.tensor([100.0, 200.0], dtype=torch.float32)
         candidate_event_time = torch.tensor([103.0, 210.0, 999.0], dtype=torch.float32)
@@ -160,6 +173,67 @@ class RetrievalTrainingLossTests(unittest.TestCase):
         )
         self.assertTrue(torch.allclose(dt, expected))
 
+    def test_parent_relative_time_delta_is_invariant_to_absolute_mjd_shift(self):
+        first = torch.tensor([60002.0, 60105.0])
+        parent = torch.tensor([60000.0, 60100.0])
+        original = compute_parent_relative_time_delta_days(first, parent)
+        shifted = compute_parent_relative_time_delta_days(
+            first + 5000.0, parent + 5000.0
+        )
+        self.assertTrue(torch.allclose(original, torch.tensor([2.0, 5.0])))
+        self.assertTrue(torch.allclose(original, shifted))
+
+    def test_gallery_parent_relative_mode_reuses_each_candidate_delay(self):
+        query = torch.tensor([100.0, 9000.0])
+        candidate = torch.tensor([103.0, 211.0, 9999.0])
+        parent = torch.tensor([100.0, 200.0, 9990.0])
+        dt = build_gallery_time_delta_matrix(
+            query,
+            candidate,
+            candidate_parent_event_time_mjd=parent,
+            distractor_time_mode="parent_relative",
+        )
+        expected = torch.tensor([[3.0, 11.0, 9.0], [3.0, 11.0, 9.0]])
+        self.assertTrue(torch.allclose(dt, expected))
+
+    def test_mixed_external_time_sampler_has_exact_requested_mixture(self):
+        generator = torch.Generator().manual_seed(17)
+        sampled = sample_mixed_external_time_deltas(
+            torch.tensor([10.0, 20.0]),
+            10,
+            empirical_fraction=0.5,
+            window_days=0.1,
+            generator=generator,
+        )
+        empirical = sampled >= 10.0
+        self.assertEqual(int(empirical.sum()), 5)
+        self.assertTrue(torch.all(sampled[~empirical] >= 0.0))
+        self.assertTrue(torch.all(sampled[~empirical] <= 0.1))
+
+    def test_mixed_external_time_sampler_rejects_empty_finite_pool(self):
+        with self.assertRaisesRegex(ValueError, "finite positive pool"):
+            sample_mixed_external_time_deltas(
+                torch.tensor([float("nan")]), 4, empirical_fraction=0.5
+            )
+
+    def test_mismatched_negative_candidates_respect_eligibility_mask(self):
+        torch.manual_seed(3)
+        gw_indices = torch.tensor([0, 1, 2, 3])
+        eligible = torch.tensor([True, False, True, False])
+        selected = sample_mismatched_negatives(
+            4,
+            torch.device("cpu"),
+            gw_indices=gw_indices,
+            eligible_candidate_mask=eligible,
+        )
+        self.assertIsNotNone(selected)
+        self.assertTrue(torch.all(eligible[selected]))
+        self.assertTrue(torch.all(gw_indices[selected] != gw_indices))
+
+    def test_parent_relative_time_delta_rejects_missing_parent_times(self):
+        with self.assertRaisesRegex(ValueError, "parent-relative"):
+            compute_parent_relative_time_delta_days(torch.tensor([1.0]), None)
+
 
 class GalleryHardNCELossTests(unittest.TestCase):
     def _scores_and_mask(self, n_query=5, n_cand=8, seed=1):
@@ -176,8 +250,9 @@ class GalleryHardNCELossTests(unittest.TestCase):
         scores, pos_mask = self._scores_and_mask(n_query=4, n_cand=5, seed=2)
         full = compute_fusion_gallery_nce_loss(scores, pos_mask)
         hard = compute_fusion_gallery_hard_nce_loss(scores, pos_mask, topk=100)
-        self.assertTrue(torch.allclose(full, hard, atol=1e-5),
-                        f"full={full:.6f} hard={hard:.6f}")
+        self.assertTrue(
+            torch.allclose(full, hard, atol=1e-5), f"full={full:.6f} hard={hard:.6f}"
+        )
 
     def test_hard_nce_ignores_positive_candidates(self):
         scores, pos_mask = self._scores_and_mask(n_query=4, n_cand=8, seed=3)
@@ -219,8 +294,11 @@ class GalleryHardNCELossTests(unittest.TestCase):
         for topk in [1, 2, 4, 6, 8, 100]:
             hard = compute_fusion_gallery_hard_nce_loss(scores, pos_mask, topk=topk)
             if prev is not None:
-                self.assertGreaterEqual(hard.item(), prev.item() - 1e-5,
-                                        f"topk={topk} gave {hard:.6f} < prev {prev:.6f}")
+                self.assertGreaterEqual(
+                    hard.item(),
+                    prev.item() - 1e-5,
+                    f"topk={topk} gave {hard:.6f} < prev {prev:.6f}",
+                )
             prev = hard
 
 
@@ -236,9 +314,7 @@ class FusionGalleryRerankTests(unittest.TestCase):
         )
 
         self.assertEqual(topk_indices.tolist(), [[0, 1], [0, 1]])
-        self.assertEqual(
-            topk_positive_mask.tolist(), [[False, False], [True, False]]
-        )
+        self.assertEqual(topk_positive_mask.tolist(), [[False, False], [True, False]])
         self.assertEqual(candidate_recall_mask.tolist(), [False, True])
 
     def test_gallery_topk_force_include_positives_preserves_legacy_behavior(self):
@@ -306,6 +382,7 @@ class FusionGalleryRerankTests(unittest.TestCase):
 class GalleryHardNegWeightTests(unittest.TestCase):
     def _args(self, **overrides):
         import argparse
+
         defaults = {
             "gallery_hard_neg_enable": True,
             "gallery_loss_weight": 1.0,
@@ -344,6 +421,7 @@ class GalleryHardNegWeightTests(unittest.TestCase):
 
     def test_is_enabled_false_by_default(self):
         import argparse
+
         args = argparse.Namespace()
         self.assertFalse(is_gallery_hard_neg_enabled(args))
 
@@ -379,7 +457,10 @@ class ExtendedSimReturnTests(unittest.TestCase):
         extra_neg_z = torch.randn(4, 256)
 
         _, sim_inbatch, sim_ext = model.compute_itc_loss(
-            g, z_l, gw_indices=gw_indices, extra_neg_z=extra_neg_z,
+            g,
+            z_l,
+            gw_indices=gw_indices,
+            extra_neg_z=extra_neg_z,
         )
         self.assertEqual(tuple(sim_inbatch.shape), (4, 4))
         self.assertEqual(tuple(sim_ext.shape), (4, 8))
@@ -393,7 +474,10 @@ class ExtendedSimReturnTests(unittest.TestCase):
         gw_indices = torch.tensor([0, 0, 1, 1], dtype=torch.long)
 
         _, sim_inbatch, sim_ext = model.compute_itc_loss(
-            g, z_l, gw_indices=gw_indices, extra_neg_z=None,
+            g,
+            z_l,
+            gw_indices=gw_indices,
+            extra_neg_z=None,
         )
         self.assertEqual(tuple(sim_ext.shape), (4, 4))
         self.assertTrue(torch.allclose(sim_ext, sim_inbatch, atol=1e-6))
@@ -406,7 +490,10 @@ class ExtendedSimReturnTests(unittest.TestCase):
         extra_neg_z = torch.randn(4, 256)
 
         _, sim_inbatch, sim_ext = model.compute_supcon_loss(
-            g, z_l, gw_indices, extra_neg_z=extra_neg_z,
+            g,
+            z_l,
+            gw_indices,
+            extra_neg_z=extra_neg_z,
         )
         self.assertEqual(tuple(sim_inbatch.shape), (4, 4))
         self.assertEqual(tuple(sim_ext.shape), (4, 8))
@@ -419,7 +506,10 @@ class ExtendedSimReturnTests(unittest.TestCase):
         gw_indices = torch.tensor([0, 0, 1, 1], dtype=torch.long)
 
         _, sim_inbatch, sim_ext = model.compute_supcon_loss(
-            g, z_l, gw_indices, extra_neg_z=None,
+            g,
+            z_l,
+            gw_indices,
+            extra_neg_z=None,
         )
         self.assertEqual(tuple(sim_ext.shape), (4, 4))
         self.assertTrue(torch.allclose(sim_ext, sim_inbatch, atol=1e-6))
@@ -427,6 +517,7 @@ class ExtendedSimReturnTests(unittest.TestCase):
     def test_retrieval_metrics_ignore_external_neg_gw_indices(self):
         """External negatives with gw_index=-1 should not match any query."""
         from metrics import compute_retrieval_metrics
+
         torch.manual_seed(42)
         sim_g2o = torch.randn(4, 8)
         # First 4 candidates are in-batch, last 4 are external negs

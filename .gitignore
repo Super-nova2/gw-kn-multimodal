@@ -33,6 +33,7 @@ hpo_results/
 !*.json.example
 !Model/args/eval/fixed_checkpoint_attribution_v1.json
 !Model/args/eval/fixed_checkpoint_attribution_v2.json
+!Model/args/MAGIKS_BNS_NSBH_physical_pairing_v1.json
 archive/
 
 # Generated exports

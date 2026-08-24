@@ -424,6 +424,126 @@ def compute_time_delta_days(opt_zero_time_mjd, gw_anchor_time_mjd):
     return dt
 
 
+def compute_parent_relative_time_delta_days(
+    opt_first_detection_mjd, parent_gw_event_time_mjd
+):
+    """Return candidate detection delay relative to its own parent GW event."""
+    if opt_first_detection_mjd is None or parent_gw_event_time_mjd is None:
+        raise ValueError(
+            "parent-relative time deltas require first-detection and parent GW times."
+        )
+    first = opt_first_detection_mjd.to(torch.float32).reshape(-1)
+    parent = parent_gw_event_time_mjd.to(
+        device=first.device, dtype=torch.float32
+    ).reshape(-1)
+    if first.shape != parent.shape:
+        raise ValueError(
+            "first-detection and parent GW time arrays must have equal shapes."
+        )
+    dt = first - parent
+    if not torch.isfinite(dt).all():
+        raise ValueError("parent-relative time deltas must all be finite.")
+    return dt
+
+
+def sample_mixed_external_time_deltas(
+    positive_dt_days,
+    n_samples,
+    *,
+    empirical_fraction=0.5,
+    window_days=30.0,
+    generator=None,
+):
+    """Sample external-negative dt from empirical KN and operational priors."""
+    pool = positive_dt_days.to(torch.float32).reshape(-1)
+    pool = pool[torch.isfinite(pool)]
+    if pool.numel() == 0:
+        raise ValueError("mixed external dt sampling requires a finite positive pool.")
+    n_samples = int(n_samples)
+    if n_samples < 0:
+        raise ValueError("n_samples must be non-negative.")
+    fraction = float(empirical_fraction)
+    if not 0.0 <= fraction <= 1.0:
+        raise ValueError("empirical_fraction must be in [0, 1].")
+    window_days = float(window_days)
+    if window_days <= 0.0:
+        raise ValueError("window_days must be positive.")
+    if n_samples == 0:
+        return pool.new_empty((0,))
+
+    n_empirical = round(n_samples * fraction)
+    n_uniform = n_samples - n_empirical
+    parts = []
+    if n_empirical:
+        indices = torch.randint(
+            pool.numel(),
+            (n_empirical,),
+            device=pool.device,
+            generator=generator,
+        )
+        parts.append(pool[indices])
+    if n_uniform:
+        parts.append(
+            torch.rand(
+                (n_uniform,),
+                device=pool.device,
+                dtype=pool.dtype,
+                generator=generator,
+            )
+            * window_days
+        )
+    sampled = torch.cat(parts, dim=0)
+    permutation = torch.randperm(
+        sampled.numel(), device=sampled.device, generator=generator
+    )
+    return sampled[permutation]
+
+
+def build_mismatched_classification_time_deltas(
+    *,
+    mode,
+    batch_size,
+    device,
+    window_days,
+    candidate_indices,
+    opt_first_detection_mjd,
+    parent_gw_event_time_mjd,
+):
+    """Build dt for in-batch mismatched-KN classification pairs."""
+    if str(mode).strip().lower() == "mixed_empirical":
+        return compute_parent_relative_time_delta_days(
+            opt_first_detection_mjd[candidate_indices],
+            parent_gw_event_time_mjd[candidate_indices],
+        )
+    return sample_mis_neg_dt_days(batch_size, device, window_days=window_days)
+
+
+def build_external_classification_time_deltas(
+    *,
+    mode,
+    positive_dt_pool,
+    n_samples,
+    empirical_fraction,
+    window_days,
+    negative_event_time_mjd,
+    query_event_time_mjd,
+    device,
+    generator=None,
+):
+    """Build dt for external non-KN classification negatives."""
+    if str(mode).strip().lower() == "mixed_empirical":
+        return sample_mixed_external_time_deltas(
+            positive_dt_pool,
+            n_samples,
+            empirical_fraction=empirical_fraction,
+            window_days=window_days,
+            generator=generator,
+        )
+    if negative_event_time_mjd is not None and query_event_time_mjd is not None:
+        return compute_time_delta_days(negative_event_time_mjd, query_event_time_mjd)
+    return torch.zeros((int(n_samples),), device=device, dtype=torch.float32)
+
+
 def resolve_optical_candidate_time_mjd(
     opt_first_detection_mjd, fallback_event_time_mjd
 ):
@@ -532,6 +652,7 @@ def sample_mismatched_negatives(
     samples_per_gw=1,
     gw_indices=None,
     source_types=None,
+    eligible_candidate_mask=None,
 ):
     """
     Select an optical curve from a different GW event for each anchor.
@@ -561,6 +682,17 @@ def sample_mismatched_negatives(
                 )
 
         different_gw = gw_indices.unsqueeze(1) != gw_indices.unsqueeze(0)
+        if eligible_candidate_mask is not None:
+            eligible = torch.as_tensor(
+                eligible_candidate_mask, device=device, dtype=torch.bool
+            ).reshape(-1)
+            if eligible.numel() != batch_size:
+                raise ValueError(
+                    "eligible_candidate_mask must have one value per batch row."
+                )
+            different_gw = different_gw & eligible.unsqueeze(0)
+        if not bool(different_gw.any(dim=1).all()):
+            return None
         candidate_mask = different_gw
         if source_types is not None:
             same_source = source_types.unsqueeze(1) == source_types.unsqueeze(0)
@@ -1755,6 +1887,7 @@ def build_gallery_time_delta_matrix(
     query_event_time_mjd,
     candidate_event_time_mjd,
     *,
+    candidate_parent_event_time_mjd=None,
     positive_mask=None,
     distractor_time_mode="actual",
     distractor_time_window_days=30.0,
@@ -1762,6 +1895,8 @@ def build_gallery_time_delta_matrix(
     """Build per-query/per-candidate dt for fusion mini-gallery scoring.
 
     In ``actual`` mode this is the raw candidate-minus-query MJD difference.
+    In ``parent_relative`` mode each candidate uses its detection delay relative
+    to its own parent GW, re-anchored identically for every query.
     In ``synthetic_after_gw`` mode, matching positives keep their real dt while
     every non-matching distractor is assigned a synthetic first-detection offset
     sampled uniformly from [0, distractor_time_window_days].
@@ -1773,10 +1908,16 @@ def build_gallery_time_delta_matrix(
     candidate = candidate_event_time_mjd.to(
         device=query.device, dtype=torch.float32
     ).reshape(1, -1)
+    mode = str(distractor_time_mode).strip().lower()
+    if mode in {"parent_relative", "candidate_relative", "empirical"}:
+        parent_dt = compute_parent_relative_time_delta_days(
+            candidate.reshape(-1), candidate_parent_event_time_mjd
+        )
+        return parent_dt.reshape(1, -1).expand(query.size(0), -1)
+
     dt = candidate - query
     dt = torch.where(torch.isfinite(dt), dt, torch.zeros_like(dt))
 
-    mode = str(distractor_time_mode).strip().lower()
     if mode in {"actual", "real", "none"}:
         return dt
     if mode not in {"synthetic_after_gw", "synthetic", "after_gw"}:
@@ -2101,6 +2242,8 @@ def evaluate(
         "hard": {"sum": 0.0, "sum_sq": 0.0, "count": 0},
         "extra": {"sum": 0.0, "sum_sq": 0.0, "count": 0},
     }
+    validation_dt_generator = torch.Generator(device=device)
+    validation_dt_generator.manual_seed(int(args.seed) + 104729)
     neg_gw_probabilities = {
         ("bns", 1): [],
         ("bns", 2): [],
@@ -2373,6 +2516,7 @@ def evaluate(
                         dt_pos = torch.zeros(
                             (batch_size,), device=device, dtype=torch.float32
                         )
+                    _accumulate_time_delta_stats(dt_stats, "pos", dt_pos[pos_mask])
                     logits_pos = model.fusion_logits(
                         g,
                         h_l,
@@ -2409,6 +2553,7 @@ def evaluate(
                         samples_per_gw=args.samples_per_gw,
                         gw_indices=gw_indices,
                         source_types=batch_source_types,
+                        eligible_candidate_mask=itc_pair_mask,
                     )
 
                     if mis_idx is None:
@@ -2420,9 +2565,16 @@ def evaluate(
                         h_l_mis = h_l[mis_idx].clone()
                         z_l_mis = z_l[mis_idx].clone()
                         coords_mis = opt_coords[mis_idx].clone()
-                        dt_mis = sample_mis_neg_dt_days(
-                            batch_size, device, window_days=args.mis_neg_dt_window_days
+                        dt_mis = build_mismatched_classification_time_deltas(
+                            mode=args.cls_distractor_time_mode,
+                            batch_size=batch_size,
+                            device=device,
+                            window_days=args.mis_neg_dt_window_days,
+                            candidate_indices=mis_idx,
+                            opt_first_detection_mjd=_opt_first_detection_mjd,
+                            parent_gw_event_time_mjd=batch_event_time_mjd,
                         )
+                        _accumulate_time_delta_stats(dt_stats, "hard", dt_mis)
                         cred_level_mis = (
                             compute_credible_level(gw_m, coords_mis)
                             if need_cred_level
@@ -2464,17 +2616,16 @@ def evaluate(
                             if neg_zero_time_mjd_for_cls is not None
                             else None
                         )
-                        dt_neg = (
-                            compute_time_delta_days(
-                                neg_event_time, batch_event_time_mjd
-                            )
-                            if (
-                                neg_event_time is not None
-                                and batch_event_time_mjd is not None
-                            )
-                            else torch.zeros(
-                                (batch_size,), device=device, dtype=torch.float32
-                            )
+                        dt_neg = build_external_classification_time_deltas(
+                            mode=args.cls_distractor_time_mode,
+                            positive_dt_pool=dt_pos[itc_pair_mask],
+                            n_samples=batch_size,
+                            empirical_fraction=args.cls_external_empirical_dt_fraction,
+                            window_days=args.mis_neg_dt_window_days,
+                            negative_event_time_mjd=neg_event_time,
+                            query_event_time_mjd=batch_event_time_mjd,
+                            device=device,
+                            generator=validation_dt_generator,
                         )
                         logits_neg = model.fusion_logits(
                             g,
@@ -2561,17 +2712,28 @@ def evaluate(
                 compute_gallery_this_epoch = (
                     gallery_loss_active or fusion_gallery_metrics_enabled
                 )
-                if compute_gallery_this_epoch and gallery_extra_h_l is not None:
-                    h_candidates = [h_l]
-                    z_candidates = [z_l]
-                    coords_candidates = [opt_coords]
-                    candidate_gw_indices = [gw_indices]
+                if compute_gallery_this_epoch and itc_pair_mask.any():
+                    gallery_query_g = g[itc_pair_mask]
+                    gallery_query_H = H_gw[itc_pair_mask] if H_gw is not None else None
+                    gallery_query_gw_s = gw_s[itc_pair_mask]
+                    gallery_query_gw_m = gw_m[itc_pair_mask]
+                    gallery_query_event_time = (
+                        batch_event_time_mjd[itc_pair_mask]
+                        if batch_event_time_mjd is not None
+                        else None
+                    )
+                    h_candidates = [h_l[itc_pair_mask]]
+                    z_candidates = [z_l[itc_pair_mask]]
+                    coords_candidates = [opt_coords[itc_pair_mask]]
+                    candidate_gw_indices = [itc_gw_indices]
                     candidate_time_blocks = []
+                    candidate_parent_time_blocks = []
                     if batch_event_time_mjd is not None:
                         pos_gallery_time = resolve_optical_candidate_time_mjd(
                             _opt_first_detection_mjd, batch_event_time_mjd
-                        ).to(device=device, dtype=torch.float32)
+                        )[itc_pair_mask].to(device=device, dtype=torch.float32)
                         candidate_time_blocks.append(pos_gallery_time)
+                        candidate_parent_time_blocks.append(gallery_query_event_time)
                     if (
                         has_negatives
                         and bool(args.gallery_include_extra_negatives)
@@ -2603,11 +2765,19 @@ def evaluate(
                                         device=device, dtype=torch.float32
                                     )
                                 )
+                            candidate_parent_time_blocks.append(
+                                torch.full(
+                                    (batch_size,),
+                                    float("nan"),
+                                    device=device,
+                                    dtype=torch.float32,
+                                )
+                            )
                     h_gallery = torch.cat(h_candidates, dim=0)
                     z_gallery = torch.cat(z_candidates, dim=0)
                     coords_gallery = torch.cat(coords_candidates, dim=0)
                     gallery_gw_indices = torch.cat(candidate_gw_indices, dim=0)
-                    gallery_positive_mask = gw_indices.unsqueeze(
+                    gallery_positive_mask = itc_gw_indices.unsqueeze(
                         1
                     ) == gallery_gw_indices.unsqueeze(0)
                     gallery_candidate_time = (
@@ -2615,19 +2785,25 @@ def evaluate(
                         if candidate_time_blocks
                         else None
                     )
+                    gallery_candidate_parent_time = (
+                        torch.cat(candidate_parent_time_blocks, dim=0)
+                        if candidate_parent_time_blocks
+                        else None
+                    )
                     dt_gallery = build_gallery_time_delta_matrix(
-                        batch_event_time_mjd,
+                        gallery_query_event_time,
                         gallery_candidate_time,
+                        candidate_parent_event_time_mjd=gallery_candidate_parent_time,
                         positive_mask=gallery_positive_mask,
                         distractor_time_mode=args.gallery_distractor_time_mode,
                         distractor_time_window_days=args.gallery_distractor_time_window_days,
                     )
                     gallery_scores = compute_fusion_gallery_score_matrix(
                         model,
-                        g=g,
-                        H_gw=H_gw,
-                        gw_s=gw_s,
-                        gw_m=gw_m,
+                        g=gallery_query_g,
+                        H_gw=gallery_query_H,
+                        gw_s=gallery_query_gw_s,
+                        gw_m=gallery_query_gw_m,
                         h_candidates=h_gallery,
                         z_candidates=z_gallery,
                         opt_coords_candidates=coords_gallery,
@@ -3095,9 +3271,30 @@ def train(args):
         args.gallery_distractor_time_mode = "synthetic_after_gw"
     if args.gallery_distractor_time_mode in {"real", "none"}:
         args.gallery_distractor_time_mode = "actual"
-    if args.gallery_distractor_time_mode not in {"actual", "synthetic_after_gw"}:
+    if args.gallery_distractor_time_mode in {"candidate_relative", "empirical"}:
+        args.gallery_distractor_time_mode = "parent_relative"
+    if args.gallery_distractor_time_mode not in {
+        "actual",
+        "synthetic_after_gw",
+        "parent_relative",
+    }:
         raise ValueError(
-            "gallery_distractor_time_mode must be 'actual' or 'synthetic_after_gw'."
+            "gallery_distractor_time_mode must be 'actual', "
+            "'synthetic_after_gw', or 'parent_relative'."
+        )
+    args.cls_distractor_time_mode = str(args.cls_distractor_time_mode).strip().lower()
+    if args.cls_distractor_time_mode not in {"legacy", "mixed_empirical"}:
+        raise ValueError(
+            "cls_distractor_time_mode must be 'legacy' or 'mixed_empirical'."
+        )
+    if not 0.0 <= float(args.cls_external_empirical_dt_fraction) <= 1.0:
+        raise ValueError("cls_external_empirical_dt_fraction must be in [0, 1].")
+    if args.gallery_distractor_time_mode == "parent_relative" and bool(
+        args.gallery_include_extra_negatives
+    ):
+        raise ValueError(
+            "parent_relative gallery timing requires "
+            "gallery_include_extra_negatives=false."
         )
     if args.gallery_distractor_time_window_days <= 0:
         raise ValueError("gallery_distractor_time_window_days must be > 0.")
@@ -3867,6 +4064,7 @@ def train(args):
                         samples_per_gw=args.samples_per_gw,
                         gw_indices=gw_indices,
                         source_types=batch_source_types,
+                        eligible_candidate_mask=itc_pair_mask,
                     )
 
                     if mis_idx is None:
@@ -3879,8 +4077,14 @@ def train(args):
                         h_l_mis = h_l[mis_idx].clone()
                         z_l_mis = z_l[mis_idx].clone()
                         coords_mis = opt_coords[mis_idx].clone()
-                        dt_mis = sample_mis_neg_dt_days(
-                            batch_size, device, window_days=args.mis_neg_dt_window_days
+                        dt_mis = build_mismatched_classification_time_deltas(
+                            mode=args.cls_distractor_time_mode,
+                            batch_size=batch_size,
+                            device=device,
+                            window_days=args.mis_neg_dt_window_days,
+                            candidate_indices=mis_idx,
+                            opt_first_detection_mjd=_opt_first_detection_mjd,
+                            parent_gw_event_time_mjd=batch_event_time_mjd,
                         )
 
                         cred_level_mis = (
@@ -3923,17 +4127,15 @@ def train(args):
                             if neg_zero_time_mjd_for_cls is not None
                             else None
                         )
-                        dt_neg = (
-                            compute_time_delta_days(
-                                neg_event_time, batch_event_time_mjd
-                            )
-                            if (
-                                neg_event_time is not None
-                                and batch_event_time_mjd is not None
-                            )
-                            else torch.zeros(
-                                (batch_size,), device=device, dtype=torch.float32
-                            )
+                        dt_neg = build_external_classification_time_deltas(
+                            mode=args.cls_distractor_time_mode,
+                            positive_dt_pool=dt_pos[itc_pair_mask],
+                            n_samples=batch_size,
+                            empirical_fraction=args.cls_external_empirical_dt_fraction,
+                            window_days=args.mis_neg_dt_window_days,
+                            negative_event_time_mjd=neg_event_time,
+                            query_event_time_mjd=batch_event_time_mjd,
+                            device=device,
                         )
                         logits_neg = model.fusion_logits(
                             g,
@@ -4012,7 +4214,7 @@ def train(args):
                     total_loss = itc_weight * itc_loss
 
                 # --- Shared gallery computation (independent of CLS branch) ---
-                if is_retrieval_active(args, epoch) and gallery_extra_h_l is not None:
+                if is_retrieval_active(args, epoch) and itc_pair_mask.any():
                     gallery_query_g = g[itc_pair_mask]
                     gallery_query_H = H_gw[itc_pair_mask] if H_gw is not None else None
                     gallery_query_gw_s = gw_s[itc_pair_mask]
@@ -4027,11 +4229,13 @@ def train(args):
                     coords_candidates = [opt_coords[itc_pair_mask]]
                     candidate_gw_indices = [itc_gw_indices]
                     candidate_time_blocks = []
+                    candidate_parent_time_blocks = []
                     if batch_event_time_mjd is not None:
                         pos_gallery_time = resolve_optical_candidate_time_mjd(
                             _opt_first_detection_mjd, batch_event_time_mjd
                         )[itc_pair_mask].to(device=device, dtype=torch.float32)
                         candidate_time_blocks.append(pos_gallery_time)
+                        candidate_parent_time_blocks.append(gallery_query_event_time)
                     if (
                         has_negatives
                         and bool(args.gallery_include_extra_negatives)
@@ -4063,6 +4267,14 @@ def train(args):
                                         device=device, dtype=torch.float32
                                     )
                                 )
+                            candidate_parent_time_blocks.append(
+                                torch.full(
+                                    (batch_size,),
+                                    float("nan"),
+                                    device=device,
+                                    dtype=torch.float32,
+                                )
+                            )
                     h_gallery = torch.cat(h_candidates, dim=0)
                     z_gallery = torch.cat(z_candidates, dim=0)
                     coords_gallery = torch.cat(coords_candidates, dim=0)
@@ -4075,9 +4287,15 @@ def train(args):
                         if candidate_time_blocks
                         else None
                     )
+                    gallery_candidate_parent_time = (
+                        torch.cat(candidate_parent_time_blocks, dim=0)
+                        if candidate_parent_time_blocks
+                        else None
+                    )
                     dt_gallery = build_gallery_time_delta_matrix(
                         gallery_query_event_time,
                         gallery_candidate_time,
+                        candidate_parent_event_time_mjd=gallery_candidate_parent_time,
                         positive_mask=gallery_pos_mask_full,
                         distractor_time_mode=args.gallery_distractor_time_mode,
                         distractor_time_window_days=args.gallery_distractor_time_window_days,
@@ -5266,7 +5484,7 @@ if __name__ == "__main__":
         "--gallery_distractor_time_mode",
         type=str,
         default="actual",
-        choices=["actual", "synthetic_after_gw"],
+        choices=["actual", "synthetic_after_gw", "parent_relative"],
         help="Time-delta policy for non-matching fusion mini-gallery distractors.",
     )
     parser.add_argument(
@@ -5366,6 +5584,23 @@ if __name__ == "__main__":
         default=30.0,
         help="Synthetic time delta for in-batch mismatched negatives: Uniform(0, window_days) days. "
         "Models the realistic scenario where optical first detection follows GW by 0–window days.",
+    )
+    parser.add_argument(
+        "--cls_distractor_time_mode",
+        type=str,
+        default="legacy",
+        choices=["legacy", "mixed_empirical"],
+        help=(
+            "Time-delta policy for mismatched-KN and external classification "
+            "negatives. mixed_empirical uses parent-relative KN delays and a "
+            "mixture of empirical-positive and operational-uniform external dt."
+        ),
+    )
+    parser.add_argument(
+        "--cls_external_empirical_dt_fraction",
+        type=float,
+        default=0.5,
+        help="Fraction of external-negative dt drawn from positive KN delays.",
     )
     parser.add_argument(
         "--hardneg_time_window_days",
