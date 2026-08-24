@@ -4,6 +4,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import pytest
 
 MODEL_DIR = Path(__file__).resolve().parents[2] / "Model"
@@ -17,6 +18,7 @@ from mixed_retrieval import (
     mixed_score_outcome,
     select_source_balanced_queries,
 )
+from scripts.eval import eval_mixed_retrieval_comparison as mixed_eval
 
 
 def _sequences(query_ids: list[int], n_trials: int, n_candidates: int):
@@ -132,3 +134,46 @@ def test_source_balanced_query_selection() -> None:
     assert len(selected) == 6
     assert sum(value < 5 for value in selected) == 3
     assert sum(value >= 5 for value in selected) == 3
+
+
+def test_legacy_plotter_is_called_for_each_condition_and_scope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rows = []
+    for condition in ("training_aligned", "positive_shared"):
+        for scope in ("all", "kn_only", "nonkn_only"):
+            for model in ("Physical Pairing v1", "Default MAGIKS"):
+                for size in (10, 100):
+                    rows.append(
+                        {
+                            "model": model,
+                            "condition": condition,
+                            "scope": scope,
+                            "gallery_size": size,
+                            "source": "all",
+                            "recall_at_1": 0.2,
+                            "recall_at_5": 0.4,
+                            "recall_at_10": 0.5,
+                            "mrr": 0.3,
+                            "random_recall_at_1": 1.0 / size,
+                            "random_recall_at_5": min(5, size) / size,
+                            "random_recall_at_10": min(10, size) / size,
+                            "random_mrr": 0.1,
+                        }
+                    )
+    calls = []
+
+    def fake_plotter(curve_rows, output_dir):
+        calls.append(list(curve_rows))
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "retrieval_curves.png").touch()
+        (output_dir / "retrieval_curves.pdf").touch()
+
+    monkeypatch.setattr(mixed_eval, "plot_retrieval_curves", fake_plotter)
+    paths = mixed_eval._plot_with_legacy_retrieval_plotter(pd.DataFrame(rows), tmp_path)
+
+    assert len(calls) == 6
+    assert len(paths) == 12
+    for curve_rows in calls:
+        random_rows = [row for row in curve_rows if row["method"] == "Random ranking"]
+        assert len(random_rows) == 8

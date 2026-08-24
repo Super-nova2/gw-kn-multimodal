@@ -33,7 +33,10 @@ from mixed_retrieval import (
     mixed_score_outcome,
     select_source_balanced_queries,
 )
-from retrieval_gallery import build_synthetic_time_sky_candidate_sequences
+from retrieval_gallery import (
+    build_synthetic_time_sky_candidate_sequences,
+    plot_retrieval_curves,
+)
 
 from scripts.eval import eval_retrieval_comparison as base
 
@@ -323,6 +326,65 @@ def _aggregate(outcomes: pd.DataFrame, *, kn_fraction: float) -> pd.DataFrame:
     for metric in METRIC_COLUMNS:
         result[f"random_{metric}"] = [item[metric] for item in baselines]
     return result
+
+
+def _plot_with_legacy_retrieval_plotter(
+    metrics: pd.DataFrame, output_dir: Path
+) -> list[str]:
+    """Render each mixed condition/scope with the established curve plotter."""
+    metric_fields = (
+        ("R@1", "recall_at_1", "random_recall_at_1"),
+        ("R@5", "recall_at_5", "random_recall_at_5"),
+        ("R@10", "recall_at_10", "random_recall_at_10"),
+        ("MRR", "mrr", "random_mrr"),
+    )
+    all_source = metrics[metrics["source"].eq("all")]
+    relative_paths: list[str] = []
+    for condition in sorted(all_source["condition"].unique()):
+        for scope in MIXED_SCOPES:
+            panel = all_source[
+                all_source["condition"].eq(condition) & all_source["scope"].eq(scope)
+            ]
+            curve_rows: list[dict[str, Any]] = []
+            for row in panel.to_dict(orient="records"):
+                for metric_label, metric_field, _random_field in metric_fields:
+                    curve_rows.append(
+                        {
+                            "method": str(row["model"]),
+                            "gallery_size_target": int(row["gallery_size"]),
+                            "gallery_size_actual": float(row["gallery_size"]),
+                            "coverage": 1.0,
+                            "fill_ratio_mean": 1.0,
+                            "full_coverage": 1.0,
+                            "metric_name": metric_label,
+                            "metric_value": float(row[metric_field]),
+                        }
+                    )
+            random_rows = panel.groupby("gallery_size", as_index=False).first()
+            for row in random_rows.to_dict(orient="records"):
+                for metric_label, _metric_field, random_field in metric_fields:
+                    curve_rows.append(
+                        {
+                            "method": "Random ranking",
+                            "gallery_size_target": int(row["gallery_size"]),
+                            "gallery_size_actual": float(row["gallery_size"]),
+                            "coverage": 1.0,
+                            "fill_ratio_mean": 1.0,
+                            "full_coverage": 1.0,
+                            "metric_name": metric_label,
+                            "metric_value": float(row[random_field]),
+                        }
+                    )
+            plot_dir = output_dir / "plots" / str(condition) / str(scope)
+            plot_retrieval_curves(curve_rows, plot_dir)
+            for filename in ("retrieval_curves.png", "retrieval_curves.pdf"):
+                plot_path = plot_dir / filename
+                if not plot_path.is_file():
+                    raise RuntimeError(
+                        f"Legacy retrieval plotter did not create {plot_path}"
+                    )
+                relative_paths.append(str(plot_path.relative_to(output_dir)))
+    return relative_paths
 
 
 def _paired_bootstrap(
@@ -677,6 +739,7 @@ def run(config_path: Path) -> None:
     )
     metrics = _aggregate(outcome_frame, kn_fraction=cfg["kn_fraction"])
     metrics.to_csv(output_dir / "mixed_retrieval_metrics.csv", index=False)
+    plot_paths = _plot_with_legacy_retrieval_plotter(metrics, output_dir)
     bootstrap = _paired_bootstrap(
         outcome_frame,
         new_name=str(cfg.get("bootstrap_new_model", "Physical Pairing v1")),
@@ -726,6 +789,7 @@ def run(config_path: Path) -> None:
             "outcomes": "mixed_retrieval_outcomes.csv.gz",
             "metrics": "mixed_retrieval_metrics.csv",
             "paired_bootstrap": "paired_bootstrap.csv",
+            "retrieval_plots": plot_paths,
         },
     }
     temporary = output_dir / "mixed_retrieval_comparison.json.tmp"
