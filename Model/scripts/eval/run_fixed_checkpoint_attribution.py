@@ -864,7 +864,8 @@ def effective_physical_parameters(
 ) -> Dict[str, float]:
     """Return Bulla-template-effective ejecta and viewing parameters."""
     source = str(source_type).lower()
-    dyn = float(row["mej_dyn"])
+    dyn_key = "mej_dyn" if "mej_dyn" in row else "mej_dynamic"
+    dyn = float(row[dyn_key])
     wind = float(row["mej_wind"])
     if source == "bns":
         dyn = float(np.clip(dyn, 0.001, 0.02))
@@ -874,11 +875,17 @@ def effective_physical_parameters(
         wind = float(np.clip(wind, 0.01, 0.09))
     else:
         raise ValueError(f"Unsupported source_type={source_type!r}")
+    if "costheta" in row:
+        costheta = float(row["costheta"])
+    elif "theta_jn" in row:
+        costheta = float(np.cos(float(row["theta_jn"])))
+    else:
+        raise KeyError("Physical catalog requires costheta or theta_jn.")
     return {
         "effective_mej_dyn": dyn,
         "effective_mej_wind": wind,
         "effective_mej_total": dyn + wind,
-        "abs_costheta": abs(float(row["costheta"])),
+        "abs_costheta": abs(costheta),
     }
 
 
@@ -1325,10 +1332,20 @@ def _read_gw_tables(test_data_path: str) -> Dict[str, Any]:
     with h5py.File(test_data_path, "r") as handle:
         gw = handle["events/gw_data"]
         opt = handle["events/optical_data"]
+        event_ids = _decode_strings(gw["ids"][:])
+        simulation_ids = (
+            np.asarray(gw["simulation_id"][:], dtype=np.int64)
+            if "simulation_id" in gw
+            else np.asarray(
+                [int(event_id.rsplit("_", 1)[1]) for event_id in event_ids],
+                dtype=np.int64,
+            )
+        )
         return {
             "scalars": np.asarray(gw["scalars"][:], dtype=np.float32),
             "source_types": _decode_strings(gw["source_type"][:]),
-            "event_ids": _decode_strings(gw["ids"][:]),
+            "event_ids": event_ids,
+            "simulation_ids": simulation_ids,
             "event_time_mjd": np.asarray(gw["event_time_mjd"][:], dtype=np.float64),
             "optical_parent": np.asarray(opt["parent_gw_idx"][:], dtype=np.int64),
         }
@@ -1405,6 +1422,8 @@ def _load_all_kn_bank(
 
 def _load_physical_metadata(
     event_ids: Sequence[str],
+    source_types: Sequence[str],
+    simulation_ids: Sequence[int],
     catalog_paths: Mapping[str, str],
 ) -> Dict[int, Dict[str, float]]:
     catalogs: Dict[str, pd.DataFrame] = {}
@@ -1414,12 +1433,16 @@ def _load_physical_metadata(
             raise ValueError(f"Duplicate simulation_id values in {path}")
         catalogs[str(source).lower()] = frame.set_index("simulation_id", drop=False)
     metadata: Dict[int, Dict[str, float]] = {}
-    for gw_id, event_id in enumerate(event_ids):
-        source, simulation_id = str(event_id).rsplit("_", 1)
-        source = source.lower()
-        if source not in catalogs or int(simulation_id) not in catalogs[source].index:
+    if not (len(event_ids) == len(source_types) == len(simulation_ids)):
+        raise ValueError("GW identity arrays must have equal lengths.")
+    for gw_id, (event_id, source_type, simulation_id) in enumerate(
+        zip(event_ids, source_types, simulation_ids)
+    ):
+        source = str(source_type).lower()
+        simulation_id = int(simulation_id)
+        if source not in catalogs or simulation_id not in catalogs[source].index:
             raise KeyError(f"No physical catalog row for event_id={event_id}")
-        row = catalogs[source].loc[int(simulation_id)]
+        row = catalogs[source].loc[simulation_id]
         metadata[gw_id] = effective_physical_parameters(source, row)
     return metadata
 
@@ -2057,7 +2080,10 @@ def run_condition(config: str | Path) -> None:
     ]
     if cfg["task"] in {"kn_nuisance_matched", "kn_same_source_random"}:
         physical = _load_physical_metadata(
-            gw_tables["event_ids"], cfg["physical_catalogs"]
+            gw_tables["event_ids"],
+            gw_tables["source_types"],
+            gw_tables["simulation_ids"],
+            cfg["physical_catalogs"],
         )
         candidate_rows = _candidate_rows(
             cfg=cfg,

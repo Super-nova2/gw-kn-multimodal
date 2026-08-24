@@ -16,7 +16,7 @@ set -euo pipefail
 SCRIPT_SUBDIR="Model/scripts/eval"
 REPO_NAME="gw-kn-multimodal"
 WORKSPACE_ROOT_DEFAULT="/fred/oz016/bgao_kn"
-DEFAULT_TEMPLATE_REL="Model/args/eval/fixed_checkpoint_attribution_v2.json"
+DEFAULT_TEMPLATE_REL="Model/args/eval/fixed_checkpoint_attribution_v3.json"
 
 if [[ -n "${SLURM_JOB_ID:-}" && -n "${SLURM_SUBMIT_DIR:-}" ]]; then
     if [[ "$(basename "${SLURM_SUBMIT_DIR}")" == "${REPO_NAME}" ]]; then

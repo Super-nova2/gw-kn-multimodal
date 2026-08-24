@@ -36,6 +36,7 @@ from scripts.eval.run_fixed_checkpoint_attribution import (  # noqa: E402
 )
 from scripts.eval.evaluate import _build_gallery_query_cache  # noqa: E402
 from scripts.eval.run_fixed_checkpoint_attribution import (  # noqa: E402
+    _load_physical_metadata,
     _compact_operational_negative_galleries,
     _encode_streamed_negative_bank,
     _read_gw_tables,
@@ -143,6 +144,25 @@ class AttributionPreparationTests(unittest.TestCase):
             )
             self.assertEqual({job["seed"] for job in jobs}, {123, 456})
             self.assertTrue(all(job["payload"]["gallery_trials"] == 10 for job in jobs))
+
+    def test_physical_metadata_uses_explicit_hdf5_identity_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            catalog = Path(tmpdir) / "bns.csv"
+            pd.DataFrame(
+                {
+                    "simulation_id": [3],
+                    "mej_dynamic": [0.005],
+                    "mej_wind": [0.03],
+                    "theta_jn": [np.pi / 3.0],
+                }
+            ).to_csv(catalog, index=False)
+
+            metadata = _load_physical_metadata(
+                ["bns_test_pos_3"], ["bns"], [3], {"bns": str(catalog)}
+            )
+
+            self.assertAlmostEqual(metadata[0]["effective_mej_dyn"], 0.005)
+            self.assertAlmostEqual(metadata[0]["abs_costheta"], 0.5)
 
 
 class AttributionAggregationTests(unittest.TestCase):
