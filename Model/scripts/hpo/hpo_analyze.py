@@ -40,6 +40,8 @@ PREFERRED_SLICE_PARAMS = [
     "gallery_hard_neg_ramp_epochs",
     "gallery_hard_neg_weight",
     "gallery_hard_neg_topk",
+    "gallery_kn_distractor_fraction",
+    "gallery_training_size",
     "time_compat_weight",
     # Backward-compatible legacy params
     "enc_dim",

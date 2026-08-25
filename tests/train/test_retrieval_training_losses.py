@@ -1,5 +1,6 @@
 import sys
 import unittest
+from types import SimpleNamespace
 from pathlib import Path
 
 import numpy as np
@@ -14,16 +15,51 @@ from scripts.train.train import (  # noqa: E402
     build_gallery_time_delta_matrix,
     compute_parent_relative_time_delta_days,
     compute_fusion_gallery_hard_nce_loss,
+    compute_fusion_gallery_stratified_hard_nce_loss,
     compute_fusion_gallery_metrics,
     compute_fusion_gallery_nce_loss,
     compute_gallery_hard_neg_weight,
     compute_residual_rerank_loss,
     is_gallery_hard_neg_enabled,
     sample_mixed_external_time_deltas,
+    sample_mixed_training_gallery_indices,
     sample_mismatched_negatives,
     select_gallery_topk,
 )
 from model import MAGIKSModel  # noqa: E402
+from validation_gallery import (  # noqa: E402
+    mixed_validation_candidate_coordinates,
+    resolve_mixed_validation_settings,
+)
+
+
+class MixedValidationSettingsTests(unittest.TestCase):
+    def test_validation_fractions_are_independent_of_training_tunables(self):
+        args = SimpleNamespace(
+            gallery_kn_distractor_fraction=0.4,
+            gallery_nonkn_empirical_fraction=0.1,
+            validation_gallery_condition="training_aligned",
+            validation_gallery_kn_distractor_fraction=0.25,
+            validation_gallery_nonkn_empirical_fraction=0.5,
+        )
+        settings = resolve_mixed_validation_settings(args)
+        self.assertEqual(settings["condition"], "training_aligned")
+        self.assertEqual(settings["kn_fraction"], 0.25)
+        self.assertEqual(settings["nonkn_empirical_fraction"], 0.5)
+
+    def test_training_aligned_coordinates_match_training_semantics(self):
+        shared = np.array([1.0, 2.0])
+        synthetic = np.zeros((3, 2))
+        coordinates = mixed_validation_candidate_coordinates(
+            "training_aligned",
+            shared,
+            synthetic,
+            n_kn=2,
+            n_nonkn=3,
+        )
+        self.assertIsNone(coordinates["positive"])
+        np.testing.assert_array_equal(coordinates["kn"], np.tile(shared, (2, 1)))
+        np.testing.assert_array_equal(coordinates["nonkn"], synthetic)
 
 
 class _TinySupConModel:
@@ -302,6 +338,69 @@ class GalleryHardNCELossTests(unittest.TestCase):
             prev = hard
 
 
+class MixedGalleryTrainingTests(unittest.TestCase):
+    def test_sampler_preserves_ratio_and_excludes_query_parent(self):
+        torch.manual_seed(12)
+        parent = torch.arange(8).repeat_interleave(4)
+        sampled = sample_mixed_training_gallery_indices(
+            parent,
+            n_external=40,
+            gallery_size=17,
+            kn_fraction=0.25,
+            max_queries=3,
+        )
+        self.assertEqual(tuple(sampled["kn_rows"].shape), (3, 5))
+        self.assertEqual(tuple(sampled["nonkn_rows"].shape), (3, 12))
+        self.assertEqual(sampled["n_kn_negative"], 4)
+        self.assertEqual(sampled["n_nonkn_negative"], 12)
+        for query_row, candidates in zip(sampled["query_rows"], sampled["kn_rows"]):
+            self.assertEqual(int(candidates[0]), int(query_row))
+            self.assertTrue(torch.all(parent[candidates[1:]] != parent[query_row]))
+            self.assertEqual(len(set(candidates[1:].tolist())), 4)
+
+    def test_stratified_hard_loss_uses_requested_type_quota(self):
+        scores = torch.tensor(
+            [[5.0, 4.0, 1.0, 9.0, 8.0, 7.0, 6.0, 0.0]],
+            dtype=torch.float32,
+        )
+        positive = torch.tensor(
+            [[True, False, False, False, False, False, False, False]]
+        )
+        kn = torch.tensor([[False, True, True, False, False, False, False, False]])
+        nonkn = torch.tensor([[False, False, False, True, True, True, True, True]])
+        actual = compute_fusion_gallery_stratified_hard_nce_loss(
+            scores,
+            positive,
+            kn,
+            nonkn,
+            topk=4,
+            kn_fraction=0.25,
+        )
+        # One hardest KN (column 1), three hardest non-KN (columns 3, 4, 5).
+        expected_scores = scores[:, [0, 1, 3, 4, 5]]
+        expected_pos = torch.tensor([[True, False, False, False, False]])
+        expected = compute_fusion_gallery_nce_loss(expected_scores, expected_pos)
+        self.assertTrue(torch.allclose(actual, expected))
+
+    def test_stratified_top32_allocates_eight_kn_and_twenty_four_nonkn(self):
+        scores = torch.arange(41, dtype=torch.float32).reshape(1, -1)
+        positive = torch.zeros_like(scores, dtype=torch.bool)
+        positive[:, 0] = True
+        kn = torch.zeros_like(positive)
+        kn[:, 1:11] = True
+        nonkn = torch.zeros_like(positive)
+        nonkn[:, 11:] = True
+        loss = compute_fusion_gallery_stratified_hard_nce_loss(
+            scores, positive, kn, nonkn, topk=32, kn_fraction=0.25
+        )
+        expected_columns = [0] + list(range(3, 11)) + list(range(17, 41))
+        expected = compute_fusion_gallery_nce_loss(
+            scores[:, expected_columns],
+            torch.tensor([[True] + [False] * 32]),
+        )
+        self.assertTrue(torch.allclose(loss, expected))
+
+
 class FusionGalleryRerankTests(unittest.TestCase):
     def test_gallery_topk_does_not_force_include_positives_by_default(self):
         sim = torch.tensor([[0.9, 0.8, 0.1], [0.7, 0.6, 0.5]], dtype=torch.float32)
@@ -440,6 +539,26 @@ class GalleryHardNegWeightTests(unittest.TestCase):
         self.assertEqual(compute_gallery_hard_neg_weight(args, 24), 0.0)
         self.assertAlmostEqual(compute_gallery_hard_neg_weight(args, 25), 0.5)
         self.assertAlmostEqual(compute_gallery_hard_neg_weight(args, 26), 0.5)
+
+    def test_physical_pairing_v1_hard_weight_ramp(self):
+        args = self._args(
+            staged_training_enable=True,
+            itc_weight=1.0,
+            cls_weight=0.5,
+            stage_itc_epochs=8,
+            stage_cls_ramp_epochs=4,
+            stage_retrieval_ramp_epochs=4,
+            epochs=100,
+            gallery_hard_neg_start_after_retrieval_epochs=4,
+            gallery_hard_neg_ramp_epochs=4,
+            gallery_hard_neg_weight=0.25,
+        )
+        # Zero-based epochs 16..19 correspond to one-based epochs 17..20.
+        self.assertEqual(compute_gallery_hard_neg_weight(args, 15), 0.0)
+        self.assertAlmostEqual(compute_gallery_hard_neg_weight(args, 16), 0.0625)
+        self.assertAlmostEqual(compute_gallery_hard_neg_weight(args, 17), 0.125)
+        self.assertAlmostEqual(compute_gallery_hard_neg_weight(args, 18), 0.1875)
+        self.assertAlmostEqual(compute_gallery_hard_neg_weight(args, 19), 0.25)
 
 
 class ExtendedSimReturnTests(unittest.TestCase):

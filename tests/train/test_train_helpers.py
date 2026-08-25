@@ -676,19 +676,23 @@ class CurrentScheduleConfigTests(unittest.TestCase):
         self.assertEqual(cfg["cls_external_neg_weight"], 0.15)
         self.assertEqual(cfg["gallery_loss_weight"], 1.0)
 
-    def test_physical_pairing_config_uses_kn_only_hard_gallery(self):
+    def test_physical_pairing_config_uses_mixed_gallery(self):
         cfg = self._merged_config("MAGIKS_BNS_NSBH_physical_pairing_v1.json")
 
-        self.assertEqual(cfg["gallery_distractor_time_mode"], "parent_relative")
-        self.assertEqual(cfg["cls_distractor_time_mode"], "mixed_empirical")
-        self.assertEqual(cfg["cls_external_empirical_dt_fraction"], 0.5)
+        self.assertEqual(cfg["gallery_candidate_mode"], "mixed_kn_nonkn")
+        self.assertEqual(cfg["gallery_training_size"], 1000)
+        self.assertEqual(cfg["gallery_kn_distractor_fraction"], 0.25)
+        self.assertEqual(cfg["gallery_candidate_coordinate_mode"], "positive_shared")
+        self.assertEqual(cfg["gallery_kn_distractor_time_mode"], "parent_relative")
+        self.assertEqual(cfg["gallery_nonkn_empirical_fraction"], 0.5)
         self.assertFalse(cfg["gallery_include_extra_negatives"])
         self.assertTrue(cfg["gallery_hard_neg_enable"])
         self.assertEqual(cfg["gallery_hard_neg_topk"], 32)
-        self.assertEqual(cfg["gallery_hard_neg_weight"], 0.5)
-        self.assertEqual(cfg["gallery_hard_neg_start_after_retrieval_epochs"], 2)
-        self.assertEqual(cfg["gallery_hard_neg_ramp_epochs"], 3)
-        self.assertEqual(cfg["best_ckpt_metric"], "fusion_gallery_mrr")
+        self.assertEqual(cfg["gallery_hard_neg_weight"], 0.25)
+        self.assertEqual(cfg["gallery_hard_neg_start_after_retrieval_epochs"], 4)
+        self.assertEqual(cfg["gallery_hard_neg_ramp_epochs"], 4)
+        self.assertEqual(cfg["best_ckpt_metric"], "hard_gallery_macro_retrieval_score")
+        self.assertEqual(cfg["validation_gallery_mode"], "mixed_kn_nonkn")
 
     def test_hard_mining_variant_keeps_gallery_hard_mining_disabled(self):
         cfg = self._merged_config("MAGIKS_BNS_NSBH_hard_mining.json")

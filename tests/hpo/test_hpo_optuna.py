@@ -61,12 +61,35 @@ class HpoObjectiveTests(unittest.TestCase):
         self.assertTrue(math.isnan(score))
 
 
+    def test_mixed_gallery_objective_uses_explicit_alias(self):
+        hpo = load_hpo_module()
+        results = {"val_mixed_gallery_macro_retrieval_score": 0.73}
+
+        score = hpo.compute_objective_score(
+            results,
+            hpo.OBJECTIVE_PRESETS[
+                "mixed_gallery_training_aligned_macro_retrieval"
+            ],
+        )
+
+        self.assertEqual(score, 0.73)
+
 class HpoV6ConfigTests(unittest.TestCase):
     def test_current_training_keys_are_allowed_by_hpo(self):
         hpo = load_hpo_module()
         required = {
             "neg_gw_pair_ratio",
+            "gallery_candidate_mode",
+            "gallery_training_size",
+            "gallery_kn_distractor_fraction",
+            "gallery_candidate_coordinate_mode",
+            "gallery_kn_distractor_time_mode",
+            "gallery_nonkn_distractor_time_mode",
+            "gallery_nonkn_empirical_fraction",
             "staged_training_enable",
+            "validation_gallery_condition",
+            "validation_gallery_kn_distractor_fraction",
+            "validation_gallery_nonkn_empirical_fraction",
             "stage_itc_epochs",
             "stage_cls_ramp_epochs",
             "stage_retrieval_ramp_epochs",
@@ -187,6 +210,18 @@ class HpoV6ConfigTests(unittest.TestCase):
             candidate, baseline, min_neg_recall=0.85, max_auprc_drop=0.005
         )
         self.assertTrue(hpo.constraints_are_feasible(values))
+        metrics = {"gallery_100_mrr": 0.8, "gallery_100_recall_at_1": 0.8}
+        baseline["val_mixed_gallery"] = {"by_source": {"bns": metrics}}
+        candidate["val_mixed_gallery"] = {"by_source": {"bns": metrics}}
+        values = hpo.compute_relative_constraint_values(
+            candidate,
+            baseline,
+            min_neg_recall=0.85,
+            max_auprc_drop=0.005,
+            gallery_size_weights={100: 1.0},
+            max_worst_source_drop=0.005,
+        )
+        self.assertEqual(len(values), 3)
         records = [
             {"trial_number": 0, "score": 0.1, "constraints": [0.1, 0.0]},
             {"trial_number": 1, "score": 0.9, "constraints": [-0.1, -0.1]},

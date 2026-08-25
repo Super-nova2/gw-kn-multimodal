@@ -5,7 +5,7 @@
   "epochs": 100,
   "batch_size": 1024,
   "steps_per_epoch": 100,
-  "ckpt_path": "<BASE_DIR>/data/model/checkpoints_bns_nsbh/bns_nsbh_physical_pairing_v1",
+  "ckpt_path": "<BASE_DIR>/data/model/checkpoints_bns_nsbh/bns_nsbh_physical_pairing_mixed_v1",
   "stage_to_jobfs": true,
   "cache_in_memory": true,
   "val_split": 0.2,
@@ -32,8 +32,8 @@
   "time_delta_cls_clip": 10.0,
   "time_compat_weight": 0.6,
   "gallery_hard_neg_enable": true,
-  "gallery_hard_neg_start_after_retrieval_epochs": 2,
-  "gallery_hard_neg_ramp_epochs": 3,
+  "gallery_hard_neg_start_after_retrieval_epochs": 4,
+  "gallery_hard_neg_ramp_epochs": 4,
   "validation_gallery_sizes": [
     100,
     500,
@@ -51,7 +51,7 @@
     "5000": 0.3
   },
   "validation_gallery_eval_interval": 5,
-  "best_ckpt_metric": "fusion_gallery_mrr",
+  "best_ckpt_metric": "hard_gallery_macro_retrieval_score",
   "fusion_physical_weight": 1.5,
   "gallery_include_extra_negatives": false,
   "staged_training_enable": true,
@@ -69,5 +69,13 @@
   "cls_distractor_time_mode": "mixed_empirical",
   "cls_external_empirical_dt_fraction": 0.5,
   "gallery_hard_neg_topk": 32,
-  "gallery_hard_neg_weight": 0.5
+  "gallery_hard_neg_weight": 0.25,
+  "gallery_candidate_mode": "mixed_kn_nonkn",
+  "gallery_training_size": 1000,
+  "gallery_kn_distractor_fraction": 0.25,
+  "gallery_candidate_coordinate_mode": "positive_shared",
+  "gallery_kn_distractor_time_mode": "parent_relative",
+  "gallery_nonkn_distractor_time_mode": "empirical_uniform_mixture",
+  "gallery_nonkn_empirical_fraction": 0.5,
+  "validation_gallery_mode": "mixed_kn_nonkn"
 }

@@ -14,7 +14,7 @@ import os
 import subprocess
 import sys
 import time
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import optuna
@@ -151,6 +151,9 @@ MAGIKS_ARG_KEYS = {
     "val_split_stratify_by_source",
     "validation_gallery_enable",
     "validation_gallery_mode",
+    "validation_gallery_condition",
+    "validation_gallery_kn_distractor_fraction",
+    "validation_gallery_nonkn_empirical_fraction",
     "validation_gallery_sizes",
     "validation_gallery_queries_per_source",
     "validation_gallery_trials",
@@ -170,6 +173,13 @@ MAGIKS_ARG_KEYS = {
     "validation_confirmation_gallery_trials",
     "gallery_score_chunk_size",
     "max_gallery_queries",
+    "gallery_candidate_mode",
+    "gallery_training_size",
+    "gallery_kn_distractor_fraction",
+    "gallery_candidate_coordinate_mode",
+    "gallery_kn_distractor_time_mode",
+    "gallery_nonkn_distractor_time_mode",
+    "gallery_nonkn_empirical_fraction",
     "gallery_include_extra_negatives",
     "gallery_distractor_time_mode",
     "gallery_distractor_time_window_days",
@@ -319,6 +329,9 @@ OBJECTIVE_PRESETS = {
     "hard_gallery_macro_retrieval": {
         "val_hard_gallery_macro_retrieval_score": 1.0,
     },
+    "mixed_gallery_training_aligned_macro_retrieval": {
+        "val_mixed_gallery_macro_retrieval_score": 1.0,
+    },
     # Fully user-defined weighted sum via `objective_weights`.
     "weighted_sum": None,
 }
@@ -335,6 +348,9 @@ SUPPORTED_OBJECTIVE_COMPONENTS = {
     "val_hard_gallery_macro_mrr",
     "val_hard_gallery_macro_recall_at_1",
     "val_hard_gallery_macro_retrieval_score",
+    "val_mixed_gallery_macro_mrr",
+    "val_mixed_gallery_macro_recall_at_1",
+    "val_mixed_gallery_macro_retrieval_score",
     "val_itc_acc",
     "val_neg_gw_min_recall",
     "val_neg_gw_guardrail_met",
@@ -353,6 +369,9 @@ METRIC_SHORT_NAMES = {
     "val_hard_gallery_macro_mrr": "HardMacroMRR",
     "val_hard_gallery_macro_recall_at_1": "HardMacroR@1",
     "val_hard_gallery_macro_retrieval_score": "HardMacroScore",
+    "val_mixed_gallery_macro_mrr": "MixedMacroMRR",
+    "val_mixed_gallery_macro_recall_at_1": "MixedMacroR@1",
+    "val_mixed_gallery_macro_retrieval_score": "MixedMacroScore",
     "val_neg_gw_min_recall": "NegGWMinRecall",
     "val_neg_gw_guardrail_met": "NegGWGuardrail",
 }
@@ -460,8 +479,6 @@ def _validate_successive_halving_config(cfg: Dict[str, Any]) -> None:
     rungs = cfg.get("promotion_rungs")
     if not rungs:
         return
-    if len(cfg["tunable_params"]) != 8:
-        raise ValueError("successive-halving v7 must tune exactly 8 parameters.")
     epochs = [int(item["epochs"]) for item in rungs]
     keeps = [int(item["keep"]) for item in rungs]
     if epochs != sorted(set(epochs)) or epochs[-1] != 100:
@@ -479,6 +496,12 @@ def _validate_successive_halving_config(cfg: Dict[str, Any]) -> None:
         raise ValueError(
             "baseline_trial must specify every and only tunable parameter."
         )
+    for index, anchor in enumerate(cfg.get("anchor_trials", [])):
+        if set(anchor) != set(cfg["tunable_params"]):
+            raise ValueError(
+                f"anchor_trials[{index}] must specify every and only tunable "
+                "parameter."
+            )
     weights = cfg.get("gallery_size_weights", {})
     if {int(size) for size in weights} != {100, 500, 1000, 2000, 5000}:
         raise ValueError(
@@ -651,6 +674,7 @@ def load_hpo_config(config_path: str) -> Dict[str, Any]:
     cfg.setdefault("tunable_params", list(DEFAULT_TUNABLE_PARAMS))
     cfg.setdefault("fixed_overrides", {})
     cfg.setdefault("retrain_overrides", {})
+    cfg.setdefault("anchor_trials", [])
     cfg.setdefault("stage_joint_itc_end_ratio", None)
     cfg.setdefault("num_workers", 4)
 
@@ -677,6 +701,8 @@ def load_hpo_config(config_path: str) -> Dict[str, Any]:
         raise ValueError("fixed_overrides must be an object")
     if not isinstance(cfg["retrain_overrides"], dict):
         raise ValueError("retrain_overrides must be an object")
+    if not isinstance(cfg["anchor_trials"], list):
+        raise ValueError("anchor_trials must be a list")
 
     valid_tunable_names = (MAGIKS_ARG_KEYS - {"hpo_trial_number"}) | DERIVED_PARAM_KEYS
     unknown_tunable = sorted(set(cfg["tunable_params"]) - valid_tunable_names)
@@ -703,6 +729,11 @@ def load_hpo_config(config_path: str) -> Dict[str, Any]:
         if p not in cfg["search_space"]:
             raise ValueError(f"Missing search_space for tunable parameter '{p}'")
         _validate_search_space_spec(p, cfg["search_space"][p])
+    extra_search_space = sorted(set(cfg["search_space"]) - set(cfg["tunable_params"]))
+    if extra_search_space:
+        raise ValueError(
+            f"search_space contains non-tunable parameter(s): {extra_search_space}"
+        )
 
     _validate_balanced_model_capacity_config(cfg)
     _validate_stage_joint_itc_schedule_config(cfg)
@@ -1058,12 +1089,20 @@ def compute_objective_score(
     return weighted_sum / weight_total
 
 
+def _gallery_results(results: Dict[str, Any]) -> Dict[str, Any]:
+    mixed = results.get("val_mixed_gallery")
+    if isinstance(mixed, dict) and mixed:
+        return mixed
+    hard = results.get("val_hard_gallery", {})
+    return hard if isinstance(hard, dict) else {}
+
+
 def compute_retrieval_weighted_score(
     results: Dict[str, Any], gallery_size_weights: Dict[Any, float]
 ) -> float:
     """Score source-macro retrieval with explicit gallery-size importance."""
-    hard = results.get("val_hard_gallery", {})
-    source_macro = hard.get("source_macro", {}) if isinstance(hard, dict) else {}
+    gallery = _gallery_results(results)
+    source_macro = gallery.get("source_macro", {})
     weighted_sum = 0.0
     weight_total = 0.0
     for raw_size, raw_weight in gallery_size_weights.items():
@@ -1078,12 +1117,37 @@ def compute_retrieval_weighted_score(
     return weighted_sum / weight_total if weight_total > 0.0 else float("nan")
 
 
+def compute_worst_source_retrieval_score(
+    results: Dict[str, Any], gallery_size_weights: Dict[Any, float]
+) -> float:
+    """Return the lowest source-specific weighted 0.8 MRR + 0.2 R@1 score."""
+    by_source = _gallery_results(results).get("by_source", {})
+    scores = []
+    for source_metrics in by_source.values():
+        weighted_sum = 0.0
+        weight_total = 0.0
+        for raw_size, raw_weight in gallery_size_weights.items():
+            size = int(raw_size)
+            weight = float(raw_weight)
+            mrr = _read_metric(source_metrics, f"gallery_{size}_mrr")
+            r1 = _read_metric(source_metrics, f"gallery_{size}_recall_at_1")
+            if weight < 0.0 or math.isnan(mrr) or math.isnan(r1):
+                return float("nan")
+            weighted_sum += weight * (0.8 * mrr + 0.2 * r1)
+            weight_total += weight
+        if weight_total > 0.0:
+            scores.append(weighted_sum / weight_total)
+    return min(scores) if scores else float("nan")
+
+
 def compute_relative_constraint_values(
     results: Dict[str, Any],
     baseline_results: Dict[str, Any],
     *,
     min_neg_recall: float,
     max_auprc_drop: float,
+    gallery_size_weights: Optional[Dict[Any, float]] = None,
+    max_worst_source_drop: Optional[float] = None,
 ) -> List[float]:
     """Return Optuna-style violations (feasible iff every value is <= 0)."""
     neg_recall = _read_metric(results, "val_neg_gw_min_recall")
@@ -1093,6 +1157,14 @@ def compute_relative_constraint_values(
         float(min_neg_recall) - neg_recall,
         baseline_auprc - float(max_auprc_drop) - auprc,
     ]
+    if max_worst_source_drop is not None:
+        if gallery_size_weights is None:
+            raise ValueError("gallery_size_weights is required for source constraint")
+        worst = compute_worst_source_retrieval_score(results, gallery_size_weights)
+        baseline_worst = compute_worst_source_retrieval_score(
+            baseline_results, gallery_size_weights
+        )
+        values.append(baseline_worst - float(max_worst_source_drop) - worst)
     return [value if math.isfinite(value) else float("inf") for value in values]
 
 
@@ -1114,7 +1186,12 @@ def select_promotions(records, keep_count: int, baseline_trial_number: int):
     return [baseline] + ranked[: max(0, int(keep_count) - 1)]
 
 
-def summarize_confirmation_runs(runs, size_weights, baseline_trial_number=0):
+def summarize_confirmation_runs(
+    runs,
+    size_weights,
+    baseline_trial_number=0,
+    max_worst_source_drop=None,
+):
     """Apply the predeclared robust replacement gates to confirmation results."""
     grouped = {}
     for run in runs:
@@ -1136,9 +1213,7 @@ def summarize_confirmation_runs(runs, size_weights, baseline_trial_number=0):
                 np.mean(
                     [
                         _read_metric(
-                            x["results"]
-                            .get("val_hard_gallery", {})
-                            .get("source_macro", {}),
+                            _gallery_results(x["results"]).get("source_macro", {}),
                             f"gallery_{size}_mrr",
                         )
                         for x in items
@@ -1146,7 +1221,7 @@ def summarize_confirmation_runs(runs, size_weights, baseline_trial_number=0):
                 )
             )
         for item in items:
-            by_source = item["results"].get("val_hard_gallery", {}).get("by_source", {})
+            by_source = _gallery_results(item["results"]).get("by_source", {})
             for source_metrics in by_source.values():
                 weighted_value = 0.0
                 weight_total = 0.0
@@ -1209,6 +1284,12 @@ def summarize_confirmation_runs(runs, size_weights, baseline_trial_number=0):
             "pooled_neg_recall_ge_0.85": current["pooled_neg_gw_recall"] >= 0.85,
             "each_seed_neg_recall_ge_0.83": current["min_seed_neg_gw_recall"] >= 0.83,
         }
+        if max_worst_source_drop is not None:
+            gates["worst_source_drop_le_limit"] = (
+                current["worst_source_score"]
+                >= baseline_metrics["worst_source_score"]
+                - float(max_worst_source_drop)
+            )
         current.update(
             seed_wins=wins, gates=gates, passes_all_gates=all(gates.values())
         )
@@ -1448,6 +1529,10 @@ def _restore_first_rung_records(study, hpo_cfg, first_epoch, size_weights):
             baseline_results,
             min_neg_recall=float(hpo_cfg["constraints"]["min_neg_gw_recall"]),
             max_auprc_drop=float(hpo_cfg["constraints"]["max_auprc_drop"]),
+            gallery_size_weights=size_weights,
+            max_worst_source_drop=hpo_cfg["constraints"].get(
+                "max_worst_source_drop"
+            ),
         )
         records.append(
             {
@@ -1486,9 +1571,12 @@ def run_successive_halving(hpo_cfg: Dict[str, Any], base_cfg: Dict[str, Any]) ->
     rung_specs = hpo_cfg["promotion_rungs"]
     size_weights = hpo_cfg["gallery_size_weights"]
     baseline_params = hpo_cfg["baseline_trial"]
+    constraint_count = 3 if hpo_cfg["constraints"].get(
+        "max_worst_source_drop"
+    ) is not None else 2
 
     def constraints_func(frozen_trial):
-        return frozen_trial.user_attrs.get("constraint_values", [0.0, 0.0])
+        return frozen_trial.user_attrs.get("constraint_values", [0.0] * constraint_count)
 
     sampler = TPESampler(
         n_startup_trials=int(hpo_cfg["n_startup_trials"]),
@@ -1507,6 +1595,8 @@ def run_successive_halving(hpo_cfg: Dict[str, Any], base_cfg: Dict[str, Any]) ->
     resume_existing = bool(study.trials)
     if not resume_existing:
         study.enqueue_trial(baseline_params)
+        for anchor_params in hpo_cfg["anchor_trials"]:
+            study.enqueue_trial(anchor_params)
     first_epoch = int(rung_specs[0]["epochs"])
     records = (
         _restore_first_rung_records(study, hpo_cfg, first_epoch, size_weights)
@@ -1551,6 +1641,10 @@ def run_successive_halving(hpo_cfg: Dict[str, Any], base_cfg: Dict[str, Any]) ->
             baseline_results,
             min_neg_recall=float(hpo_cfg["constraints"]["min_neg_gw_recall"]),
             max_auprc_drop=float(hpo_cfg["constraints"]["max_auprc_drop"]),
+            gallery_size_weights=size_weights,
+            max_worst_source_drop=hpo_cfg["constraints"].get(
+                "max_worst_source_drop"
+            ),
         )
         record.update(score=score, constraints=constraints)
         record["rungs"][str(first_epoch)] = results
@@ -1598,6 +1692,10 @@ def run_successive_halving(hpo_cfg: Dict[str, Any], base_cfg: Dict[str, Any]) ->
                 baseline_results,
                 min_neg_recall=float(hpo_cfg["constraints"]["min_neg_gw_recall"]),
                 max_auprc_drop=float(hpo_cfg["constraints"]["max_auprc_drop"]),
+                gallery_size_weights=size_weights,
+                max_worst_source_drop=hpo_cfg["constraints"].get(
+                    "max_worst_source_drop"
+                ),
             )
             record.update(config=config, score=score, constraints=constraints)
             record["rungs"][str(epoch_limit)] = results
@@ -1617,9 +1715,12 @@ def run_successive_halving(hpo_cfg: Dict[str, Any], base_cfg: Dict[str, Any]) ->
     confirmation_runs = []
     for record in finalists:
         seed_42_results = dict(record["rungs"][str(rung_specs[-1]["epochs"])])
-        seed_42_results["val_hard_gallery"] = seed_42_results.pop(
-            "val_confirmation_hard_gallery"
-        )
+        confirmation_gallery = seed_42_results.pop("val_confirmation_hard_gallery")
+        seed_42_results["val_hard_gallery"] = confirmation_gallery
+        if confirmation_gallery.get("mode") == "mixed_kn_nonkn" and (
+            confirmation_gallery.get("condition") == "training_aligned"
+        ):
+            seed_42_results["val_mixed_gallery"] = confirmation_gallery
         confirmation_runs.append(
             {
                 "trial_number": record["trial_number"],
@@ -1669,7 +1770,12 @@ def run_successive_halving(hpo_cfg: Dict[str, Any], base_cfg: Dict[str, Any]) ->
         confirmation_runs,
     )
     decision = summarize_confirmation_runs(
-        confirmation_runs, size_weights, baseline_number
+        confirmation_runs,
+        size_weights,
+        baseline_number,
+        hpo_cfg["confirmation"].get(
+            "max_worst_source_drop", hpo_cfg["constraints"].get("max_worst_source_drop")
+        ),
     )
     _write_json(
         os.path.join(hpo_cfg["output_dir"], "confirmation_decision.json"), decision

@@ -16,6 +16,7 @@ from validation_gallery import (
     ValidationGalleryContext,
     parse_validation_gallery_sizes,
 )
+from mixed_retrieval import allocate_mixed_negative_counts
 from tqdm import tqdm
 import torch
 import torch.nn.functional as F
@@ -1442,12 +1443,17 @@ def compute_best_ckpt_stage_epochs(args):
             getattr(args, "cls_ramp_epochs", 0),
         )
 
-    if is_gallery_enabled(args) and not is_staged_training_enabled(args):
-        retrieval_start = int(getattr(args, "retrieval_start_epoch", 0))
-        stage_epochs["fusion_gallery"] = compute_curriculum_full_epoch(
-            retrieval_start,
-            getattr(args, "gallery_loss_ramp_epochs", 0),
+    if is_gallery_enabled(args):
+        retrieval_start = (
+            get_curriculum_phase_start(args, "retrieval_intro")
+            if is_staged_training_enabled(args)
+            else int(getattr(args, "retrieval_start_epoch", 0))
         )
+        if not is_staged_training_enabled(args):
+            stage_epochs["fusion_gallery"] = compute_curriculum_full_epoch(
+                retrieval_start,
+                getattr(args, "gallery_loss_ramp_epochs", 0),
+            )
         if (
             is_gallery_hard_neg_enabled(args)
             and float(getattr(args, "gallery_hard_neg_weight", 0.0)) > 0.0
@@ -1761,6 +1767,209 @@ def compute_fusion_gallery_hard_nce_loss(scores, positive_mask, topk):
     return (torch.logsumexp(reduced, dim=1) - torch.logsumexp(pos_only, dim=1)).mean()
 
 
+def compute_fusion_gallery_stratified_hard_nce_loss(
+    scores,
+    positive_mask,
+    kn_negative_mask,
+    nonkn_negative_mask,
+    *,
+    topk,
+    kn_fraction,
+):
+    """Hard-gallery NCE with a fixed KN/non-KN negative composition."""
+    if scores.ndim != 2:
+        raise ValueError("scores must have shape [n_query, n_candidate].")
+    for name, mask in (
+        ("positive_mask", positive_mask),
+        ("kn_negative_mask", kn_negative_mask),
+        ("nonkn_negative_mask", nonkn_negative_mask),
+    ):
+        if mask.shape != scores.shape:
+            raise ValueError(f"{name} must match scores shape.")
+    positive_mask = positive_mask.to(device=scores.device, dtype=torch.bool)
+    kn_negative_mask = kn_negative_mask.to(device=scores.device, dtype=torch.bool)
+    nonkn_negative_mask = nonkn_negative_mask.to(device=scores.device, dtype=torch.bool)
+    if (positive_mask & (kn_negative_mask | nonkn_negative_mask)).any():
+        raise ValueError("positive and negative type masks must be disjoint.")
+    if (kn_negative_mask & nonkn_negative_mask).any():
+        raise ValueError("KN and non-KN negative masks must be disjoint.")
+
+    topk = int(topk)
+    if topk < 2:
+        raise ValueError("stratified hard gallery topk must be >= 2.")
+    n_kn_target, n_nonkn_target = allocate_mixed_negative_counts(
+        topk + 1, float(kn_fraction)
+    )
+    valid_rows = positive_mask.any(dim=1) & (
+        kn_negative_mask | nonkn_negative_mask
+    ).any(dim=1)
+    if not valid_rows.any():
+        return scores.sum() * 0.0
+
+    scores_v = scores[valid_rows]
+    pos_v = positive_mask[valid_rows]
+    kn_v = kn_negative_mask[valid_rows]
+    nonkn_v = nonkn_negative_mask[valid_rows]
+    neg_large = torch.finfo(scores_v.dtype).min
+    keep = pos_v.clone()
+    for row in range(scores_v.size(0)):
+        selected = []
+        shortages = 0
+        for mask, requested in (
+            (kn_v[row], n_kn_target),
+            (nonkn_v[row], n_nonkn_target),
+        ):
+            candidates = torch.nonzero(mask, as_tuple=False).flatten()
+            take = min(int(requested), int(candidates.numel()))
+            shortages += int(requested) - take
+            if take:
+                local = scores_v[row, candidates].topk(take).indices
+                selected.append(candidates[local])
+        if shortages:
+            already = torch.zeros_like(pos_v[row])
+            for values in selected:
+                already[values] = True
+            fallback = (kn_v[row] | nonkn_v[row]) & ~already
+            candidates = torch.nonzero(fallback, as_tuple=False).flatten()
+            take = min(shortages, int(candidates.numel()))
+            if take:
+                local = scores_v[row, candidates].topk(take).indices
+                selected.append(candidates[local])
+        for values in selected:
+            keep[row, values] = True
+
+    reduced = scores_v.masked_fill(~keep, neg_large)
+    pos_only = scores_v.masked_fill(~pos_v, neg_large)
+    return (torch.logsumexp(reduced, dim=1) - torch.logsumexp(pos_only, dim=1)).mean()
+
+
+def sample_mixed_training_gallery_indices(
+    positive_parent_ids,
+    *,
+    n_external,
+    gallery_size,
+    kn_fraction,
+    max_queries=0,
+):
+    """Sample one-positive mixed galleries from a batch.
+
+    KN rows are sampled without replacement per query. Multiple selected rows
+    may share a non-query parent, preserving the configured ratio when the
+    batch contains fewer unique parents than requested KN distractors.
+    """
+    parent = positive_parent_ids.reshape(-1)
+    if parent.numel() == 0:
+        raise ValueError("mixed gallery requires positive KN rows.")
+    n_kn, n_nonkn = allocate_mixed_negative_counts(gallery_size, kn_fraction)
+    if int(n_external) < n_nonkn:
+        raise ValueError(
+            f"mixed gallery needs {n_nonkn} non-KN rows; batch has {n_external}."
+        )
+
+    unique_parent = torch.unique(parent)
+    max_queries = int(max_queries)
+    if max_queries > 0 and unique_parent.numel() > max_queries:
+        unique_parent = unique_parent[
+            torch.randperm(unique_parent.numel(), device=parent.device)[:max_queries]
+        ]
+    query_rows = []
+    kn_rows = []
+    nonkn_rows = []
+    for query_parent in unique_parent:
+        positives = torch.nonzero(parent == query_parent, as_tuple=False).flatten()
+        target = positives[
+            torch.randint(positives.numel(), (1,), device=parent.device).item()
+        ]
+        eligible = torch.nonzero(parent != query_parent, as_tuple=False).flatten()
+        if eligible.numel() < n_kn:
+            raise ValueError(
+                f"mixed gallery needs {n_kn} KN distractor rows after excluding "
+                f"query parent; batch has {eligible.numel()}."
+            )
+        kn_negative = eligible[
+            torch.randperm(eligible.numel(), device=parent.device)[:n_kn]
+        ]
+        external = torch.randperm(int(n_external), device=parent.device)[:n_nonkn]
+        query_rows.append(target)
+        kn_rows.append(torch.cat([target.reshape(1), kn_negative]))
+        nonkn_rows.append(external)
+    return {
+        "query_rows": torch.stack(query_rows),
+        "kn_rows": torch.stack(kn_rows),
+        "nonkn_rows": torch.stack(nonkn_rows),
+        "n_kn_negative": n_kn,
+        "n_nonkn_negative": n_nonkn,
+    }
+
+
+def build_mixed_training_gallery_batch(
+    *,
+    positive_parent_ids,
+    h_positive,
+    z_positive,
+    coords_positive,
+    positive_dt_days,
+    h_external,
+    z_external,
+    gallery_size,
+    kn_fraction,
+    max_queries,
+    nonkn_empirical_fraction,
+    nonkn_window_days,
+):
+    """Gather query-specific mixed candidate tensors and their type masks."""
+    sampled = sample_mixed_training_gallery_indices(
+        positive_parent_ids,
+        n_external=int(h_external.size(0)),
+        gallery_size=gallery_size,
+        kn_fraction=kn_fraction,
+        max_queries=max_queries,
+    )
+    query_rows = sampled["query_rows"]
+    kn_rows = sampled["kn_rows"]
+    nonkn_rows = sampled["nonkn_rows"]
+    h_gallery = torch.cat([h_positive[kn_rows], h_external[nonkn_rows]], dim=1)
+    z_gallery = torch.cat([z_positive[kn_rows], z_external[nonkn_rows]], dim=1)
+    n_query, n_candidate = h_gallery.shape[:2]
+    shared_coords = (
+        coords_positive[query_rows].unsqueeze(1).expand(n_query, n_candidate, -1)
+    )
+    kn_dt = positive_dt_days[kn_rows]
+    nonkn_dt = torch.stack(
+        [
+            sample_mixed_external_time_deltas(
+                positive_dt_days,
+                sampled["n_nonkn_negative"],
+                empirical_fraction=nonkn_empirical_fraction,
+                window_days=nonkn_window_days,
+            )
+            for _ in range(n_query)
+        ]
+    )
+    dt_gallery = torch.cat([kn_dt, nonkn_dt], dim=1)
+
+    positive_mask = torch.zeros(
+        (n_query, n_candidate), dtype=torch.bool, device=h_gallery.device
+    )
+    positive_mask[:, 0] = True
+    kn_negative_mask = torch.zeros_like(positive_mask)
+    kn_negative_mask[:, 1 : 1 + sampled["n_kn_negative"]] = True
+    nonkn_negative_mask = torch.zeros_like(positive_mask)
+    nonkn_negative_mask[:, 1 + sampled["n_kn_negative"] :] = True
+    return {
+        "query_rows": query_rows,
+        "h_candidates": h_gallery,
+        "z_candidates": z_gallery,
+        "coords_candidates": shared_coords,
+        "dt_days": dt_gallery,
+        "positive_mask": positive_mask,
+        "kn_negative_mask": kn_negative_mask,
+        "nonkn_negative_mask": nonkn_negative_mask,
+        "n_kn_negative": sampled["n_kn_negative"],
+        "n_nonkn_negative": sampled["n_nonkn_negative"],
+    }
+
+
 def compute_fusion_gallery_metrics(scores, positive_mask, ks=(1, 5)):
     """Compute retrieval metrics for fusion-head mini-gallery scores.
 
@@ -1968,7 +2177,19 @@ def compute_fusion_gallery_score_matrix(
     import math
 
     n_query = int(g.size(0))
-    n_candidate = int(h_candidates.size(0))
+    query_specific = h_candidates.ndim == 4
+    if query_specific:
+        if h_candidates.size(0) != n_query:
+            raise ValueError("query-specific candidates must match the query count.")
+        n_candidate = int(h_candidates.size(1))
+        if z_candidates.shape[:2] != (n_query, n_candidate):
+            raise ValueError("query-specific z_candidates must have shape [Q, C, D].")
+        if opt_coords_candidates.shape[:2] != (n_query, n_candidate):
+            raise ValueError(
+                "query-specific opt_coords_candidates must have shape [Q, C, 2]."
+            )
+    else:
+        n_candidate = int(h_candidates.size(0))
     if n_candidate == 0:
         return torch.empty((n_query, 0), dtype=g.dtype, device=g.device)
 
@@ -1997,24 +2218,35 @@ def compute_fusion_gallery_score_matrix(
             n_c = c_end - c_start
 
             g_pair = g_q.unsqueeze(1).expand(n_q, n_c, -1).reshape(n_q * n_c, -1)
-            h_pair = (
-                h_candidates[c_start:c_end]
-                .unsqueeze(0)
-                .expand(n_q, n_c, -1, -1)
-                .reshape(n_q * n_c, h_candidates.size(1), h_candidates.size(2))
-            )
-            z_pair = (
-                z_candidates[c_start:c_end]
-                .unsqueeze(0)
-                .expand(n_q, n_c, -1)
-                .reshape(n_q * n_c, -1)
-            )
-            coords_pair = (
-                opt_coords_candidates[c_start:c_end]
-                .unsqueeze(0)
-                .expand(n_q, n_c, -1)
-                .reshape(n_q * n_c, -1)
-            )
+            if query_specific:
+                h_pair = h_candidates[q_start:q_end, c_start:c_end].reshape(
+                    n_q * n_c, h_candidates.size(2), h_candidates.size(3)
+                )
+                z_pair = z_candidates[q_start:q_end, c_start:c_end].reshape(
+                    n_q * n_c, -1
+                )
+                coords_pair = opt_coords_candidates[
+                    q_start:q_end, c_start:c_end
+                ].reshape(n_q * n_c, -1)
+            else:
+                h_pair = (
+                    h_candidates[c_start:c_end]
+                    .unsqueeze(0)
+                    .expand(n_q, n_c, -1, -1)
+                    .reshape(n_q * n_c, h_candidates.size(1), h_candidates.size(2))
+                )
+                z_pair = (
+                    z_candidates[c_start:c_end]
+                    .unsqueeze(0)
+                    .expand(n_q, n_c, -1)
+                    .reshape(n_q * n_c, -1)
+                )
+                coords_pair = (
+                    opt_coords_candidates[c_start:c_end]
+                    .unsqueeze(0)
+                    .expand(n_q, n_c, -1)
+                    .reshape(n_q * n_c, -1)
+                )
             H_pair = (
                 None
                 if H_q is None
@@ -2124,7 +2356,10 @@ def compute_ckpt_selection_score(val_metrics, metric_name):
         return float(ret_m.get("fusion_gallery_recall_at_5", 0.0))
     if metric_name == "fusion_gallery_mrr":
         return float(ret_m.get("fusion_gallery_mrr", 0.0))
-    if metric_name == "hard_gallery_macro_retrieval_score":
+    if metric_name in {
+        "hard_gallery_macro_retrieval_score",
+        "mixed_gallery_macro_retrieval_score",
+    }:
         return float(val_metrics.get("hard_gallery", {}).get("selection_score", 0.0))
 
     raise ValueError(f"Unsupported best_ckpt_metric: {metric_name}")
@@ -2798,6 +3033,55 @@ def evaluate(
                         distractor_time_mode=args.gallery_distractor_time_mode,
                         distractor_time_window_days=args.gallery_distractor_time_window_days,
                     )
+                    gallery_kn_negative_mask = None
+                    gallery_nonkn_negative_mask = None
+                    if args.gallery_candidate_mode == "mixed_kn_nonkn":
+                        if (
+                            gallery_extra_h_l is None
+                            or gallery_extra_z_l is None
+                            or gallery_query_event_time is None
+                            or not candidate_time_blocks
+                        ):
+                            raise ValueError(
+                                "mixed training gallery requires external non-KN "
+                                "features and KN first-detection/event times."
+                            )
+                        positive_dt_days = compute_parent_relative_time_delta_days(
+                            candidate_time_blocks[0], gallery_query_event_time
+                        )
+                        mixed = build_mixed_training_gallery_batch(
+                            positive_parent_ids=itc_gw_indices,
+                            h_positive=h_l[itc_pair_mask],
+                            z_positive=z_l[itc_pair_mask],
+                            coords_positive=opt_coords[itc_pair_mask],
+                            positive_dt_days=positive_dt_days,
+                            h_external=gallery_extra_h_l,
+                            z_external=gallery_extra_z_l,
+                            gallery_size=args.gallery_training_size,
+                            kn_fraction=args.gallery_kn_distractor_fraction,
+                            max_queries=args.max_gallery_queries,
+                            nonkn_empirical_fraction=(
+                                args.gallery_nonkn_empirical_fraction
+                            ),
+                            nonkn_window_days=args.gallery_distractor_time_window_days,
+                        )
+                        query_rows = mixed["query_rows"]
+                        gallery_query_g = gallery_query_g[query_rows]
+                        gallery_query_H = (
+                            gallery_query_H[query_rows]
+                            if gallery_query_H is not None
+                            else None
+                        )
+                        gallery_query_gw_s = gallery_query_gw_s[query_rows]
+                        gallery_query_gw_m = gallery_query_gw_m[query_rows]
+                        gallery_query_event_time = gallery_query_event_time[query_rows]
+                        h_gallery = mixed["h_candidates"]
+                        z_gallery = mixed["z_candidates"]
+                        coords_gallery = mixed["coords_candidates"]
+                        dt_gallery = mixed["dt_days"]
+                        gallery_positive_mask = mixed["positive_mask"]
+                        gallery_kn_negative_mask = mixed["kn_negative_mask"]
+                        gallery_nonkn_negative_mask = mixed["nonkn_negative_mask"]
                     gallery_scores = compute_fusion_gallery_score_matrix(
                         model,
                         g=gallery_query_g,
@@ -2826,11 +3110,23 @@ def evaluate(
                         total_loss = total_loss + gallery_loss_weight * gallery_loss
                     gallery_hard_weight = compute_gallery_hard_neg_weight(args, epoch)
                     if gallery_hard_weight > 0.0:
-                        gallery_hard_loss = compute_fusion_gallery_hard_nce_loss(
-                            gallery_scores,
-                            gallery_positive_mask,
-                            topk=int(args.gallery_hard_neg_topk),
-                        )
+                        if gallery_kn_negative_mask is not None:
+                            gallery_hard_loss = (
+                                compute_fusion_gallery_stratified_hard_nce_loss(
+                                    gallery_scores,
+                                    gallery_positive_mask,
+                                    gallery_kn_negative_mask,
+                                    gallery_nonkn_negative_mask,
+                                    topk=int(args.gallery_hard_neg_topk),
+                                    kn_fraction=args.gallery_kn_distractor_fraction,
+                                )
+                            )
+                        else:
+                            gallery_hard_loss = compute_fusion_gallery_hard_nce_loss(
+                                gallery_scores,
+                                gallery_positive_mask,
+                                topk=int(args.gallery_hard_neg_topk),
+                            )
                         total_loss = total_loss + (
                             gallery_loss_weight
                             * gallery_hard_weight
@@ -3222,6 +3518,23 @@ def train(args):
             raise ValueError(f"{key} must be >= 0.")
     if args.gallery_hard_neg_topk < 1:
         raise ValueError("gallery_hard_neg_topk must be >= 1.")
+    if args.gallery_candidate_mode == "mixed_kn_nonkn":
+        if args.gallery_training_size < 3:
+            raise ValueError("gallery_training_size must be >= 3 in mixed mode.")
+        if not 0.0 < float(args.gallery_kn_distractor_fraction) < 1.0:
+            raise ValueError("gallery_kn_distractor_fraction must be in (0, 1).")
+        if not 0.0 <= float(args.gallery_nonkn_empirical_fraction) <= 1.0:
+            raise ValueError("gallery_nonkn_empirical_fraction must be in [0, 1].")
+        if args.gallery_candidate_coordinate_mode != "positive_shared":
+            raise ValueError("mixed gallery requires positive_shared coordinates.")
+        if args.gallery_kn_distractor_time_mode != "parent_relative":
+            raise ValueError("mixed gallery requires parent-relative KN timing.")
+        if args.gallery_nonkn_distractor_time_mode != "empirical_uniform_mixture":
+            raise ValueError("mixed gallery requires empirical/uniform non-KN timing.")
+        if args.gallery_hard_neg_enable and args.gallery_hard_neg_topk < 2:
+            raise ValueError("mixed stratified hard-negative topk must be >= 2.")
+        if args.neg_data_path is None:
+            raise ValueError("mixed training gallery requires neg_data_path.")
     if args.gallery_hard_neg_weight < 0:
         raise ValueError("gallery_hard_neg_weight must be >= 0.")
     if args.gallery_hard_neg_start_after_retrieval_epochs < 0:
@@ -3289,8 +3602,10 @@ def train(args):
         )
     if not 0.0 <= float(args.cls_external_empirical_dt_fraction) <= 1.0:
         raise ValueError("cls_external_empirical_dt_fraction must be in [0, 1].")
-    if args.gallery_distractor_time_mode == "parent_relative" and bool(
-        args.gallery_include_extra_negatives
+    if (
+        args.gallery_distractor_time_mode == "parent_relative"
+        and bool(args.gallery_include_extra_negatives)
+        and args.gallery_candidate_mode == "legacy"
     ):
         raise ValueError(
             "parent_relative gallery timing requires "
@@ -3310,6 +3625,14 @@ def train(args):
         getattr(args, "fusion_mode", None), dual_fusion=args.dual_fusion
     )
     args.dual_fusion = args.fusion_mode != "legacy_g2o"
+    if args.gallery_candidate_mode == "mixed_kn_nonkn":
+        if args.fusion_mode != "physical_dual_hgw":
+            raise ValueError("mixed training gallery requires physical_dual_hgw.")
+        if bool(args.use_similarity_as_cls_input):
+            raise ValueError(
+                "mixed positive-shared coordinates require "
+                "use_similarity_as_cls_input=false."
+            )
     args._hardneg_window_days = parse_day_windows(args.hardneg_time_window_days)
 
     torch.manual_seed(args.seed)
@@ -3583,6 +3906,20 @@ def train(args):
     if not cls_branch_enabled:
         print(
             "Retrieval-only mode enabled: fusion/classification branch disabled; extra negatives go into contrastive loss."
+        )
+
+    if args.gallery_candidate_mode == "mixed_kn_nonkn":
+        n_kn, n_nonkn = allocate_mixed_negative_counts(
+            args.gallery_training_size, args.gallery_kn_distractor_fraction
+        )
+        hard_kn, hard_nonkn = allocate_mixed_negative_counts(
+            args.gallery_hard_neg_topk + 1,
+            args.gallery_kn_distractor_fraction,
+        )
+        print(
+            "Mixed training gallery: "
+            f"1 target + {n_kn} KN + {n_nonkn} non-KN; "
+            f"stratified hard negatives={hard_kn} KN + {hard_nonkn} non-KN."
         )
 
     if hasattr(torch, "compile"):
@@ -4300,6 +4637,55 @@ def train(args):
                         distractor_time_mode=args.gallery_distractor_time_mode,
                         distractor_time_window_days=args.gallery_distractor_time_window_days,
                     )
+                    gallery_kn_negative_mask_full = None
+                    gallery_nonkn_negative_mask_full = None
+                    if args.gallery_candidate_mode == "mixed_kn_nonkn":
+                        if (
+                            gallery_extra_h_l is None
+                            or gallery_extra_z_l is None
+                            or gallery_query_event_time is None
+                            or not candidate_time_blocks
+                        ):
+                            raise ValueError(
+                                "mixed training gallery requires external non-KN "
+                                "features and KN first-detection/event times."
+                            )
+                        positive_dt_days = compute_parent_relative_time_delta_days(
+                            candidate_time_blocks[0], gallery_query_event_time
+                        )
+                        mixed = build_mixed_training_gallery_batch(
+                            positive_parent_ids=itc_gw_indices,
+                            h_positive=h_l[itc_pair_mask],
+                            z_positive=z_l[itc_pair_mask],
+                            coords_positive=opt_coords[itc_pair_mask],
+                            positive_dt_days=positive_dt_days,
+                            h_external=gallery_extra_h_l,
+                            z_external=gallery_extra_z_l,
+                            gallery_size=args.gallery_training_size,
+                            kn_fraction=args.gallery_kn_distractor_fraction,
+                            max_queries=args.max_gallery_queries,
+                            nonkn_empirical_fraction=(
+                                args.gallery_nonkn_empirical_fraction
+                            ),
+                            nonkn_window_days=args.gallery_distractor_time_window_days,
+                        )
+                        query_rows = mixed["query_rows"]
+                        gallery_query_g = gallery_query_g[query_rows]
+                        gallery_query_H = (
+                            gallery_query_H[query_rows]
+                            if gallery_query_H is not None
+                            else None
+                        )
+                        gallery_query_gw_s = gallery_query_gw_s[query_rows]
+                        gallery_query_gw_m = gallery_query_gw_m[query_rows]
+                        gallery_query_event_time = gallery_query_event_time[query_rows]
+                        h_gallery = mixed["h_candidates"]
+                        z_gallery = mixed["z_candidates"]
+                        coords_gallery = mixed["coords_candidates"]
+                        dt_gallery = mixed["dt_days"]
+                        gallery_pos_mask_full = mixed["positive_mask"]
+                        gallery_kn_negative_mask_full = mixed["kn_negative_mask"]
+                        gallery_nonkn_negative_mask_full = mixed["nonkn_negative_mask"]
 
                     # Query subsampling: randomly select a subset of queries to
                     # bound GPU memory when scoring against the full candidate gallery.
@@ -4317,6 +4703,16 @@ def train(args):
                         gw_m_q = gallery_query_gw_m[q_idx]
                         dt_q = dt_gallery[q_idx, :] if dt_gallery is not None else None
                         gallery_pos_mask = gallery_pos_mask_full[q_idx, :]
+                        gallery_kn_negative_mask = (
+                            gallery_kn_negative_mask_full[q_idx, :]
+                            if gallery_kn_negative_mask_full is not None
+                            else None
+                        )
+                        gallery_nonkn_negative_mask = (
+                            gallery_nonkn_negative_mask_full[q_idx, :]
+                            if gallery_nonkn_negative_mask_full is not None
+                            else None
+                        )
                     else:
                         g_q = gallery_query_g
                         H_q = gallery_query_H
@@ -4324,6 +4720,8 @@ def train(args):
                         gw_m_q = gallery_query_gw_m
                         dt_q = dt_gallery
                         gallery_pos_mask = gallery_pos_mask_full
+                        gallery_kn_negative_mask = gallery_kn_negative_mask_full
+                        gallery_nonkn_negative_mask = gallery_nonkn_negative_mask_full
 
                     gallery_scores = compute_fusion_gallery_score_matrix(
                         model,
@@ -4345,11 +4743,23 @@ def train(args):
                         total_loss = total_loss + gallery_loss_weight * gallery_loss
                     gallery_hard_weight = compute_gallery_hard_neg_weight(args, epoch)
                     if gallery_hard_weight > 0.0:
-                        gallery_hard_loss = compute_fusion_gallery_hard_nce_loss(
-                            gallery_scores,
-                            gallery_pos_mask,
-                            topk=int(args.gallery_hard_neg_topk),
-                        )
+                        if gallery_kn_negative_mask is not None:
+                            gallery_hard_loss = (
+                                compute_fusion_gallery_stratified_hard_nce_loss(
+                                    gallery_scores,
+                                    gallery_pos_mask,
+                                    gallery_kn_negative_mask,
+                                    gallery_nonkn_negative_mask,
+                                    topk=int(args.gallery_hard_neg_topk),
+                                    kn_fraction=args.gallery_kn_distractor_fraction,
+                                )
+                            )
+                        else:
+                            gallery_hard_loss = compute_fusion_gallery_hard_nce_loss(
+                                gallery_scores,
+                                gallery_pos_mask,
+                                topk=int(args.gallery_hard_neg_topk),
+                            )
                         total_loss = total_loss + (
                             gallery_loss_weight
                             * gallery_hard_weight
@@ -4795,6 +5205,21 @@ def train(args):
                                 "val_hard_gallery_macro_retrieval_score"
                             ] = hard_gallery["selection_score"]
                             best_val_metrics["val_hard_gallery"] = hard_gallery
+                            if (
+                                hard_gallery.get("mode") == "mixed_kn_nonkn"
+                                and hard_gallery.get("condition")
+                                == "training_aligned"
+                            ):
+                                best_val_metrics["val_mixed_gallery_macro_mrr"] = (
+                                    hard_gallery["macro_mrr"]
+                                )
+                                best_val_metrics[
+                                    "val_mixed_gallery_macro_recall_at_1"
+                                ] = hard_gallery["macro_recall_at_1"]
+                                best_val_metrics[
+                                    "val_mixed_gallery_macro_retrieval_score"
+                                ] = hard_gallery["selection_score"]
+                                best_val_metrics["val_mixed_gallery"] = hard_gallery
                         best_val_metrics["neg_gw_strata"] = strata_m
                         best_val_metrics["neg_gw_guardrail"] = neg_gw_guardrail
                         best_val_metrics["val_neg_gw_min_recall"] = float(
@@ -5079,6 +5504,7 @@ if __name__ == "__main__":
             "fusion_gallery_recall_at_5",
             "fusion_gallery_mrr",
             "hard_gallery_macro_retrieval_score",
+            "mixed_gallery_macro_retrieval_score",
         ],
         help="In-domain validation metric used for selecting best checkpoint. Supports classification and retrieval metrics.",
     )
@@ -5107,6 +5533,27 @@ if __name__ == "__main__":
         "--validation_gallery_mode",
         type=str,
         default="synthetic_time_sky_hard",
+    )
+    parser.add_argument(
+        "--validation_gallery_condition",
+        choices=["positive_shared", "training_aligned"],
+        default="positive_shared",
+        help="Coordinate condition for mixed KN/non-KN validation galleries.",
+    )
+    parser.add_argument(
+        "--validation_gallery_kn_distractor_fraction",
+        type=float,
+        default=None,
+        help="Fixed KN distractor fraction for validation; defaults to the training value.",
+    )
+    parser.add_argument(
+        "--validation_gallery_nonkn_empirical_fraction",
+        type=float,
+        default=None,
+        help=(
+            "Fixed empirical-time fraction for non-KN validation distractors; "
+            "defaults to the training value."
+        ),
     )
     parser.add_argument(
         "--validation_gallery_sizes",
@@ -5473,6 +5920,48 @@ if __name__ == "__main__":
         type=int,
         default=0,
         help="Max queries for fusion gallery scoring during training (0 = use all queries).",
+    )
+    parser.add_argument(
+        "--gallery_candidate_mode",
+        choices=["legacy", "mixed_kn_nonkn"],
+        default="legacy",
+        help="Candidate construction for the fusion training gallery.",
+    )
+    parser.add_argument(
+        "--gallery_training_size",
+        type=int,
+        default=1000,
+        help="Total candidates per query in mixed training galleries.",
+    )
+    parser.add_argument(
+        "--gallery_kn_distractor_fraction",
+        type=float,
+        default=0.25,
+        help="Fraction of mixed-gallery distractors that are KN light curves.",
+    )
+    parser.add_argument(
+        "--gallery_candidate_coordinate_mode",
+        choices=["native", "positive_shared"],
+        default="native",
+        help="Coordinate policy for training gallery candidates.",
+    )
+    parser.add_argument(
+        "--gallery_kn_distractor_time_mode",
+        choices=["parent_relative"],
+        default="parent_relative",
+        help="Time policy for KN distractors in mixed galleries.",
+    )
+    parser.add_argument(
+        "--gallery_nonkn_distractor_time_mode",
+        choices=["empirical_uniform_mixture"],
+        default="empirical_uniform_mixture",
+        help="Time policy for non-KN distractors in mixed galleries.",
+    )
+    parser.add_argument(
+        "--gallery_nonkn_empirical_fraction",
+        type=float,
+        default=0.5,
+        help="Empirical-KN fraction of mixed-gallery non-KN time offsets.",
     )
     parser.add_argument(
         "--gallery_include_extra_negatives",

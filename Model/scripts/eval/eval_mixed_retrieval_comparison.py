@@ -10,7 +10,7 @@ import json
 import os
 import random
 import sys
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -39,8 +39,11 @@ from retrieval_gallery import (
 )
 
 from scripts.eval import eval_retrieval_comparison as base
+from scripts.eval import mixed_retrieval_analysis as analysis
 
-METRIC_COLUMNS = ("recall_at_1", "recall_at_5", "recall_at_10", "mrr")
+METRIC_COLUMNS = analysis.METRIC_COLUMNS
+
+SOURCE_AGGREGATIONS = ("pooled", "source_macro")
 
 
 def _json_default(value: Any) -> Any:
@@ -78,6 +81,8 @@ def _resolve_path(cfg_dir: Path, value: Any) -> str | None:
 def _normalise_config(raw: Mapping[str, Any], config_path: Path) -> dict[str, Any]:
     cfg_dir = config_path.parent
     cfg = dict(raw)
+    cfg["requested_test_data_path"] = str(cfg.get("test_data_path", ""))
+    cfg["requested_neg_data_path"] = str(cfg.get("neg_data_path", ""))
     cfg["test_data_path"] = _resolve_path(cfg_dir, cfg.get("test_data_path"))
     cfg["neg_data_path"] = _resolve_path(cfg_dir, cfg.get("neg_data_path"))
     cfg["output_dir"] = _resolve_path(cfg_dir, cfg.get("output_dir"))
@@ -89,7 +94,7 @@ def _normalise_config(raw: Mapping[str, Any], config_path: Path) -> dict[str, An
     cfg["seed"] = int(cfg.get("seed", 42))
     cfg["kn_fraction"] = float(cfg.get("kn_fraction", 0.25))
     cfg["kn_candidate_mode"] = str(cfg.get("kn_candidate_mode", "kn_random")).lower()
-    cfg["n_neg_samples"] = int(cfg.get("n_neg_samples", 100000))
+    cfg["n_neg_samples"] = int(cfg.get("n_neg_samples", 500000))
     cfg["neg_group"] = str(cfg.get("neg_group", "ELASTICC/optical_data"))
     cfg["batch_size"] = int(cfg.get("batch_size", 512))
     cfg["num_workers"] = int(cfg.get("num_workers", 2))
@@ -114,6 +119,79 @@ def _normalise_config(raw: Mapping[str, Any], config_path: Path) -> dict[str, An
     unknown = set(cfg["conditions"]) - {"training_aligned", "positive_shared"}
     if unknown:
         raise ValueError(f"Unsupported conditions: {sorted(unknown)}")
+    cfg["primary_condition"] = str(cfg.get("primary_condition", "training_aligned"))
+    cfg["primary_scope"] = str(cfg.get("primary_scope", "all"))
+    if cfg["primary_condition"] not in cfg["conditions"]:
+        raise ValueError("primary_condition must be included in conditions")
+    if cfg["primary_scope"] not in MIXED_SCOPES:
+        raise ValueError(f"primary_scope must be one of {MIXED_SCOPES}")
+    cfg["bootstrap_samples"] = int(cfg.get("bootstrap_samples", 5000))
+    cfg["bootstrap_seed"] = int(cfg.get("bootstrap_seed", int(cfg["seed"]) + 17))
+    if cfg["bootstrap_samples"] < 1:
+        raise ValueError("bootstrap_samples must be >= 1")
+
+    primary = dict(cfg.get("primary_metric", {}))
+    primary["name"] = str(primary.get("name", "training_selection_score"))
+    primary["source_aggregation"] = str(
+        primary.get("source_aggregation", "source_macro")
+    )
+    primary["metric_weights"] = {
+        str(key): float(value)
+        for key, value in primary.get(
+            "metric_weights", {"mrr": 0.8, "recall_at_1": 0.2}
+        ).items()
+    }
+    primary["gallery_size_weights"] = {
+        int(key): float(value)
+        for key, value in primary.get(
+            "gallery_size_weights",
+            {100: 0.10, 500: 0.15, 1000: 0.20, 2000: 0.25, 5000: 0.30},
+        ).items()
+    }
+    if primary["source_aggregation"] != "source_macro":
+        raise ValueError("primary_metric.source_aggregation must be source_macro")
+    if set(primary["metric_weights"]) - set(METRIC_COLUMNS):
+        raise ValueError("primary_metric contains an unsupported metric")
+    if not set(primary["gallery_size_weights"]).issubset(cfg["gallery_sizes"]):
+        raise ValueError("primary_metric gallery sizes must be evaluated")
+    for key in ("metric_weights", "gallery_size_weights"):
+        if not np.isclose(sum(primary[key].values()), 1.0):
+            raise ValueError(f"primary_metric.{key} weights must sum to 1")
+    cfg["primary_metric"] = primary
+
+    redshift = dict(cfg.get("redshift_analysis", {}))
+    redshift["enabled"] = bool(redshift.get("enabled", False))
+    if redshift["enabled"]:
+        redshift["catalogs"] = base._normalize_redshift_catalog_paths(
+            redshift.get("catalogs"), cfg_dir
+        )
+        redshift["bin_edges"], redshift["bin_labels"] = (
+            base._normalize_redshift_bin_config(
+                redshift.get("bin_edges"), redshift.get("bin_labels")
+            )
+        )
+        redshift["primary_gallery_size"] = int(
+            redshift.get("primary_gallery_size", 1000)
+        )
+        if redshift["primary_gallery_size"] not in cfg["gallery_sizes"]:
+            raise ValueError("redshift primary_gallery_size must be evaluated")
+        redshift["aggregations"] = [
+            str(value)
+            for value in redshift.get("aggregations", list(SOURCE_AGGREGATIONS))
+        ]
+        unknown_aggregations = set(redshift["aggregations"]) - set(SOURCE_AGGREGATIONS)
+        if unknown_aggregations:
+            raise ValueError(
+                f"Unsupported redshift aggregations: {sorted(unknown_aggregations)}"
+            )
+        redshift["min_queries_per_bin_pooled"] = int(
+            redshift.get("min_queries_per_bin_pooled", 30)
+        )
+        redshift["min_queries_per_bin_source"] = int(
+            redshift.get("min_queries_per_bin_source", 10)
+        )
+        redshift["validate_scalars"] = bool(redshift.get("validate_scalars", True))
+    cfg["redshift_analysis"] = redshift
     if not cfg["test_data_path"] or not cfg["neg_data_path"] or not cfg["output_dir"]:
         raise ValueError("test_data_path, neg_data_path and output_dir are required")
     if not 0.0 <= cfg["nonkn_training_empirical_fraction"] <= 1.0:
@@ -213,6 +291,144 @@ def _candidate_dt(metadata: Mapping[str, Any], indices: np.ndarray) -> np.ndarra
     first = np.asarray(metadata["first_detection_mjd"], dtype=np.float64)[indices]
     event = np.asarray(metadata["event_time_mjd"], dtype=np.float64)[parent]
     return np.abs(first - event).astype(np.float32)
+
+
+def _condition_candidate_features(
+    condition: str,
+    *,
+    positive_coordinate: np.ndarray,
+    positive_dt_days: np.ndarray,
+    kn_dt_days: np.ndarray,
+    nonkn_synthetic_coordinates: np.ndarray,
+    nonkn_training_aligned_dt_days: np.ndarray,
+    n_kn: int,
+    n_nonkn: int,
+) -> dict[str, np.ndarray | None]:
+    """Return candidate sky/time features for one evaluation condition."""
+    positive_coordinate = np.asarray(positive_coordinate, dtype=np.float32).reshape(
+        1, 2
+    )
+    positive_dt_days = np.asarray(positive_dt_days, dtype=np.float32).reshape(1)
+    if condition == "positive_shared":
+        return {
+            "positive_coordinates": positive_coordinate,
+            "kn_coordinates": np.repeat(positive_coordinate, int(n_kn), axis=0),
+            "nonkn_coordinates": np.repeat(positive_coordinate, int(n_nonkn), axis=0),
+            "kn_dt_days": np.full(int(n_kn), positive_dt_days[0], dtype=np.float32),
+            "nonkn_dt_days": np.full(
+                int(n_nonkn), positive_dt_days[0], dtype=np.float32
+            ),
+        }
+    if condition != "training_aligned":
+        raise ValueError(f"Unsupported condition: {condition}")
+    return {
+        "positive_coordinates": None,
+        "kn_coordinates": np.repeat(positive_coordinate, int(n_kn), axis=0),
+        "nonkn_coordinates": np.asarray(nonkn_synthetic_coordinates, dtype=np.float32),
+        "kn_dt_days": np.asarray(kn_dt_days, dtype=np.float32),
+        "nonkn_dt_days": np.asarray(nonkn_training_aligned_dt_days, dtype=np.float32),
+    }
+
+
+def _validate_redshift_query_metadata(
+    query_gw: Sequence[int],
+    source_types: Sequence[str],
+    redshift_metadata: Mapping[int, Mapping[str, Any]],
+    *,
+    bin_edges: Sequence[float],
+    bin_labels: Sequence[str],
+    min_pooled: int,
+    min_per_source: int,
+) -> tuple[dict[int, dict[str, Any]], list[dict[str, Any]]]:
+    """Validate query redshift coverage and return per-query metadata and bin counts."""
+    query_rows: dict[int, dict[str, Any]] = {}
+    missing: list[int] = []
+    outside: list[tuple[int, float]] = []
+    for gw_id in query_gw:
+        if int(gw_id) not in redshift_metadata:
+            missing.append(int(gw_id))
+            continue
+        redshift = float(redshift_metadata[int(gw_id)]["redshift"])
+        bin_index = base._find_redshift_bin(redshift, list(bin_edges))
+        if not np.isfinite(redshift) or bin_index < 0:
+            outside.append((int(gw_id), redshift))
+            continue
+        query_rows[int(gw_id)] = {
+            "redshift": redshift,
+            "redshift_bin_index": int(bin_index),
+            "redshift_bin_label": str(bin_labels[bin_index]),
+            "source": str(source_types[int(gw_id)]).lower(),
+        }
+    if missing:
+        raise ValueError(
+            f"Missing redshift metadata for {len(missing)} selected GW IDs; "
+            f"examples={missing[:5]}"
+        )
+    if outside:
+        raise ValueError(
+            f"{len(outside)} selected GW redshifts fall outside configured bins; "
+            f"examples={outside[:5]}"
+        )
+
+    counts: list[dict[str, Any]] = []
+    for bin_index, label in enumerate(bin_labels):
+        in_bin = [
+            row for row in query_rows.values() if row["redshift_bin_index"] == bin_index
+        ]
+        pooled = len(in_bin)
+        counts.append(
+            {
+                "redshift_bin_index": int(bin_index),
+                "redshift_bin_label": str(label),
+                "source": "pooled",
+                "n_queries": int(pooled),
+            }
+        )
+        if pooled < int(min_pooled):
+            raise ValueError(
+                f"Redshift bin {label!r} has {pooled} pooled queries; "
+                f"minimum is {min_pooled}"
+            )
+        for source in sorted({row["source"] for row in query_rows.values()}):
+            source_count = sum(row["source"] == source for row in in_bin)
+            counts.append(
+                {
+                    "redshift_bin_index": int(bin_index),
+                    "redshift_bin_label": str(label),
+                    "source": source,
+                    "n_queries": int(source_count),
+                }
+            )
+            if source_count < int(min_per_source):
+                raise ValueError(
+                    f"Redshift bin {label!r} has {source_count} {source} queries; "
+                    f"minimum is {min_per_source}"
+                )
+    return query_rows, counts
+
+
+def _load_query_redshifts(
+    cfg: Mapping[str, Any],
+    query_gw: Sequence[int],
+    source_types: Sequence[str],
+) -> tuple[dict[int, dict[str, Any]], list[dict[str, Any]]]:
+    redshift_cfg = cfg["redshift_analysis"]
+    if not redshift_cfg.get("enabled", False):
+        return {}, []
+    metadata = base._build_redshift_metadata_from_catalogs(
+        cfg["test_data_path"],
+        redshift_cfg["catalogs"],
+        validate_scalars=redshift_cfg["validate_scalars"],
+    )
+    return _validate_redshift_query_metadata(
+        query_gw,
+        source_types,
+        metadata,
+        bin_edges=redshift_cfg["bin_edges"],
+        bin_labels=redshift_cfg["bin_labels"],
+        min_pooled=redshift_cfg["min_queries_per_bin_pooled"],
+        min_per_source=redshift_cfg["min_queries_per_bin_source"],
+    )
 
 
 def _random_baseline(n_candidates: int) -> dict[str, float]:
@@ -395,42 +611,14 @@ def _paired_bootstrap(
     n_bootstrap: int,
     seed: int,
 ) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    key_columns = ["condition", "scope", "gallery_size", "trial", "gw_id", "source"]
-    new = outcomes[outcomes["model"] == new_name].set_index(key_columns)
-    old = outcomes[outcomes["model"] == baseline_name].set_index(key_columns)
-    common = new.index.intersection(old.index)
-    if common.empty:
-        return rows
-    joined = new.loc[common, list(METRIC_COLUMNS)].sort_index()
-    old_joined = old.loc[common, list(METRIC_COLUMNS)].sort_index()
-    delta = joined - old_joined
-    rng = np.random.default_rng(int(seed))
-    for group_key, frame in delta.reset_index().groupby(
-        ["condition", "scope", "gallery_size", "source"], sort=True
-    ):
-        condition, scope, size, source = group_key
-        for metric in METRIC_COLUMNS:
-            values = frame[metric].to_numpy(dtype=np.float64)
-            draws = np.empty(int(n_bootstrap), dtype=np.float64)
-            for index in range(int(n_bootstrap)):
-                draws[index] = rng.choice(values, size=values.size, replace=True).mean()
-            rows.append(
-                {
-                    "condition": condition,
-                    "scope": scope,
-                    "gallery_size": int(size),
-                    "source": source,
-                    "metric": metric,
-                    "new_model": new_name,
-                    "baseline_model": baseline_name,
-                    "mean_delta": float(values.mean()),
-                    "ci_low": float(np.quantile(draws, 0.025)),
-                    "ci_high": float(np.quantile(draws, 0.975)),
-                    "n_pairs": int(values.size),
-                }
-            )
-    return rows
+    collapsed = analysis.collapse_trials(outcomes)
+    return analysis.paired_bootstrap(
+        collapsed,
+        new_name=new_name,
+        baseline_name=baseline_name,
+        n_bootstrap=n_bootstrap,
+        seed=seed,
+    ).to_dict(orient="records")
 
 
 def run(config_path: Path) -> None:
@@ -458,6 +646,9 @@ def run(config_path: Path) -> None:
         metadata["source_types"],
         queries_per_source=cfg["queries_per_source"],
         seed=seed,
+    )
+    query_redshifts, redshift_bin_counts = _load_query_redshifts(
+        cfg, query_gw, metadata["source_types"]
     )
     all_kn_indices = np.arange(metadata["parent"].size, dtype=np.int64)
     kn_bank, remap = base.load_selected_positive_bank(
@@ -655,27 +846,17 @@ def run(config_path: Path) -> None:
                 pos_dt = _candidate_dt(metadata, np.asarray([pos_idx], dtype=np.int64))
                 kn_dt = _candidate_dt(metadata, kn_idx)
                 for condition in cfg["conditions"]:
-                    shared = condition == "positive_shared"
-                    pos_coords = pos_coord.reshape(1, 2) if shared else None
-                    kn_coords = np.repeat(pos_coord.reshape(1, 2), kn_idx.size, axis=0)
-                    nonkn_coords = (
-                        np.repeat(pos_coord.reshape(1, 2), nonkn_idx.size, axis=0)
-                        if shared
-                        else np.asarray(
-                            spec["nonkn_synthetic_coordinates"], dtype=np.float32
-                        )
-                    )
-                    kn_dt_values = (
-                        np.full(kn_idx.size, pos_dt[0], dtype=np.float32)
-                        if shared
-                        else kn_dt
-                    )
-                    nonkn_dt_values = (
-                        np.full(nonkn_idx.size, pos_dt[0], dtype=np.float32)
-                        if shared
-                        else np.asarray(
-                            spec["nonkn_training_aligned_dt_days"], dtype=np.float32
-                        )
+                    features = _condition_candidate_features(
+                        condition,
+                        positive_coordinate=pos_coord,
+                        positive_dt_days=pos_dt,
+                        kn_dt_days=kn_dt,
+                        nonkn_synthetic_coordinates=spec["nonkn_synthetic_coordinates"],
+                        nonkn_training_aligned_dt_days=spec[
+                            "nonkn_training_aligned_dt_days"
+                        ],
+                        n_kn=kn_idx.size,
+                        n_nonkn=nonkn_idx.size,
                     )
                     pos_scores = base._score_candidate_bank_with_logits(
                         model,
@@ -684,7 +865,7 @@ def run(config_path: Path) -> None:
                         kn_embeddings,
                         device,
                         dual,
-                        candidate_coords=pos_coords,
+                        candidate_coords=features["positive_coordinates"],
                         candidate_abs_dt_days=pos_dt,
                         amp_dtype=amp_dtype,
                         amp_enabled=amp_enabled,
@@ -696,8 +877,8 @@ def run(config_path: Path) -> None:
                         kn_embeddings,
                         device,
                         dual,
-                        candidate_coords=kn_coords,
-                        candidate_abs_dt_days=kn_dt_values,
+                        candidate_coords=features["kn_coordinates"],
+                        candidate_abs_dt_days=features["kn_dt_days"],
                         amp_dtype=amp_dtype,
                         amp_enabled=amp_enabled,
                     )
@@ -708,8 +889,8 @@ def run(config_path: Path) -> None:
                         nonkn_embeddings,
                         device,
                         dual,
-                        candidate_coords=nonkn_coords,
-                        candidate_abs_dt_days=nonkn_dt_values,
+                        candidate_coords=features["nonkn_coordinates"],
+                        candidate_abs_dt_days=features["nonkn_dt_days"],
                         amp_dtype=amp_dtype,
                         amp_enabled=amp_enabled,
                     )
@@ -734,22 +915,59 @@ def run(config_path: Path) -> None:
             torch.cuda.empty_cache()
 
     outcome_frame = pd.DataFrame(outcomes)
+    if query_redshifts:
+        outcome_frame["redshift"] = outcome_frame["gw_id"].map(
+            lambda gw_id: query_redshifts[int(gw_id)]["redshift"]
+        )
+        outcome_frame["redshift_bin_index"] = outcome_frame["gw_id"].map(
+            lambda gw_id: query_redshifts[int(gw_id)]["redshift_bin_index"]
+        )
+        outcome_frame["redshift_bin_label"] = outcome_frame["gw_id"].map(
+            lambda gw_id: query_redshifts[int(gw_id)]["redshift_bin_label"]
+        )
     outcome_frame.to_csv(
         output_dir / "mixed_retrieval_outcomes.csv.gz", index=False, compression="gzip"
     )
     metrics = _aggregate(outcome_frame, kn_fraction=cfg["kn_fraction"])
     metrics.to_csv(output_dir / "mixed_retrieval_metrics.csv", index=False)
-    plot_paths = _plot_with_legacy_retrieval_plotter(metrics, output_dir)
-    bootstrap = _paired_bootstrap(
-        outcome_frame,
-        new_name=str(cfg.get("bootstrap_new_model", "Physical Pairing v1")),
-        baseline_name=str(cfg.get("bootstrap_baseline_model", "Default MAGIKS")),
-        n_bootstrap=int(cfg.get("bootstrap_samples", 2000)),
-        seed=seed + 17,
-    )
-    pd.DataFrame(bootstrap).to_csv(output_dir / "paired_bootstrap.csv", index=False)
+    processed = analysis.postprocess(outcome_frame, cfg, output_dir)
     result = {
         "evaluation_mode": "mixed_kn_nonkn",
+        "experiment_id": str(cfg.get("experiment_id", "")),
+        "protocol": {
+            "primary_analysis": {
+                "condition": cfg["primary_condition"],
+                "scope": cfg["primary_scope"],
+                "candidate_mode": cfg["kn_candidate_mode"],
+                "source_aggregation": cfg["primary_metric"]["source_aggregation"],
+                "primary_metric": cfg["primary_metric"],
+            },
+            "condition_semantics": {
+                "training_aligned": {
+                    "positive_sky": "native",
+                    "kn_sky": "positive_shared",
+                    "nonkn_sky": "synthetic_within_credible_region",
+                    "kn_time": "parent_relative",
+                    "nonkn_time": "empirical_uniform_mixture",
+                },
+                "positive_shared": {
+                    "role": "supplementary_strict_control",
+                    "candidate_sky": "positive_shared",
+                    "candidate_time": "positive_shared",
+                },
+            },
+            "intentional_training_differences": [
+                "held-out ELASTICC test candidates replace ELASTICC2 training candidates",
+                "training_aligned non-KN sky is sampled within the query credible region",
+                "evaluation sweeps multiple gallery sizes",
+            ],
+            "inference": {
+                "bootstrap_unit": "gw_id_after_trial_mean",
+                "bootstrap_samples": cfg["bootstrap_samples"],
+                "bootstrap_seed": cfg["bootstrap_seed"],
+                "source_resampling": "stratified",
+            },
+        },
         "config": cfg,
         "experiment_digest": base.stable_digest(raw),
         "code_digest": base.source_tree_digest(MODEL_DIR),
@@ -768,12 +986,21 @@ def run(config_path: Path) -> None:
             for spec in model_specs
         ],
         "data_files": {
-            label: {
-                "path": cfg[label],
-                "size_bytes": os.stat(cfg[label]).st_size,
-                "mtime_ns": os.stat(cfg[label]).st_mtime_ns,
-            }
-            for label in ("test_data_path", "neg_data_path")
+            "test_data": {
+                "requested_path": cfg["requested_test_data_path"],
+                "runtime_path": cfg["test_data_path"],
+                "size_bytes": os.stat(cfg["test_data_path"]).st_size,
+                "mtime_ns": os.stat(cfg["test_data_path"]).st_mtime_ns,
+                "hdf5_groups": ["events/gw_data", "events/optical_data"],
+            },
+            "negative_data": {
+                "requested_path": cfg["requested_neg_data_path"],
+                "runtime_path": cfg["neg_data_path"],
+                "size_bytes": os.stat(cfg["neg_data_path"]).st_size,
+                "mtime_ns": os.stat(cfg["neg_data_path"]).st_mtime_ns,
+                "hdf5_group": cfg["neg_group"],
+                "role": "held_out_test_candidates",
+            },
         },
         "gallery_identity_digest": digest,
         "n_queries": len(query_gw),
@@ -783,13 +1010,14 @@ def run(config_path: Path) -> None:
             for label in sorted({metadata["source_types"][gw_id] for gw_id in query_gw})
         },
         "metrics": metrics.to_dict(orient="records"),
-        "paired_bootstrap": bootstrap,
+        "redshift_query_bin_counts": redshift_bin_counts,
+        "training_effect": processed["training_effect"].iloc[0].to_dict(),
+        "paired_bootstrap": processed["paired_bootstrap"].to_dict(orient="records"),
         "artifacts": {
             "manifest": "mixed_gallery_manifest.json.gz",
             "outcomes": "mixed_retrieval_outcomes.csv.gz",
             "metrics": "mixed_retrieval_metrics.csv",
-            "paired_bootstrap": "paired_bootstrap.csv",
-            "retrieval_plots": plot_paths,
+            **processed["artifacts"],
         },
     }
     temporary = output_dir / "mixed_retrieval_comparison.json.tmp"
@@ -800,11 +1028,78 @@ def run(config_path: Path) -> None:
     print(f"Mixed retrieval comparison complete: {output_dir}")
 
 
+def run_postprocess_only(config_path: Path) -> None:
+    """Regenerate GW-level statistics and plots from saved outcome rows."""
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    if str(raw.get("evaluation_mode", "")) != "mixed_kn_nonkn":
+        raise ValueError("evaluation_mode must be 'mixed_kn_nonkn'")
+    cfg = _normalise_config(raw, config_path)
+    output_dir = Path(cfg["output_dir"])
+    outcome_path = output_dir / "mixed_retrieval_outcomes.csv.gz"
+    if not outcome_path.is_file():
+        raise FileNotFoundError(
+            f"Postprocess-only requires saved outcomes: {outcome_path}"
+        )
+    outcomes = pd.read_csv(outcome_path)
+    redshift_cfg = cfg["redshift_analysis"]
+    if redshift_cfg.get("enabled", False) and "redshift" not in outcomes.columns:
+        metadata = _load_kn_metadata(cfg["test_data_path"])
+        query_gw = sorted(outcomes["gw_id"].astype(int).unique().tolist())
+        query_redshifts, _ = _load_query_redshifts(
+            cfg, query_gw, metadata["source_types"]
+        )
+        outcomes["redshift"] = outcomes["gw_id"].map(
+            lambda gw_id: query_redshifts[int(gw_id)]["redshift"]
+        )
+        outcomes["redshift_bin_index"] = outcomes["gw_id"].map(
+            lambda gw_id: query_redshifts[int(gw_id)]["redshift_bin_index"]
+        )
+        outcomes["redshift_bin_label"] = outcomes["gw_id"].map(
+            lambda gw_id: query_redshifts[int(gw_id)]["redshift_bin_label"]
+        )
+
+    processed = analysis.postprocess(outcomes, cfg, output_dir)
+    summary = {
+        "experiment_id": str(cfg.get("experiment_id", "")),
+        "mode": "postprocess_only",
+        "input_outcomes": str(outcome_path),
+        "training_effect": processed["training_effect"].iloc[0].to_dict(),
+        "artifacts": processed["artifacts"],
+    }
+    summary_path = output_dir / "mixed_retrieval_postprocess.json"
+    temporary = summary_path.with_suffix(".json.tmp")
+    temporary.write_text(
+        json.dumps(summary, indent=2, default=_json_default), encoding="utf-8"
+    )
+    os.replace(temporary, summary_path)
+
+    result_path = output_dir / "mixed_retrieval_comparison.json"
+    if result_path.is_file():
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+        result["training_effect"] = summary["training_effect"]
+        result.setdefault("artifacts", {}).update(processed["artifacts"])
+        temporary = result_path.with_suffix(".json.tmp")
+        temporary.write_text(
+            json.dumps(result, indent=2, default=_json_default), encoding="utf-8"
+        )
+        os.replace(temporary, result_path)
+    print(f"Mixed retrieval postprocessing complete: {output_dir}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True, type=Path)
+    parser.add_argument(
+        "--postprocess-only",
+        action="store_true",
+        help="Regenerate statistics and plots from saved outcome rows.",
+    )
     args = parser.parse_args()
-    run(args.config.expanduser().resolve())
+    config_path = args.config.expanduser().resolve()
+    if args.postprocess_only:
+        run_postprocess_only(config_path)
+    else:
+        run(config_path)
 
 
 if __name__ == "__main__":
