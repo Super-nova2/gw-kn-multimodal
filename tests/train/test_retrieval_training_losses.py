@@ -358,6 +358,19 @@ class MixedGalleryTrainingTests(unittest.TestCase):
             self.assertTrue(torch.all(parent[candidates[1:]] != parent[query_row]))
             self.assertEqual(len(set(candidates[1:].tolist())), 4)
 
+    def test_sampler_allows_repeated_parents_but_not_repeated_rows(self):
+        parent = torch.arange(3).repeat_interleave(4)
+        sampled = sample_mixed_training_gallery_indices(
+            parent,
+            n_external=8,
+            gallery_size=5,
+            kn_fraction=0.75,
+        )
+        for candidates in sampled["kn_rows"]:
+            negative_rows = candidates[1:]
+            self.assertEqual(len(set(negative_rows.tolist())), 3)
+            self.assertLess(len(set(parent[negative_rows].tolist())), 3)
+
     def test_stratified_hard_loss_uses_requested_type_quota(self):
         scores = torch.tensor(
             [[5.0, 4.0, 1.0, 9.0, 8.0, 7.0, 6.0, 0.0]],

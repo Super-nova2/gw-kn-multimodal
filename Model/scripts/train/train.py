@@ -1365,6 +1365,7 @@ FUSION_GALLERY_BEST_CKPT_METRICS = {
 }
 HARD_GALLERY_BEST_CKPT_METRICS = {
     "hard_gallery_macro_retrieval_score",
+    "mixed_gallery_macro_retrieval_score",
 }
 
 
@@ -1853,9 +1854,9 @@ def sample_mixed_training_gallery_indices(
 ):
     """Sample one-positive mixed galleries from a batch.
 
-    KN rows are sampled without replacement per query. Multiple selected rows
-    may share a non-query parent, preserving the configured ratio when the
-    batch contains fewer unique parents than requested KN distractors.
+    KN distractor parents are sampled uniformly with replacement per query.
+    Each parent draw consumes one previously unused optical row, so parent IDs
+    may repeat while optical row indices remain unique.
     """
     parent = positive_parent_ids.reshape(-1)
     if parent.numel() == 0:
@@ -1866,36 +1867,64 @@ def sample_mixed_training_gallery_indices(
             f"mixed gallery needs {n_nonkn} non-KN rows; batch has {n_external}."
         )
 
-    unique_parent = torch.unique(parent)
+    parent_cpu = parent.detach().cpu()
+    unique_parent = torch.unique(parent_cpu)
     max_queries = int(max_queries)
     if max_queries > 0 and unique_parent.numel() > max_queries:
         unique_parent = unique_parent[
-            torch.randperm(unique_parent.numel(), device=parent.device)[:max_queries]
+            torch.randperm(unique_parent.numel())[:max_queries]
         ]
+
+    parent_rows = {
+        int(parent_id): torch.nonzero(
+            parent_cpu == parent_id, as_tuple=False
+        ).flatten().tolist()
+        for parent_id in torch.unique(parent_cpu)
+    }
+
     query_rows = []
     kn_rows = []
     nonkn_rows = []
-    for query_parent in unique_parent:
-        positives = torch.nonzero(parent == query_parent, as_tuple=False).flatten()
-        target = positives[
-            torch.randint(positives.numel(), (1,), device=parent.device).item()
+    for query_parent_value in unique_parent.tolist():
+        query_parent = int(query_parent_value)
+        positives = parent_rows[query_parent]
+        target = positives[torch.randint(len(positives), (1,)).item()]
+        eligible_parents = [
+            parent_id for parent_id in parent_rows if parent_id != query_parent
         ]
-        eligible = torch.nonzero(parent != query_parent, as_tuple=False).flatten()
-        if eligible.numel() < n_kn:
+        n_eligible_rows = sum(
+            len(parent_rows[parent_id]) for parent_id in eligible_parents
+        )
+        if n_eligible_rows < n_kn:
             raise ValueError(
-                f"mixed gallery needs {n_kn} KN distractor rows after excluding "
-                f"query parent; batch has {eligible.numel()}."
+                f"mixed gallery needs {n_kn} distinct KN distractor rows after "
+                f"excluding the query parent; batch has {n_eligible_rows}."
             )
-        kn_negative = eligible[
-            torch.randperm(eligible.numel(), device=parent.device)[:n_kn]
-        ]
+        active_parents = eligible_parents.copy()
+        available_rows = {}
+        kn_negative = []
+        for _ in range(n_kn):
+            parent_slot = torch.randint(len(active_parents), (1,)).item()
+            selected_parent = active_parents[parent_slot]
+            rows = available_rows.get(selected_parent)
+            if rows is None:
+                source_rows = parent_rows[selected_parent]
+                order = torch.randperm(len(source_rows)).tolist()
+                rows = [source_rows[index] for index in order]
+                available_rows[selected_parent] = rows
+            kn_negative.append(rows.pop())
+            if not rows:
+                active_parents[parent_slot] = active_parents[-1]
+                active_parents.pop()
         external = torch.randperm(int(n_external), device=parent.device)[:n_nonkn]
         query_rows.append(target)
-        kn_rows.append(torch.cat([target.reshape(1), kn_negative]))
+        kn_rows.append([target, *kn_negative])
         nonkn_rows.append(external)
     return {
-        "query_rows": torch.stack(query_rows),
-        "kn_rows": torch.stack(kn_rows),
+        "query_rows": torch.tensor(
+            query_rows, dtype=torch.long, device=parent.device
+        ),
+        "kn_rows": torch.tensor(kn_rows, dtype=torch.long, device=parent.device),
         "nonkn_rows": torch.stack(nonkn_rows),
         "n_kn_negative": n_kn,
         "n_nonkn_negative": n_nonkn,
@@ -3458,9 +3487,8 @@ def train(args):
     args.validation_gallery_sizes = list(
         parse_validation_gallery_sizes(args.validation_gallery_sizes)
     )
-    if (
-        not bool(args.validation_gallery_enable)
-        and args.best_ckpt_metric == "hard_gallery_macro_retrieval_score"
+    if not bool(args.validation_gallery_enable) and (
+        args.best_ckpt_metric in HARD_GALLERY_BEST_CKPT_METRICS
     ):
         args.best_ckpt_metric = "fusion_gallery_mrr"
         print(

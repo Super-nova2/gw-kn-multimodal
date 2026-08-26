@@ -303,6 +303,18 @@ class BestCheckpointEligibilityTests(unittest.TestCase):
         self.assertTrue(train.is_best_ckpt_selection_eligible(args, epoch=0))
 
 
+    def test_mixed_gallery_metric_is_available_when_validation_is_enabled(self):
+        args = _args(
+            best_ckpt_metric="mixed_gallery_macro_retrieval_score",
+            validation_gallery_enable=True,
+        )
+
+        self.assertEqual(
+            train.compute_best_ckpt_metric_ready_epoch(args),
+            0,
+        )
+
+
 class MetricComputationSwitchTests(unittest.TestCase):
     def test_fusion_gallery_metrics_can_be_enabled_without_gallery_loss(self):
         args = _args(gallery_loss_weight=0.0)

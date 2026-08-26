@@ -1,10 +1,10 @@
 {
-  "study_name": "magiks_hpo_v8_mixed_gallery_training_aligned_20260825",
+  "study_name": "magiks_hpo_v8_mixed_gallery_training_aligned_retry1_20260826",
   "n_trials": 50,
   "n_startup_trials": 12,
   "sampler_seed": 42,
   "epochs_per_trial": 30,
-  "output_dir": "<BASE_DIR>/data/model/hpo_results_bns_nsbh_v8_mixed_gallery_20260825",
+  "output_dir": "<BASE_DIR>/data/model/hpo_results_bns_nsbh_v8_mixed_gallery_retry1_20260826",
   "default_train_config": "<REPO_ROOT>/Model/args/defaults/MAGIKS_BNS_NSBH_default.json",
   "base_train_config": "<REPO_ROOT>/Model/args/MAGIKS_BNS_NSBH_full.json",
   "best_ckpt_metric": "mixed_gallery_macro_retrieval_score",
