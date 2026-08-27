@@ -71,6 +71,7 @@ from retrieval_gallery import (  # noqa: E402
     aggregate_gallery_outcomes,
     build_comparison_model_specs,
     build_curve_rows,
+    build_exhaustive_gallery_specs,
     build_prefixed_gallery_specs,
     build_synthetic_time_sky_candidate_sequences,
     build_time_sky_candidate_sequences,
@@ -642,7 +643,7 @@ def _find_redshift_bin(z: float, edges: List[float]) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Redshift CSV and plot writers (adapted from eval_gw170817a_retrieval.py)
+# Optional redshift CSV and plot writers for generic comparison runs
 # ---------------------------------------------------------------------------
 def write_redshift_csv(rows: Sequence[Mapping[str, Any]], output_path: Path) -> None:
     """Write redshift-binned metrics to a CSV file."""
@@ -978,6 +979,7 @@ _PARTIAL_REFRESH_COMPAT_FIELDS = (
     "seed",
     "gallery_sizes",
     "gallery_trials",
+    "gallery_repeats_per_positive",
     "gallery_candidate_mode",
     "gallery_candidate_time_window_days",
     "gallery_candidate_credible_level_max",
@@ -1160,6 +1162,7 @@ _BASELINE_COMPARISON_FIELDS = (
     "seed",
     "gallery_sizes",
     "gallery_trials",
+    "gallery_repeats_per_positive",
     "gallery_candidate_mode",
     "gallery_candidate_time_window_days",
     "gallery_candidate_credible_level_max",
@@ -2152,6 +2155,10 @@ def enrich_gallery_outcomes(ranks: Mapping[Tuple[int, int, int], int], galleries
             "actual_gallery_size": int(gallery_spec.get("actual_gallery_size", key[0])),
             "coverage_met": bool(gallery_spec.get("coverage_met", True)),
             "is_undersized": bool(gallery_spec.get("is_undersized", False)),
+            "positive_index": int(gallery_spec.get("positive_index", -1)),
+            "source_positive_index": int(gallery_spec.get("source_positive_index", gallery_spec.get("positive_index", -1))),
+            "positive_ordinal": gallery_spec.get("positive_ordinal", ""),
+            "repeat": gallery_spec.get("repeat", ""),
         }
     return outcomes
 
@@ -3392,8 +3399,8 @@ def normalize_shared_config(cfg: Dict[str, Any], cfg_path: Path) -> Dict[str, An
     tutorial_neg_group = str(cfg.get("tutorial_neg_group", DEFAULT_TUTORIAL_NEG_GROUP))
     force_tutorial_distractors = _as_bool(cfg.get("force_tutorial_distractors", True), default=True)
     positive_selection = str(cfg.get("positive_selection", "random")).strip().lower()
-    if positive_selection not in {"random", "batch"}:
-        raise ValueError("positive_selection must be one of {'random', 'batch'}.")
+    if positive_selection not in {"random", "batch", "exhaustive"}:
+        raise ValueError("positive_selection must be one of {'random', 'batch', 'exhaustive'}.")
     # --- Redshift analysis ---
     redshift_analysis_enable = _as_bool(cfg.get("redshift_analysis_enable", False), default=False)
     redshift_catalogs = _normalize_redshift_catalog_paths(
@@ -3426,6 +3433,7 @@ def normalize_shared_config(cfg: Dict[str, Any], cfg_path: Path) -> Dict[str, An
         "num_workers": int(cfg.get("num_workers", 2)),
         "gallery_sizes": _parse_gallery_sizes(cfg.get("gallery_sizes", "10,100,500,1000,2000,5000")),
         "gallery_trials": int(cfg.get("gallery_trials", 1)),
+        "gallery_repeats_per_positive": int(cfg.get("gallery_repeats_per_positive", 1)),
         "gallery_candidate_mode": str(cfg.get("gallery_candidate_mode", "time_sky_hard")).strip().lower(),
         "gallery_candidate_time_window_days": float(cfg.get("gallery_candidate_time_window_days", 30.0)),
         "gallery_candidate_credible_level_max": float(cfg.get("gallery_candidate_credible_level_max", 0.9)),
@@ -3447,6 +3455,8 @@ def normalize_shared_config(cfg: Dict[str, Any], cfg_path: Path) -> Dict[str, An
         "strict_output_safety": _as_bool(cfg.get("strict_output_safety", False)),
         "resume": _as_bool(cfg.get("resume", False)),
         "experiment_id": str(cfg.get("experiment_id", "")).strip(),
+        "evaluation_name": str(cfg.get("evaluation_name", "Unified Ablation Comparison")).strip(),
+        "result_filename": str(cfg.get("result_filename", "ablation_comparison.json")).strip(),
         "candidate_time_delta_mode": normalize_candidate_time_delta_mode(
             cfg.get("candidate_time_delta_mode", "native")
         ),
@@ -3466,6 +3476,10 @@ def normalize_shared_config(cfg: Dict[str, Any], cfg_path: Path) -> Dict[str, An
         "redshift_bin_edges": redshift_bin_edges,
         "redshift_bin_labels": redshift_bin_labels,
     }
+    if Path(normalized["result_filename"]).name != normalized["result_filename"] or not normalized["result_filename"].endswith(".json"):
+        raise ValueError("result_filename must be a JSON basename, not a path.")
+    if normalized["gallery_repeats_per_positive"] <= 0:
+        raise ValueError("gallery_repeats_per_positive must be positive.")
     if normalized["test_data_path"] is None:
         raise ValueError("Comparison config is missing test_data_path")
     return normalized
@@ -3542,7 +3556,7 @@ def main():
     seed = int(cfg["seed"])
 
     print("=" * 60)
-    print("Unified Ablation Comparison")
+    print(cfg["evaluation_name"])
     print("=" * 60)
     print(f"Device: {device}")
     print(f"Input optical window: {comparison_window}  (source: {cfg.get('comparison_window_source', 'N/A')})")
@@ -3655,6 +3669,17 @@ def main():
         },
     }
     gw_source_map = build_gw_source_map(gw_source_types, all_test_gw_ids)
+    requested_n_trials = n_trials
+    if positive_selection == "exhaustive":
+        if len(set(full_test_positive_counts.tolist())) != 1:
+            raise ValueError(
+                "positive_selection=exhaustive requires the same positive count for every GW parent."
+            )
+        n_trials = int(full_test_positive_counts[0]) * int(cfg["gallery_repeats_per_positive"])
+        print(
+            f"Exhaustive positive coverage: {int(full_test_positive_counts[0])} positives/GW "
+            f"x {cfg['gallery_repeats_per_positive']} repeats = {n_trials} trials."
+        )
 
     # --- Redshift metadata recovery from source catalogs ---
     redshift_metadata = None
@@ -3715,8 +3740,19 @@ def main():
                 f"include_undersized={bool(cfg['gallery_include_undersized'])}"
             )
         else:
-            # --- Random: each trial randomly selects a positive per GW ---
-            if gallery_candidate_mode in ("time_sky_hard", "synthetic_time_sky_hard"):
+            if positive_selection == "exhaustive":
+                if gallery_candidate_mode not in ("time_sky_hard", "synthetic_time_sky_hard"):
+                    raise ValueError("Exhaustive positives require a time/sky candidate mode.")
+                galleries, unique_gw, constructed_trials = build_exhaustive_gallery_specs(
+                    gw_positive_indices=gw_positive_indices,
+                    candidate_sequences=candidate_sequences,
+                    gallery_sizes=gallery_sizes,
+                    repeats_per_positive=cfg["gallery_repeats_per_positive"],
+                    include_undersized=bool(cfg["gallery_include_undersized"]),
+                )
+                if constructed_trials != n_trials:
+                    raise AssertionError("Exhaustive gallery trial count changed unexpectedly.")
+            elif gallery_candidate_mode in ("time_sky_hard", "synthetic_time_sky_hard"):
                 galleries, unique_gw = build_prefixed_gallery_specs(
                     gw_positive_indices=gw_positive_indices,
                     candidate_sequences=candidate_sequences,
@@ -4280,6 +4316,8 @@ def main():
             "used_num_workers": cfg.get("used_num_workers", cfg["num_workers"]),
             "gallery_sizes": gallery_sizes,
             "gallery_trials": n_trials,
+            "requested_gallery_trials": requested_n_trials,
+            "gallery_repeats_per_positive": cfg["gallery_repeats_per_positive"],
             "gallery_candidate_mode": cfg["gallery_candidate_mode"],
             "gallery_candidate_time_window_days": cfg["gallery_candidate_time_window_days"],
             "gallery_candidate_credible_level_max": cfg["gallery_candidate_credible_level_max"],
@@ -4325,7 +4363,7 @@ def main():
             ],
         },
     }
-    output_path = output_dir / "ablation_comparison.json"
+    output_path = output_dir / cfg["result_filename"]
     write_json_atomic(output_path, output)
     completed_artifacts = [output_path.name]
     if retrieval_writer is not None:

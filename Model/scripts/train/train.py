@@ -1876,9 +1876,9 @@ def sample_mixed_training_gallery_indices(
         ]
 
     parent_rows = {
-        int(parent_id): torch.nonzero(
-            parent_cpu == parent_id, as_tuple=False
-        ).flatten().tolist()
+        int(parent_id): torch.nonzero(parent_cpu == parent_id, as_tuple=False)
+        .flatten()
+        .tolist()
         for parent_id in torch.unique(parent_cpu)
     }
 
@@ -1921,9 +1921,7 @@ def sample_mixed_training_gallery_indices(
         kn_rows.append([target, *kn_negative])
         nonkn_rows.append(external)
     return {
-        "query_rows": torch.tensor(
-            query_rows, dtype=torch.long, device=parent.device
-        ),
+        "query_rows": torch.tensor(query_rows, dtype=torch.long, device=parent.device),
         "kn_rows": torch.tensor(kn_rows, dtype=torch.long, device=parent.device),
         "nonkn_rows": torch.stack(nonkn_rows),
         "n_kn_negative": n_kn,
@@ -2398,6 +2396,82 @@ def is_checkpoint_score_improved(current_score, previous_best, min_delta):
     return previous_best is None or float(current_score) > (
         float(previous_best) + float(min_delta)
     )
+
+
+def build_validation_result_summary(
+    args,
+    val_metrics,
+    epoch,
+    best_tracking_start_epoch,
+    neg_gw_guardrail,
+    selection_score,
+    *,
+    checkpoint_selected,
+):
+    """Build the validation summary consumed by HPO and training reports.
+
+    HPO still needs the final validation metrics when a safety guardrail rejects
+    every checkpoint. Such a trial is made infeasible by its saved guardrail
+    metrics instead of failing merely because no best checkpoint was selected.
+    """
+    retrieval_metrics = val_metrics.get("retrieval", {})
+    classification_metrics = val_metrics.get("classification", {})
+    summary = {
+        "best_ckpt_metric": args.best_ckpt_metric,
+        "best_ckpt_score": float(selection_score),
+        "best_checkpoint_available": bool(checkpoint_selected),
+        "summary_source": (
+            "best_checkpoint" if checkpoint_selected else "last_validation"
+        ),
+        "best_val_acc_total": classification_metrics.get("acc_total", 0),
+        "best_val_loss": val_metrics["total"],
+        "best_epoch": epoch,
+        "best_epoch_1based": epoch + 1,
+        "best_tracking_start_epoch": best_tracking_start_epoch,
+        "best_tracking_start_epoch_1based": (
+            best_tracking_start_epoch + 1
+            if best_tracking_start_epoch is not None
+            else None
+        ),
+        "val_itc_loss": val_metrics.get("itc", 0),
+        "val_cls_loss": val_metrics.get("cls", 0),
+        "val_recall_at_1": retrieval_metrics.get("g2o_recall_at_1", 0),
+        "val_recall_at_5": retrieval_metrics.get("g2o_recall_at_5", 0),
+        "val_mrr": retrieval_metrics.get("g2o_mrr", 0),
+        "val_auroc": classification_metrics.get("auroc", 0),
+        "val_auprc": classification_metrics.get("auprc", 0),
+    }
+    for metric_name in sorted(FUSION_GALLERY_BEST_CKPT_METRICS):
+        summary[f"val_{metric_name}"] = retrieval_metrics.get(metric_name, 0)
+
+    hard_gallery = val_metrics.get("hard_gallery", {})
+    if hard_gallery:
+        summary["val_hard_gallery_macro_mrr"] = hard_gallery["macro_mrr"]
+        summary["val_hard_gallery_macro_recall_at_1"] = hard_gallery[
+            "macro_recall_at_1"
+        ]
+        summary["val_hard_gallery_macro_retrieval_score"] = hard_gallery[
+            "selection_score"
+        ]
+        summary["val_hard_gallery"] = hard_gallery
+        if (
+            hard_gallery.get("mode") == "mixed_kn_nonkn"
+            and hard_gallery.get("condition") == "training_aligned"
+        ):
+            summary["val_mixed_gallery_macro_mrr"] = hard_gallery["macro_mrr"]
+            summary["val_mixed_gallery_macro_recall_at_1"] = hard_gallery[
+                "macro_recall_at_1"
+            ]
+            summary["val_mixed_gallery_macro_retrieval_score"] = hard_gallery[
+                "selection_score"
+            ]
+            summary["val_mixed_gallery"] = hard_gallery
+
+    summary["neg_gw_strata"] = val_metrics.get("neg_gw_strata", {})
+    summary["neg_gw_guardrail"] = neg_gw_guardrail
+    summary["val_neg_gw_min_recall"] = float(neg_gw_guardrail["min_recall"])
+    summary["val_neg_gw_guardrail_met"] = int(bool(neg_gw_guardrail["met"]))
+    return summary
 
 
 NEG_GW_STRATA_KEYS = ("bns_type1", "bns_type2", "nsbh_type1", "nsbh_type2")
@@ -4023,6 +4097,9 @@ def train(args):
     best_val_score = resume_training_state.get("best_val_score")
     best_epoch_idx = resume_training_state.get("best_epoch_idx")
     best_val_metrics = dict(resume_training_state.get("best_val_metrics", {}))
+    latest_val_metrics_summary = dict(
+        resume_training_state.get("latest_val_metrics_summary", {})
+    )
     epochs_no_improve = int(resume_training_state.get("epochs_no_improve", 0))
     best_tracking_started = bool(
         resume_training_state.get("best_tracking_started", False)
@@ -5127,6 +5204,15 @@ def train(args):
                 )
 
                 neg_gw_guardrail = resolve_neg_gw_guardrail(args, val_metrics)
+                latest_val_metrics_summary = build_validation_result_summary(
+                    args,
+                    val_metrics,
+                    epoch,
+                    best_tracking_start_epoch,
+                    neg_gw_guardrail,
+                    current_selection_score,
+                    checkpoint_selected=False,
+                )
                 guardrail_active = (
                     bool(neg_gw_guardrail["enabled"]) and train_neg_gw_ratio > 0.0
                 )
@@ -5182,79 +5268,14 @@ def train(args):
                         best_val_score = current_selection_score
                         best_epoch_idx = int(epoch)
                         is_best_epoch = True
-                        retrieval_metrics = val_metrics.get("retrieval", {})
-                        classification_metrics = val_metrics.get("classification", {})
-                        best_val_metrics = {
-                            "best_ckpt_metric": args.best_ckpt_metric,
-                            "best_ckpt_score": current_selection_score,
-                            "best_val_acc_total": classification_metrics.get(
-                                "acc_total", 0
-                            ),
-                            "best_val_loss": val_metrics["total"],
-                            "best_epoch": epoch,
-                            "best_epoch_1based": epoch + 1,
-                            "best_tracking_start_epoch": best_tracking_start_epoch,
-                            "best_tracking_start_epoch_1based": (
-                                best_tracking_start_epoch + 1
-                                if best_tracking_start_epoch is not None
-                                else None
-                            ),
-                            "val_itc_loss": val_metrics.get("itc", 0),
-                            "val_cls_loss": val_metrics.get("cls", 0),
-                            "val_recall_at_1": val_metrics.get("retrieval", {}).get(
-                                "g2o_recall_at_1", 0
-                            ),
-                            "val_recall_at_5": val_metrics.get("retrieval", {}).get(
-                                "g2o_recall_at_5", 0
-                            ),
-                            "val_mrr": val_metrics.get("retrieval", {}).get(
-                                "g2o_mrr", 0
-                            ),
-                            "val_auroc": val_metrics.get("classification", {}).get(
-                                "auroc", 0
-                            ),
-                            "val_auprc": val_metrics.get("classification", {}).get(
-                                "auprc", 0
-                            ),
-                        }
-                        for metric_name in sorted(FUSION_GALLERY_BEST_CKPT_METRICS):
-                            best_val_metrics[f"val_{metric_name}"] = (
-                                retrieval_metrics.get(metric_name, 0)
-                            )
-                        hard_gallery = val_metrics.get("hard_gallery", {})
-                        if hard_gallery:
-                            best_val_metrics["val_hard_gallery_macro_mrr"] = (
-                                hard_gallery["macro_mrr"]
-                            )
-                            best_val_metrics["val_hard_gallery_macro_recall_at_1"] = (
-                                hard_gallery["macro_recall_at_1"]
-                            )
-                            best_val_metrics[
-                                "val_hard_gallery_macro_retrieval_score"
-                            ] = hard_gallery["selection_score"]
-                            best_val_metrics["val_hard_gallery"] = hard_gallery
-                            if (
-                                hard_gallery.get("mode") == "mixed_kn_nonkn"
-                                and hard_gallery.get("condition")
-                                == "training_aligned"
-                            ):
-                                best_val_metrics["val_mixed_gallery_macro_mrr"] = (
-                                    hard_gallery["macro_mrr"]
-                                )
-                                best_val_metrics[
-                                    "val_mixed_gallery_macro_recall_at_1"
-                                ] = hard_gallery["macro_recall_at_1"]
-                                best_val_metrics[
-                                    "val_mixed_gallery_macro_retrieval_score"
-                                ] = hard_gallery["selection_score"]
-                                best_val_metrics["val_mixed_gallery"] = hard_gallery
-                        best_val_metrics["neg_gw_strata"] = strata_m
-                        best_val_metrics["neg_gw_guardrail"] = neg_gw_guardrail
-                        best_val_metrics["val_neg_gw_min_recall"] = float(
-                            neg_gw_guardrail["min_recall"]
-                        )
-                        best_val_metrics["val_neg_gw_guardrail_met"] = int(
-                            bool(neg_gw_guardrail["met"])
+                        best_val_metrics = build_validation_result_summary(
+                            args,
+                            val_metrics,
+                            epoch,
+                            best_tracking_start_epoch,
+                            neg_gw_guardrail,
+                            current_selection_score,
+                            checkpoint_selected=True,
                         )
                         epochs_no_improve = 0
                         best_ckpt = os.path.join(
@@ -5363,6 +5384,7 @@ def train(args):
                         "best_val_score": best_val_score,
                         "best_epoch_idx": best_epoch_idx,
                         "best_val_metrics": best_val_metrics,
+                        "latest_val_metrics_summary": latest_val_metrics_summary,
                         "epochs_no_improve": epochs_no_improve,
                         "best_tracking_started": best_tracking_started,
                         "best_tracking_start_epoch": best_tracking_start_epoch,
@@ -5417,25 +5439,27 @@ def train(args):
 
     writer.close()
 
-    # Write trial results JSON for HPO collection
-    if best_val_metrics:
-        best_val_metrics["final_epoch"] = last_completed_epoch
-        best_val_metrics["dataset_window_metadata"] = getattr(
+    # Write trial results JSON for HPO collection. If every checkpoint was
+    # blocked by a guardrail, emit the latest validation summary so HPO can
+    # record the trial as infeasible and continue the study.
+    result_metrics = dict(best_val_metrics or latest_val_metrics_summary)
+    if result_metrics:
+        result_metrics["final_epoch"] = last_completed_epoch
+        result_metrics["dataset_window_metadata"] = getattr(
             args, "_dataset_window_metadata", None
         )
-        best_val_metrics["effective_input_window_metadata"] = getattr(
+        result_metrics["effective_input_window_metadata"] = getattr(
             args, "_effective_input_window_metadata", None
         )
         result_path = os.path.join(args.ckpt_path, "ALBEF", "trial_results.json")
         summary_dir = os.path.dirname(result_path)
         os.makedirs(summary_dir, exist_ok=True)
-        for summary_name in (
-            "trial_results.json",
-            "train_summary.json",
-            "best_checkpoint_summary.json",
-        ):
+        summary_names = ["trial_results.json", "train_summary.json"]
+        if best_val_metrics:
+            summary_names.append("best_checkpoint_summary.json")
+        for summary_name in summary_names:
             summary_path = os.path.join(summary_dir, summary_name)
-            write_json_atomic(summary_path, best_val_metrics)
+            write_json_atomic(summary_path, result_metrics)
         print(f"Trial results saved to: {result_path}")
 
 

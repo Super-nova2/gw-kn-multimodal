@@ -1285,11 +1285,9 @@ def summarize_confirmation_runs(
             "each_seed_neg_recall_ge_0.83": current["min_seed_neg_gw_recall"] >= 0.83,
         }
         if max_worst_source_drop is not None:
-            gates["worst_source_drop_le_limit"] = (
-                current["worst_source_score"]
-                >= baseline_metrics["worst_source_score"]
-                - float(max_worst_source_drop)
-            )
+            gates["worst_source_drop_le_limit"] = current[
+                "worst_source_score"
+            ] >= baseline_metrics["worst_source_score"] - float(max_worst_source_drop)
         current.update(
             seed_wins=wins, gates=gates, passes_all_gates=all(gates.values())
         )
@@ -1471,18 +1469,33 @@ def _labeled_result_path(output_dir: str, trial_number: int, label: str) -> str:
 
 
 def _restore_first_rung_records(study, hpo_cfg, first_epoch, size_weights):
-    """Reconstruct v7 state after all first-rung Optuna trials completed."""
-    trials = sorted(study.trials, key=lambda item: item.number)
+    """Reconstruct completed first-rung trials, ignoring terminal failures."""
+    all_trials = sorted(study.trials, key=lambda item: item.number)
     expected = int(hpo_cfg["n_trials"])
     complete_state = optuna.trial.TrialState.COMPLETE
-    if len(trials) != expected or any(t.state != complete_state for t in trials):
+    incomplete = [
+        trial
+        for trial in all_trials
+        if trial.state
+        not in {
+            complete_state,
+            optuna.trial.TrialState.PRUNED,
+            optuna.trial.TrialState.FAIL,
+        }
+    ]
+    if incomplete:
+        states = ", ".join(f"{t.number}:{t.state.name}" for t in incomplete)
         raise RuntimeError(
-            "Cannot resume successive halving unless the first rung contains "
-            f"exactly {expected} COMPLETE Optuna trials; found {len(trials)}."
+            "Cannot resume successive halving while existing first-rung trials "
+            f"are incomplete ({states}). Repair or finish them first."
         )
-    if [t.number for t in trials] != list(range(expected)):
+    trials = [trial for trial in all_trials if trial.state == complete_state]
+    if not trials:
+        return []
+    if len(trials) > expected:
         raise RuntimeError(
-            "Cannot resume: first-rung trial numbers are not contiguous."
+            "Cannot resume successive halving: found "
+            f"{len(trials)} COMPLETE trials for configured n_trials={expected}."
         )
 
     baseline_path = _labeled_result_path(
@@ -1530,9 +1543,7 @@ def _restore_first_rung_records(study, hpo_cfg, first_epoch, size_weights):
             min_neg_recall=float(hpo_cfg["constraints"]["min_neg_gw_recall"]),
             max_auprc_drop=float(hpo_cfg["constraints"]["max_auprc_drop"]),
             gallery_size_weights=size_weights,
-            max_worst_source_drop=hpo_cfg["constraints"].get(
-                "max_worst_source_drop"
-            ),
+            max_worst_source_drop=hpo_cfg["constraints"].get("max_worst_source_drop"),
         )
         records.append(
             {
@@ -1544,7 +1555,7 @@ def _restore_first_rung_records(study, hpo_cfg, first_epoch, size_weights):
                 "constraints": constraints,
             }
         )
-    print(f"Restored {len(records)} completed epoch-{first_epoch} trials.")
+    print(f"Restored {len(records)}/{expected} completed epoch-{first_epoch} trials.")
     return records
 
 
@@ -1571,12 +1582,14 @@ def run_successive_halving(hpo_cfg: Dict[str, Any], base_cfg: Dict[str, Any]) ->
     rung_specs = hpo_cfg["promotion_rungs"]
     size_weights = hpo_cfg["gallery_size_weights"]
     baseline_params = hpo_cfg["baseline_trial"]
-    constraint_count = 3 if hpo_cfg["constraints"].get(
-        "max_worst_source_drop"
-    ) is not None else 2
+    constraint_count = (
+        3 if hpo_cfg["constraints"].get("max_worst_source_drop") is not None else 2
+    )
 
     def constraints_func(frozen_trial):
-        return frozen_trial.user_attrs.get("constraint_values", [0.0] * constraint_count)
+        return frozen_trial.user_attrs.get(
+            "constraint_values", [0.0] * constraint_count
+        )
 
     sampler = TPESampler(
         n_startup_trials=int(hpo_cfg["n_startup_trials"]),
@@ -1603,9 +1616,8 @@ def run_successive_halving(hpo_cfg: Dict[str, Any], base_cfg: Dict[str, Any]) ->
         if resume_existing
         else []
     )
-    baseline_results = None
-    first_rung_runs = 0 if resume_existing else int(hpo_cfg["n_trials"])
-    for _ in range(first_rung_runs):
+    baseline_results = records[0]["rungs"][str(first_epoch)] if records else None
+    while len(records) < int(hpo_cfg["n_trials"]):
         trial = study.ask()
         config = build_trial_config(trial, hpo_cfg, base_cfg)
         config.update(
@@ -1630,7 +1642,17 @@ def run_successive_halving(hpo_cfg: Dict[str, Any], base_cfg: Dict[str, Any]) ->
             "config": config,
             "rungs": {},
         }
-        results = _run_labeled_training(config, record, hpo_cfg, f"epoch_{first_epoch}")
+        try:
+            results = _run_labeled_training(
+                config, record, hpo_cfg, f"epoch_{first_epoch}"
+            )
+        except optuna.TrialPruned as exc:
+            study.tell(trial, state=optuna.trial.TrialState.PRUNED)
+            print(
+                f"Trial {trial.number}: pruned from the first rung ({exc}); "
+                "continuing until the requested number of COMPLETE trials is reached."
+            )
+            continue
         if trial.number == 0:
             baseline_results = results
         if baseline_results is None:
@@ -1642,9 +1664,7 @@ def run_successive_halving(hpo_cfg: Dict[str, Any], base_cfg: Dict[str, Any]) ->
             min_neg_recall=float(hpo_cfg["constraints"]["min_neg_gw_recall"]),
             max_auprc_drop=float(hpo_cfg["constraints"]["max_auprc_drop"]),
             gallery_size_weights=size_weights,
-            max_worst_source_drop=hpo_cfg["constraints"].get(
-                "max_worst_source_drop"
-            ),
+            max_worst_source_drop=hpo_cfg["constraints"].get("max_worst_source_drop"),
         )
         record.update(score=score, constraints=constraints)
         record["rungs"][str(first_epoch)] = results

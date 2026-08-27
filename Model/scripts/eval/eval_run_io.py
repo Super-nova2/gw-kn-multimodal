@@ -19,6 +19,9 @@ RETRIEVAL_FIELDS = (
     "seed",
     "trial",
     "gw_id",
+    "positive_optical_index",
+    "positive_ordinal",
+    "repeat",
     "source_type",
     "redshift_bin",
     "redshift",
@@ -266,6 +269,9 @@ def retrieval_outcome_rows(
             "seed": int(seed),
             "trial": int(trial),
             "gw_id": int(gw_id),
+            "positive_optical_index": int(outcome.get("source_positive_index", outcome.get("positive_index", -1))),
+            "positive_ordinal": outcome.get("positive_ordinal", ""),
+            "repeat": outcome.get("repeat", ""),
             "source_type": str(
                 (gw_source_map or {}).get(int(gw_id), "unknown")
             ),

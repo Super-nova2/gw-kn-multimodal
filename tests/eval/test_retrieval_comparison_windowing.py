@@ -1,5 +1,4 @@
 """Unit tests for random-mode input window cropping and gallery stabilisation."""
-import json
 import os
 import sys
 import tempfile
@@ -200,12 +199,6 @@ class TestNormalizeSharedConfigWindow(unittest.TestCase):
 
         self.assertEqual(cfg["gallery_candidate_time_window_days"], 30.0)
 
-    def test_gw170817a_default_gallery_window_is_post_30_days(self):
-        from eval_gw170817a_retrieval import normalize_config
-
-        cfg = normalize_config({"test_data_path": self.h5_path}, Path("/tmp/test.json"))
-
-        self.assertEqual(cfg["gallery_candidate_time_window_days"], 30.0)
 
 
 class TestPrecomputeTutorialGalleries(unittest.TestCase):
@@ -298,66 +291,6 @@ class TestGalleryCoverageFillRatio(unittest.TestCase):
         self.assertAlmostEqual(rows[0]["coverage"], 0.35)
         self.assertAlmostEqual(rows[0]["full_coverage"], 0.0)
 
-    def test_gw170817_redshift_coverage_is_mean_fill_ratio(self):
-        from eval_gw170817a_retrieval import aggregate_redshift_metrics
-
-        outcomes = {
-            (500, 0, 1): {"rank": 0, "actual_gallery_size": 100, "coverage_met": False},
-            (500, 0, 2): {"rank": 1, "actual_gallery_size": 250, "coverage_met": False},
-        }
-        redshift_metadata = {
-            1: {"redshift": 0.05, "redshift_bin": 0},
-            2: {"redshift": 0.06, "redshift_bin": 0},
-        }
-
-        rows = aggregate_redshift_metrics(
-            outcomes=outcomes,
-            gallery_sizes=[500],
-            n_trials=1,
-            unique_gw=[1, 2],
-            redshift_metadata=redshift_metadata,
-            method_name="test",
-        )
-
-        self.assertEqual(len(rows), 1)
-        self.assertAlmostEqual(rows[0]["coverage"], 0.35)
-        self.assertAlmostEqual(rows[0]["full_coverage"], 0.0)
-
-    def test_gw170817_log10_weighted_macro_metrics_across_gallery_sizes(self):
-        from eval_gw170817a_retrieval import aggregate_redshift_macro_metrics
-
-        rows = [
-            {
-                "method": "test",
-                "redshift_bin": 0,
-                "redshift": 0.03,
-                "gallery_size": 10,
-                "n_queries": 4,
-                "recall_at_1": 0.25,
-                "recall_at_10": 0.75,
-                "mrr": 0.5,
-            },
-            {
-                "method": "test",
-                "redshift_bin": 0,
-                "redshift": 0.03,
-                "gallery_size": 1000,
-                "n_queries": 4,
-                "recall_at_1": 0.75,
-                "recall_at_10": 0.25,
-                "mrr": 0.9,
-            },
-        ]
-
-        macro_rows = aggregate_redshift_macro_metrics(rows)
-
-        self.assertEqual(len(macro_rows), 1)
-        macro = macro_rows[0]
-        self.assertAlmostEqual(macro["macro_recall_at_1"], (0.25 * 1.0 + 0.75 * 3.0) / 4.0)
-        self.assertAlmostEqual(macro["macro_recall_at_10"], (0.75 * 1.0 + 0.25 * 3.0) / 4.0)
-        self.assertAlmostEqual(macro["macro_mrr"], (0.5 * 1.0 + 0.9 * 3.0) / 4.0)
-        self.assertAlmostEqual(macro["gallery_weight_sum"], 4.0)
-        self.assertEqual(macro["n_gallery_sizes"], 2)
 
 
 class TestSkymapCredibleLevels(unittest.TestCase):

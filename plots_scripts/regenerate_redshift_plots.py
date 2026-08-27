@@ -29,11 +29,7 @@ from eval_retrieval_comparison import (  # noqa: E402
     plot_redshift_macro_metrics as plot_ablation_redshift_macro_metrics,
     plot_redshift_metrics as plot_ablation_redshift_metrics,
 )
-from eval_gw170817a_retrieval import (  # noqa: E402
-    plot_redshift_coverage as plot_gw170817a_redshift_coverage,
-    plot_redshift_macro_metrics as plot_gw170817a_redshift_macro_metrics,
-    plot_redshift_metrics as plot_gw170817a_redshift_metrics,
-)
+
 
 PlotFn = Callable[[Sequence[Mapping[str, object]], Path], None]
 
@@ -46,15 +42,6 @@ CASES = [
         "plot_redshift_metrics": plot_ablation_redshift_metrics,
         "plot_redshift_coverage": plot_ablation_redshift_coverage,
         "plot_redshift_macro_metrics": plot_ablation_redshift_macro_metrics,
-    },
-    {
-        "name": "gw170817a_lsst_retrieval",
-        "result_dir": MODEL_DIR / "eval_results" / "gw170817a_lsst_retrieval",
-        "json_name": "gw170817a_retrieval.json",
-        "paper_dir": PROJECT_ROOT / "paper_draft" / "figures" / "results" / "gw170817a_lsst_retrieval",
-        "plot_redshift_metrics": plot_gw170817a_redshift_metrics,
-        "plot_redshift_coverage": plot_gw170817a_redshift_coverage,
-        "plot_redshift_macro_metrics": plot_gw170817a_redshift_macro_metrics,
     },
 ]
 

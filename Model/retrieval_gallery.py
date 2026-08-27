@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import h5py
 import numpy as np
@@ -648,6 +648,72 @@ def build_prefixed_gallery_specs(
     return galleries, unique_gw
 
 
+
+def build_exhaustive_gallery_specs(
+    *,
+    gw_positive_indices: Mapping[int, Any],
+    candidate_sequences: Mapping[Tuple[int, int], Mapping[str, Any]],
+    gallery_sizes: Sequence[int],
+    repeats_per_positive: int,
+    include_undersized: bool,
+) -> Tuple[Dict[Tuple[int, int, int], Dict[str, Any]], List[int], int]:
+    """Build deterministic galleries that query every positive equally often."""
+    repeats = int(repeats_per_positive)
+    if repeats <= 0:
+        raise ValueError("repeats_per_positive must be positive.")
+    unique_gw = sorted(int(gw_id) for gw_id in gw_positive_indices)
+    positives = {
+        gw_id: np.sort(_as_numpy_1d(gw_positive_indices[gw_id], dtype=np.int64))
+        for gw_id in unique_gw
+    }
+    counts = {gw_id: int(values.size) for gw_id, values in positives.items()}
+    if not counts or min(counts.values()) <= 0:
+        raise ValueError("Exhaustive gallery construction requires positives for every GW event.")
+    if len(set(counts.values())) != 1:
+        raise ValueError(
+            "Exhaustive gallery construction requires a balanced crossed panel; "
+            f"positive counts per GW are {counts}."
+        )
+
+    n_trials = next(iter(counts.values())) * repeats
+    galleries: Dict[Tuple[int, int, int], Dict[str, Any]] = {}
+    for trial in range(n_trials):
+        positive_ordinal = trial // repeats
+        repeat = trial % repeats
+        for gw_id in unique_gw:
+            seq = candidate_sequences.get((trial, gw_id), {})
+            neg_idx = _as_numpy_1d(seq.get("candidate_indices", []), dtype=np.int64)
+            neg_cred = _as_numpy_1d(seq.get("credible_levels", []), dtype=np.float32)
+            neg_dt = _as_numpy_1d(seq.get("abs_dt_days", []), dtype=np.float32)
+            neg_coords = (np.asarray(seq["synthetic_coordinates"], dtype=np.float32).reshape(-1, 2)
+                          if "synthetic_coordinates" in seq else None)
+            neg_times = (_as_numpy_1d(seq["synthetic_zero_time_mjd_cls_base"], dtype=np.float64)
+                         if "synthetic_zero_time_mjd_cls_base" in seq else None)
+            for requested in (int(size) for size in gallery_sizes):
+                target_neg = max(requested - 1, 0)
+                if target_neg > neg_idx.size and not include_undersized:
+                    continue
+                take_neg = min(target_neg, int(neg_idx.size))
+                spec = {
+                    "positive_index": int(positives[gw_id][positive_ordinal]),
+                    "positive_ordinal": int(positive_ordinal),
+                    "repeat": int(repeat),
+                    "negative_indices": neg_idx[:take_neg],
+                    "negative_credible_levels": neg_cred[:take_neg],
+                    "negative_abs_dt_days": neg_dt[:take_neg],
+                    "requested_gallery_size": requested,
+                    "actual_gallery_size": 1 + take_neg,
+                    "coverage_met": bool(1 + take_neg >= requested),
+                    "is_undersized": bool(1 + take_neg < requested),
+                }
+                if neg_coords is not None:
+                    spec["negative_synthetic_coordinates"] = neg_coords[:take_neg]
+                if neg_times is not None:
+                    spec["negative_synthetic_zero_time_mjd_cls_base"] = neg_times[:take_neg]
+                galleries[(requested, trial, gw_id)] = spec
+    return galleries, unique_gw, n_trials
+
+
 def extract_gallery_negative_abs_dt_days(
     gallery_spec: Mapping[str, Any],
     *,
@@ -708,6 +774,10 @@ def score_all_galleries_skymap(
             "actual_gallery_size": int(gallery_spec["actual_gallery_size"]),
             "coverage_met": bool(gallery_spec["coverage_met"]),
             "is_undersized": bool(gallery_spec["is_undersized"]),
+            "positive_index": int(gallery_spec["positive_index"]),
+            "source_positive_index": int(gallery_spec.get("source_positive_index", gallery_spec["positive_index"])),
+            "positive_ordinal": gallery_spec.get("positive_ordinal", ""),
+            "repeat": gallery_spec.get("repeat", ""),
         }
 
     return outcomes

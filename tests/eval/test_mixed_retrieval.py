@@ -414,6 +414,172 @@ def test_interval_plots_export_nonempty_png_and_pdf(tmp_path: Path) -> None:
     assert all((tmp_path / path).stat().st_size > 0 for path in paths)
 
 
+def test_interval_plots_use_legacy_retrieval_visual_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    model_order = ["Mixed Gallery v1", "Default MAGIKS", "Optical-only"]
+    rows = []
+    for model_index, model in enumerate(model_order):
+        for size in (10, 100):
+            for metric, _ in mixed_eval.analysis.PLOT_METRICS:
+                estimate = 0.5 - 0.1 * model_index
+                rows.append(
+                    {
+                        "model": model,
+                        "condition": "training_aligned",
+                        "scope": "all",
+                        "gallery_size": size,
+                        "metric": metric,
+                        "source_aggregation": "pooled",
+                        "estimate": estimate,
+                        "ci_low": estimate - 0.02,
+                        "ci_high": estimate + 0.02,
+                        "n_unique_gw": 4,
+                    }
+                )
+
+    captured = []
+
+    def capture_figure(fig, stem):
+        captured.append((fig, stem))
+        return [str(stem.with_suffix(".png"))]
+
+    monkeypatch.setattr(mixed_eval.analysis, "_save_figure", capture_figure)
+    mixed_eval.analysis.plot_retrieval_curves(
+        pd.DataFrame(rows),
+        output_dir=tmp_path,
+        model_order=model_order,
+        kn_fraction=0.25,
+    )
+
+    assert len(captured) == 1
+    figure, _ = captured[0]
+    assert tuple(figure.get_size_inches()) == pytest.approx(
+        mixed_eval.analysis.RETRIEVAL_CURVES_FIGSIZE
+    )
+    assert figure.axes[0].get_ylabel() == "Recall@1"
+    assert figure.axes[1].get_ylabel() == "Recall@10"
+    assert figure.axes[2].get_ylabel() == "MRR"
+    assert [axis.get_ylim() for axis in figure.axes] == [(0.0, 1.05)] * 3
+
+    expected_models = sorted(
+        model_order, key=mixed_eval.analysis._plot_method_draw_order
+    )
+    expected_methods = [*expected_models, "Random ranking"]
+    expected_colors = mixed_eval.analysis._legacy_method_colors(expected_methods)
+    for axis in figure.axes:
+        lines = axis.lines
+        assert [line.get_label() for line in lines] == [
+            mixed_eval.analysis._plot_method_label(method)
+            for method in expected_methods
+        ]
+        assert [line.get_color() for line in lines] == [
+            expected_colors[method] for method in expected_methods
+        ]
+        assert all(line.get_marker() == "o" for line in lines)
+        assert all(line.get_linewidth() == pytest.approx(2.0) for line in lines)
+        assert all(line.get_linestyle() == "-" for line in lines)
+    assert [axis.texts[-1].get_text() for axis in figure.axes] == [
+        "(a)",
+        "(b)",
+        "(c)",
+    ]
+
+
+def test_redshift_plots_use_legacy_pooled_and_macro_settings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    model_order = ["Mixed Gallery v1", "Default MAGIKS"]
+    rows = []
+    for aggregation in ("pooled", "source_macro"):
+        for model_index, model in enumerate(model_order):
+            for bin_index, redshift in enumerate((0.02, 0.08)):
+                for metric, _ in mixed_eval.analysis.PLOT_METRICS:
+                    estimate = 0.5 - 0.1 * model_index - 0.05 * bin_index
+                    rows.append(
+                        {
+                            "model": model,
+                            "condition": "training_aligned",
+                            "scope": "all",
+                            "gallery_size": 1000,
+                            "redshift_bin_index": bin_index,
+                            "redshift_bin_label": ("low", "high")[bin_index],
+                            "redshift": redshift,
+                            "metric": metric,
+                            "source_aggregation": aggregation,
+                            "estimate": estimate,
+                            "ci_low": estimate - 0.02,
+                            "ci_high": estimate + 0.02,
+                            "n_unique_gw": 4,
+                        }
+                    )
+
+    captured = []
+
+    def capture_figure(fig, stem, **kwargs):
+        captured.append((fig, stem, kwargs))
+        return [str(stem.with_suffix(".png"))]
+
+    monkeypatch.setattr(mixed_eval.analysis, "_save_figure", capture_figure)
+    mixed_eval.analysis.plot_redshift_performance(
+        pd.DataFrame(rows),
+        output_dir=tmp_path,
+        model_order=model_order,
+        condition="training_aligned",
+        scope="all",
+        gallery_size=1000,
+        bin_labels=["low", "high"],
+        aggregations=["pooled", "source_macro"],
+        kn_fraction=0.25,
+    )
+
+    assert [stem.name for _, stem, _ in captured] == [
+        "redshift_performance",
+        "redshift_performance_source_macro",
+    ]
+    pooled, macro = [figure for figure, _, _ in captured]
+    assert tuple(pooled.get_size_inches()) == pytest.approx(
+        mixed_eval.analysis.RETRIEVAL_CURVES_FIGSIZE
+    )
+    assert [kwargs["pad_inches"] for _, _, kwargs in captured] == [
+        0.04,
+        0.04,
+    ]
+    assert tuple(macro.get_size_inches()) == pytest.approx(
+        mixed_eval.analysis.RETRIEVAL_CURVES_FIGSIZE
+    )
+    pooled.canvas.draw()
+    macro.canvas.draw()
+    pooled_sizes = [axis.get_window_extent().size for axis in pooled.axes]
+    macro_sizes = [axis.get_window_extent().size for axis in macro.axes]
+    assert min(size[0] for size in pooled_sizes + macro_sizes) > 300
+    assert min(size[1] for size in pooled_sizes + macro_sizes) > 300
+    np.testing.assert_allclose(
+        [size[1] for size in pooled_sizes],
+        [size[1] for size in macro_sizes],
+    )
+    assert [axis.get_ylabel() for axis in pooled.axes] == ["R@1", "R@10", "MRR"]
+    assert [axis.get_ylabel() for axis in macro.axes] == [
+        "Macro R@1",
+        "Macro R@10",
+        "Macro MRR",
+    ]
+
+    expected_models = sorted(
+        model_order, key=mixed_eval.analysis._plot_method_draw_order
+    )
+    expected_labels = [
+        mixed_eval.analysis._plot_method_label(model) for model in expected_models
+    ]
+    for figure in (pooled, macro):
+        for axis in figure.axes:
+            assert [line.get_label() for line in axis.lines] == expected_labels
+            assert all(
+                np.allclose(line.get_xdata(), [0.02, 0.08]) for line in axis.lines
+            )
+            assert not axis.collections
+
+
 def test_postprocess_only_fails_cleanly_without_outcomes(tmp_path: Path) -> None:
     config = {
         "evaluation_mode": "mixed_kn_nonkn",
@@ -504,6 +670,10 @@ def test_postprocess_writes_statistics_and_redshift_artifacts(tmp_path: Path) ->
     }
     processed = mixed_eval.analysis.postprocess(outcomes, cfg, tmp_path)
     assert processed["training_effect"].iloc[0]["conclusion"] == "supported"
+    np.testing.assert_allclose(
+        sorted(processed["redshift_intervals"]["redshift"].unique()),
+        [0.02, 0.08],
+    )
     for filename in (
         "gw_metric_intervals.csv",
         "paired_bootstrap.csv",
@@ -514,5 +684,9 @@ def test_postprocess_writes_statistics_and_redshift_artifacts(tmp_path: Path) ->
         assert (tmp_path / filename).stat().st_size > 0
     assert any(
         path.endswith("redshift_performance.png")
+        for path in processed["artifacts"]["redshift_plots"]
+    )
+    assert any(
+        path.endswith("redshift_performance_source_macro.png")
         for path in processed["artifacts"]["redshift_plots"]
     )

@@ -52,6 +52,7 @@ def sample_posterior_coordinates(
     level: float = 0.9,
     nside: int = 256,
     seed: int | None = None,
+    replace: bool = True,
 ):
     """Sample fixed-order HEALPix pixel centers from a 2D sky posterior."""
     if n_samples < 0:
@@ -67,6 +68,11 @@ def sample_posterior_coordinates(
     eligible = np.flatnonzero((credible_level <= level) & (probability > 0))
     if len(eligible) == 0:
         raise ValueError(f"Sky map has no pixels inside the {level:g} credible region")
+    if not replace and int(n_samples) > len(eligible):
+        raise ValueError(
+            f"Requested {n_samples} unique coordinates but only {len(eligible)} "
+            f"pixels lie inside the {level:g} credible region"
+        )
 
     conditional_probability = probability[eligible]
     conditional_probability /= conditional_probability.sum()
@@ -74,7 +80,7 @@ def sample_posterior_coordinates(
     selected = rng.choice(
         eligible,
         size=int(n_samples),
-        replace=True,
+        replace=bool(replace),
         p=conditional_probability,
     )
     theta, phi = hp.pix2ang(nside, selected, nest=True)
@@ -90,6 +96,7 @@ def sample_posterior_3d(
     level: float = 0.9,
     nside: int = 256,
     seed: int | None = None,
+    replace: bool = True,
 ):
     """Sample sky position and conditional distance from a 3D GW posterior."""
     if n_samples < 0:
@@ -128,6 +135,11 @@ def sample_posterior_3d(
         raise ValueError(
             f"Sky map has no valid 3D pixels inside the {level:g} credible region"
         )
+    if not replace and int(n_samples) > len(eligible):
+        raise ValueError(
+            f"Requested {n_samples} unique coordinates but only {len(eligible)} "
+            f"valid pixels lie inside the {level:g} credible region"
+        )
 
     conditional_probability = probability[eligible]
     conditional_probability /= conditional_probability.sum()
@@ -135,7 +147,7 @@ def sample_posterior_3d(
     selected = rng.choice(
         eligible,
         size=int(n_samples),
-        replace=True,
+        replace=bool(replace),
         p=conditional_probability,
     )
     theta, phi = hp.pix2ang(nside, selected, nest=True)
@@ -242,4 +254,40 @@ def build_fixed_distance_coordinate_samples(
     )
     distance = np.full(samples_per_event, float(distance_mpc), dtype=float)
     is_true_position = np.zeros(samples_per_event, dtype=bool)
+    return ra, dec, distance, probability, is_true_position
+
+
+def build_fixed_distance_truth_coordinate_samples(
+    mocmap,
+    *,
+    true_ra: float,
+    true_dec: float,
+    distance_mpc: float,
+    samples_per_event: int,
+    level: float = 0.9,
+    nside: int = 256,
+    seed: int | None = None,
+):
+    """Build one real position plus unique posterior positions at fixed distance."""
+    if samples_per_event < 1:
+        raise ValueError("samples_per_event must be >= 1")
+    if not np.isfinite(distance_mpc) or distance_mpc <= 0:
+        raise ValueError("distance_mpc must be finite and positive")
+    posterior_count = int(samples_per_event) - 1
+    posterior_ra, posterior_dec, _sampled_distance, posterior_probability = (
+        sample_posterior_3d(
+            mocmap,
+            posterior_count,
+            level=level,
+            nside=nside,
+            seed=seed,
+            replace=False,
+        )
+    )
+    ra = np.concatenate(([float(true_ra)], posterior_ra))
+    dec = np.concatenate(([float(true_dec)], posterior_dec))
+    distance = np.full(int(samples_per_event), float(distance_mpc), dtype=float)
+    probability = np.concatenate(([np.nan], posterior_probability))
+    is_true_position = np.zeros(int(samples_per_event), dtype=bool)
+    is_true_position[0] = True
     return ra, dec, distance, probability, is_true_position

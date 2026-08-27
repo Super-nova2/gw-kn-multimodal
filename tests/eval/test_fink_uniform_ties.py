@@ -16,7 +16,6 @@ for path in (MODEL_DIR, SCRIPT_DIR):
 
 retrieval_gallery = importlib.import_module("retrieval_gallery")
 comparison = importlib.import_module("scripts.eval.eval_retrieval_comparison")
-gw170817 = importlib.import_module("scripts.eval.eval_gw170817a_retrieval")
 
 
 class UniformRandomTieMetricTests(unittest.TestCase):
@@ -62,7 +61,7 @@ class UniformRandomTieMetricTests(unittest.TestCase):
         self.assertAlmostEqual(metrics["gallery_10_mrr"], expected["mrr"])
         self.assertAlmostEqual(by_source["bns"]["gallery_10_recall_at_1"], 0.1)
 
-    def test_both_redshift_aggregators_use_same_expected_contributions(self) -> None:
+    def test_common_redshift_aggregator_uses_expected_contributions(self) -> None:
         expected = retrieval_gallery.uniform_random_tie_metric_contributions(2, 7)
         outcomes = {
             (10, 0, 3): {
@@ -83,18 +82,10 @@ class UniformRandomTieMetricTests(unittest.TestCase):
             bin_labels=["low"],
             method_name="Fink RF",
         )
-        gw_rows = gw170817.aggregate_redshift_metrics(
-            outcomes=outcomes,
-            gallery_sizes=[10],
-            n_trials=1,
-            unique_gw=[3],
-            redshift_metadata=metadata,
-            method_name="Fink RF",
-        )
+
 
         for key in ("recall_at_1", "recall_at_5", "recall_at_10", "mrr"):
             self.assertAlmostEqual(main_rows[0][key], expected[key])
-            self.assertAlmostEqual(gw_rows[0][key], expected[key])
 
 
     def test_fink_scorer_records_tie_counts_and_expected_metrics(self) -> None:

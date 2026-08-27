@@ -74,7 +74,6 @@ class TimeZeroRegressionTests(unittest.TestCase):
             band=np.asarray(["r", "r", "r", "r", "r"]),
             photflag=np.asarray([0, 0, 0, 0, 0], dtype=np.int64),
             head_mjd_detect_first=103.0,
-            event_time_mjd=99.0,
             fluxcal_to_psfflux_factor=1.0,
             psfflux_zp=31.4,
             lupt_b_njy=[100.0] * 6,

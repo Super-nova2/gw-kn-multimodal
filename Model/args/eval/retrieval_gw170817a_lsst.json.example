@@ -1,4 +1,7 @@
 {
+  "evaluation_name": "GW170817A LSST scenario retrieval",
+  "result_filename": "gw170817a_retrieval.json",
+  "experiment_id": "gw170817a_lsst_scenarios_v1",
   "models": [
     {
       "name": "Skymap-only",
@@ -7,47 +10,43 @@
     {
       "name": "Optical-only baseline",
       "type": "optical",
-      "checkpoint": "<BASE_DIR>/data/model/checkpoints_optical/optical_only/optical_only_kn_baseline",
-      "config": "<REPO_ROOT>/optical_only/args/optical_only_kn_baseline.json"
-    },
-    {
-      "name": "Fink Random Forest",
-      "type": "fink_rf",
-      "checkpoint": "<BASE_DIR>/fink-rf-reproduction/outputs/fink_rf_ugrizY_fair_albef_elasticc2/model.joblib"
+      "checkpoint": "/fred/oz016/bgao_kn/data/model/checkpoints_optical/optical_only/optical_only_kn_baseline_albef_20260821",
+      "config": "/fred/oz016/bgao_kn/gw-kn-multimodal/optical_only/args/optical_only_kn_baseline.json"
     },
     {
       "name": "Full",
       "type": "multimodal",
-      "checkpoint": "<BASE_DIR>/data/model/checkpoints_bns_nsbh/bns_nsbh_full",
-      "config": "<REPO_ROOT>/Model/args/MAGIKS_BNS_NSBH_full.json"
-    },
-    {
-      "name": "w/o Retrieval Loss",
-      "type": "multimodal",
-      "checkpoint": "<BASE_DIR>/data/model/checkpoints_bns_nsbh/bns_nsbh_ablation_no_retrieval_loss",
-      "config": "<REPO_ROOT>/Model/args/MAGIKS_BNS_NSBH_no_retrieval_loss.json"
+      "checkpoint": "/fred/oz016/bgao_kn/data/model/checkpoints_bns_nsbh/bns_nsbh_full",
+      "config": "/fred/oz016/bgao_kn/gw-kn-multimodal/Model/args/MAGIKS_BNS_NSBH_full.json"
     }
   ],
-  "test_data_path": "<BASE_DIR>/data/ALBEF_dataset/gw170817a_lsst_redshift_test.h5",
-  "neg_data_path": "<BASE_DIR>/data/Optical_Only_dataset/ELASTICC_negative_dataset.h5",
+  "test_data_path": "/fred/oz016/bgao_kn/data/ALBEF_dataset/gw170817a_lsst_scenarios.h5",
+  "neg_data_path": "/fred/oz016/bgao_kn/data/Optical_Negative_dataset/ELASTICC_negative_dataset.h5",
   "neg_group": "ELASTICC/optical_data",
-  "output_dir": "<REPO_ROOT>/Model/eval_results/gw170817a_lsst_retrieval",
+  "output_dir": "/fred/oz016/bgao_kn/gw-kn-multimodal/Model/eval_results/gw170817a_lsst_scenarios",
+  "positive_selection": "exhaustive",
+  "gallery_repeats_per_positive": 3,
   "gallery_sizes": "10,100,500,1000,2000,5000",
-  "gallery_trials": 10,
+  "gallery_trials": 150,
   "gallery_candidate_mode": "synthetic_time_sky_hard",
   "gallery_candidate_time_window_days": 30.0,
   "gallery_candidate_credible_level_max": 0.9,
   "gallery_include_undersized": true,
-  "max_kn_per_redshift_bin": 200,
   "n_neg_samples": 500000,
   "seed": 42,
   "batch_size": 512,
   "num_workers": 2,
   "device": "cuda",
   "amp_dtype": "bf16",
+  "opt_n_ref": 64,
+  "opt_ref_start": -0.1,
+  "opt_ref_end": 0.2,
+  "force_tutorial_distractors": false,
   "nonkn_cls_base_field": "zero_time_mjd_cls_base",
-  "comparison_window": [
-    -0.1,
-    0.2
-  ]
+  "hard_negative_strategy": "simple",
+  "compute_classification_metrics": false,
+  "save_outcomes": true,
+  "strict_output_safety": true,
+  "stage_to_jobfs": true,
+  "redshift_analysis_enable": false
 }

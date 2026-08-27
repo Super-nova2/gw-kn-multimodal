@@ -139,6 +139,7 @@ TEST_DATA_PATH=$(jq -r '.test_data_path // empty' "$config_file")
 NEG_DATA_PATH=$(jq -r '.neg_data_path // empty' "$config_file")
 NEG_GROUP=$(jq -r '.neg_group // empty' "$config_file")
 OUTPUT_DIR=$(jq -r '.output_dir // empty' "$config_file")
+RESULT_FILENAME=$(jq -r '.result_filename // "ablation_comparison.json"' "$config_file")
 POST_MERGE_BASE_RESULT=$(jq -r '.post_merge_base_result // empty' "$config_file")
 POST_MERGE_OUTPUT_DIR=$(jq -r '.post_merge_output_dir // empty' "$config_file")
 STRICT_OUTPUT_SAFETY=$(jq -r '.strict_output_safety // false' "$config_file")
@@ -212,6 +213,7 @@ echo "AMP dtype: ${AMP_DTYPE:-auto}"
 echo "Models (${MODEL_COUNT}): ${MODEL_NAMES}"
 echo "Gallery sizes: ${GALLERY_SIZES:-default}"
 echo "Gallery trials: ${GALLERY_TRIALS:-default}"
+echo "Positive repeats: $(jq -r '.gallery_repeats_per_positive // 1' "$config_file")"
 echo "Gallery candidate mode: ${GALLERY_CANDIDATE_MODE}"
 if [[ -n "${GALLERY_CANDIDATE_TIME_WINDOW_DAYS}" && "${GALLERY_CANDIDATE_TIME_WINDOW_DAYS}" != "null" ]]; then
     echo "Candidate time window: +/-${GALLERY_CANDIDATE_TIME_WINDOW_DAYS} days"
@@ -230,7 +232,7 @@ if [[ -n "$POST_MERGE_BASE_RESULT" ]]; then
     echo "Post-merge output: ${POST_MERGE_OUTPUT_DIR}"
 fi
 echo "Expected outputs:"
-echo "  ${OUTPUT_DIR}/ablation_comparison.json"
+echo "  ${OUTPUT_DIR}/${RESULT_FILENAME}"
 echo "  ${OUTPUT_DIR}/retrieval_curves.png"
 echo "  ${OUTPUT_DIR}/retrieval_coverage.png"
 if [[ -n "${redshift_analysis_enable:-}" && "${redshift_analysis_enable}" != "false" ]]; then

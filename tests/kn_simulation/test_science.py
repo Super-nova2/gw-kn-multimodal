@@ -33,6 +33,26 @@ def test_snana_input_uses_only_prepared_catalog_fields():
     assert "GENPEAK_MEJWIND:  0.02" in output
 
 
+def test_snana_input_applies_catalog_cosmology_fields():
+    catalog = pd.DataFrame(
+        {
+            "simulation_id": [7],
+            "trigger_mjd": [62000.0],
+            "viewing_costheta": [0.5],
+            "phi_deg": [30.0],
+            "mej_dynamic": [0.01],
+            "mej_wind": [0.02],
+            "snana_h0": [67.74],
+            "snana_omega_matter": [0.3075],
+            "snana_omega_lambda": [0.6910098315],
+        }
+    )
+    output = gen_input(catalog, "H0: 70\nOMEGA_MATTER: 0.3\n", 7, gw_type="bns")
+    assert "H0:  67.74" in output
+    assert "OMEGA_MATTER:  0.3075" in output
+    assert "OMEGA_LAMBDA: 0.6910098315" in output
+
+
 def test_snana_input_rejects_unfiltered_ejecta():
     catalog = pd.DataFrame(
         {

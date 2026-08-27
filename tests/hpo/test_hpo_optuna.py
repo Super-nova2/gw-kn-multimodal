@@ -60,19 +60,17 @@ class HpoObjectiveTests(unittest.TestCase):
 
         self.assertTrue(math.isnan(score))
 
-
     def test_mixed_gallery_objective_uses_explicit_alias(self):
         hpo = load_hpo_module()
         results = {"val_mixed_gallery_macro_retrieval_score": 0.73}
 
         score = hpo.compute_objective_score(
             results,
-            hpo.OBJECTIVE_PRESETS[
-                "mixed_gallery_training_aligned_macro_retrieval"
-            ],
+            hpo.OBJECTIVE_PRESETS["mixed_gallery_training_aligned_macro_retrieval"],
         )
 
         self.assertEqual(score, 0.73)
+
 
 class HpoV6ConfigTests(unittest.TestCase):
     def test_current_training_keys_are_allowed_by_hpo(self):
@@ -285,6 +283,160 @@ class HpoV6ConfigTests(unittest.TestCase):
         self.assertEqual(records[1]["rungs"]["30"]["val_auprc"], 0.898)
         self.assertEqual(records[1]["config"]["data_path"], "/new-jobfs/train.h5")
         self.assertEqual(records[1]["config"]["num_workers"], 8)
+
+    def test_restore_first_rung_records_accepts_completed_prefix(self):
+        hpo = load_hpo_module()
+        weights = {100: 1.0}
+        result = {
+            "val_hard_gallery": {
+                "source_macro": {
+                    "gallery_100_mrr": 0.5,
+                    "gallery_100_recall_at_1": 0.5,
+                },
+                "by_source": {
+                    "bns": {
+                        "gallery_100_mrr": 0.5,
+                        "gallery_100_recall_at_1": 0.5,
+                    }
+                },
+            },
+            "val_neg_gw_min_recall": 0.9,
+            "val_auprc": 0.9,
+        }
+        with tempfile.TemporaryDirectory() as output_dir:
+            config_dir = Path(output_dir) / "configs"
+            result_dir = Path(output_dir) / "results" / "trial_0"
+            config_dir.mkdir(parents=True)
+            result_dir.mkdir(parents=True)
+            (config_dir / "trial_0_epoch_30.json").write_text(
+                json.dumps({"ckpt_path": "trial_0"})
+            )
+            (result_dir / "results_epoch_30.json").write_text(json.dumps(result))
+            study = SimpleNamespace(
+                trials=[
+                    SimpleNamespace(
+                        number=0,
+                        state=hpo.optuna.trial.TrialState.COMPLETE,
+                        value=0.5,
+                        params={"lr": 1e-4},
+                    )
+                ]
+            )
+            config = {
+                "n_trials": 3,
+                "output_dir": output_dir,
+                "constraints": {
+                    "min_neg_gw_recall": 0.85,
+                    "max_auprc_drop": 0.005,
+                },
+            }
+
+            records = hpo._restore_first_rung_records(study, config, 30, weights)
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["trial_number"], 0)
+
+    def test_restore_first_rung_records_ignores_pruned_trials(self):
+        hpo = load_hpo_module()
+        weights = {100: 1.0}
+        result = {
+            "val_hard_gallery": {
+                "source_macro": {
+                    "gallery_100_mrr": 0.5,
+                    "gallery_100_recall_at_1": 0.5,
+                },
+                "by_source": {
+                    "bns": {
+                        "gallery_100_mrr": 0.5,
+                        "gallery_100_recall_at_1": 0.5,
+                    }
+                },
+            },
+            "val_neg_gw_min_recall": 0.9,
+            "val_auprc": 0.9,
+        }
+        with tempfile.TemporaryDirectory() as output_dir:
+            config_dir = Path(output_dir) / "configs"
+            result_dir = Path(output_dir) / "results" / "trial_0"
+            config_dir.mkdir(parents=True)
+            result_dir.mkdir(parents=True)
+            (config_dir / "trial_0_epoch_30.json").write_text(
+                json.dumps({"ckpt_path": "trial_0"})
+            )
+            (result_dir / "results_epoch_30.json").write_text(json.dumps(result))
+            study = SimpleNamespace(
+                trials=[
+                    SimpleNamespace(
+                        number=0,
+                        state=hpo.optuna.trial.TrialState.COMPLETE,
+                        value=0.5,
+                        params={},
+                    ),
+                    SimpleNamespace(
+                        number=1,
+                        state=hpo.optuna.trial.TrialState.PRUNED,
+                        value=None,
+                        params={},
+                    ),
+                ]
+            )
+            config = {
+                "n_trials": 2,
+                "output_dir": output_dir,
+                "constraints": {
+                    "min_neg_gw_recall": 0.85,
+                    "max_auprc_drop": 0.005,
+                },
+            }
+
+            records = hpo._restore_first_rung_records(study, config, 30, weights)
+
+        self.assertEqual([record["trial_number"] for record in records], [0])
+
+    def test_validation_summary_preserves_guardrail_rejected_metrics(self):
+        train_module_path = (
+            Path(__file__).resolve().parents[2]
+            / "Model"
+            / "scripts"
+            / "train"
+            / "train.py"
+        )
+        spec = importlib.util.spec_from_file_location("train", train_module_path)
+        train = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(train)
+        args = SimpleNamespace(best_ckpt_metric="mixed_gallery_macro_retrieval_score")
+        hard_gallery = {
+            "mode": "mixed_kn_nonkn",
+            "condition": "training_aligned",
+            "macro_mrr": 0.08,
+            "macro_recall_at_1": 0.03,
+            "selection_score": 0.067,
+        }
+        guardrail = {"met": False, "min_recall": 0.848, "threshold": 0.85}
+
+        summary = train.build_validation_result_summary(
+            args,
+            {
+                "total": 8.5,
+                "itc": 4.2,
+                "cls": 0.4,
+                "retrieval": {},
+                "classification": {"auprc": 0.92, "auroc": 0.97},
+                "hard_gallery": hard_gallery,
+                "neg_gw_strata": {},
+            },
+            29,
+            19,
+            guardrail,
+            0.067,
+            checkpoint_selected=False,
+        )
+
+        self.assertFalse(summary["best_checkpoint_available"])
+        self.assertEqual(summary["summary_source"], "last_validation")
+        self.assertEqual(summary["val_mixed_gallery_macro_retrieval_score"], 0.067)
+        self.assertEqual(summary["val_neg_gw_guardrail_met"], 0)
 
     def test_labeled_training_auto_resumes_incomplete_checkpoint(self):
         hpo = load_hpo_module()

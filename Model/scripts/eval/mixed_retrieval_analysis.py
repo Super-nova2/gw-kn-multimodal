@@ -10,7 +10,20 @@ from typing import Any
 import numpy as np
 import pandas as pd
 from mixed_retrieval import MIXED_SCOPES, allocate_mixed_negative_counts
-from plot_style import apply_mnras_style
+from plot_style import (
+    add_panel_labels_below,
+    apply_mnras_style,
+    layout_top_below_legend,
+)
+from retrieval_gallery import (
+    PLOT_DPI,
+    PLOT_FONT_BASE,
+    RETRIEVAL_CURVES_FIGSIZE,
+    RETRIEVAL_TWO_ROW_LEGEND_FIGSIZE,
+    _plot_method_color_map,
+    _plot_method_draw_order,
+    _plot_method_label,
+)
 
 METRIC_COLUMNS = ("recall_at_1", "recall_at_5", "recall_at_10", "mrr")
 PLOT_METRICS = (
@@ -18,17 +31,6 @@ PLOT_METRICS = (
     ("recall_at_10", "R@10"),
     ("mrr", "MRR"),
 )
-MODEL_STYLES = {
-    "Mixed Gallery v1": {"color": "#1769AA", "marker": "o", "linestyle": "-"},
-    "Default MAGIKS": {"color": "#E07A1F", "marker": "s", "linestyle": "--"},
-    "Optical-only": {"color": "#73777B", "marker": "D", "linestyle": ":"},
-}
-FALLBACK_STYLES = (
-    {"color": "#1769AA", "marker": "o", "linestyle": "-"},
-    {"color": "#E07A1F", "marker": "s", "linestyle": "--"},
-    {"color": "#73777B", "marker": "D", "linestyle": ":"},
-)
-RANDOM_STYLE = {"color": "#333333", "linestyle": ":", "linewidth": 1.2}
 
 
 def _json_default(value: Any) -> Any:
@@ -202,6 +204,8 @@ def bootstrap_metric_intervals(
         if not isinstance(group_key, tuple):
             group_key = (group_key,)
         common = dict(zip(group_columns, group_key))
+        if "redshift_bin_index" in extra_group_columns and "redshift" in frame:
+            common["redshift"] = float(frame["redshift"].to_numpy(dtype=float).mean())
         summaries = _summarize_source_aggregations(
             frame,
             value_columns=METRIC_COLUMNS,
@@ -354,18 +358,37 @@ def training_effect_summary(
     )
 
 
-def _model_style(model: str, model_index: int) -> dict[str, Any]:
-    return dict(
-        MODEL_STYLES.get(model, FALLBACK_STYLES[model_index % len(FALLBACK_STYLES)])
-    )
+def _legacy_method_colors(model_order: Sequence[str]) -> dict[str, str]:
+    methods = sorted({str(model) for model in model_order}, key=_plot_method_draw_order)
+    return _plot_method_color_map(methods)
 
 
-def _save_figure(fig: Any, stem: Path) -> list[str]:
+def _add_legacy_legend_and_layout(fig: Any, axes: Any, *, bottom: float = 0.06) -> None:
+    handles, labels = axes[0].get_legend_handles_labels()
+    legend = None
+    if handles:
+        legend = fig.legend(
+            handles,
+            labels,
+            loc="upper center",
+            bbox_to_anchor=(0.5, 0.985),
+            ncol=max(1, min(4, len(labels))),
+            frameon=False,
+        )
+    add_panel_labels_below(axes, y=-0.24, fontsize=PLOT_FONT_BASE)
+    layout_top = layout_top_below_legend(fig, legend) if legend is not None else 0.94
+    fig.tight_layout(rect=(0, bottom, 1, layout_top))
+
+
+def _save_figure(fig: Any, stem: Path, *, pad_inches: float = 0.04) -> list[str]:
     stem.parent.mkdir(parents=True, exist_ok=True)
     paths = []
     for suffix in (".png", ".pdf"):
         path = stem.with_suffix(suffix)
-        fig.savefig(path, dpi=300, bbox_inches="tight")
+        save_kwargs = {"bbox_inches": "tight", "pad_inches": pad_inches}
+        if suffix == ".png":
+            save_kwargs["dpi"] = PLOT_DPI
+        fig.savefig(path, **save_kwargs)
         if not path.is_file() or path.stat().st_size == 0:
             raise RuntimeError(f"Plot export failed: {path}")
         paths.append(str(path))
@@ -382,7 +405,16 @@ def plot_retrieval_curves(
     """Render interval-aware retrieval curves for every condition and scope."""
     import matplotlib.pyplot as plt
 
-    apply_mnras_style(plt, base_font_size=13)
+    apply_mnras_style(plt, base_font_size=PLOT_FONT_BASE)
+    plot_models = sorted(
+        {str(model) for model in model_order}, key=_plot_method_draw_order
+    )
+    method_colors = _legacy_method_colors([*model_order, "Random ranking"])
+    figure_size = (
+        RETRIEVAL_TWO_ROW_LEGEND_FIGSIZE
+        if len(method_colors) > 4
+        else RETRIEVAL_CURVES_FIGSIZE
+    )
     paths: list[str] = []
     pooled = intervals[intervals["source_aggregation"].eq("pooled")]
     for condition in sorted(pooled["condition"].unique()):
@@ -392,25 +424,31 @@ def plot_retrieval_curves(
             ]
             if panel.empty:
                 continue
-            fig, axes = plt.subplots(1, 3, figsize=(15.2, 4.8), sharex=True)
+            fig, axes = plt.subplots(1, 3, figsize=figure_size)
             for metric_index, (metric, label) in enumerate(PLOT_METRICS):
                 ax = axes[metric_index]
                 metric_panel = panel[panel["metric"].eq(metric)]
-                for model_index, model in enumerate(model_order):
+                for model in plot_models:
                     series = metric_panel[metric_panel["model"].eq(model)].sort_values(
                         "gallery_size"
                     )
                     if series.empty:
                         continue
-                    style = _model_style(model, model_index)
                     x = series["gallery_size"].to_numpy(dtype=float)
                     estimate = series["estimate"].to_numpy(dtype=float)
-                    ax.plot(x, estimate, label=model, markersize=5, **style)
+                    ax.plot(
+                        x,
+                        estimate,
+                        marker="o",
+                        linewidth=2,
+                        label=_plot_method_label(model),
+                        color=method_colors[model],
+                    )
                     ax.fill_between(
                         x,
                         series["ci_low"].to_numpy(dtype=float),
                         series["ci_high"].to_numpy(dtype=float),
-                        color=style["color"],
+                        color=method_colors[model],
                         alpha=0.13,
                         linewidth=0,
                     )
@@ -424,29 +462,22 @@ def plot_retrieval_curves(
                         "nonkn_only": 1 + n_nonkn,
                     }[scope]
                     random_values.append(random_baseline(n_candidates)[metric])
-                ax.plot(sizes, random_values, label="Random ranking", **RANDOM_STYLE)
+                ax.plot(
+                    sizes,
+                    random_values,
+                    marker="o",
+                    linewidth=2,
+                    label=_plot_method_label("Random ranking"),
+                    color=method_colors["Random ranking"],
+                )
                 ax.set_xscale("log")
-                ax.set_ylim(bottom=0.0)
-                ax.set_title(label)
                 ax.set_xlabel("Gallery size")
-                if metric_index == 0:
-                    ax.set_ylabel("Retrieval performance")
-                ax.grid(True, alpha=0.2)
-            handles, labels = axes[0].get_legend_handles_labels()
-            fig.legend(
-                handles, labels, loc="upper center", ncol=len(labels), frameon=False
-            )
-            title = condition.replace("_", " ").title()
-            fig.suptitle(f"{title}: {scope.replace('_', ' ')} candidates", y=0.94)
-            n_unique_gw = int(panel["n_unique_gw"].max())
-            fig.text(
-                0.5,
-                0.01,
-                f"n={n_unique_gw} query GWs; shading is a source-stratified 95% GW bootstrap interval.",
-                ha="center",
-                fontsize=10,
-            )
-            fig.tight_layout(rect=(0, 0.05, 1, 0.86))
+                ax.set_ylabel(
+                    {"R@1": "Recall@1", "R@10": "Recall@10", "MRR": "MRR"}[label]
+                )
+                ax.set_ylim(0.0, 1.05)
+                ax.grid(True, alpha=0.3)
+            _add_legacy_legend_and_layout(fig, axes)
             plot_dir = output_dir / "plots" / condition / scope
             paths.extend(_save_figure(fig, plot_dir / "retrieval_curves"))
             plt.close(fig)
@@ -464,7 +495,7 @@ def plot_training_deltas(
     """Render paired Mixed-minus-Default metric deltas over gallery size."""
     import matplotlib.pyplot as plt
 
-    apply_mnras_style(plt, base_font_size=13)
+    apply_mnras_style(plt, base_font_size=PLOT_FONT_BASE)
     panel = paired[
         paired["condition"].eq(condition)
         & paired["scope"].eq(scope)
@@ -472,41 +503,37 @@ def plot_training_deltas(
     ]
     if panel.empty:
         return []
-    fig, axes = plt.subplots(1, 3, figsize=(15.2, 4.8), sharex=True)
+    summary = primary.iloc[0]
+    new_model = str(summary["new_model"])
+    baseline_model = str(summary["baseline_model"])
+    method_color = _legacy_method_colors([new_model, baseline_model])[new_model]
+    fig, axes = plt.subplots(1, 3, figsize=RETRIEVAL_CURVES_FIGSIZE)
     for axis, (metric, label) in zip(axes, PLOT_METRICS):
         series = panel[panel["metric"].eq(metric)].sort_values("gallery_size")
         x = series["gallery_size"].to_numpy(dtype=float)
         y = series["mean_delta"].to_numpy(dtype=float)
         axis.axhline(0.0, color="#333333", linewidth=1.0)
-        axis.plot(x, y, color="#1769AA", marker="o", linestyle="-")
+        axis.plot(
+            x,
+            y,
+            color=method_color,
+            marker="o",
+            linewidth=2,
+            label=f"{_plot_method_label(new_model)} − {_plot_method_label(baseline_model)}",
+        )
         axis.fill_between(
             x,
             series["ci_low"].to_numpy(dtype=float),
             series["ci_high"].to_numpy(dtype=float),
-            color="#1769AA",
-            alpha=0.15,
+            color=method_color,
+            alpha=0.13,
             linewidth=0,
         )
         axis.set_xscale("log")
-        axis.set_title(label)
         axis.set_xlabel("Gallery size")
-        axis.grid(True, alpha=0.2)
-    axes[0].set_ylabel("Mixed Gallery v1 − Default MAGIKS")
-    summary = primary.iloc[0]
-    fig.suptitle(
-        "Paired retrieval deltas; "
-        f"training score Δ={summary['mean_delta']:.4f} "
-        f"[{summary['ci_low']:.4f}, {summary['ci_high']:.4f}]",
-        y=0.96,
-    )
-    fig.text(
-        0.5,
-        0.01,
-        "Equal-source macro; trials averaged within GW before paired bootstrap.",
-        ha="center",
-        fontsize=10,
-    )
-    fig.tight_layout(rect=(0, 0.05, 1, 0.88))
+        axis.set_ylabel(f"Δ {label}")
+        axis.grid(True, alpha=0.3)
+    _add_legacy_legend_and_layout(fig, axes)
     paths = _save_figure(
         fig, output_dir / "plots" / condition / scope / "training_effect_delta"
     )
@@ -536,78 +563,56 @@ def plot_redshift_performance(
     ]
     if panel.empty:
         return []
-    apply_mnras_style(plt, base_font_size=12)
-    fig, axes = plt.subplots(
-        len(aggregations), 3, figsize=(15.2, 4.3 * len(aggregations)), squeeze=False
+    apply_mnras_style(plt, base_font_size=PLOT_FONT_BASE)
+    plot_models = sorted(
+        {str(model) for model in model_order}, key=_plot_method_draw_order
     )
-    x = np.arange(len(bin_labels), dtype=float)
-    for row_index, aggregation in enumerate(aggregations):
+    method_colors = _legacy_method_colors(model_order)
+    paths: list[str] = []
+    figure_size = (
+        RETRIEVAL_TWO_ROW_LEGEND_FIGSIZE
+        if len(method_colors) > 4
+        else RETRIEVAL_CURVES_FIGSIZE
+    )
+    for aggregation in aggregations:
         aggregation_panel = panel[panel["source_aggregation"].eq(aggregation)]
-        count_rows = (
-            aggregation_panel[aggregation_panel["metric"].eq(PLOT_METRICS[0][0])]
-            .groupby("redshift_bin_index", sort=True)["n_unique_gw"]
-            .first()
-        )
-        tick_labels = [
-            f"{label}\n(n={int(count_rows.loc[index])})"
-            for index, label in enumerate(bin_labels)
-        ]
-        for column_index, (metric, label) in enumerate(PLOT_METRICS):
-            ax = axes[row_index, column_index]
+        if aggregation_panel.empty:
+            continue
+        is_macro = aggregation == "source_macro"
+        fig, axes = plt.subplots(1, 3, figsize=figure_size, sharex=False, sharey=False)
+        for ax, (metric, label) in zip(axes, PLOT_METRICS):
             metric_panel = aggregation_panel[aggregation_panel["metric"].eq(metric)]
-            for model_index, model in enumerate(model_order):
+            for model in plot_models:
                 series = metric_panel[metric_panel["model"].eq(model)].sort_values(
-                    "redshift_bin_index"
+                    "redshift"
                 )
                 if series.empty:
                     continue
-                style = _model_style(model, model_index)
-                estimate = series["estimate"].to_numpy(dtype=float)
-                ax.plot(x, estimate, label=model, markersize=5, **style)
-                ax.fill_between(
-                    x,
-                    series["ci_low"].to_numpy(dtype=float),
-                    series["ci_high"].to_numpy(dtype=float),
-                    color=style["color"],
-                    alpha=0.13,
-                    linewidth=0,
+                ax.plot(
+                    series["redshift"].to_numpy(dtype=float),
+                    series["estimate"].to_numpy(dtype=float),
+                    marker="o",
+                    linewidth=2,
+                    label=_plot_method_label(model),
+                    color=method_colors[model],
                 )
-            n_kn, n_nonkn = allocate_mixed_negative_counts(gallery_size, kn_fraction)
-            n_candidates = {
-                "all": gallery_size,
-                "kn_only": 1 + n_kn,
-                "nonkn_only": 1 + n_nonkn,
-            }[scope]
-            ax.axhline(
-                random_baseline(n_candidates)[metric],
-                label="Random ranking",
-                **RANDOM_STYLE,
+            ax.set_xlabel("Redshift")
+            ax.set_ylabel(f"Macro {label}" if is_macro else label)
+            ax.grid(True, alpha=0.3)
+        _add_legacy_legend_and_layout(fig, axes)
+        suffix = "" if aggregation == "pooled" else f"_{aggregation}"
+        paths.extend(
+            _save_figure(
+                fig,
+                output_dir
+                / "plots"
+                / condition
+                / scope
+                / f"redshift_performance{suffix}",
+                pad_inches=0.04,
             )
-            ax.set_ylim(bottom=0.0)
-            ax.set_title(label)
-            ax.set_xticks(x, tick_labels, rotation=18, ha="right")
-            ax.grid(True, alpha=0.2)
-            if column_index == 0:
-                ax.set_ylabel(
-                    "Pooled" if aggregation == "pooled" else "Equal-source macro"
-                )
-    handles, labels = axes[0, 0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc="upper center", ncol=len(labels), frameon=False)
-    fig.suptitle(
-        f"Retrieval by query-GW redshift (gallery size {gallery_size})", y=0.97
-    )
-    fig.text(
-        0.5,
-        0.01,
-        "Bins apply to query GW events only; shading is a 95% GW bootstrap interval.",
-        ha="center",
-        fontsize=10,
-    )
-    fig.tight_layout(rect=(0, 0.04, 1, 0.91))
-    paths = _save_figure(
-        fig, output_dir / "plots" / condition / scope / "redshift_performance"
-    )
-    plt.close(fig)
+        )
+        plt.close(fig)
     return [str(Path(path).relative_to(output_dir)) for path in paths]
 
 

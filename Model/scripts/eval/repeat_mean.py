@@ -213,7 +213,7 @@ def _write_json_new(path: Path, payload: Mapping[str, Any]) -> None:
 
 
 def prepare_experiment(config_path: Path, *, dry_run: bool) -> list[Path]:
-    """Generate three seed configs, two smoke configs, and two mean configs."""
+    """Generate seed, smoke, and mean configs for the generic retrieval comparison."""
     raw = _load_json(config_path)
     base = config_path.parent
     seeds = tuple(int(value) for value in raw.get("eval_seeds", ()))
@@ -227,7 +227,6 @@ def prepare_experiment(config_path: Path, *, dry_run: bool) -> list[Path]:
     generated_root = _resolve(base, raw["generated_config_root"])
     eval_specs = {
         "retrieval": _resolve(base, raw["retrieval_base_config"]),
-        "gw170817": _resolve(base, raw["gw170817_base_config"]),
     }
     for source in eval_specs.values():
         if not source.is_file():
@@ -269,13 +268,8 @@ def prepare_experiment(config_path: Path, *, dry_run: bool) -> list[Path]:
                 "n_neg_samples": int(raw.get("smoke_n_neg_samples", 2000)),
             }
         )
-        if task == "retrieval":
-            smoke["max_gw_events"] = int(raw.get("smoke_max_gw_events", 4))
-            smoke["test_steps"] = int(raw.get("smoke_test_steps", 1))
-        else:
-            smoke["max_kn_per_redshift_bin"] = int(
-                raw.get("smoke_max_kn_per_redshift_bin", 1)
-            )
+        smoke["max_gw_events"] = int(raw.get("smoke_max_gw_events", 4))
+        smoke["test_steps"] = int(raw.get("smoke_test_steps", 1))
         planned.append((generated_root / "smoke" / f"{task}.json", smoke))
         planned.append(
             (
@@ -1976,33 +1970,22 @@ def generate_paper_assets(
         raise ValueError("gallery_trials must be exactly 10")
     output_root = _resolve(config_path.parent, str(raw["output_root"]))
     retrieval_root = output_root / "retrieval"
-    gw170817_root = output_root / "gw170817"
-
     retrieval_mean_dir, retrieval_summary, retrieval_mean_sources = _load_completed_mean(
         retrieval_root
     )
-    gw_mean_dir, gw_summary, gw_mean_sources = _load_completed_mean(gw170817_root)
     retrieval_payloads, classification, retrieval_seed_sources = _load_seed_plot_inputs(
         retrieval_root,
         result_name="ablation_comparison.json",
         require_classification=True,
     )
-    gw_payloads, _, gw_seed_sources = _load_seed_plot_inputs(
-        gw170817_root,
-        result_name="gw170817a_retrieval.json",
-        require_classification=False,
-    )
 
     retrieval_output = retrieval_mean_dir / "paper_replacements"
-    gw_output = gw_mean_dir / "paper_replacements"
-    for output in (retrieval_output, gw_output):
-        if output.exists():
-            raise FileExistsError(f"Paper replacement output already exists: {output}")
+    if retrieval_output.exists():
+        raise FileExistsError(f"Paper replacement output already exists: {retrieval_output}")
 
     retrieval_stage = Path(
         tempfile.mkdtemp(prefix=".paper_replacements.", dir=retrieval_mean_dir)
     )
-    gw_stage = Path(tempfile.mkdtemp(prefix=".paper_replacements.", dir=gw_mean_dir))
     paper_sources = [paper_dir / "main.tex", paper_dir / "aastex701.cls"]
     try:
         retrieval_success = _generate_retrieval_paper_assets(
@@ -2011,39 +1994,20 @@ def generate_paper_assets(
             retrieval_payloads,
             classification,
             paper_dir,
-            [
-                *retrieval_mean_sources,
-                *retrieval_seed_sources,
-                *paper_sources,
-            ],
+            [*retrieval_mean_sources, *retrieval_seed_sources, *paper_sources],
         )
-        gw_success = _generate_gw170817_paper_assets(
-            gw_stage,
-            gw_summary,
-            gw_payloads,
-            paper_dir,
-            [*gw_mean_sources, *gw_seed_sources, *paper_sources],
-        )
-        for stage, output in (
-            (retrieval_stage, retrieval_output),
-            (gw_stage, gw_output),
-        ):
-            if output.exists():
-                raise FileExistsError(f"Paper replacement output appeared during generation: {output}")
-            os.replace(stage, output)
+        if retrieval_output.exists():
+            raise FileExistsError(f"Paper replacement output appeared during generation: {retrieval_output}")
+        os.replace(retrieval_stage, retrieval_output)
     finally:
-        for stage in (retrieval_stage, gw_stage):
-            if stage.exists():
-                shutil.rmtree(stage)
+        if retrieval_stage.exists():
+            shutil.rmtree(retrieval_stage)
 
     result = {
         "retrieval_output": str(retrieval_output),
-        "gw170817_output": str(gw_output),
         "retrieval_artifacts": retrieval_success["artifacts"],
-        "gw170817_artifacts": gw_success["artifacts"],
     }
     print(f"Generated paper replacement assets in {retrieval_output}")
-    print(f"Generated paper replacement assets in {gw_output}")
     return result
 
 def aggregate_seed_mean(

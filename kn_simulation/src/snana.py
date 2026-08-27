@@ -30,6 +30,7 @@ from rubin_too import (
 )
 from sky_sampling import (
     build_fixed_distance_coordinate_samples,
+    build_fixed_distance_truth_coordinate_samples,
     build_posterior_coordinate_samples,
     build_test_coordinate_samples,
 )
@@ -121,6 +122,20 @@ def gen_input(injections, text, sim_id, gw_type="bns", sndata_sim_dir=None):
             )
     for pattern, replacement in replacements.items():
         text = re.sub(pattern, replacement, text, flags=re.MULTILINE)
+    cosmology_columns = (
+        ("H0", "snana_h0"),
+        ("OMEGA_MATTER", "snana_omega_matter"),
+        ("OMEGA_LAMBDA", "snana_omega_lambda"),
+    )
+    for keyword, column in cosmology_columns:
+        if column not in row or not np.isfinite(float(row[column])):
+            continue
+        value = float(row[column])
+        pattern = rf"^({keyword}:\s*)\S+.*$"
+        if re.search(pattern, text, flags=re.MULTILINE):
+            text = re.sub(pattern, rf"\1 {value}", text, flags=re.MULTILINE)
+        else:
+            text += f"\n{keyword}: {value}\n"
     return text
 
 
@@ -156,6 +171,18 @@ def _coordinate_samples(args, injections, sky_map, sim_id):
     if args.coordinate_mode == "posterior_fixed_distance":
         return build_fixed_distance_coordinate_samples(
             sky_map,
+            distance_mpc=float(row["luminosity_distance"]),
+            samples_per_event=samples_per_event,
+            level=args.level,
+            nside=args.sampling_nside,
+            seed=seed,
+        )
+
+    if args.coordinate_mode == "posterior_fixed_distance_with_truth":
+        return build_fixed_distance_truth_coordinate_samples(
+            sky_map,
+            true_ra=float(row["ra_deg"]),
+            true_dec=float(row["dec_deg"]),
             distance_mpc=float(row["luminosity_distance"]),
             samples_per_event=samples_per_event,
             level=args.level,
@@ -285,7 +312,12 @@ def build_parser():
     )
     parser.add_argument(
         "--coordinate_mode",
-        choices=("posterior_3d", "posterior_test", "posterior_fixed_distance"),
+        choices=(
+            "posterior_3d",
+            "posterior_test",
+            "posterior_fixed_distance",
+            "posterior_fixed_distance_with_truth",
+        ),
         default="posterior_3d",
     )
     parser.add_argument("--samples_per_event", type=int, default=64)
@@ -452,7 +484,10 @@ def main(argv=None):
             if redshift.ndim == 0:
                 redshift = np.full(len(ra), float(redshift), dtype=float)
             true_mask = np.asarray(is_true, dtype=bool)
-            if args.coordinate_mode == "posterior_fixed_distance":
+            if args.coordinate_mode in (
+                "posterior_fixed_distance",
+                "posterior_fixed_distance_with_truth",
+            ):
                 redshift[:] = float(row["redshift"])
             elif np.any(true_mask):
                 redshift[true_mask] = float(row["redshift"])
@@ -613,7 +648,10 @@ def main(argv=None):
                 gw_type=args.GW_type,
                 sndata_sim_dir=args.sndata_sim_dir,
             )
-            if args.coordinate_mode == "posterior_fixed_distance":
+            if args.coordinate_mode in (
+                "posterior_fixed_distance",
+                "posterior_fixed_distance_with_truth",
+            ):
                 parent_redshift = float(row["redshift"])
                 redshift_min = max(1.0e-5, parent_redshift - 1.0e-4)
                 redshift_max = parent_redshift + 1.0e-4
