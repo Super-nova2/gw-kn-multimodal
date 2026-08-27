@@ -142,7 +142,7 @@ bash Model/scripts/train/train.sh Model/args/MAGIKS_BNS_NSBH_full.json
 
 训练脚本会从 JSON 中读取数据路径、负样本路径、时间偏移设置、模型超参数和 checkpoint 目录。
 
-### 3. 评估多模态模型
+### 3. 评估多模态模型与检索消融
 
 ```bash
 cd <BASE_DIR>/gw-kn-multimodal
@@ -157,29 +157,48 @@ bash Model/scripts/eval/submit_test_evaluate.sh /path/to/eval_args.json
 
 支持检索、分类、OOD 监控和负样本时间偏移评估。
 
-### 3b. 固定 checkpoint 的 GW 输入归因
-
-扩展版 v2 固定同一个 checkpoint，不重新训练，共生成 31 个任务/seed：
-
-- 12 个 KN-vs-non-KN operational 条件
-- 18 个 nuisance-nearest KN-vs-KN 条件，其中 4 个是 GW×光变 factorial 条件
-- 1 个 random-same-source KN baseline，用于量化 nearest-nuisance gallery 的额外难度
+检索组件消融继续采用 KN 正例加 non-KN distractors 的统一协议：
 
 ```bash
-# 仅检查将生成的任务，不写配置、不提交
-DRY_RUN=true bash Model/scripts/eval/submit_fixed_checkpoint_attribution.sh \
-  Model/args/eval/fixed_checkpoint_attribution_v2.json smoke
+# 旧 9 模型组件消融主表
+bash Model/scripts/eval/submit_retrieval_comparison.sh \
+  Model/args/eval/retrieval_comparison.json
 
-# smoke 或完整 seed42
-bash Model/scripts/eval/submit_fixed_checkpoint_attribution.sh \
-  Model/args/eval/fixed_checkpoint_attribution_v2.json smoke
-bash Model/scripts/eval/submit_fixed_checkpoint_attribution.sh \
-  Model/args/eval/fixed_checkpoint_attribution_v2.json seed42
+# Mixed Gallery v1、Default MAGIKS、Optical-only 的训练策略对照
+bash Model/scripts/eval/submit_retrieval_comparison.sh \
+  Model/args/eval/retrieval_comparison_mixed_gallery_v1.json
 ```
 
-factorial 条件检验 distance×brightness、primary-spin×temporal-evolution，
-以及 inclination×color/time-evolution。聚合器额外输出交互效应、随机与
-nearest gallery 的性能差，以及两种 gallery 的 nuisance/物理距离分布。
+两组结果使用相同的 `synthetic_time_sky_hard` non-KN gallery，但分别回答
+组件消融和训练策略比较问题，不应合并为同一张消融表。mixed KN/non-KN
+gallery 评测代码仍保留为探索性分析，不作为当前检索主结果。
+
+### 3b. GW–KN 配对物理敏感性
+
+该固定 checkpoint 实验在同为 BNS 或同为 NSBH 的事件间构造 crossed pairs，
+计算真实配对相对交叉配对的 fusion-logit interaction。候选 sky position 和
+GW–首次探测时间差在四个 crossed cells 中共享，因此可加的 GW-only、
+optical-only 和时间差偏好会被抵消。
+
+光变亮度、颜色、误差和内部时间演化保持原样；亮度不归一化、不匹配、
+也不单独消融，因为 GW 距离、倾角、质量和自旋对 KN 亮度的影响属于本实验
+希望保留的整体物理关联。
+
+```bash
+# 仅校验配置与输入，不创建结果、不提交
+DRY_RUN=true bash Model/scripts/eval/submit_gw_kn_pairing_sensitivity.sh \
+  Model/args/eval/gw_kn_pairing_sensitivity.json
+
+# 完整评测
+bash Model/scripts/eval/submit_gw_kn_pairing_sensitivity.sh \
+  Model/args/eval/gw_kn_pairing_sensitivity.json
+```
+
+运行配置从 `Model/args/eval/gw_kn_pairing_sensitivity.json.example` 生成。
+主要输出包括 event/curve pair manifest、四格原始分数、pair-level interaction、
+bootstrap/permutation 置信结果和物理距离趋势图。历史 fixed-checkpoint
+attribution 脚本与结果仅为复现保留，不再属于推荐主流程。
+
 
 ### 4. 构建 optical-only 数据集
 

@@ -31,12 +31,8 @@ hpo_results/
 # User-local JSON configs (explicit experiment configs may be tracked)
 *.json
 !*.json.example
-!Model/args/eval/fixed_checkpoint_attribution_v1.json
-!Model/args/eval/fixed_checkpoint_attribution_v2.json
 !Model/args/MAGIKS_BNS_NSBH_physical_pairing_v1.json
 !Model/args/eval/retrieval_comparison_mixed_kn_nonkn.json
-!Model/args/eval/retrieval_comparison_mixed_kn_nonkn_smoke.json
-!Model/args/eval/retrieval_comparison_mixed_kn_nuisance.json
 archive/
 
 # Generated exports
