@@ -645,8 +645,8 @@ class CurrentScheduleConfigTests(unittest.TestCase):
 
     RUN_CONFIGS = (
         "MAGIKS_BNS_NSBH_full.json",
-        "MAGIKS_BNS_NSBH_physical_pairing_v1.json",
-        "MAGIKS_BNS_NSBH_hard_mining.json",
+        "MAGIKS_BNS_NSBH_fiducial_params.json",
+        "MAGIKS_BNS_NSBH_no_hard_mining.json",
         "MAGIKS_BNS_NSBH_no_retrieval_loss.json",
         "MAGIKS_BNS_NSBH_no_itc_loss.json",
         "MAGIKS_BNS_NSBH_no_cls_loss.json",
@@ -670,11 +670,17 @@ class CurrentScheduleConfigTests(unittest.TestCase):
             json_config=os.path.join(root, run_config),
         )
 
-    def test_default_uses_sequential_loss_schedule(self):
+    def test_default_uses_hpo_v7_mixed_gallery_schedule(self):
         cfg = self._merged_config("MAGIKS_BNS_NSBH_full.json")
 
+        self.assertAlmostEqual(cfg["lr"], 0.0005782703604715653)
+        self.assertAlmostEqual(cfg["weight_decay"], 0.016857292961516286)
+        self.assertEqual(cfg["gallery_loss_weight"], 0.75)
+        self.assertEqual(cfg["itc_weight"], 1.5)
+        self.assertEqual(cfg["cls_weight"], 0.75)
+        self.assertEqual(cfg["fusion_physical_weight"], 1.5)
         self.assertTrue(cfg["staged_training_enable"])
-        self.assertEqual(cfg["stage_itc_epochs"], 8)
+        self.assertEqual(cfg["stage_itc_epochs"], 10)
         self.assertEqual(cfg["stage_cls_ramp_epochs"], 4)
         self.assertEqual(cfg["stage_retrieval_ramp_epochs"], 4)
         self.assertEqual(cfg["stage_joint_itc_start_weight"], 0.5)
@@ -686,37 +692,49 @@ class CurrentScheduleConfigTests(unittest.TestCase):
         self.assertEqual(cfg["cls_neg_gw_weight"], 0.2)
         self.assertEqual(cfg["cls_mismatched_weight"], 0.15)
         self.assertEqual(cfg["cls_external_neg_weight"], 0.15)
-        self.assertEqual(cfg["gallery_loss_weight"], 1.0)
-
-    def test_physical_pairing_config_uses_mixed_gallery(self):
-        cfg = self._merged_config("MAGIKS_BNS_NSBH_physical_pairing_v1.json")
-
         self.assertEqual(cfg["gallery_candidate_mode"], "mixed_kn_nonkn")
-        self.assertEqual(cfg["gallery_training_size"], 1000)
-        self.assertEqual(cfg["gallery_kn_distractor_fraction"], 0.25)
-        self.assertEqual(cfg["gallery_candidate_coordinate_mode"], "positive_shared")
-        self.assertEqual(cfg["gallery_kn_distractor_time_mode"], "parent_relative")
-        self.assertEqual(cfg["gallery_nonkn_empirical_fraction"], 0.5)
-        self.assertFalse(cfg["gallery_include_extra_negatives"])
-        self.assertTrue(cfg["gallery_hard_neg_enable"])
-        self.assertEqual(cfg["gallery_hard_neg_topk"], 32)
-        self.assertEqual(cfg["gallery_hard_neg_weight"], 0.25)
-        self.assertEqual(cfg["gallery_hard_neg_start_after_retrieval_epochs"], 4)
-        self.assertEqual(cfg["gallery_hard_neg_ramp_epochs"], 4)
-        self.assertEqual(cfg["best_ckpt_metric"], "hard_gallery_macro_retrieval_score")
         self.assertEqual(cfg["validation_gallery_mode"], "mixed_kn_nonkn")
+        self.assertEqual(cfg["validation_gallery_condition"], "training_aligned")
+        self.assertEqual(
+            cfg["best_ckpt_metric"], "mixed_gallery_macro_retrieval_score"
+        )
 
-    def test_hard_mining_variant_keeps_gallery_hard_mining_disabled(self):
-        cfg = self._merged_config("MAGIKS_BNS_NSBH_hard_mining.json")
+    def test_fiducial_params_use_archived_typical_values(self):
+        cfg = self._merged_config("MAGIKS_BNS_NSBH_fiducial_params.json")
 
+        self.assertEqual(cfg["lr"], 0.0005)
+        self.assertEqual(cfg["weight_decay"], 0.02)
         self.assertEqual(cfg["gallery_loss_weight"], 1.0)
+        self.assertEqual(cfg["itc_weight"], 1.0)
+        self.assertEqual(cfg["cls_weight"], 1.0)
+        self.assertEqual(cfg["fusion_physical_weight"], 2.0)
+        self.assertEqual(cfg["stage_itc_epochs"], 8)
+        self.assertEqual(cfg["stage_joint_itc_start_weight"], 0.5)
+        self.assertEqual(cfg["early_stop_min_delta"], 0.01)
+        self.assertEqual(cfg["max_gallery_queries"], 64)
+        self.assertEqual(cfg["gallery_distractor_time_mode"], "synthetic_after_gw")
         self.assertFalse(cfg["gallery_hard_neg_enable"])
+        self.assertEqual(cfg["gallery_hard_neg_start_after_retrieval_epochs"], 10)
+        self.assertEqual(cfg["gallery_hard_neg_ramp_epochs"], 0)
+        self.assertEqual(cfg["gallery_candidate_mode"], "mixed_kn_nonkn")
+        self.assertEqual(cfg["validation_gallery_condition"], "training_aligned")
 
-    def test_hard_disabled_ablations_keep_gallery_hard_mining_off(self):
+    def test_current_training_configs_use_mixed_gallery(self):
+        for run_config in self.RUN_CONFIGS:
+            with self.subTest(run_config=run_config):
+                cfg = self._merged_config(run_config)
+                self.assertEqual(cfg["gallery_candidate_mode"], "mixed_kn_nonkn")
+                self.assertEqual(cfg["validation_gallery_mode"], "mixed_kn_nonkn")
+                self.assertEqual(
+                    cfg["validation_gallery_condition"], "training_aligned"
+                )
+
+    def test_no_hard_mining_variants_keep_gallery_hard_mining_off(self):
         expected = {
-            "MAGIKS_BNS_NSBH_hard_mining.json": 1.0,
+            "MAGIKS_BNS_NSBH_fiducial_params.json": 1.0,
+            "MAGIKS_BNS_NSBH_no_hard_mining.json": 0.75,
             "MAGIKS_BNS_NSBH_no_retrieval_loss.json": 0.0,
-            "MAGIKS_BNS_NSBH_no_fusion.json": 1.0,
+            "MAGIKS_BNS_NSBH_no_fusion.json": 0.75,
         }
 
         for run_config, gallery_weight in expected.items():

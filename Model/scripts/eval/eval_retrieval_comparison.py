@@ -1535,7 +1535,7 @@ def load_optical_model(checkpoint_path: str, device: torch.device) -> Tuple[Opti
     state_dict = migrate_time_embed_state_dict(state_dict)
     model.load_state_dict(state_dict, strict=False)
     model.to(device).eval()
-    print(f"  Loaded optical-only model from {checkpoint_path}")
+    print(f"  Loaded optical control model from {checkpoint_path}")
     return model, ckpt_args
 
 

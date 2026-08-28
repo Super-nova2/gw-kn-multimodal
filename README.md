@@ -200,6 +200,41 @@ bootstrap/permutation 置信结果和物理距离趋势图。历史 fixed-checkp
 attribution 脚本与结果仅为复现保留，不再属于推荐主流程。
 
 
+### 3c. 单参数 directional-win 与 Physics Ejecta Bridge
+
+v2 复用 v1 的单参数 event/curve pair manifest，只用 directional-win 比较
+`Mixed Gallery v1`、`Default MAGIKS`、`Physics Ejecta Bridge` 和
+`GW-blind Control`。Bridge 从现有 train HDF5 构建两侧 feature-space kNN
+posterior，并以统一 ejecta/倾角/距离空间中的 Bhattacharyya overlap 排序；它是
+可实现的物理参考，不是 Bayes 理论上限。v2 不生成或比较 interaction。
+
+先拟合冻结的训练集 artifact：
+
+```bash
+bash Model/scripts/eval/submit_physics_ejecta_bridge_fit.sh \
+  Model/args/eval/physics_ejecta_bridge_fit.json
+```
+
+拟合器会对 BNS/NSBH 合并执行一次连续块 HDF5 读取，并使用批量多核距离搜索；日志分别记录读取、特征提取、GW/光变近邻搜索和超参数网格耗时。正式配置默认使用 8 CPU、24 GB。
+
+artifact 完成后校验并提交评测：
+
+```bash
+DRY_RUN=true bash Model/scripts/eval/submit_gw_kn_pairing_sensitivity.sh \
+  Model/args/eval/gw_kn_single_parameter_sensitivity_bridge.json
+
+JOB_NAME=MAGIKS_single_param_bridge \
+  bash Model/scripts/eval/submit_gw_kn_pairing_sensitivity.sh \
+  Model/args/eval/gw_kn_single_parameter_sensitivity_bridge.json
+```
+
+tracked 模板分别为
+`physics_ejecta_bridge_fit.json.example` 和
+`gw_kn_single_parameter_sensitivity_bridge.json.example`。测试集 ejecta truth
+不参与 Bridge 拟合、调参或评分；新结果只报告 absolute/paired directional-win、
+Holm 校正、caliper 稳健性和 target-separation dose response。
+
+
 ### 4. 构建 optical-only 数据集
 
 这个流程会把光变序列做 first-detection 对齐、2 小时同波段合并、luptitude 变换，并输出 optical-only HDF5。

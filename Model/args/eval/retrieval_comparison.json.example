@@ -22,10 +22,10 @@
       "config": "<REPO_ROOT>/Model/args/MAGIKS_BNS_NSBH_full.json"
     },
     {
-      "name": "Fiducial",
+      "name": "w/o Hard Mining",
       "type": "multimodal",
-      "checkpoint": "<BASE_DIR>/data/model/checkpoints_bns_nsbh/archive/pre_hpo_v7_trial23_20260820/bns_nsbh_full",
-      "config": "<REPO_ROOT>/Model/args/MAGIKS_BNS_NSBH_full_fiducial.json"
+      "checkpoint": "<BASE_DIR>/data/model/checkpoints_bns_nsbh/bns_nsbh_no_hard_mining_hpo_v7_mixed_gallery",
+      "config": "<REPO_ROOT>/Model/args/MAGIKS_BNS_NSBH_no_hard_mining.json"
     },
     {
       "name": "w/o Contrastive Loss",

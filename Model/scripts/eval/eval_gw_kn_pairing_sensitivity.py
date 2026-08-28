@@ -2420,6 +2420,18 @@ def run(
     config_path = Path(config).expanduser().resolve()
     with config_path.open("r", encoding="utf-8") as handle:
         raw = json.load(handle)
+    if str(raw.get("primary_metric", "")) == "directional_win_rate":
+        from scripts.eval.eval_gw_kn_directional_bridge import (
+            run_directional_bridge,
+        )
+
+        run_directional_bridge(
+            config_path,
+            raw,
+            validate_only=validate_only,
+            preflight_pairs=preflight_pairs,
+        )
+        return
     cfg = normalise_config(raw, config_path)
     if not Path(cfg["test_data_path"]).is_file():
         raise FileNotFoundError(cfg["test_data_path"])
