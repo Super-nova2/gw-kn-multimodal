@@ -9,7 +9,13 @@ import pytest
 
 from Model.scripts.eval.eval_gw_kn_directional_bridge import (
     BRIDGE_NAME,
+    DOSE_BIN_LABELS,
     GW_BLIND_NAME,
+    PLOT_AXIS_SCALE,
+    PLOT_FONT_SCALE,
+    PLOT_LATEX_PREAMBLE,
+    PLOT_LEGEND_SCALE,
+    PLOT_PARAMETER_LABELS,
     aggregate_pair_dwr,
     decision_row,
     normalise_v2_config,
@@ -50,6 +56,29 @@ def test_v2_config_rejects_interaction_comparison(tmp_path: Path) -> None:
             },
             config,
         )
+
+
+def test_plot_labels_use_physical_symbols_and_readable_dose_names() -> None:
+    assert set(PLOT_PARAMETER_LABELS) == {
+        "chirp_mass_detector",
+        "mass_ratio",
+        "chi_eff",
+        "primary_spin_z",
+        "abs_costheta",
+        "log10_distance_gpc",
+    }
+    assert all(label.startswith("$") for label in PLOT_PARAMETER_LABELS.values())
+    assert DOSE_BIN_LABELS == {
+        "T1_low": "Low",
+        "T2_mid": "Medium",
+        "T3_high": "High",
+    }
+    assert all("_" not in label for label in DOSE_BIN_LABELS.values())
+    assert r"\usepackage{txfonts}" in PLOT_LATEX_PREAMBLE
+    assert r"\setmainfont{Times New Roman}" in PLOT_LATEX_PREAMBLE
+    assert PLOT_FONT_SCALE == 2.0
+    assert PLOT_AXIS_SCALE == 1.5
+    assert PLOT_LEGEND_SCALE == 1.5
 
 
 def test_deterministic_split_keeps_event_identity() -> None:

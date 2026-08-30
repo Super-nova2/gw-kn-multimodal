@@ -1329,6 +1329,25 @@ def is_gallery_enabled(args):
     return float(getattr(args, "gallery_loss_weight", 0.0)) > 0.0
 
 
+MIXED_GALLERY_FUSION_MODES = frozenset({"physical_dual_hgw", "concat_proj"})
+
+
+def validate_mixed_gallery_fusion_compatibility(args):
+    if args.gallery_candidate_mode != "mixed_kn_nonkn":
+        return
+    if args.fusion_mode not in MIXED_GALLERY_FUSION_MODES:
+        allowed = ", ".join(sorted(MIXED_GALLERY_FUSION_MODES))
+        raise ValueError(
+            "mixed training gallery requires a fusion mode with physical-dual "
+            f"encoders; expected one of: {allowed}."
+        )
+    if bool(args.use_similarity_as_cls_input):
+        raise ValueError(
+            "mixed positive-shared coordinates require "
+            "use_similarity_as_cls_input=false."
+        )
+
+
 def compute_gallery_loss_weight(args, epoch):
     if is_staged_training_enabled(args):
         return resolve_sequential_curriculum(args, epoch)["weights"]["retrieval"]
@@ -3727,14 +3746,7 @@ def train(args):
         getattr(args, "fusion_mode", None), dual_fusion=args.dual_fusion
     )
     args.dual_fusion = args.fusion_mode != "legacy_g2o"
-    if args.gallery_candidate_mode == "mixed_kn_nonkn":
-        if args.fusion_mode != "physical_dual_hgw":
-            raise ValueError("mixed training gallery requires physical_dual_hgw.")
-        if bool(args.use_similarity_as_cls_input):
-            raise ValueError(
-                "mixed positive-shared coordinates require "
-                "use_similarity_as_cls_input=false."
-            )
+    validate_mixed_gallery_fusion_compatibility(args)
     args._hardneg_window_days = parse_day_windows(args.hardneg_time_window_days)
 
     torch.manual_seed(args.seed)

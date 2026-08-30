@@ -1,6 +1,6 @@
 # Model configuration layout
 
-- `MAGIKS_BNS_NSBH*.json.example`: current training and ablation templates. Full and its HPO-based ablations use the HPO v7 Trial 27 schedule; `fiducial_params` uses the archived typical values near the search-space centre. All active templates use mixed KN/non-KN galleries with `training_aligned` validation.
+- `MAGIKS_BNS_NSBH*.json.example`: current training and ablation templates. Full and its HPO-based ablations use the HPO v7 Trial 27 schedule; `fiducial_params` uses the archived typical values near the search-space centre. All active templates use mixed KN/non-KN `training_aligned` validation. The no-cross ablation trains the same mixed gallery through `concat_proj`; no-fusion disables classification and fusion-gallery training entirely and is evaluated with contrastive scoring.
 - `MAGIKS_BNS_NSBH_*_legacy_comparison.json.example`: pre-HPO-v7 full and physical-pairing controls retained for direct comparison; their runtime JSON files continue to target the original checkpoints.
 - `archive/pre_hpo_v7_mixed_gallery_20260828/`: local byte-for-byte backup of the nine runtime configs and templates before this migration.
 - `defaults/`: shared current defaults; experiment JSON overrides these values.

@@ -55,6 +55,28 @@ EXPECTED_PAIR_DIGEST = (
     "893bd33191190756b5987f1f8d9b0d54d6388777fced96a5f616fddb2533f1ee"
 )
 
+PLOT_PARAMETER_LABELS = {
+    "chirp_mass_detector": (
+        r"$\mathcal{M}_{c}^{\mathrm{det}}$ (detector-frame chirp mass)"
+    ),
+    "mass_ratio": r"$q$ (mass ratio)",
+    "chi_eff": r"$\chi_{\mathrm{eff}}$ (effective spin)",
+    "primary_spin_z": r"$\chi_{1z}$ (primary spin)",
+    "abs_costheta": r"$|\cos\theta_{\mathrm{JN}}|$ (inclination)",
+    "log10_distance_gpc": (r"$\log_{10}(d_{L}/\mathrm{Gpc})$ (luminosity distance)"),
+}
+DOSE_BIN_LABELS = {
+    "T1_low": "Low",
+    "T2_mid": "Medium",
+    "T3_high": "High",
+}
+PLOT_LATEX_PREAMBLE = (
+    r"\usepackage{txfonts}" r"\usepackage{fontspec}" r"\setmainfont{Times New Roman}"
+)
+PLOT_FONT_SCALE = 2.0
+PLOT_AXIS_SCALE = 1.5
+PLOT_LEGEND_SCALE = 1.5
+
 DECISION_FIELDS = (
     "model",
     "model_type",
@@ -159,15 +181,18 @@ def normalise_v2_config(
     if bool(raw.get("compare_interaction", False)):
         raise ValueError("v2 does not support interaction comparison")
     models = [dict(model) for model in raw.get("models", [])]
-    names = {str(model.get("name")) for model in models}
+    model_names = [str(model.get("name")) for model in models]
+    names = set(model_names)
+    if len(names) != len(model_names):
+        raise ValueError("v2 model names must be unique")
     required = {
         str(raw.get("new_model_name", "Mixed Gallery v1")),
         str(raw.get("baseline_model_name", "Default MAGIKS")),
         BRIDGE_NAME,
         GW_BLIND_NAME,
     }
-    if names != required or len(models) != 4:
-        raise ValueError(f"v2 models must contain exactly {sorted(required)}")
+    if not required.issubset(names):
+        raise ValueError(f"v2 models must contain at least {sorted(required)}")
     bridge_specs = [
         model for model in models if model.get("type") == "physics_ejecta_bridge"
     ]
@@ -183,12 +208,24 @@ def normalise_v2_config(
         model for model in models if model.get("type") != "physics_ejecta_bridge"
     ]
     legacy_raw = dict(raw)
-    legacy_raw["models"] = neural_models
     legacy_raw["optical_null_model_name"] = GW_BLIND_NAME
     legacy_raw["new_model_name"] = str(raw.get("new_model_name", "Mixed Gallery v1"))
     legacy_raw["baseline_model_name"] = str(
         raw.get("baseline_model_name", "Default MAGIKS")
     )
+    legacy_validation_names = {
+        legacy_raw["new_model_name"],
+        legacy_raw["baseline_model_name"],
+        GW_BLIND_NAME,
+    }
+    legacy_raw["models"] = [
+        model
+        for model in neural_models
+        if str(model.get("name")) in legacy_validation_names
+    ]
+    specs_raw = dict(raw)
+    specs_raw["models"] = neural_models
+    specs_raw["optical_null_model_name"] = GW_BLIND_NAME
     cfg = v1.normalise_config(legacy_raw, config_path)
     cfg["primary_metric"] = "directional_win_rate"
     cfg["compare_interaction"] = False
@@ -198,9 +235,71 @@ def normalise_v2_config(
     cfg["expected_pair_manifest_sha256"] = str(
         raw.get("expected_pair_manifest_sha256", EXPECTED_PAIR_DIGEST)
     )
+    default_comparisons = [
+        {
+            "model": cfg["new_model_name"],
+            "baseline_model": BRIDGE_NAME,
+            "family": "mixed_minus_bridge_directional_win_rate",
+            "label": "Mixed - Bridge",
+        },
+        {
+            "model": cfg["baseline_model_name"],
+            "baseline_model": BRIDGE_NAME,
+            "family": "default_minus_bridge_directional_win_rate",
+            "label": "Default - Bridge",
+        },
+        {
+            "model": cfg["new_model_name"],
+            "baseline_model": cfg["baseline_model_name"],
+            "family": "mixed_minus_default_directional_win_rate",
+            "label": "Mixed - Default",
+        },
+    ]
+    comparisons = [
+        {
+            "model": str(item["model"]),
+            "baseline_model": str(item["baseline_model"]),
+            "family": str(item["family"]),
+            "label": str(
+                item.get("label", f"{item['model']} - {item['baseline_model']}")
+            ),
+        }
+        for item in raw.get("pairwise_comparisons", default_comparisons)
+    ]
+    if not comparisons or len({item["family"] for item in comparisons}) != len(
+        comparisons
+    ):
+        raise ValueError("v2 pairwise comparison families must be non-empty and unique")
+    for item in comparisons:
+        if item["model"] not in names or item["baseline_model"] not in names:
+            raise ValueError(f"Unknown v2 pairwise comparison: {item}")
+        if item["model"] == item["baseline_model"]:
+            raise ValueError(f"Self comparison is invalid: {item}")
+    cfg["pairwise_comparisons"] = comparisons
+    cfg["plot_model_order"] = [
+        str(value) for value in raw.get("plot_model_order", model_names)
+    ]
+    if set(cfg["plot_model_order"]) != names or len(cfg["plot_model_order"]) != len(
+        names
+    ):
+        raise ValueError("plot_model_order must contain every v2 model exactly once")
+    plot_families = raw.get(
+        "plot_pairwise_families", [item["family"] for item in comparisons]
+    )
+    cfg["plot_pairwise_comparisons"] = [
+        item for item in comparisons if item["family"] in set(plot_families)
+    ]
+    if len(cfg["plot_pairwise_comparisons"]) != len(plot_families):
+        raise ValueError("plot_pairwise_families contains an unknown family")
+    cfg["robustness_model_order"] = [
+        str(value)
+        for value in raw.get("robustness_model_order", cfg["plot_model_order"][:3])
+    ]
+    if not set(cfg["robustness_model_order"]).issubset(names):
+        raise ValueError("robustness_model_order contains an unknown model")
     if cfg["pairing_mode"] != "single_parameter":
         raise ValueError("Directional Bridge v2 requires pairing_mode=single_parameter")
-    specs = base._build_model_specs(legacy_raw, config_path.parent)
+    specs = base._build_model_specs(specs_raw, config_path.parent)
     return cfg, specs, bridge
 
 
@@ -401,14 +500,16 @@ def summarize_dwr(
     bootstrap_samples: int,
     permutation_samples: int,
     seed: int,
+    comparisons: Sequence[tuple[str, str, str]] | None = None,
 ) -> list[dict[str, Any]]:
     frame = pd.DataFrame(pair_rows)
     rows: list[dict[str, Any]] = []
-    comparisons = (
-        (new_model, BRIDGE_NAME, "mixed_minus_bridge_directional_win_rate"),
-        (default_model, BRIDGE_NAME, "default_minus_bridge_directional_win_rate"),
-        (new_model, default_model, "mixed_minus_default_directional_win_rate"),
-    )
+    if comparisons is None:
+        comparisons = (
+            (new_model, BRIDGE_NAME, "mixed_minus_bridge_directional_win_rate"),
+            (default_model, BRIDGE_NAME, "default_minus_bridge_directional_win_rate"),
+            (new_model, default_model, "mixed_minus_default_directional_win_rate"),
+        )
     for (target_value, caliper_value), target_frame in frame.groupby(
         ["target_parameter", "caliper_iqr"], sort=True
     ):
@@ -820,10 +921,29 @@ def plot_dwr_results(
     summary_rows: Sequence[Mapping[str, Any]],
     dose_rows: Sequence[Mapping[str, Any]],
     output_dir: Path,
+    *,
+    model_order: Sequence[str],
+    pairwise_comparisons: Sequence[Mapping[str, str]],
+    robustness_models: Sequence[str],
 ) -> list[str]:
     import matplotlib
 
-    matplotlib.use("Agg")
+    matplotlib.use("pgf", force=True)
+    matplotlib.rcParams.update(
+        {
+            "pgf.texsystem": "xelatex",
+            "pgf.rcfonts": False,
+            "pgf.preamble": PLOT_LATEX_PREAMBLE,
+            "font.family": "serif",
+            "font.serif": ["Times New Roman"],
+            "font.size": 12 * PLOT_FONT_SCALE,
+            "axes.labelsize": 12 * PLOT_AXIS_SCALE,
+            "axes.titlesize": 14 * PLOT_AXIS_SCALE,
+            "xtick.labelsize": 11 * PLOT_AXIS_SCALE,
+            "ytick.labelsize": 11 * PLOT_AXIS_SCALE,
+            "legend.fontsize": 10 * PLOT_LEGEND_SCALE,
+        }
+    )
     import matplotlib.pyplot as plt
 
     summary = pd.DataFrame(summary_rows)
@@ -843,8 +963,19 @@ def plot_dwr_results(
         "abs_costheta",
         "log10_distance_gpc",
     ]
-    models = ["Mixed Gallery v1", "Default MAGIKS", BRIDGE_NAME, GW_BLIND_NAME]
-    colors = ["#1f77b4", "#ff7f0e", "#9467bd", "#2ca02c"]
+    target_labels = [PLOT_PARAMETER_LABELS[target] for target in targets]
+    models = list(model_order)
+    palette = [
+        "#1f77b4",
+        "#ff7f0e",
+        "#9467bd",
+        "#2ca02c",
+        "#8c564b",
+        "#e377c2",
+        "#7f7f7f",
+    ]
+    colors = [palette[index % len(palette)] for index in range(len(models))]
+    color_map = dict(zip(models, colors))
     artifacts: list[str] = []
     absolute = primary[primary["endpoint"] == "absolute_directional_win_rate"]
     fig, ax = plt.subplots(figsize=(10, 6))
@@ -867,9 +998,8 @@ def plot_dwr_results(
             label=model,
         )
     ax.axvline(0.5, color="black", linestyle="--", linewidth=1)
-    ax.set_yticks(np.arange(len(targets)), targets)
+    ax.set_yticks(np.arange(len(targets)), target_labels)
     ax.set_xlabel("Directional-win rate")
-    ax.set_title("Single-parameter GW--KN directional sensitivity")
     ax.legend(loc="best")
     fig.tight_layout()
     for suffix in ("png", "pdf"):
@@ -880,14 +1010,14 @@ def plot_dwr_results(
         artifacts.append(name)
     plt.close(fig)
     delta = primary[primary["endpoint"] == "paired_directional_win_rate_delta"].copy()
-    comparisons = [
-        ("Mixed Gallery v1", BRIDGE_NAME, "Mixed - Bridge"),
-        ("Default MAGIKS", BRIDGE_NAME, "Default - Bridge"),
-        ("Mixed Gallery v1", "Default MAGIKS", "Mixed - Default"),
-    ]
+    comparisons = list(pairwise_comparisons)
     fig, ax = plt.subplots(figsize=(10, 6))
     offsets = np.linspace(-0.18, 0.18, len(comparisons))
-    for offset, (model, baseline, label), color in zip(offsets, comparisons, colors):
+    for offset, comparison in zip(offsets, comparisons):
+        model = str(comparison["model"])
+        baseline = str(comparison["baseline_model"])
+        label = str(comparison["label"])
+        color = color_map.get(model, "#333333")
         rows = delta[
             (delta["model"] == model) & (delta["baseline_model"] == baseline)
         ].set_index("target_parameter")
@@ -907,9 +1037,8 @@ def plot_dwr_results(
             label=label,
         )
     ax.axvline(0.0, color="black", linestyle="--", linewidth=1)
-    ax.set_yticks(np.arange(len(targets)), targets)
+    ax.set_yticks(np.arange(len(targets)), target_labels)
     ax.set_xlabel("Paired directional-win difference")
-    ax.set_title("Directional-win model differences")
     ax.legend(loc="best")
     fig.tight_layout()
     for suffix in ("png", "pdf"):
@@ -926,11 +1055,12 @@ def plot_dwr_results(
             == _primary_source(str(row["target_parameter"])),
             axis=1,
         )
-        & summary["model"].isin(models[:3])
+        & summary["model"].isin(robustness_models)
     ]
     fig, axes = plt.subplots(2, 3, figsize=(15, 8), sharex=True)
     for ax, target in zip(axes.flat, targets):
-        for model, color in zip(models[:3], colors[:3]):
+        for model in robustness_models:
+            color = color_map.get(model, "#333333")
             rows = robustness[
                 (robustness["target_parameter"] == target)
                 & (robustness["model"] == model)
@@ -943,8 +1073,8 @@ def plot_dwr_results(
                 label=model,
             )
         ax.axhline(0.0, color="black", linestyle="--", linewidth=1)
-        ax.set_title(target)
-    axes[0, 0].legend(fontsize=8)
+        ax.set_title(PLOT_PARAMETER_LABELS[target])
+    axes[0, 0].legend(fontsize=8 * PLOT_LEGEND_SCALE)
     fig.supxlabel("Maximum non-target GW difference (IQR)")
     fig.supylabel("Directional-win - 0.5")
     fig.tight_layout()
@@ -965,20 +1095,21 @@ def plot_dwr_results(
     ]
     fig, axes = plt.subplots(2, 3, figsize=(15, 8), sharex=True)
     for ax, target in zip(axes.flat, targets):
-        for model, color in zip(models[:3], colors[:3]):
+        for model in robustness_models:
+            color = color_map.get(model, "#333333")
             rows = dose[
                 (dose["target_parameter"] == target) & (dose["model"] == model)
             ].sort_values("dose_bin")
             ax.plot(
-                rows["dose_bin"],
+                rows["dose_bin"].map(DOSE_BIN_LABELS),
                 rows["directional_win_rate"],
                 marker="o",
                 color=color,
                 label=model,
             )
         ax.axhline(0.5, color="black", linestyle="--", linewidth=1)
-        ax.set_title(target)
-    axes[0, 0].legend(fontsize=8)
+        ax.set_title(PLOT_PARAMETER_LABELS[target])
+    axes[0, 0].legend(fontsize=8 * PLOT_LEGEND_SCALE)
     fig.supxlabel("Target-separation rank tertile")
     fig.supylabel("Directional-win rate")
     fig.tight_layout()
@@ -1143,6 +1274,10 @@ def run_directional_bridge(
         bootstrap_samples=cfg["bootstrap_samples"],
         permutation_samples=cfg["permutation_samples"],
         seed=cfg["seed"],
+        comparisons=[
+            (item["model"], item["baseline_model"], item["family"])
+            for item in cfg["pairwise_comparisons"]
+        ],
     )
     robustness_rows = [
         row
@@ -1197,7 +1332,14 @@ def run_directional_bridge(
     finally:
         gw_writer.close()
         lc_writer.close()
-    plot_artifacts = plot_dwr_results(summary_rows, dose_rows, output_dir)
+    plot_artifacts = plot_dwr_results(
+        summary_rows,
+        dose_rows,
+        output_dir,
+        model_order=cfg["plot_model_order"],
+        pairwise_comparisons=cfg["plot_pairwise_comparisons"],
+        robustness_models=cfg["robustness_model_order"],
+    )
     result = {
         "experiment_id": str(raw["experiment_id"]),
         "pairing_mode": "single_parameter",
@@ -1217,6 +1359,7 @@ def run_directional_bridge(
             "brightness": "native_unmodified_not_normalized",
             "physics_bridge_role": "achievable_physics_reference_not_bayes_ceiling",
             "test_truth_fields_used_for_bridge_scoring": [],
+            "pairwise_comparisons": cfg["pairwise_comparisons"],
         },
         "config": cfg,
     }

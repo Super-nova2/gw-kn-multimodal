@@ -20,7 +20,7 @@
   "grad_clip_norm": 1.0,
   "warmup_epochs": 5,
   "min_lr": 0.00002,
-  "gallery_loss_weight": 0.75,
+  "gallery_loss_weight": 0.0,
   "gallery_distractor_time_mode": "parent_relative",
   "gallery_distractor_time_window_days": 30.0,
   "itc_weight": 1.5,
@@ -78,5 +78,8 @@
   "validation_gallery_mode": "mixed_kn_nonkn",
   "validation_gallery_condition": "training_aligned",
   "validation_gallery_kn_distractor_fraction": 0.25,
-  "validation_gallery_nonkn_empirical_fraction": 0.5
+  "validation_gallery_nonkn_empirical_fraction": 0.5,
+  "compute_cls_metrics": false,
+  "compute_fusion_gallery_metrics": false,
+  "validation_gallery_enable": false
 }

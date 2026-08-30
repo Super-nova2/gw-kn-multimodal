@@ -165,6 +165,60 @@ class SequentialCurriculumTests(unittest.TestCase):
         self.assertFalse(train.should_run_validation(28, 30, 5))
         self.assertTrue(train.should_run_validation(29, 30, 5))
 
+    def test_mixed_gallery_accepts_concat_projection_fusion(self):
+        args = argparse.Namespace(
+            gallery_candidate_mode="mixed_kn_nonkn",
+            fusion_mode="concat_proj",
+            use_similarity_as_cls_input=False,
+        )
+        train.validate_mixed_gallery_fusion_compatibility(args)
+
+    def test_mixed_gallery_rejects_legacy_fusion(self):
+        args = argparse.Namespace(
+            gallery_candidate_mode="mixed_kn_nonkn",
+            fusion_mode="legacy_g2o",
+            use_similarity_as_cls_input=False,
+        )
+        with self.assertRaisesRegex(ValueError, "physical_dual_hgw"):
+            train.validate_mixed_gallery_fusion_compatibility(args)
+
+    def test_concat_projection_scores_query_specific_mixed_gallery(self):
+        torch.manual_seed(13)
+        model = train.MAGIKSModel(
+            fusion_mode="concat_proj",
+            dual_fusion=True,
+            use_lightweight_gw=True,
+            enc_dim=8,
+            proj_dim=8,
+            optical_curve_dim=8,
+            optical_coord_dim=8,
+            contrastive_hidden_dim=8,
+            ref_time_dim=8,
+            fusion_dropout=0.0,
+        )
+        n_query, n_candidate = 2, 5
+        g = torch.randn(n_query, 8, requires_grad=True)
+        z_candidates = torch.randn(
+            n_query, n_candidate, 8, requires_grad=True
+        )
+        scores = train.compute_fusion_gallery_score_matrix(
+            model,
+            g=g,
+            H_gw=torch.randn(n_query, 4, 8),
+            gw_s=torch.randn(n_query, 7),
+            gw_m=torch.randn(n_query, 7, 16),
+            h_candidates=torch.randn(n_query, n_candidate, 3, 8),
+            z_candidates=z_candidates,
+            opt_coords_candidates=torch.randn(n_query, n_candidate, 2),
+            dt_days_matrix=torch.randn(n_query, n_candidate),
+            chunk_size=4,
+        )
+
+        self.assertEqual(tuple(scores.shape), (n_query, n_candidate))
+        self.assertTrue(torch.isfinite(scores).all())
+        scores.sum().backward()
+        self.assertTrue(any(p.grad is not None for p in model.fusion.parameters()))
+
     def test_scheduler_resume_matches_uninterrupted_run(self):
         args = argparse.Namespace(
             epochs=30,
@@ -228,9 +282,9 @@ class SequentialCurriculumTests(unittest.TestCase):
                 8,
             ),
             "no_fusion": (
-                _curriculum_args(cls_weight=0.0),
-                ["itc", "retrieval_intro", "joint"],
-                12,
+                _curriculum_args(cls_weight=0.0, gallery_loss_weight=0.0),
+                ["itc", "joint"],
+                8,
             ),
             "no_cross": (
                 _curriculum_args(),
@@ -719,7 +773,7 @@ class CurrentScheduleConfigTests(unittest.TestCase):
         self.assertEqual(cfg["gallery_candidate_mode"], "mixed_kn_nonkn")
         self.assertEqual(cfg["validation_gallery_condition"], "training_aligned")
 
-    def test_current_training_configs_use_mixed_gallery(self):
+    def test_current_training_configs_use_mixed_gallery_validation(self):
         for run_config in self.RUN_CONFIGS:
             with self.subTest(run_config=run_config):
                 cfg = self._merged_config(run_config)
@@ -734,7 +788,7 @@ class CurrentScheduleConfigTests(unittest.TestCase):
             "MAGIKS_BNS_NSBH_fiducial_params.json": 1.0,
             "MAGIKS_BNS_NSBH_no_hard_mining.json": 0.75,
             "MAGIKS_BNS_NSBH_no_retrieval_loss.json": 0.0,
-            "MAGIKS_BNS_NSBH_no_fusion.json": 0.75,
+            "MAGIKS_BNS_NSBH_no_fusion.json": 0.0,
         }
 
         for run_config, gallery_weight in expected.items():
@@ -742,6 +796,16 @@ class CurrentScheduleConfigTests(unittest.TestCase):
                 cfg = self._merged_config(run_config)
                 self.assertEqual(cfg["gallery_loss_weight"], gallery_weight)
                 self.assertFalse(cfg["gallery_hard_neg_enable"])
+
+    def test_no_fusion_disables_all_fusion_training_and_metrics(self):
+        cfg = self._merged_config("MAGIKS_BNS_NSBH_no_fusion.json")
+
+        self.assertEqual(cfg["cls_weight"], 0.0)
+        self.assertEqual(cfg["gallery_loss_weight"], 0.0)
+        self.assertFalse(cfg["compute_cls_metrics"])
+        self.assertFalse(cfg["compute_fusion_gallery_metrics"])
+        self.assertFalse(cfg["validation_gallery_enable"])
+        self.assertEqual(cfg["best_ckpt_metric"], "g2o_mrr")
 
     def test_current_training_configs_do_not_contain_removed_keys(self):
         configs = [
