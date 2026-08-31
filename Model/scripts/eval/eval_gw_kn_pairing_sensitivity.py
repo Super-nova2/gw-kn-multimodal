@@ -453,7 +453,7 @@ def normalise_config(raw: Mapping[str, Any], config_path: Path) -> dict[str, Any
         cfg["baseline_model_name"],
         cfg["optical_null_model_name"],
     }
-    if set(names) != required_names or len(names) != 3:
+    if set(names) != required_names or len(names) != len(required_names):
         raise ValueError(
             "models must contain exactly the configured new, baseline, and "
             "optical-null model names"

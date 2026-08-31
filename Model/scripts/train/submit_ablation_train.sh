@@ -22,8 +22,6 @@ echo ""
 
 declare -A EXPERIMENTS=(
     ["full"]="MAGIKS_BNS_NSBH_full.json"
-    ["fiducial_params"]="MAGIKS_BNS_NSBH_fiducial_params.json"
-    ["no_hard_mining"]="MAGIKS_BNS_NSBH_no_hard_mining.json"
     ["no_retrieval_loss"]="MAGIKS_BNS_NSBH_no_retrieval_loss.json"
     ["no_cls_loss"]="MAGIKS_BNS_NSBH_no_cls_loss.json"
     ["no_itc_loss"]="MAGIKS_BNS_NSBH_no_itc_loss.json"
@@ -33,8 +31,6 @@ declare -A EXPERIMENTS=(
 
 SUBMIT_ORDER=(
     "full"
-    "fiducial_params"
-    "no_hard_mining"
     "no_retrieval_loss"
     "no_cls_loss"
     "no_itc_loss"

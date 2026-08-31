@@ -58,6 +58,63 @@ def test_v2_config_rejects_interaction_comparison(tmp_path: Path) -> None:
         )
 
 
+def test_v2_config_allows_one_neural_model_with_bridge_and_zero_baseline(
+    tmp_path: Path,
+) -> None:
+    full_name = "Full"
+    (tmp_path / "full.pth").touch()
+    (tmp_path / "optical.pth").touch()
+    (tmp_path / "full.json").write_text("{}")
+    (tmp_path / "optical.json").write_text("{}")
+    (tmp_path / "bridge").mkdir()
+    raw = {
+        "primary_metric": "directional_win_rate",
+        "compare_interaction": False,
+        "pairing_mode": "single_parameter",
+        "single_parameter_profile": "source_physical_v1",
+        "models": [
+            {
+                "name": full_name,
+                "type": "multimodal",
+                "scoring": "logits",
+                "checkpoint": "full.pth",
+                "config": "full.json",
+            },
+            {
+                "name": BRIDGE_NAME,
+                "type": "physics_ejecta_bridge",
+                "artifact_path": "bridge",
+            },
+            {
+                "name": GW_BLIND_NAME,
+                "type": "optical",
+                "checkpoint": "optical.pth",
+                "config": "optical.json",
+            },
+        ],
+        "new_model_name": full_name,
+        "baseline_model_name": full_name,
+        "test_data_path": "test.h5",
+        "output_dir": "out",
+        "pairwise_comparisons": [
+            {
+                "model": full_name,
+                "baseline_model": BRIDGE_NAME,
+                "family": "full_minus_bridge_directional_win_rate",
+            }
+        ],
+        "plot_model_order": [full_name, BRIDGE_NAME, GW_BLIND_NAME],
+        "plot_pairwise_families": ["full_minus_bridge_directional_win_rate"],
+        "robustness_model_order": [full_name, BRIDGE_NAME, GW_BLIND_NAME],
+    }
+
+    cfg, specs, bridge = normalise_v2_config(raw, tmp_path / "config.json")
+
+    assert cfg["new_model_name"] == cfg["baseline_model_name"] == full_name
+    assert {spec["name"] for spec in specs} == {full_name, GW_BLIND_NAME}
+    assert bridge["name"] == BRIDGE_NAME
+
+
 def test_plot_labels_use_physical_symbols_and_readable_dose_names() -> None:
     assert set(PLOT_PARAMETER_LABELS) == {
         "chirp_mass_detector",

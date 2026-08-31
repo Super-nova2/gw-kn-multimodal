@@ -31,7 +31,7 @@
   "time_delta_cls_scale_days": 30.0,
   "time_delta_cls_clip": 10.0,
   "time_compat_weight": 0.6,
-  "gallery_hard_neg_enable": true,
+  "gallery_hard_neg_enable": false,
   "gallery_hard_neg_start_after_retrieval_epochs": 4,
   "gallery_hard_neg_ramp_epochs": 4,
   "validation_gallery_sizes": [
@@ -67,7 +67,7 @@
   "cls_distractor_time_mode": "mixed_empirical",
   "cls_external_empirical_dt_fraction": 0.5,
   "gallery_hard_neg_topk": 32,
-  "gallery_hard_neg_weight": 0.25,
+  "gallery_hard_neg_weight": 0.0,
   "gallery_candidate_mode": "mixed_kn_nonkn",
   "gallery_training_size": 1000,
   "gallery_kn_distractor_fraction": 0.25,
