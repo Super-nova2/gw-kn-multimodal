@@ -54,3 +54,4 @@ dataset/test/
 
 # Validation files
 Model/scripts/validation/
+Model/scripts/eval/archive/
