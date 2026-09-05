@@ -8,42 +8,43 @@ from __future__ import annotations
 import json
 import shutil
 import sys
+import tempfile
 from pathlib import Path
-from typing import Callable, Mapping, Sequence
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
 PROJECT_ROOT = REPO_ROOT.parent
 MODEL_DIR = REPO_ROOT / "Model"
-MODEL_SCRIPT_DIR = MODEL_DIR / "script"
+MODEL_SCRIPT_DIR = MODEL_DIR / "scripts" / "eval"
 for p in (str(REPO_ROOT), str(MODEL_DIR), str(MODEL_SCRIPT_DIR)):
     if p not in sys.path:
         sys.path.insert(0, p)
 
-from retrieval_gallery import (  # noqa: E402
-    plot_retrieval_coverage,
-    plot_retrieval_curves,
-)
-from eval_retrieval_comparison import (  # noqa: E402
-    plot_redshift_coverage as plot_ablation_redshift_coverage,
+from eval_retrieval_comparison import (  # noqa: I001
     plot_redshift_macro_metrics as plot_ablation_redshift_macro_metrics,
-    plot_redshift_metrics as plot_ablation_redshift_metrics,
 )
+from retrieval_gallery import plot_retrieval_curves
 
-
-PlotFn = Callable[[Sequence[Mapping[str, object]], Path], None]
 
 CASES = [
     {
-        "name": "retrieval_comparison_v11",
-        "result_dir": MODEL_DIR / "eval_results" / "retrieval_comparison_v11",
+        "name": "retrieval_comparison_mixed_gallery_v1_all_models",
+        "result_dir": MODEL_DIR / "eval_results" / "retrieval_comparison_mixed_gallery_v1_all_models",
         "json_name": "ablation_comparison.json",
-        "paper_dir": PROJECT_ROOT / "paper_draft" / "figures" / "results" / "retrieval_comparison",
-        "plot_redshift_metrics": plot_ablation_redshift_metrics,
-        "plot_redshift_coverage": plot_ablation_redshift_coverage,
-        "plot_redshift_macro_metrics": plot_ablation_redshift_macro_metrics,
+        "paper_dir": PROJECT_ROOT / "paper_apj" / "figures" / "results" / "retrieval_comparison",
     },
 ]
+
+PAPER_METHODS = {
+    "Full (HPO v7 + Mixed Gallery)",
+    "w/o Contrastive Loss",
+    "w/o Retrieval Loss",
+    "w/o Cross-Attn",
+    "w/o Fusion",
+    "Optical-only",
+    "Fink Random Forest",
+    "Skymap-only",
+}
 
 PAPER_FILES = [
     "retrieval_curves.pdf",
@@ -51,10 +52,10 @@ PAPER_FILES = [
 ]
 
 
-def _copy_paper_files(result_dir: Path, paper_dir: Path) -> None:
+def _copy_paper_files(render_dir: Path, paper_dir: Path) -> None:
     paper_dir.mkdir(parents=True, exist_ok=True)
     for filename in PAPER_FILES:
-        src = result_dir / filename
+        src = render_dir / filename
         if not src.exists():
             print(f"  WARN: {src} not found; not copied")
             continue
@@ -75,23 +76,24 @@ def main() -> int:
         with json_path.open("r", encoding="utf-8") as f:
             data = json.load(f)
 
-        curve_rows = data.get("curve_rows", [])
-        redshift_rows = data.get("redshift_rows", [])
-        redshift_macro_rows = data.get("redshift_macro_rows", [])
+        curve_rows = [
+            row for row in data.get("curve_rows", [])
+            if str(row.get("method")) in PAPER_METHODS
+        ]
+        redshift_macro_rows = [
+            row for row in data.get("redshift_macro_rows", [])
+            if str(row.get("method")) in PAPER_METHODS
+        ]
 
-        if curve_rows:
-            print(f"  {len(curve_rows)} curve rows: regenerating retrieval curves/coverage")
-            plot_retrieval_curves(curve_rows, result_dir)
-            plot_retrieval_coverage(curve_rows, result_dir)
-        if redshift_rows:
-            print(f"  {len(redshift_rows)} redshift rows: regenerating redshift diagnostics")
-            case["plot_redshift_metrics"](redshift_rows, result_dir)
-            case["plot_redshift_coverage"](redshift_rows, result_dir)
-        if redshift_macro_rows:
-            print(f"  {len(redshift_macro_rows)} redshift macro rows: regenerating paper macro plot")
-            case["plot_redshift_macro_metrics"](redshift_macro_rows, result_dir)
-
-        _copy_paper_files(result_dir, Path(case["paper_dir"]))
+        with tempfile.TemporaryDirectory(prefix="magiks_retrieval_figures_") as tmp:
+            render_dir = Path(tmp)
+            if curve_rows:
+                print(f"  {len(curve_rows)} curve rows: regenerating paper retrieval curves")
+                plot_retrieval_curves(curve_rows, render_dir)
+            if redshift_macro_rows:
+                print(f"  {len(redshift_macro_rows)} redshift macro rows: regenerating paper macro plot")
+                plot_ablation_redshift_macro_metrics(redshift_macro_rows, render_dir)
+            _copy_paper_files(render_dir, Path(case["paper_dir"]))
         print(f"  Done: {case['name']}")
     return 0
 

@@ -84,6 +84,7 @@ from retrieval_gallery import (  # noqa: E402
     _plot_method_color_map,
     _plot_method_draw_order,
     _plot_method_label,
+    _plot_method_zorder,
     plot_retrieval_curves,
     score_all_galleries_skymap,
 )
@@ -820,6 +821,7 @@ def plot_redshift_metrics(
                         linewidth=2,
                         label=label_fn(method),
                         color=method_colors[method],
+                        zorder=_plot_method_zorder(method),
                     )
             ax.set_xlabel("Redshift")
             ax.set_ylabel(metric_label)
@@ -877,6 +879,7 @@ def plot_redshift_macro_metrics(
                 linewidth=2,
                 label=label_fn(method),
                 color=method_colors[method],
+                zorder=_plot_method_zorder(method),
             )
         ax.set_xlabel("Redshift")
         ax.set_ylabel(metric_label)
@@ -946,8 +949,9 @@ def plot_redshift_coverage(rows: Sequence[Mapping[str, Any]], output_dir: Path) 
                     [float(row["coverage"]) for row in method_rows],
                     marker="o",
                     linewidth=2,
-                    label=method,
+                    label=_plot_method_label(method),
                     color=method_colors[method],
+                    zorder=_plot_method_zorder(method),
                 )
         ax.set_xlabel("Redshift")
         ax.set_ylabel("Mean Fill Ratio")

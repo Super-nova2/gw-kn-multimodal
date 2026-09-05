@@ -71,6 +71,23 @@ def _make_two_pixel_skymap_xy(*, first_high: str) -> torch.Tensor:
 
 
 class RetrievalGalleryTests(unittest.TestCase):
+    def test_current_full_name_uses_magiks_red_and_draws_on_top(self) -> None:
+        full_name = "Full (HPO v7 + Mixed Gallery)"
+        methods = [full_name, "w/o Retrieval Loss", "Optical-only"]
+
+        self.assertEqual(retrieval_gallery._plot_method_label(full_name), "MAGIKS")
+        self.assertEqual(
+            retrieval_gallery._plot_method_color_map(methods)[full_name], "#D62728"
+        )
+        self.assertEqual(
+            sorted(methods, key=retrieval_gallery._plot_method_draw_order)[-1],
+            full_name,
+        )
+        self.assertGreater(
+            retrieval_gallery._plot_method_zorder(full_name),
+            retrieval_gallery._plot_method_zorder("w/o Retrieval Loss"),
+        )
+
     def test_no_classification_color_preserves_existing_method_colors(self) -> None:
         existing_methods = [
             "Fink Random Forest",

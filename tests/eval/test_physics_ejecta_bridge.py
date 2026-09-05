@@ -15,6 +15,8 @@ from Model.scripts.eval.eval_gw_kn_directional_bridge import (
     PLOT_FONT_SCALE,
     PLOT_LATEX_PREAMBLE,
     PLOT_LEGEND_SCALE,
+    PLOT_MODEL_LABELS,
+    PLOT_MODEL_MARKERS,
     PLOT_PARAMETER_LABELS,
     aggregate_pair_dwr,
     decision_row,
@@ -125,6 +127,19 @@ def test_plot_labels_use_physical_symbols_and_readable_dose_names() -> None:
         "log10_distance_gpc",
     }
     assert all(label.startswith("$") for label in PLOT_PARAMETER_LABELS.values())
+    assert "NSBH" in PLOT_PARAMETER_LABELS["primary_spin_z"]
+    assert r"\iota" in PLOT_PARAMETER_LABELS["abs_costheta"]
+    assert r"\theta" not in PLOT_PARAMETER_LABELS["abs_costheta"]
+    assert PLOT_MODEL_LABELS == {
+        "Full": "MAGIKS",
+        BRIDGE_NAME: "Physics-informed empirical bridge",
+        GW_BLIND_NAME: "GW-independent optical control",
+    }
+    assert PLOT_MODEL_MARKERS == {
+        "Full": "o",
+        BRIDGE_NAME: "s",
+        GW_BLIND_NAME: "D",
+    }
     assert DOSE_BIN_LABELS == {
         "T1_low": "Low",
         "T2_mid": "Medium",

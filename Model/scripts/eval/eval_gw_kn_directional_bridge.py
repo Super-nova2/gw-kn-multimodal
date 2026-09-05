@@ -61,9 +61,24 @@ PLOT_PARAMETER_LABELS = {
     ),
     "mass_ratio": r"$q$ (mass ratio)",
     "chi_eff": r"$\chi_{\mathrm{eff}}$ (effective spin)",
-    "primary_spin_z": r"$\chi_{1z}$ (primary spin)",
-    "abs_costheta": r"$|\cos\theta_{\mathrm{JN}}|$ (inclination)",
+    "primary_spin_z": r"$\chi_{1z}$ (primary spin; NSBH)",
+    "abs_costheta": r"$|\cos\iota|$ (inclination)",
     "log10_distance_gpc": (r"$\log_{10}(d_{L}/\mathrm{Gpc})$ (luminosity distance)"),
+}
+PLOT_MODEL_LABELS = {
+    "Full": "MAGIKS",
+    BRIDGE_NAME: "Physics-informed empirical bridge",
+    GW_BLIND_NAME: "GW-independent optical control",
+}
+PLOT_MODEL_MARKERS = {
+    "Full": "o",
+    BRIDGE_NAME: "s",
+    GW_BLIND_NAME: "D",
+}
+PLOT_MODEL_COLORS = {
+    "Full": "#1f77b4",
+    BRIDGE_NAME: "#ff7f0e",
+    GW_BLIND_NAME: "#666666",
 }
 DOSE_BIN_LABELS = {
     "T1_low": "Low",
@@ -974,7 +989,10 @@ def plot_dwr_results(
         "#e377c2",
         "#7f7f7f",
     ]
-    colors = [palette[index % len(palette)] for index in range(len(models))]
+    colors = [
+        PLOT_MODEL_COLORS.get(model, palette[index % len(palette)])
+        for index, model in enumerate(models)
+    ]
     color_map = dict(zip(models, colors))
     artifacts: list[str] = []
     absolute = primary[primary["endpoint"] == "absolute_directional_win_rate"]
@@ -992,14 +1010,16 @@ def plot_dwr_results(
             estimate,
             y,
             xerr=[estimate - low, high - estimate],
-            fmt="o",
+            fmt=PLOT_MODEL_MARKERS.get(model, "o"),
             capsize=3,
             color=color,
-            label=model,
+            markerfacecolor="white" if model == GW_BLIND_NAME else color,
+            markeredgecolor=color,
+            label=PLOT_MODEL_LABELS.get(model, model),
         )
     ax.axvline(0.5, color="black", linestyle="--", linewidth=1)
     ax.set_yticks(np.arange(len(targets)), target_labels)
-    ax.set_xlabel("Directional-win rate")
+    ax.set_xlabel("Directional consistency rate")
     ax.legend(loc="best")
     fig.tight_layout()
     for suffix in ("png", "pdf"):
@@ -1070,7 +1090,7 @@ def plot_dwr_results(
                 rows["estimate"] - 0.5,
                 marker="o",
                 color=color,
-                label=model,
+                label=PLOT_MODEL_LABELS.get(model, model),
             )
         ax.axhline(0.0, color="black", linestyle="--", linewidth=1)
         ax.set_title(PLOT_PARAMETER_LABELS[target])
@@ -1105,7 +1125,7 @@ def plot_dwr_results(
                 rows["directional_win_rate"],
                 marker="o",
                 color=color,
-                label=model,
+                label=PLOT_MODEL_LABELS.get(model, model),
             )
         ax.axhline(0.5, color="black", linestyle="--", linewidth=1)
         ax.set_title(PLOT_PARAMETER_LABELS[target])

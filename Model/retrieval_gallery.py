@@ -24,6 +24,7 @@ PLOT_METHOD_LABELS = {
     "full": "MAGIKS",
     "Full": "MAGIKS",
     "Full v11": "MAGIKS",
+    "Full (HPO v7 + Mixed Gallery)": "MAGIKS",
     "w/o Retrieval Loss": "w/o Retrieval Loss",
     "v11 w/o Retrieval Loss": "w/o Retrieval Loss",
     "w/o Cross-Attn": "w/o Cross Attention",
@@ -47,6 +48,7 @@ PLOT_METHOD_COLORS = {
     "full": "#D62728",
     "Full": "#D62728",
     "Full v11": "#D62728",
+    "Full (HPO v7 + Mixed Gallery)": "#D62728",
     "MAGIKS": "#D62728",
     "w/o Classification Loss": "#17BECF",
     "\u5168\u6a21\u6001": "#D62728",
@@ -87,8 +89,13 @@ def _plot_method_color_map(methods: Sequence[str]) -> Dict[str, str]:
 def _plot_method_draw_order(method: str) -> tuple:
     """Sort key: 'full' variants draw last (on top of other curves)."""
     s = str(method)
-    is_full = "全模态" in s or "Full" in s
+    is_full = "全模态" in s or "Full" in s or _plot_method_label(s) == "MAGIKS"
     return (int(is_full), s)
+
+
+def _plot_method_zorder(method: str) -> int:
+    """Keep MAGIKS visibly above overlapping comparison curves."""
+    return 10 if _plot_method_label(str(method)) == "MAGIKS" else 2
 
 
 def _remove_stale_pdf(path: Path) -> None:
@@ -1036,6 +1043,7 @@ def plot_retrieval_curves(curve_rows: Sequence[Mapping[str, Any]], output_dir: P
                 linewidth=2,
                 label=_plot_method_label(method),
                 color=method_colors[method],
+                zorder=_plot_method_zorder(method),
             )
         ax.set_xscale("log")
         ax.set_xlabel("Gallery size")
@@ -1110,6 +1118,7 @@ def plot_retrieval_coverage(curve_rows: Sequence[Mapping[str, Any]], output_dir:
             linewidth=2,
             label=_plot_method_label(method),
             color=method_colors[method],
+            zorder=_plot_method_zorder(method),
         )
 
     ax.set_xscale("log")
