@@ -1,162 +1,117 @@
-# Python Environment Setup — bgao_kn
+# Python Environment Setup: gw-kn-multimodal
 
-> **Language / 语言**: [中文](#中文版) | [English](#english-version)
-
----
+[中文](#中文版) | [English](#english-version) | [项目说明 / Project README](README.md)
 
 <a id="中文版"></a>
 
 ## 中文版
 
-本项目的 Python 环境用于千新星（kilonova）多信使天文学研究，包含 GW 数据分析、Rubin/LSST 巡天模拟、机器学习等工具链。
+### 选择安装方式
 
-### 环境概览
+本仓库是脚本与研究环境集合。完整环境由 `pyproject.toml` 和 `uv.lock` 定义，要求 **Python >=3.10,<3.11**；锁文件针对 Python 3.10，PyTorch 使用 CUDA 12.6 wheel。安装 Python 依赖不会安装外部数据、checkpoint、SNANA 或 Slurm。
 
-- **Python**: >=3.10, <3.11
-- **核心依赖**: lalsuite, ligo.skymap, astropy, torch (CUDA 12.6), fink-client 等
-- **管理工具**: [uv](https://docs.astral.sh/uv/) (推荐) 或 pip
+| 文件 | 用途与限制 |
+| --- | --- |
+| [requirements.txt](requirements.txt) | 核心模型的最小依赖，多数未固定版本；不覆盖完整模拟和开发工具链 |
+| [pyproject.toml](pyproject.toml) + [uv.lock](uv.lock) | 完整研究依赖、CUDA 索引和 `dev` 可选依赖；推荐以锁文件重建 |
+| [requirements-rubin.txt](requirements-rubin.txt) | 历史 `rubin` 环境快照，包含 `opsimsummaryv2==0.1`；与当前锁文件不是同一组版本 |
 
-### 需要分发的文件
+例如，当前锁文件包含 torch `2.11.0+cu126` / torchvision `0.26.0+cu126`，历史快照固定为 `2.9.1+cu126` / `0.24.1+cu126`。请选择一种安装来源；不要把历史快照叠加到锁文件环境后仍视为同一个环境。
 
-在任意设备上重建环境，只需要以下文件：
+### 方法一：完整锁定环境
 
-| 文件 | 用途 |
-|---|---|
-| `pyproject.toml` | 项目依赖声明（直接依赖 + uv 配置） |
-| `uv.lock` | 锁文件，包含所有依赖的精确版本（方法一使用） |
-| `requirements-rubin.txt` | pip freeze 导出的完整依赖列表（方法二/三使用） |
-
-将这三个文件复制到目标目录即可开始重建。
-
----
-
-### 方法一：使用 `uv sync`（推荐）
-
-从 `uv.lock` 锁文件精确重建环境，保证完全可复现。
-
-#### 前提
-
-```bash
-# 安装 uv（如果尚未安装）
-curl -LsSf https://astral.sh/uv/install.sh | sh
-```
-
-需要系统中有 Python 3.10。如果没有，uv 可以自动下载：
+在安装了 uv 的机器上，从仓库根目录运行：
 
 ```bash
 uv python install 3.10
-```
-
-在 OzSTAR 集群上，也可以使用系统模块：
-
-```bash
-module load Python/3.10.4-GCCcore-11.3.0
-```
-
-#### 重建步骤
-
-```bash
-# 进入包含 pyproject.toml 和 uv.lock 的目录
-cd /path/to/your/project
-
-# 从 lockfile 创建 .venv 并安装所有依赖
-uv sync
-```
-
-环境将创建在 `.venv/` 目录下。激活方式：
-
-```bash
+uv sync --locked
 source .venv/bin/activate
 ```
 
-或直接使用 `uv run` 执行脚本（无需手动激活）：
+`uv sync --locked` 要求依赖声明与锁文件一致，不更新锁文件。OzSTAR 上也可先加载已有的 Python 3.10 模块。环境创建在仓库的 `.venv/`；现有工作区中的 `rubin/` 是另一个环境，不会被自动激活。
+
+需要 pytest、Ruff 和 Black 时，启用已声明的 `dev` extra：
 
 ```bash
-uv run python your_script.py
-uv run jupyter lab
+uv sync --locked --extra dev
+uv run --locked --extra dev python -m pytest tests/config/test_config_templates.py tests/config/test_optical_only_layout.py
 ```
 
-#### 添加 / 移除依赖
+完整测试命令是 `python -m pytest`；部分测试依赖科学计算包或本地历史配置。此处的配置检查不会提交训练或模拟作业。
+
+### 方法二：最小模型环境
+
+仅做核心模型开发、且不需要完整研究工具链时，可在独立环境中安装：
 
 ```bash
-uv add <package-name>        # 自动更新 pyproject.toml 和 uv.lock
-uv remove <package-name>     # 移除依赖
+python3.10 -m venv .venv-minimal
+source .venv-minimal/bin/activate
+python -m pip install -r requirements.txt
+python -m pip install 'pytest>=7' ruff black
 ```
 
----
+该依赖表不固定 PyTorch CUDA 构建，也不包括模拟入口所需的全部依赖。使用 SNANA、Bridge 拟合或完整分析工具链时，优先采用方法一。
 
-### 方法二：使用 `uv pip install`（从 requirements 文件）
+### 方法三：历史 rubin 快照
 
-不使用 project 模式，直接从冻结的依赖列表安装。适合只需快速搭建、不打算管理依赖变更的场景。
+此方式需要外部 `opsimsummaryv2` 源码，且源码包版本须满足快照中的 `0.1`。它不是仓库自带文件。以下 `/path/to/opsimsummaryv2` 必须替换为实际源码路径：
 
 ```bash
-# 创建虚拟环境（uv 会自动查找或下载 Python 3.10）
-uv venv myenv --python 3.10
-
-# 安装所有依赖
-uv pip install -r requirements-rubin.txt \
-    --extra-index-url https://download.pytorch.org/whl/cu126 \
-    --index-strategy unsafe-best-match \
-    --python myenv/bin/python
-
-# 激活
-source myenv/bin/activate
+python3.10 -m venv .venv-rubin-snapshot
+source .venv-rubin-snapshot/bin/activate
+python -m pip install -e /path/to/opsimsummaryv2 \
+  -r requirements-rubin.txt \
+  --extra-index-url https://download.pytorch.org/whl/cu126
 ```
 
-> **说明**: `--extra-index-url` 和 `--index-strategy` 是 PyTorch CUDA 版本所需的参数。
-
----
-
-### 方法三：使用 `pip`（备选，无需 uv）
+也可用 uv 的 pip 接口在单独环境中安装同一快照：
 
 ```bash
-# 确保有 Python 3.10，然后创建虚拟环境
-python3.10 -m venv myenv
-source myenv/bin/activate
-
-# 安装所有依赖
-pip install -r requirements-rubin.txt \
-    --extra-index-url https://download.pytorch.org/whl/cu126
+uv venv .venv-rubin-snapshot --python 3.10
+uv pip install --python .venv-rubin-snapshot/bin/python \
+  -e /path/to/opsimsummaryv2 -r requirements-rubin.txt \
+  --extra-index-url https://download.pytorch.org/whl/cu126 \
+  --index-strategy unsafe-best-match
 ```
 
-> **说明**: pip 安装速度较 uv 慢很多（约 10-100x），但不需要额外安装任何工具。
+直接安装快照而不提供 `opsimsummaryv2` 的可用来源可能失败。快照和项目依赖中的 `fink-client` 都指向同一个 Git commit，需要 Git 以及对该源码仓库的访问。
 
----
+### 模拟与集群依赖
 
-### 特殊包处理
-
-#### opsimsummaryv2
-
-`opsimsummaryv2` (作者: Bastien Carreres) 不在 PyPI 上，未包含在 `pyproject.toml` 的依赖中。
-使用方法一或方法二重建环境后，需要手动安装：
+`opsimsummaryv2` 未列入项目的直接依赖。采用方法一后，模拟用户需另外安装其源码到同一个 Python 环境：
 
 ```bash
-# 如果有源码目录
-uv pip install -e /path/to/opsimsummaryv2/   # uv 方式
-pip install -e /path/to/opsimsummaryv2/       # pip 方式
+uv pip install --python .venv/bin/python -e /path/to/opsimsummaryv2
 ```
 
-该包的依赖（astropy, healpy, numpy, pandas, scikit-learn, sqlalchemy）已全部包含在环境中。
+之后使用会精确同步环境的 `uv sync` 时，需检查这个额外安装的包是否仍存在。模拟流程还需要：
 
-#### fink-client
+- 外部 GWSamplegen 正负目录、各自的 skymap 和完整数据来源记录。
+- Rubin baseline v5.1 OpSim 数据库，以及 profile 引用的 ToO 配置。
+- SNANA 的 `snlc_sim.exe`、SNDATA_ROOT 模型和标定数据；Python 安装不能替代这些文件。
+- Slurm 的 `sbatch` 等命令、可用分区和资源配额；部分训练/评估包装器还依赖 `jq`。
+- 可写的节点临时目录。生产模拟要求 `SLURM_TMPDIR` 或 `JOBFS`，当前 profile 请求 5 GiB；模型任务的 HDF5 暂存要求另见对应脚本。
 
-`fink-client` 从 GitHub 仓库的指定 commit 直接安装，已在 `pyproject.toml` 和 `requirements-rubin.txt` 中配置，无需额外操作。
+激活环境后再提交作业，包装器调用的是作业环境中的 `python`。GPU 可用性应在已分配的 GPU 节点检查，登录节点返回 False 不代表依赖安装失败：
 
----
+```bash
+python -c 'import sys, torch; print(sys.version); print(torch.__version__, torch.version.cuda, torch.cuda.is_available())'
+python -m pip check
+```
 
-### 常见问题
+CPU-only 环境需单独选择兼容的 PyTorch 安装方案。锁文件和历史快照都包含 CUDA 构建，仅把索引 URL 改为 CPU 不会使现有 CUDA 版本约束变成 CPU 环境。
 
-**Q: `uv sync` 时提示找不到 Python 3.10？**
-A: 运行 `uv python install 3.10`，uv 会自动下载并管理 Python 版本。
+### 路径与配置
 
-**Q: PyTorch 安装失败？**
-A: 确保能访问 `https://download.pytorch.org/whl/cu126`。该 index 已在 `pyproject.toml` 中配置。如不需要 GPU，可将 `pyproject.toml` 中的 `cu126` 改为 `cpu`。
+见 [README 配置生成步骤](README.md#configuration)。`BASE_DIR` 表示数据工作区，`REPO_ROOT` 表示代码根目录；JSON 占位符必须在运行前替换。模拟 YAML 会自动展开这两个变量；部分评估包装器使用 `WORKSPACE_ROOT`，默认也是 `/fred/oz016/bgao_kn`。
 
-**Q: CUDA 显示不可用 (`torch.cuda.is_available()` 返回 False)？**
-A: 需要在有 NVIDIA GPU 的机器上运行。在 HPC 集群中，需要通过作业调度器（如 Slurm）分配 GPU 节点。
+仍有硬编码的 OzSTAR 日志目录、Slurm 分区和论文输出位置。可在运行前只读搜索：
 
-**Q: 不需要 GPU / 只需要 CPU 版本的 PyTorch？**
-A: 将 `pyproject.toml` 中 `[[tool.uv.index]]` 的 URL 改为 `https://download.pytorch.org/whl/cpu`，然后重新 `uv lock && uv sync`。
+```bash
+rg -n '/fred/oz016/bgao_kn|WORKSPACE_ROOT|#SBATCH' Model optical_only kn_simulation plots_scripts
+```
+
+各入口支持的资源覆盖变量并不相同，需查看所用 shell 脚本。外部数据、runtime JSON、日志目录、模型权重和模拟可执行文件全部就绪后，再提交计算任务。
 
 ---
 
@@ -164,152 +119,109 @@ A: 将 `pyproject.toml` 中 `[[tool.uv.index]]` 的 URL 改为 `https://download
 
 ## English Version
 
-This Python environment is designed for kilonova multi-messenger astronomy research, including GW data analysis, Rubin/LSST survey simulations, and machine learning pipelines.
+### Choose an Installation Source
 
-### Environment Overview
+This repository contains scripts and a research environment. The full environment is defined by `pyproject.toml` and `uv.lock` and requires **Python >=3.10,<3.11**. The lock targets Python 3.10 and CUDA 12.6 PyTorch wheels. Installing Python dependencies does not install datasets, checkpoints, SNANA or Slurm.
 
-- **Python**: >=3.10, <3.11
-- **Key dependencies**: lalsuite, ligo.skymap, astropy, torch (CUDA 12.6), fink-client, etc.
-- **Package manager**: [uv](https://docs.astral.sh/uv/) (recommended) or pip
+| File | Purpose and limits |
+| --- | --- |
+| [requirements.txt](requirements.txt) | Minimal core-model dependencies, mostly unpinned; not the full simulation or development toolchain |
+| [pyproject.toml](pyproject.toml) + [uv.lock](uv.lock) | Full research dependencies, CUDA index and optional `dev` tools; preferred for rebuilding |
+| [requirements-rubin.txt](requirements-rubin.txt) | Historical `rubin` snapshot including `opsimsummaryv2==0.1`; versions differ from the current lock |
 
-### Files to Distribute
+For example, the current lock contains torch `2.11.0+cu126` / torchvision `0.26.0+cu126`, while the snapshot pins `2.9.1+cu126` / `0.24.1+cu126`. Choose one installation source. Installing the snapshot over a locked environment does not preserve that locked environment.
 
-To rebuild the environment on any machine, you only need these files:
+### Method 1: Full Locked Environment
 
-| File | Purpose |
-|---|---|
-| `pyproject.toml` | Project dependency declaration (direct deps + uv config) |
-| `uv.lock` | Lock file with exact versions of all dependencies (for Method 1) |
-| `requirements-rubin.txt` | Frozen dependency list exported via pip freeze (for Method 2/3) |
-
-Copy these three files to your target directory to get started.
-
----
-
-### Method 1: `uv sync` (Recommended)
-
-Rebuild the environment from the `uv.lock` lock file for fully reproducible results.
-
-#### Prerequisites
-
-```bash
-# Install uv (if not already installed)
-curl -LsSf https://astral.sh/uv/install.sh | sh
-```
-
-Python 3.10 is required. If not available on your system, uv can download it automatically:
+With uv installed, run from the repository root:
 
 ```bash
 uv python install 3.10
-```
-
-On the OzSTAR cluster, you can also use the system module:
-
-```bash
-module load Python/3.10.4-GCCcore-11.3.0
-```
-
-#### Rebuild Steps
-
-```bash
-# Navigate to the directory containing pyproject.toml and uv.lock
-cd /path/to/your/project
-
-# Create .venv and install all dependencies from the lock file
-uv sync
-```
-
-The environment will be created in the `.venv/` directory. To activate:
-
-```bash
+uv sync --locked
 source .venv/bin/activate
 ```
 
-Or use `uv run` to execute scripts directly (no manual activation needed):
+`uv sync --locked` requires the dependency declaration and lock to agree without updating the lock. On OzSTAR, an available Python 3.10 module can also supply the interpreter. The environment is created at `.venv/` in this repository; an existing workspace `rubin/` is a separate environment and is not automatically activated.
+
+Enable the declared `dev` extra for pytest, Ruff and Black:
 
 ```bash
-uv run python your_script.py
-uv run jupyter lab
+uv sync --locked --extra dev
+uv run --locked --extra dev python -m pytest tests/config/test_config_templates.py tests/config/test_optical_only_layout.py
 ```
 
-#### Adding / Removing Dependencies
+Run the full suite with `python -m pytest`. Some tests depend on scientific packages or local historical configurations. The configuration checks above do not submit training or simulation jobs.
+
+### Method 2: Minimal Model Environment
+
+For core-model development without the complete research toolchain, use a separate environment:
 
 ```bash
-uv add <package-name>        # Automatically updates pyproject.toml and uv.lock
-uv remove <package-name>     # Remove a dependency
+python3.10 -m venv .venv-minimal
+source .venv-minimal/bin/activate
+python -m pip install -r requirements.txt
+python -m pip install 'pytest>=7' ruff black
 ```
 
----
+This list does not pin a PyTorch CUDA build or cover all simulation dependencies. Prefer Method 1 for SNANA workflows, Bridge fitting or the full analysis toolchain.
 
-### Method 2: `uv pip install` (From requirements file)
+### Method 3: Historical rubin Snapshot
 
-Install directly from the frozen dependency list without using project mode. Suitable for quick setup when you don't plan to manage dependency changes.
+This requires an external `opsimsummaryv2` source checkout whose package version satisfies the snapshot's `0.1` pin. It is not bundled in this repository. Replace `/path/to/opsimsummaryv2` with the actual source directory:
 
 ```bash
-# Create a virtual environment (uv will find or download Python 3.10 automatically)
-uv venv myenv --python 3.10
-
-# Install all dependencies
-uv pip install -r requirements-rubin.txt \
-    --extra-index-url https://download.pytorch.org/whl/cu126 \
-    --index-strategy unsafe-best-match \
-    --python myenv/bin/python
-
-# Activate
-source myenv/bin/activate
+python3.10 -m venv .venv-rubin-snapshot
+source .venv-rubin-snapshot/bin/activate
+python -m pip install -e /path/to/opsimsummaryv2 \
+  -r requirements-rubin.txt \
+  --extra-index-url https://download.pytorch.org/whl/cu126
 ```
 
-> **Note**: `--extra-index-url` and `--index-strategy` are required for the PyTorch CUDA build.
-
----
-
-### Method 3: `pip` (Fallback, no uv needed)
+Alternatively, install the same snapshot in a separate environment through uv's pip interface:
 
 ```bash
-# Make sure Python 3.10 is available, then create a virtual environment
-python3.10 -m venv myenv
-source myenv/bin/activate
-
-# Install all dependencies
-pip install -r requirements-rubin.txt \
-    --extra-index-url https://download.pytorch.org/whl/cu126
+uv venv .venv-rubin-snapshot --python 3.10
+uv pip install --python .venv-rubin-snapshot/bin/python \
+  -e /path/to/opsimsummaryv2 -r requirements-rubin.txt \
+  --extra-index-url https://download.pytorch.org/whl/cu126 \
+  --index-strategy unsafe-best-match
 ```
 
-> **Note**: pip is significantly slower than uv (~10-100x), but requires no additional tools.
+Installing the snapshot without an available `opsimsummaryv2` source can fail. Both the snapshot and project declaration obtain `fink-client` from the same Git commit, requiring Git and access to its source repository.
 
----
+### Simulation and Cluster Dependencies
 
-### Special Packages
-
-#### opsimsummaryv2
-
-`opsimsummaryv2` (author: Bastien Carreres) is not available on PyPI and is not included in `pyproject.toml`.
-After rebuilding the environment via any method above, install it manually:
+`opsimsummaryv2` is absent from the project's direct dependencies. After Method 1, simulation users must install its source into the same interpreter:
 
 ```bash
-# If you have the source code
-uv pip install -e /path/to/opsimsummaryv2/   # uv
-pip install -e /path/to/opsimsummaryv2/       # pip
+uv pip install --python .venv/bin/python -e /path/to/opsimsummaryv2
 ```
 
-All of its dependencies (astropy, healpy, numpy, pandas, scikit-learn, sqlalchemy) are already included in the environment.
+After subsequent exact environment synchronization with `uv sync`, check that this additional package is still installed. Simulation also requires:
 
-#### fink-client
+- External GWSamplegen positive/negative catalogs, their separate skymaps and bundle provenance.
+- The Rubin baseline v5.1 OpSim database and the ToO configuration referenced by the profile.
+- SNANA `snlc_sim.exe`, SNDATA_ROOT models and calibration data; Python installation does not supply them.
+- Slurm commands such as `sbatch`, suitable partitions and resources; some training/evaluation wrappers also need `jq`.
+- Writable node-local storage. Production simulation requires `SLURM_TMPDIR` or `JOBFS` and currently requests 5 GiB; model HDF5 staging requirements are specified by each launcher.
 
-`fink-client` is installed directly from a pinned GitHub commit. It is already configured in both `pyproject.toml` and `requirements-rubin.txt` — no extra steps needed.
+Activate the environment before submission: wrappers call `python` from the job environment. Check GPU availability inside a GPU allocation; False on a login node does not by itself indicate a broken installation:
 
----
+```bash
+python -c 'import sys, torch; print(sys.version); print(torch.__version__, torch.version.cuda, torch.cuda.is_available())'
+python -m pip check
+```
 
-### FAQ
+A CPU-only environment requires a separate, compatible PyTorch installation choice. Both the lock and snapshot contain CUDA builds; changing an index URL alone does not convert CUDA version constraints into a CPU environment.
 
-**Q: `uv sync` says it can't find Python 3.10?**
-A: Run `uv python install 3.10` — uv will download and manage the Python version for you.
+### Paths and Configuration
 
-**Q: PyTorch installation fails?**
-A: Make sure `https://download.pytorch.org/whl/cu126` is accessible. The index is already configured in `pyproject.toml`. If you don't need a GPU, change `cu126` to `cpu` in the index URL.
+See [runtime configuration generation](README_en.md#configuration). `BASE_DIR` denotes the data workspace and `REPO_ROOT` the code root. Replace JSON placeholders before use; simulation YAML expands these variables automatically. Some evaluation wrappers instead use `WORKSPACE_ROOT`, also defaulting to `/fred/oz016/bgao_kn`.
 
-**Q: CUDA is not available (`torch.cuda.is_available()` returns False)?**
-A: You need to run on a machine with an NVIDIA GPU. On HPC clusters, allocate a GPU node via the job scheduler (e.g., Slurm).
+Some OzSTAR log paths, Slurm partitions and paper output locations remain hardcoded. Search before running:
 
-**Q: Don't need GPU / want CPU-only PyTorch?**
-A: Change the `[[tool.uv.index]]` URL in `pyproject.toml` to `https://download.pytorch.org/whl/cpu`, then run `uv lock && uv sync`.
+```bash
+rg -n '/fred/oz016/bgao_kn|WORKSPACE_ROOT|#SBATCH' Model optical_only kn_simulation plots_scripts
+```
+
+Resource override variables differ between wrappers; inspect the shell entry point you will use. Prepare external data, runtime JSON, log directories, model weights and simulation executables before submitting compute work.

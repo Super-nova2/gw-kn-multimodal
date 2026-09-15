@@ -1,7 +1,11 @@
 # GWSamplegen to Rubin/SNANA production pipeline
 
-This is the maintained optical-simulation entry point. The repository's
-Historical `dataset/` has been backed up to `$BASE_DIR/backups/` and removed; GW170817 scripts live in `kn_simulation/gw170817a/`.
+[Project README](../README_en.md) | [中文说明](../README.md) | [Environment](../ENVIRONMENT.md) | [Runtime products](runs/README.md)
+
+This is the maintained production optical-simulation entry point. The historical
+`dataset/` directory has been removed. Local backups under `$BASE_DIR/backups/`
+are not distributed with the repository. The separate fixed-physics
+[GW170817A scenario experiment](gw170817a/README.md) has its own wrapper.
 
 The supported data flow is:
 
@@ -29,13 +33,22 @@ Do not execute files under `src/` directly. Do not place legacy
 
 ## Prerequisites
 
+Run commands from the repository root with the Python environment activated.
+Set `BASE_DIR` to the external data workspace; the profile loader derives
+`REPO_ROOT` from the checkout and expands both variables in YAML. The four
+tracked production profiles are `bns_train`, `nsbh_train`, `bns_test` and
+`nsbh_test`; no `test_aug` profile is distributed.
+
 The matching GWSamplegen dual bundle must be complete. Production profiles read positive and type-1 maps from
 `data/skymap/positive/<source>_skymap_<split>` and
 `data/skymap/negative/<source>_skymap_<split>`. Canonical catalogs and bundle
 provenance live under
 `GWSamplegen/outputs/production_am_bayestar/dual/<source>_<split>_seed_1234/`. `BASE_DIR` defaults to
 `/fred/oz016/bgao_kn`. Profiles also require the Rubin OpSim database, SNANA
-installation, SNDATA_ROOT models, and `sbatch`.
+installation, SNDATA_ROOT models, `opsimsummaryv2`, and `sbatch`. See the
+[environment guide](../ENVIRONMENT.md#english-version) for dependencies outside
+the Python lock file. A GitHub checkout does not contain the catalogs, skymaps,
+OpSim database or SNANA models.
 
 ## Commands
 
@@ -53,6 +66,7 @@ This validates the complete catalog and every expected skymap before writing:
 kn_simulation/runs/bns_train/catalog.csv
 kn_simulation/runs/bns_train/catalog.input.json
 kn_simulation/runs/bns_train/kn_catalog.csv
+kn_simulation/runs/bns_train/kn_catalog.manifest.json
 kn_simulation/runs/bns_train/neg_catalog.csv
 kn_simulation/runs/bns_train/dual_catalog.manifest.json
 ```
@@ -117,7 +131,10 @@ kn_simulation/bin/kn-sim submit bns_train \
 
 ## Catalog contract
 
-Only the complete GWSamplegen `catalog.csv` schema is accepted. In particular,
+Both streams must use the complete GWSamplegen catalog schema. The production
+interface takes `--pos-catalog` and `--neg-catalog` together; the retained
+`--catalog` option is a legacy single-positive input, not a substitute for the
+dual bundle. In particular,
 `network_snr` must be present, finite, and non-negative. Truth-level
 `mej_dynamic` and `mej_wind` must be finite and consistent with `mej_total`.
 Recovered parameters are preserved but are not used to recompute ejecta.
@@ -254,3 +271,28 @@ Run this sequence independently for `bns_train`, `nsbh_train`, `bns_test`, and
 `nsbh_test`. The combined BNS+NSBH dataset submit script now uses the four
 profile aggregates by default; legacy `BNS_SIM_ROOT`/`NSBH_SIM_ROOT` remains an
 explicit fallback when the artifact variables are empty.
+
+## Build the Model Dataset
+
+After the BNS and NSBH aggregates for the selected split are ready, run from
+the repository root:
+
+```bash
+PROFILE=final_train DATASET_MODE=train \
+    bash Model/scripts/data/submit_create_dataset_bns_nsbh.sh
+PROFILE=astro_test DATASET_MODE=test \
+    bash Model/scripts/data/submit_create_dataset_bns_nsbh.sh
+```
+
+These submit jobs, so prepare the matching inputs before each command. Default
+outputs under `$BASE_DIR/data/ALBEF_dataset/` are `combined_dataset_train.h5`
+and `combined_dataset_astro_test.h5`. `BNS_SIM_ARTIFACT` and
+`NSBH_SIM_ARTIFACT` select alternative aggregates; the dataset builder also
+requires the separate negative catalogs and negative skymap roots.
+
+The aggregate archives optical simulation state; the final model HDF5 adds
+GW parents and labels. Physical double-zero ejecta events become type-1 GW
+negatives. Events with ejecta but no usable optical counterpart can supply
+type-2 GW negatives. Optical rows reference positive parents only. External
+non-KN optical distractors are another input, not the retained negative GW
+catalog. See the [MAGIKS guide](../Model/args/README.md) for training inputs.
