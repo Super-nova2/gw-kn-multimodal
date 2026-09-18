@@ -1,6 +1,6 @@
 # gw-kn-multimodal
 
-[English](README.md) | [中文](README_zh.md)
+[English](README.md) | [中文](README_cn.md)
 
 面向千新星（kilonova, KN）识别的多模态研究仓库：从 GWSamplegen 引力波目录出发，经 Rubin/SNANA 光学模拟和 HDF5 数据集构建，训练与评估 GW + optical 联合模型 MAGIKS，并与 optical-only、Skymap-only 和 Fink Random Forest 基线比较。
 

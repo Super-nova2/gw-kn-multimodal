@@ -1,6 +1,6 @@
 # MAGIKS Configuration Guide
 
-[Project README](../../README.md) | [中文说明](../../README_zh.md) | [Environment](../../ENVIRONMENT.md)
+[Project README](../../README.md) | [中文说明](../../README_cn.md) | [Environment](../../ENVIRONMENT.md)
 
 ## Templates and Runtime Files
 

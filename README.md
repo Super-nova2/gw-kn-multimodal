@@ -1,6 +1,6 @@
 # gw-kn-multimodal
 
-[English](README.md) | [中文](README_zh.md)
+[English](README.md) | [中文](README_cn.md)
 
 A multimodal research repository for kilonova (KN) identification: starting from GWSamplegen gravitational-wave catalogs, it runs Rubin/SNANA optical simulations, builds HDF5 datasets, and trains and evaluates the joint GW + optical model MAGIKS alongside optical-only, Skymap-only, and Fink Random Forest baselines.
 

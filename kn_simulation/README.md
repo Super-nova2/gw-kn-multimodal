@@ -1,6 +1,6 @@
 # GWSamplegen to Rubin/SNANA production pipeline
 
-[Project README](../README.md) | [中文说明](../README_zh.md) | [Environment](../ENVIRONMENT.md) | [Runtime products](runs/README.md)
+[Project README](../README.md) | [中文说明](../README_cn.md) | [Environment](../ENVIRONMENT.md) | [Runtime products](runs/README.md)
 
 This is the maintained production optical-simulation entry point. The historical
 `dataset/` directory has been removed. Local backups under `$BASE_DIR/backups/`

@@ -1,6 +1,6 @@
 # Optical-Only Configuration Guide
 
-[Project README](../../README.md) | [中文说明](../../README_zh.md) | [MAGIKS configuration](../../Model/args/README.md)
+[Project README](../../README.md) | [中文说明](../../README_cn.md) | [MAGIKS configuration](../../Model/args/README.md)
 
 ## Current Templates
 
