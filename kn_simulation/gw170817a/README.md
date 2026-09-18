@@ -1,6 +1,6 @@
 # GW170817A LSST scenario retrieval
 
-[Project README](../../README_en.md) | [Production simulation](../README.md) | [Environment](../../ENVIRONMENT.md)
+[Project README](../../README.md) | [Production simulation](../README.md) | [Environment](../../ENVIRONMENT.md)
 
 This directory builds one fixed-physics GW170817A retrieval benchmark. It does
 not scan redshift. Every GW parent uses the same posterior-median detector-frame
@@ -58,7 +58,7 @@ are intentionally absent.
 
 Wait for dataset construction to finish. Generate the ignored runtime JSON
 from [retrieval_gw170817a_lsst.json.example](../../Model/args/eval/retrieval_gw170817a_lsst.json.example)
-using the [README configuration command](../../README_en.md#configuration).
+using the [README configuration command](../../README.md#configuration).
 The current template contains hardcoded OzSTAR paths; that command translates
 their data and repository prefixes as well as expanding placeholders in the
 other templates. Copying this template alone does not adapt it to a different

@@ -1,6 +1,6 @@
 # Runtime Directories
 
-[Production pipeline](../README.md) | [Project README](../../README_en.md)
+[Production pipeline](../README.md) | [Project README](../../README.md)
 
 Only this guide is tracked here. Each production profile creates an ignored
 run directory: `bns_train`, `nsbh_train`, `bns_test` or `nsbh_test`.

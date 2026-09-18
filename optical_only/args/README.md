@@ -1,6 +1,6 @@
 # Optical-Only Configuration Guide
 
-[Project README](../../README_en.md) | [中文说明](../../README.md) | [MAGIKS configuration](../../Model/args/README.md)
+[Project README](../../README.md) | [中文说明](../../README_zh.md) | [MAGIKS configuration](../../Model/args/README.md)
 
 ## Current Templates
 
@@ -21,7 +21,7 @@ are preserved for compatibility; the artifact is not included in Git.
 
 ## Prepare and Run
 
-Generate runtime JSON using the [repository configuration example](../../README_en.md#configuration).
+Generate runtime JSON using the [repository configuration example](../../README.md#configuration).
 It replaces `<BASE_DIR>` and `<REPO_ROOT>` in tracked templates and preserves
 existing local files. Runtime `*.json` is ignored by Git and needs manual
 comparison with templates after updates.

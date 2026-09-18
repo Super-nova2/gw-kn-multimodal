@@ -216,7 +216,7 @@ A CPU-only environment requires a separate, compatible PyTorch installation choi
 
 ### Paths and Configuration
 
-See [runtime configuration generation](README_en.md#configuration). `BASE_DIR` denotes the data workspace and `REPO_ROOT` the code root. Replace JSON placeholders before use; simulation YAML expands these variables automatically. Some evaluation wrappers instead use `WORKSPACE_ROOT`, also defaulting to `/fred/oz016/bgao_kn`.
+See [runtime configuration generation](README.md#configuration). `BASE_DIR` denotes the data workspace and `REPO_ROOT` the code root. Replace JSON placeholders before use; simulation YAML expands these variables automatically. Some evaluation wrappers instead use `WORKSPACE_ROOT`, also defaulting to `/fred/oz016/bgao_kn`.
 
 Some OzSTAR log paths, Slurm partitions and paper output locations remain hardcoded. Search before running:
 

@@ -1,11 +1,11 @@
 # MAGIKS Configuration Guide
 
-[Project README](../../README_en.md) | [中文说明](../../README.md) | [Environment](../../ENVIRONMENT.md)
+[Project README](../../README.md) | [中文说明](../../README_zh.md) | [Environment](../../ENVIRONMENT.md)
 
 ## Templates and Runtime Files
 
 Git tracks `*.json.example`. Generate ignored runtime `*.json` files with the
-[repository configuration example](../../README_en.md#configuration), which
+[repository configuration example](../../README.md#configuration), which
 replaces both `<BASE_DIR>` and `<REPO_ROOT>`, translates legacy OzSTAR path
 prefixes, and preserves existing JSON files. The GW170817A template currently
 contains absolute paths instead of placeholders, so the existing template
